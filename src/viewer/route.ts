@@ -39,7 +39,9 @@ function parseRef(raw: string | null): string | null {
   if (raw === 'HEAD') return 'HEAD';
   if (OID.test(raw)) return raw;
   if (raw.startsWith('refs/')) {
-    if (/[\u0000-\u001f\u007f ~^:?*\[\\]|\.\.|@\{|\/\/|\s/.test(raw)) bad('ref is not a valid name');
+    // Control characters are rejected on purpose: a ref is a git name, not free text.
+    // oxlint-disable-next-line no-control-regex
+    if (/[\u0000-\u001f\u007f ~^:?*[\\]|\.\.|@\{|\/\/|\s/.test(raw)) bad('ref is not a valid name');
     return raw;
   }
   if (!/^[A-Za-z0-9._/-]+$/.test(raw) || raw.includes('..') || raw.startsWith('/') || raw.endsWith('/') || raw.endsWith('.lock')) bad('ref is not a valid name');
@@ -63,6 +65,7 @@ function parseFilter(raw: string | null, wantPresent: boolean): FilterName {
 }
 
 function locate(host: string, repoPath: string, opts: RouteOpts): RepoLocation {
+  // oxlint-disable-next-line no-control-regex -- hostnames cannot contain controls or whitespace
   if (!host || host.length > 253 || /[\u0000-\u001f\u007f\s/@\\]/.test(host)) bad(`remote host is not allowed. Supported hosts: ${opts.allowedHosts.join(', ')}.`);
   return validatePublicRepoUrl(`https://${host}/${repoPath}`, { allowedHosts: opts.allowedHosts, maxLength: VIEWER_CAPS.maxUrlLength });
 }

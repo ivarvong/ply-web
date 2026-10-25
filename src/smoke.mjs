@@ -6,7 +6,7 @@
 //
 // PLY token: ~/.config/ply/worker-token. Artifacts read token: $PLY_SMOKE_READ_JSON (default: the session scratchpad's
 // repo-create.json), field `token`. Expected README bytes: `git show a0f7f4c:README.md` in this repo.
-import { readFileSync, writeFileSync, mkdtempSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -44,7 +44,7 @@ const gitCommitView = (dir, oid) => {
   const id = (name, email, d) => { const [epoch, tz] = d.split(' '); return { name, email, time: new Date(Number(epoch) * 1000).toISOString().replace('.000Z', 'Z'), epoch: Number(epoch), tz }; };
   return { oid: o, tree, parents: parents ? parents.split(' ') : [], author: id(an, ae, ad), committer: id(cn, ce, cd), message: raw.slice(cut + 2), signed: /^gpgsig(-sha256)? /m.test(raw.slice(0, cut)) };
 };
-const sameCommit = (json, want) => { const { ref, trace, ...got } = json; const bad = Object.keys(want).filter(k => JSON.stringify(got[k]) !== JSON.stringify(want[k])); return bad.length ? `fields differ from git: ${bad.join(',')}` : { info: `${want.oid} parents=${want.parents.length} signed=${want.signed} == git (${Object.keys(want).length} fields)` }; };
+const sameCommit = (json, want) => { const { ref: _ref, trace: _trace, ...got } = json; const bad = Object.keys(want).filter(k => JSON.stringify(got[k]) !== JSON.stringify(want[k])); return bad.length ? `fields differ from git: ${bad.join(',')}` : { info: `${want.oid} parents=${want.parents.length} signed=${want.signed} == git (${Object.keys(want).length} fields)` }; };
 const leakCheck = (text, toks) => toks.filter(Boolean).every(t => !text.includes(t) && !text.includes(Buffer.from(`x-access-token:${t}`).toString('base64')));
 
 if (phase === 'gate' || phase === 'read') {

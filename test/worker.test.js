@@ -19,7 +19,7 @@ const PORT = 18900 + (process.pid % 50), PORT_RO = PORT + 50;
 const PLY = 'test-ply-token-' + 'x'.repeat(20);
 const SECRET = 'gitcred_' + 'S3cr3tT0k3n'.repeat(3);          // the git credential the auth proxy expects
 const EXPECT = `Bearer ${SECRET}`;
-let root, cleanup, srv, authSrv, echoSrv, artProxy, proc, procRo, logs = '';
+let root, cleanup, srv, authSrv, echoSrv, artProxy, proc, logs = '';
 const A = { name: 'w', email: 'w@x' };
 
 // a git host that requires `Authorization: Bearer SECRET` (401 without, 403 with a wrong one) in front of http-backend

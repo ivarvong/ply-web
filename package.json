@@ -10,9 +10,12 @@
   "scripts": {
     "smoke": "node src/smoke.mjs",
     "worker:deploy": "env -u CLOUDFLARE_API_TOKEN wrangler deploy",
-    "test": "node --test test/worker.test.js",
+    "test": "node --test test/worker.test.js && node --experimental-strip-types --test test/viewer.test.ts",
     "test:worker": "node --test test/worker.test.js",
-    "worker:test": "node --test test/worker.test.js"
+    "worker:test": "node --test test/worker.test.js",
+    "test:viewer": "node --experimental-strip-types --test test/viewer.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "oxlint"
   },
   "dependencies": {
     "ply": "github:ivarvong/ply#40cb5da42abc64126c2ac4d38eff09e1a7c549e3"

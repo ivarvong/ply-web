@@ -109,6 +109,7 @@ function checkPath(pathname: string, allowed: readonly AllowedHost[]): string {
   if (trimmed.length > 512) reject(allowed, 'remote path is too long.');
   for (const part of parts) {
     if (!part || part === '.' || part === '..') reject(allowed, 'remote path is not allowed.');
+    // oxlint-disable-next-line no-control-regex -- path segments cannot contain controls
     if (part.includes('@') || part.includes('\\') || part.includes(' ') || /[\u0000-\u001f\u007f]/.test(part)) reject(allowed, 'remote path is not allowed.');
     if (part.includes('%')) reject(allowed, 'remote path is not allowed.');
   }
@@ -124,6 +125,7 @@ export function validatePublicRepoUrl(raw: string, opts: ValidateOpts = {}): Rep
   const maxLength = opts.maxLength ?? 2048;
   if (typeof raw !== 'string' || !raw.trim()) reject(allowed, 'remote is required.');
   if (raw.length > maxLength) reject(allowed, 'remote is too long.');
+  // oxlint-disable-next-line no-control-regex -- a remote with controls is not a URL
   if (/[\u0000-\u001f\u007f\s]/.test(raw)) reject(allowed, 'remote is not a URL.');
   let u: URL;
   try { u = new URL(raw); }

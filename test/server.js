@@ -42,7 +42,7 @@ export function startGitServer(root, extraEnv = {}) {
       headerDone = true;
       res.write(head.subarray(i + sepLen));
     });
-    child.on('close', code => {
+    child.on('close', () => {
       if (!headerDone) { res.writeHead(500); res.end(Buffer.concat(stderr).toString()); return; }
       res.end();
     });
