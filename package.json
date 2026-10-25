@@ -1,0 +1,31 @@
+{
+  "name": "ply-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker for ply: the /v1 git API and the public /view repository viewer.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "smoke": "node src/smoke.mjs",
+    "worker:deploy": "env -u CLOUDFLARE_API_TOKEN wrangler deploy"
+  },
+  "dependencies": {
+    "ply": "github:ivarvong/ply#40cb5da42abc64126c2ac4d38eff09e1a7c549e3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "esbuild": "^0.24.0",
+    "oxlint": "^1.22.0",
+    "typescript": "^7.0.2",
+    "workerd": "1.20261018.1",
+    "wrangler": "^4.152.0"
+  },
+  "license": "MIT",
+  "author": "Ivar Vong",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ivarvong/ply-web.git"
+  }
+}
