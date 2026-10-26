@@ -9,8 +9,8 @@ permissions:
 
 jobs:
   check:
-    # git 2.43. ubuntu-latest is moving to Ubuntu 26, where receive-pack
-    # reports a duplicate branch create as push_rejected rather than cas_conflict.
+    # Noble's git package is 2.43. The runner image ships 2.55, which reports a
+    # stale branch delete as push_rejected. The suite matches 2.43.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -26,6 +26,14 @@ jobs:
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
           git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/"
           git config --global url."https://github.com/".insteadOf "git@github.com:"
+      - name: Use git 2.43
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/git.deb" http://archive.ubuntu.com/ubuntu/pool/main/g/git/git_2.43.0-1ubuntu7.4_amd64.deb
+          echo "c79b7948ef9860c97ec74293a90178676e63368a0711c95c28a55af4edf1adab  $RUNNER_TEMP/git.deb" | sha256sum -c -
+          dpkg-deb -x "$RUNNER_TEMP/git.deb" "$RUNNER_TEMP/git"
+          echo "$RUNNER_TEMP/git/usr/bin" >> "$GITHUB_PATH"
+          echo "GIT_EXEC_PATH=$RUNNER_TEMP/git/usr/lib/git-core" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/git/usr/bin/git" --version
       # Annotated tags in the suite need a committer. The runner has none. Do not sign.
       - name: Git identity for the test suite
         run: |
@@ -33,6 +41,7 @@ jobs:
           git config --global user.email "ply-web@example.com"
           git config --global commit.gpgsign false
           git --version
+          test "$(git --version)" = "git version 2.43.0"
       - run: npm ci
       - run: npm test
       - run: npx oxlint
