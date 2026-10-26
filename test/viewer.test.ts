@@ -2,7 +2,6 @@
 // a local git http-backend, the SQLite rate-limit object under workerd, and (when reachable) GitHub.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, copyFileSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -20,14 +19,15 @@ import { createBudget } from '../src/viewer/budget.ts';
 import { escapeHtml } from '../src/viewer/escape.ts';
 import { credentialFreeHeaders, createViewerFetch } from '../src/viewer/fetchguard.ts';
 import { handleViewer } from '../src/viewer/handle.ts';
-import { renderLoaded } from '../src/viewer/html.ts';
+import { renderError, renderHome, renderLoaded } from '../src/viewer/html.ts';
+import { VIEWER_CSS } from '../src/viewer/styles.ts';
 import { VIEWER_CAPS, VIEWER_GIT_LIMITS, VIEWER_UA, rateLimitFor } from '../src/viewer/limits.ts';
 import type { Loaded, RateNamespace, TraceModel } from '../src/viewer/model.ts';
 import { renderMarkdown } from '../src/viewer/markdown.ts';
 import { mapPack } from '../src/viewer/packmap.ts';
 import { interpretRemote } from '../src/viewer/paste.ts';
 import { parseViewerRoute, routeOptsFromEnv } from '../src/viewer/route.ts';
-import { VIEWER_JS, VIEWER_SCRIPT_HASH } from '../src/viewer/script.ts';
+import { VIEWER_CSP } from '../src/viewer/script.ts';
 import { ALLOWED_HOSTS, allowlistFromEnv, assertUpstreamUrl, validatePublicRepoUrl, type AllowedHost, type RepoLocation } from '../src/viewer/url.ts';
 
 const FIXTURE = fileURLToPath(new URL('./fixtures/viewer/small.pack', import.meta.url));
@@ -110,8 +110,61 @@ test('paste parsing stays inside the allowlist', () => {
   assert.equal(md.includes('javascript:'), true);
   assert.equal(/href="javascript:/.test(md), false);
   assert.match(md, /href="https:\/\/github.com\/octocat\/Hello-World"/);
-  assert.equal(VIEWER_SCRIPT_HASH, `sha256-${createHash('sha256').update(VIEWER_JS).digest('base64')}`);
+  assert.equal(VIEWER_CSP.includes('unsafe-inline'), false);
+  assert.match(VIEWER_CSP, /script-src 'none'/);
+  assert.match(VIEWER_CSP, /style-src 'self'/);
 });
+
+test('ssr markup uses Kumo classes, prose commits, and a strict CSP', () => {
+  const home = renderHome(null, 1_700_000_000_000)
+  assert.match(home, /name="remote"/)
+  assert.match(home, /href="\/view\.css"/)
+  assert.match(home, /bg-kumo-contrast/)
+  assert.equal(home.includes('<script'), false)
+  assert.equal(home.includes('style='), false)
+  const trace: TraceModel = { bars: [], totalMs: 12, cfRay: 'ray-ssr', requestId: 'req-ssr' }
+  const when = Date.parse('2020-01-02T03:04:05Z')
+  const loaded: Loaded = {
+    kind: 'tree',
+    header: {
+      host: 'github.com', repoPath: 'octocat/Hello-World', ref: 'refs/heads/main', commit: 'a'.repeat(40),
+      treeHref: '/view/github.com/octocat/Hello-World',
+      server: { agent: 'git/2', protocol: 2, objectFormat: 'sha1', caps: ['agent'], fetchFeatures: ['filter'], filterAdvertised: true },
+    },
+    path: '',
+    commit: {
+      oid: 'a'.repeat(40), tree: 'b'.repeat(40), parents: [], authorName: 'Ada', authorEmail: 'a@b',
+      authorTime: '2020-01-02T03:04:05Z', authorTz: '-0700',
+      message: 'Subject line\n\nThis is a wrapped\nparagraph that should flow.\n\nSecond paragraph.',
+      signed: false,
+    },
+    log: [], logStopped: false,
+    branches: [{ name: 'refs/heads/main', oid: 'a'.repeat(40), head: true }], branchesTruncated: 0,
+    entries: [], entriesTruncated: 0,
+    readme: null,
+  }
+  const html = renderLoaded(loaded, trace, when + 5 * 86_400_000)
+  assert.match(html, /This is a wrapped paragraph that should flow\./)
+  assert.match(html, /Second paragraph/)
+  assert.match(html, /5 days ago/)
+  assert.match(html, /title="02 Jan 2020, 03:04:05 UTC \(-0700\)"/)
+  assert.equal(html.includes('<pre class="msg"'), false)
+  assert.equal(html.includes('style='), false)
+  const error = renderError(400, 'bad_request', 'remote host is not allowed. Supported hosts: github.com, gitlab.com, codeberg.org, bitbucket.org, git.sr.ht.', trace)
+  assert.match(error, /That URL is not supported/)
+  assert.match(error, /Supported hosts: github.com, gitlab.com, codeberg.org, bitbucket.org, git.sr.ht/)
+  assert.equal(error.includes('<script'), false)
+  const limited = renderError(429, 'rate_limited', 'Too many viewer requests. Retry after 1s.', trace)
+  assert.match(limited, /Too many requests/)
+  assert.match(VIEWER_CSS, /--color-kumo-canvas/)
+  assert.match(VIEWER_CSS, /--text-color-kumo-brand/)
+  assert.match(VIEWER_CSS, /@media \(prefers-color-scheme: dark\)/)
+  assert.match(VIEWER_CSS, /color-scheme: light dark/)
+  assert.match(VIEWER_CSP, /script-src 'none'/)
+  assert.equal(VIEWER_CSP.includes('unsafe-inline'), false)
+  const shipped = readFileSync(fileURLToPath(new URL('../node_modules/@cloudflare/kumo/dist/styles/kumo-standalone.css', import.meta.url)), 'utf8')
+  assert.equal(VIEWER_CSS.startsWith(shipped), true)
+})
 
 test('rate and byte caps clamp and fail closed', () => {
   assert.equal(rateLimitFor('page', undefined), 60);
@@ -377,7 +430,7 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
     assert.match(html, /ray-test/);
     assert.equal(html.includes('<script>alert'), false);
     assert.match(html, /&lt;script&gt;/);
-    assert.match(page.headers.get('content-security-policy') ?? '', /script-src 'sha256-/);
+    assert.match(page.headers.get('content-security-policy') ?? '', /script-src 'none'/);
     assert.equal((page.headers.get('content-security-policy') ?? '').includes('unsafe-inline'), false);
     assert.match(page.headers.get('content-security-policy') ?? '', /style-src 'self'/);
     assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
@@ -482,6 +535,7 @@ test('a tree:0 rejection is visible, then the blob:none retry, and a denied rate
     const second = await handleViewer(new Request('https://ply.ivar.workers.dev/view/github.com/art.git', { headers: { 'cf-connecting-ip': '203.0.113.11' } }), denyEnv, {}, { fetchImpl: async () => { called++; throw new Error('fetched while limited'); }, now: 1_500 });
     assert.equal(second.status, 429);
     assert.equal(second.headers.get('retry-after'), '1');
+    assert.match(await second.text(), /Too many requests/);
     assert.equal(called, 0);
     assert.ok(fetches > 0);
     const missing = await handleViewer(new Request('https://ply.ivar.workers.dev/view'), {}, {});
@@ -499,7 +553,7 @@ test('workerd: sqlite rate limit, and /v1 still requires the bearer', { skip: WO
   const { root, cleanup } = tmpRoot();
   const out = join(root, 'wk');
   mkdirSync(out);
-  await build({ entryPoints: [fileURLToPath(new URL('../src/index.js', import.meta.url))], bundle: true, format: 'esm', outfile: join(out, 'worker.mjs'), logLevel: 'silent', external: ['cloudflare:workers'] });
+  await build({ entryPoints: [fileURLToPath(new URL('../src/index.js', import.meta.url))], bundle: true, format: 'esm', outfile: join(out, 'worker.mjs'), logLevel: 'silent', external: ['cloudflare:workers'], jsx: 'automatic', jsxImportSource: 'hono/jsx' });
   const port = 19100 + (process.pid % 40);
   const ply = 'test-ply-token-' + 'x'.repeat(20);
   writeFileSync(join(out, 'config.capnp'), `using Workerd = import "/workerd/workerd.capnp";
@@ -572,7 +626,7 @@ test('a public GitHub repository renders when the network can reach it', { timeo
   assert.match(html, /Hello-World/);
   assert.match(html, /upload-pack/);
   assert.match(html, /github-ray/);
-  assert.match(res.headers.get('content-security-policy') ?? '', /script-src 'sha256-/);
+  assert.match(res.headers.get('content-security-policy') ?? '', /script-src 'none'/);
   assert.equal((res.headers.get('content-security-policy') ?? '').includes('unsafe-inline'), false);
   const want = /[0-9a-f]{40}/.exec(html)?.[0];
   assert.ok(want);
