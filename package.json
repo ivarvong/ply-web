@@ -10,14 +10,16 @@
   "scripts": {
     "smoke": "node src/smoke.mjs",
     "worker:deploy": "wrangler deploy",
-    "test": "node --test test/worker.test.js && node --experimental-strip-types --test test/viewer.test.ts",
+    "test": "node --test test/worker.test.js && node --experimental-strip-types --import ./test/register-tsx.mjs --test test/viewer.test.ts",
     "test:worker": "node --test test/worker.test.js",
     "worker:test": "node --test test/worker.test.js",
-    "test:viewer": "node --experimental-strip-types --test test/viewer.test.ts",
+    "test:viewer": "node --experimental-strip-types --import ./test/register-tsx.mjs --test test/viewer.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "oxlint"
   },
   "dependencies": {
+    "@cloudflare/kumo": "^2.15.0",
+    "hono": "^4.13.14",
     "ply": "github:ivarvong/ply#fda093a41f4dd0441ee9a8d3d99ff699a979b97c"
   },
   "devDependencies": {
