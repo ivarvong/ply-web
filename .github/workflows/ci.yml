@@ -9,7 +9,9 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # git 2.43. ubuntu-latest is moving to Ubuntu 26, where receive-pack
+    # reports a duplicate branch create as push_rejected rather than cas_conflict.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -24,6 +26,13 @@ jobs:
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
           git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/"
           git config --global url."https://github.com/".insteadOf "git@github.com:"
+      # Annotated tags in the suite need a committer. The runner has none. Do not sign.
+      - name: Git identity for the test suite
+        run: |
+          git config --global user.name "ply-web"
+          git config --global user.email "ply-web@example.com"
+          git config --global commit.gpgsign false
+          git --version
       - run: npm ci
       - run: npm test
       - run: npx oxlint
