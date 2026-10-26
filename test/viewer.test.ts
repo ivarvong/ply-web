@@ -102,6 +102,9 @@ test('paste parsing stays inside the allowlist', () => {
   const route = parseViewerRoute(new URL('https://ply.example/view?remote=octocat/Hello-World'), routeOptsFromEnv({}));
   assert.equal(route.kind, 'redirect');
   if (route.kind === 'redirect') assert.equal(route.location, '/view/github.com/octocat/Hello-World');
+  const tagged = parseViewerRoute(new URL('https://ply.example/view/github.com/octocat/Hello-World?ref=refs/heads/main&at=v1.0.0'), routeOptsFromEnv({}));
+  assert.equal(tagged.kind, 'repo');
+  if (tagged.kind === 'repo') assert.equal(tagged.ref, 'v1.0.0');
   assert.throws(() => parseViewerRoute(new URL('https://ply.example/view?remote=evil.example/a/b'), routeOptsFromEnv({})), /Supported hosts/);
   assert.throws(() => parseViewerRoute(new URL('https://ply.example/view?remote=' + encodeURIComponent('https://user:super-secret-token@github.com/a/b')), routeOptsFromEnv({})), (err: { message?: string }) => /credentials/.test(String(err?.message)) && !String(err?.message).includes('super-secret-token'));
   const md = renderMarkdown('# Hi\n\n<script>alert(1)</script>\n\n[x](javascript:alert(1))\n\n[ok](https://github.com/octocat/Hello-World)\n');

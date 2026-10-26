@@ -17,6 +17,9 @@ export const KUMO_BUTTON_PRIMARY = 'bg-kumo-contrast text-kumo-inverse shadow-xs
 
 export const KUMO_INPUT = 'border-0 bg-kumo-control text-kumo-default ring ring-kumo-line outline-none focus:outline-none kumo-input-placeholder focus:ring-[1.5px] focus:ring-kumo-focus/50 h-9 rounded-lg px-3 font-sans'
 
+// Kumo Input size "sm": h-6.5, rounded-md, px-2, text-xs, plus the default ring variant.
+export const KUMO_INPUT_SM = 'border-0 bg-kumo-control text-kumo-default ring ring-kumo-line outline-none focus:outline-none kumo-input-placeholder focus:ring-[1.5px] focus:ring-kumo-focus/50 h-6.5 rounded-md px-2 text-xs font-sans'
+
 export const KUMO_BADGE = 'inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-kumo-fill text-kumo-badge-neutral-subtle'
 
 export const KUMO_BADGE_ORANGE = 'inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-kumo-badge-orange text-black'

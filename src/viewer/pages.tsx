@@ -8,7 +8,7 @@ import type { FileLoaded, PackLoaded, TreeLoaded, ViewerDocument } from './docum
 import { commitProse, formatBytes, percentClass, portions, shortOid } from './format.ts'
 import { LAYOUT } from './layout.ts'
 import { KUMO_INPUT, KUMO_SURFACE } from './kumo-classes.ts'
-import { Banner, Button, Crumbs, Document, Footer, IconFile, IconFolder, Protocol, RefSwitcher, Signed, Time, Trace } from './ui.tsx'
+import { Banner, Button, Document, Footer, IconFile, IconFolder, Protocol, Signed, Time, Toolbar } from './ui.tsx'
 
 const EXAMPLES = [
   ['octocat/Hello-World', '/view/github.com/octocat/Hello-World'],
@@ -57,7 +57,7 @@ function Home(props: { error: string | null }) {
           <ul class="host-list">{ALLOWED_HOSTS.map(host => <li>{host}</li>)}</ul>
           <p class="note">https, no username or password, port 443. A trailing dot or a lookalike host is rejected.</p>
         </section>
-        <section class={`${KUMO_SURFACE} pad`}>
+        <section class={`${KUMO_SURFACE} pad`} id="limits">
           <h2>Limits</h2>
           <dl class="limits">
             <div><dt>Upstream</dt><dd>{formatBytes(caps.maxUpstreamBytes)} / page</dd></div>
@@ -97,11 +97,8 @@ function TreePage(props: { loaded: TreeLoaded; trace: TraceModel; now: number })
     : null
   return (
     <Document title={`${repoName(header.repoPath)} at ${header.ref}`}>
-      <Crumbs host={header.host} repoPath={header.repoPath} ref={header.ref} path={props.loaded.path} />
-      <div class="repo-head">
-        <h1 class="repo">{repoName(header.repoPath)}</h1>
-        <RefSwitcher header={header} path={props.loaded.path} branches={props.loaded.branches} />
-      </div>
+      <Toolbar header={header} path={props.loaded.path} branches={props.loaded.branches} />
+      <h1 class="repo">{repoName(header.repoPath)}</h1>
       <Protocol header={header} />
       <p class="note">
         <a href={viewerHref(header.host, header.repoPath, { ref: header.ref, want: header.commit, filter: 'tree:0' })}>tree:0 pack</a>
@@ -136,8 +133,7 @@ function TreePage(props: { loaded: TreeLoaded; trace: TraceModel; now: number })
       </section>
       <Readme loaded={props.loaded} />
       <Log loaded={props.loaded} now={props.now} />
-      <Trace trace={props.trace} host={header.host} repoPath={header.repoPath} ref={header.ref} />
-      <Footer trace={props.trace} />
+      <Footer trace={props.trace} host={header.host} repoPath={header.repoPath} ref={header.ref} />
     </Document>
   )
 }
@@ -183,46 +179,46 @@ function Log(props: { loaded: TreeLoaded; now: number }) {
 function FilePage(props: { loaded: FileLoaded; trace: TraceModel; now: number }) {
   const { header } = props.loaded
   const rawHref = viewerHref(header.host, header.repoPath, { ref: header.ref, path: props.loaded.path, raw: '1' })
-  const name = props.loaded.path.split('/').pop() || props.loaded.path
   return (
     <Document title={props.loaded.path}>
-      <Crumbs host={header.host} repoPath={header.repoPath} ref={header.ref} path={props.loaded.path} />
-      <div class="repo-head">
-        <h1 class="repo">{name}</h1>
-        <RefSwitcher header={header} path={props.loaded.path} branches={[]} />
-      </div>
-      <Protocol header={header} />
-      <div class="filebar">
-        <p>mode <span class="mono">{props.loaded.mode}</span> · {formatBytes(props.loaded.size)} · blob <span class="mono">{shortOid(props.loaded.blob)}</span> · commit <a class="mono" href={viewerHref(header.host, header.repoPath, { ref: header.commit })}>{shortOid(header.commit)}</a></p>
-        <p><a href={rawHref}>Raw</a></p>
-      </div>
-      <section class={KUMO_SURFACE}>
+      <Toolbar header={header} path={props.loaded.path} branches={[]} />
+      <section class="code-surface">
+        <header class="file-head">
+          <span class="file-path">{props.loaded.path}</span>
+          <span class="file-meta">
+            <span><span class="meta-k">mode</span> <span class="mono">{props.loaded.mode}</span></span>
+            <span class="meta-dot" aria-hidden="true">·</span>
+            <span>{formatBytes(props.loaded.size)}</span>
+            <span class="meta-dot" aria-hidden="true">·</span>
+            <span><span class="meta-k">blob</span> <span class="mono" title={props.loaded.blob}>{shortOid(props.loaded.blob)}</span></span>
+          </span>
+          <a class="raw-link" href={rawHref}>Raw</a>
+        </header>
         <FileBody loaded={props.loaded} rawHref={rawHref} />
       </section>
-      <p class="note">Line numbers are permalinks.</p>
-      <Trace trace={props.trace} host={header.host} repoPath={header.repoPath} ref={header.ref} />
-      <Footer trace={props.trace} />
+      <Protocol header={header} />
+      <Footer trace={props.trace} host={header.host} repoPath={header.repoPath} ref={header.ref} />
     </Document>
   )
 }
 
 function FileBody(props: { loaded: FileLoaded; rawHref: string }) {
   const loaded = props.loaded
-  if (loaded.note === 'submodule') return <div class="pad"><Banner tone="info">This is a submodule (gitlink) {loaded.blob}. The blob is not in this repository.</Banner></div>
-  if (loaded.note === 'too-big') return <div class="pad"><Banner tone="alert">This file is {formatBytes(loaded.size)}, over the {formatBytes(VIEWER_CAPS.maxFileDisplayBytes)} display cap. It was not buffered. Open a smaller file, or fetch it with git.</Banner></div>
-  if (loaded.note === 'binary') return <div class="pad"><Banner tone="alert">Binary file, {formatBytes(loaded.size)}. Not shown as text. <a href={props.rawHref}>Download raw bytes</a> (not HTML).</Banner></div>
+  if (loaded.note === 'submodule') return <div class="file-note"><Banner tone="info">This is a submodule (gitlink) {loaded.blob}. The blob is not in this repository.</Banner></div>
+  if (loaded.note === 'too-big') return <div class="file-note"><Banner tone="alert">This file is {formatBytes(loaded.size)}, over the {formatBytes(VIEWER_CAPS.maxFileDisplayBytes)} display cap. It was not buffered. Open a smaller file, or fetch it with git.</Banner></div>
+  if (loaded.note === 'binary') return <div class="file-note"><Banner tone="alert">Binary file, {formatBytes(loaded.size)}. Not shown as text. <a href={props.rawHref}>Download raw bytes</a> (not HTML).</Banner></div>
   const lines = (loaded.text ?? '').split('\n')
   if (loaded.text?.endsWith('\n')) lines.pop()
   const shown = lines.slice(0, VIEWER_CAPS.maxLineRows)
   return (
-    <div class="pad">
-      {lines.length > shown.length ? <p class="note">Showing {shown.length} of {lines.length} lines.</p> : null}
+    <div class="code-wrap">
+      {lines.length > shown.length ? <p class="note file-note">Showing {shown.length} of {lines.length} lines.</p> : null}
       <div class="code" role="table" aria-label="File contents">
         {shown.map((line, index) => {
           const n = index + 1
           return (
             <div class="line" id={`L${n}`}>
-              <a class="ln" href={`#L${n}`}>{n}</a>
+              <a class="ln" href={`#L${n}`} title={`Permalink to line ${n}`}>{n}</a>
               <span class="src">{line}</span>
             </div>
           )
@@ -244,7 +240,7 @@ function PackPage(props: { loaded: PackLoaded; trace: TraceModel; now: number })
   const legend = ['header', 'commit', 'tree', 'blob', 'tag', 'ofs_delta', 'ref_delta', 'trailer'] as const
   return (
     <Document title={`pack ${shortOid(props.loaded.want)}`}>
-      <Crumbs host={header.host} repoPath={header.repoPath} ref={header.ref} path="" />
+      <Toolbar header={header} path="" branches={[]} />
       <h1 class="repo">Pack map</h1>
       <Protocol header={header} />
       <div class="stats">
@@ -299,8 +295,7 @@ function PackPage(props: { loaded: PackLoaded; trace: TraceModel; now: number })
           </li>
         ))}
       </ul>
-      <Trace trace={props.trace} host={header.host} repoPath={header.repoPath} ref={header.ref} />
-      <Footer trace={props.trace} />
+      <Footer trace={props.trace} host={header.host} repoPath={header.repoPath} ref={header.ref} />
     </Document>
   )
 }
@@ -350,24 +345,35 @@ function errorHint(code: string, status: number, message: string): string {
   return 'Go back to the viewer and paste a public repository URL.'
 }
 
-function errorTone(code: string, status: number): 'error' | 'alert' | 'info' {
-  if (code === 'rate_limited' || status === 429 || code === 'unavailable' || status === 503 || code === 'limit_exceeded' || status === 413 || code === 'timeout' || status === 504) return 'alert'
+function errorTone(code: string, status: number): 'alert' | 'info' {
   if (code === 'not_found' || status === 404) return 'info'
-  return 'error'
+  return 'alert'
+}
+
+function supportedHosts(message: string): readonly string[] {
+  const marker = 'Supported hosts:'
+  const at = message.indexOf(marker)
+  if (at < 0) return []
+  return message.slice(at + marker.length).replace(/\.$/, '').split(',').map(host => host.trim()).filter(host => host.length > 0)
 }
 
 function ErrorPage(props: Extract<ViewerDocument, { kind: 'error' }>) {
   const title = errorTitle(props.code, props.status)
+  const hosts = supportedHosts(props.message)
   return (
     <Document title={title}>
-      <div class="error-wrap">
+      <article class={`${KUMO_SURFACE} error-card`}>
         <p class="error-kicker">HTTP {props.status}</p>
         <h1 class="display">{title}</h1>
-        <Banner tone={errorTone(props.code, props.status)}>{props.message}</Banner>
-        <p class="lede">{errorHint(props.code, props.status, props.message)} <a href="/view">Back to the viewer</a>.</p>
-      </div>
-      <Trace trace={props.trace} host={props.host} repoPath={props.repoPath} ref={props.ref} />
-      <Footer trace={props.trace} />
+        <Banner tone={errorTone(props.code, props.status)}>{errorHint(props.code, props.status, props.message)}</Banner>
+        {hosts.length ? <ul class="host-list" aria-label="Supported hosts">{hosts.map(host => <li>{host}</li>)}</ul> : null}
+        <p class="lede"><a href="/view">Back to the viewer</a></p>
+        <details class="reason">
+          <summary>Why this was refused</summary>
+          <p>{props.message}</p>
+        </details>
+      </article>
+      <Footer trace={props.trace} host={props.host} repoPath={props.repoPath} ref={props.ref} />
     </Document>
   )
 }

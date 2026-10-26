@@ -1,8 +1,7 @@
 import type { Child } from 'hono/jsx'
 import type { BranchInfo, RepoHeader, TraceBar, TraceModel } from './model.ts'
-import { VIEWER_CAPS } from './limits.ts'
 import { viewerHref } from './url.ts'
-import { bannerClass, buttonClass, KUMO_BADGE, KUMO_BADGE_SUCCESS, KUMO_INPUT, type BannerTone, type ButtonSize, type ButtonVariant } from './kumo-classes.ts'
+import { bannerClass, buttonClass, KUMO_BADGE_SUCCESS, KUMO_BUTTON_SIZE_SM, KUMO_INPUT_SM, type BannerTone, type ButtonSize, type ButtonVariant } from './kumo-classes.ts'
 import { exactTime, formatBytes, formatDuration, percentClass } from './format.ts'
 import { LAYOUT } from './layout.ts'
 
@@ -92,33 +91,34 @@ function shortRef(ref: string): string {
 export function RefSwitcher(props: { header: RepoHeader; path: string; branches: readonly BranchInfo[] }) {
   const action = viewerHref(props.header.host, props.header.repoPath, {})
   const known = props.branches.some(branch => branch.name === props.header.ref || shortRef(branch.name) === props.header.ref)
+  const current = shortRef(props.header.ref)
   return (
-    <div class="switchers">
-      <form class="switch-form" action={action} method="get">
-        <label class="switch-label">
-          <span>Branch</span>
-          <span class="select-wrap">
-            <select class={`control viewer-select ${KUMO_INPUT}`} name="ref" aria-label="Branch">
-              {known ? null : <option value={props.header.ref} selected>{shortRef(props.header.ref)}</option>}
-              {props.branches.map(branch => {
-                const label = shortRef(branch.name)
-                const selected = branch.name === props.header.ref || label === props.header.ref
-                return <option value={branch.name} selected={selected}>{label}{branch.head ? ' (default)' : ''}</option>
-              })}
-            </select>
-          </span>
-        </label>
+    <div class="refbox">
+      <details class="ref-disclosure">
+        <summary class="ref-summary"><span class="ref-k">Ref</span><span class="ref-v">{current}</span></summary>
+      </details>
+      <form class="seg" action={action} method="get">
+        <select class={`seg-field viewer-select ${KUMO_INPUT_SM}`} name="ref" aria-label="Branch">
+          {known ? null : <option value={props.header.ref} selected>{current}</option>}
+          {props.branches.map(branch => {
+            const label = shortRef(branch.name)
+            const selected = branch.name === props.header.ref || label === props.header.ref
+            return <option value={branch.name} selected={selected}>{label}{branch.head ? ' (default)' : ''}</option>
+          })}
+        </select>
+        <input class={`seg-field ${KUMO_INPUT_SM}`} type="text" name="at" placeholder="tag or commit" aria-label="Tag or commit" autocomplete="off" spellcheck={false} />
         {props.path ? <input type="hidden" name="path" value={props.path} /> : null}
-        <Button variant="secondary" size="base">Switch</Button>
+        <button class={`seg-go ${KUMO_BUTTON_SIZE_SM}`} type="submit">Go</button>
       </form>
-      <form class="switch-form" action={action} method="get">
-        <label class="switch-label">
-          <span>Tag or commit</span>
-          <input class={`control ${KUMO_INPUT}`} type="text" name="ref" placeholder="v1.0.0" aria-label="Tag or commit" autocomplete="off" spellcheck={false} />
-        </label>
-        {props.path ? <input type="hidden" name="path" value={props.path} /> : null}
-        <Button variant="secondary" size="base">Open</Button>
-      </form>
+    </div>
+  )
+}
+
+export function Toolbar(props: { header: RepoHeader; path: string; branches: readonly BranchInfo[] }) {
+  return (
+    <div class="toolbar">
+      <Crumbs host={props.header.host} repoPath={props.header.repoPath} ref={props.header.ref} path={props.path} />
+      <RefSwitcher header={props.header} path={props.path} branches={props.branches} />
     </div>
   )
 }
@@ -126,26 +126,22 @@ export function RefSwitcher(props: { header: RepoHeader; path: string; branches:
 export function Protocol(props: { header: RepoHeader }) {
   const server = props.header.server
   const agent = server.agent || 'unknown'
+  const filter = server.filterAdvertised ? 'filter advertised' : 'filter not advertised'
   return (
-    <div class="meta-row">
-      <span class={KUMO_BADGE}>v{server.protocol}</span>
-      <span class={KUMO_BADGE}>{server.objectFormat}</span>
-      <span class={KUMO_BADGE}>{server.filterAdvertised ? 'filter advertised' : 'filter not advertised'}</span>
-      <span class="agent">agent {agent}</span>
-      <details class="proto">
-        <summary>Protocol</summary>
-        <div class="proto-panel">
-          <dl>
-            <div><dt>Version</dt><dd>{server.protocol}</dd></div>
-            <div><dt>Agent</dt><dd class="mono">{agent}</dd></div>
-            <div><dt>Object format</dt><dd class="mono">{server.objectFormat}</dd></div>
-            <div><dt>Filter</dt><dd>{server.filterAdvertised ? 'Advertised by the server' : 'Not advertised'}</dd></div>
-            <div><dt>Fetch</dt><dd class="mono">{server.fetchFeatures.join(' ') || 'none'}</dd></div>
-            <div><dt>Capabilities</dt><dd class="mono">{server.caps.join(' ') || 'none'}</dd></div>
-          </dl>
-        </div>
-      </details>
-    </div>
+    <details class="quiet proto">
+      <summary>
+        <span class="quiet-k">Protocol</span>
+        <span class="quiet-rest">v{server.protocol} · {server.objectFormat} · {filter}</span>
+      </summary>
+      <dl class="proto-dl">
+        <div><dt>Version</dt><dd>{server.protocol}</dd></div>
+        <div><dt>Agent</dt><dd class="mono">agent {agent}</dd></div>
+        <div><dt>Object format</dt><dd class="mono">{server.objectFormat}</dd></div>
+        <div><dt>Filter</dt><dd>{server.filterAdvertised ? 'Advertised by the server' : 'Not advertised'}</dd></div>
+        <div><dt>Fetch</dt><dd class="mono">{server.fetchFeatures.join(' ') || 'none'}</dd></div>
+        <div><dt>Capabilities</dt><dd class="mono">{server.caps.join(' ') || 'none'}</dd></div>
+      </dl>
+    </details>
   )
 }
 
@@ -170,10 +166,8 @@ export function Trace(props: { trace: TraceModel; host: string; repoPath: string
   const retry = fallbacks === 0 ? '' : fallbacks === 1 ? ' · 1 retry' : ` · ${fallbacks} retries`
   const pill = `${trace.bars.length} upstream ${trace.bars.length === 1 ? 'call' : 'calls'} · ${formatDuration(trace.totalMs)}${retry}`
   return (
-    <details class="disclosure">
-      <summary>
-        <span class={KUMO_BADGE}>{pill}</span>
-      </summary>
+    <details class="quiet trace">
+      <summary>{pill}</summary>
       {fallbacks > 0 ? <Banner tone="alert">filter tree:0 was rejected. ply retried with blob:none. The calls are serial, which is why the waterfall is a staircase.</Banner> : null}
       {trace.bars.map(bar => {
         const left = Math.max(0, Math.min(LAYOUT.percentSteps, Math.round((bar.startMs / span) * LAYOUT.percentSteps)))
@@ -207,17 +201,23 @@ export function Trace(props: { trace: TraceModel; host: string; repoPath: string
   )
 }
 
-export function Footer(props: { trace: TraceModel }) {
-  const caps = VIEWER_CAPS
+function shownId(id: string): string {
+  if (!id) return 'n/a'
+  if (id.length <= LAYOUT.requestIdShown) return id
+  return `${id.slice(0, LAYOUT.requestIdShown)}…`
+}
+
+export function Footer(props: { trace: TraceModel; host?: string; repoPath?: string; ref?: string | null }) {
+  const ray = props.trace.cfRay || 'n/a'
+  const requestId = props.trace.requestId || ''
   return (
     <footer class="site-footer">
-      <div>cf-ray {props.trace.cfRay || 'n/a'} · request {props.trace.requestId || 'n/a'}</div>
-      <details>
-        <summary>Limits</summary>
-        <p class="note">
-          {formatBytes(caps.maxUpstreamBytes)} upstream/page · {formatBytes(caps.maxPackBytes)} pack · {caps.maxPackObjects} objects · {formatBytes(caps.maxFileDisplayBytes)} file · chain {caps.maxDeltaChain} · {caps.maxSubrequests} subrequests · {caps.requestTimeoutMs / LAYOUT.msPerSecond}s/call · {caps.pageTimeoutMs / LAYOUT.msPerSecond}s/page · {caps.ratePerMinute}/min page · {caps.packRatePerMinute}/min pack.
-        </p>
-      </details>
+      {props.host ? <Trace trace={props.trace} host={props.host} repoPath={props.repoPath ?? ''} ref={props.ref ?? null} /> : null}
+      <div class="foot-row">
+        <span>cf-ray <span class="mono">{ray}</span></span>
+        <span>request <span class="mono" title={requestId || 'n/a'}>{shownId(requestId)}</span></span>
+        <a href="/view#limits">Limits</a>
+      </div>
     </footer>
   )
 }
@@ -225,5 +225,3 @@ export function Footer(props: { trace: TraceModel }) {
 export function Signed() {
   return <span class={KUMO_BADGE_SUCCESS}>Signed</span>
 }
-
-export { KUMO_BADGE }
