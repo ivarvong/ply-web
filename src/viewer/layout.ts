@@ -38,7 +38,6 @@ export const LAYOUT = Object.freeze({
   targetGapPx: 8,
   primaryHoverOpacity: 0.88,
   focusRingPx: 1.5,
-  packOffsetRem: 4.25,
   requestIdShown: 8,
   segSelectRem: 9.5,
   segInputRem: 8,

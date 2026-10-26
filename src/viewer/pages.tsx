@@ -17,14 +17,14 @@ const EXAMPLES = [
 ] as const
 
 const PACK_SWATCH: Record<string, string> = {
-  header: 'bg-kumo-contrast',
+  header: 'bg-kumo-fill',
   commit: 'bg-kumo-info',
   tree: 'bg-kumo-success',
   blob: 'bg-neutral-500',
   tag: 'bg-kumo-badge-purple',
   ofs_delta: 'bg-kumo-warning',
   ref_delta: 'bg-kumo-danger',
-  trailer: 'bg-kumo-contrast',
+  trailer: 'bg-kumo-fill',
 }
 
 function repoName(repoPath: string): string {
@@ -99,12 +99,14 @@ function TreePage(props: { loaded: TreeLoaded; trace: TraceModel; now: number })
     <Document title={`${repoName(header.repoPath)} at ${header.ref}`}>
       <Toolbar header={header} path={props.loaded.path} branches={props.loaded.branches} />
       <h1 class="repo">{repoName(header.repoPath)}</h1>
-      <Protocol header={header} />
-      <p class="note">
-        <a href={viewerHref(header.host, header.repoPath, { ref: header.ref, want: header.commit, filter: 'tree:0' })}>tree:0 pack</a>
-        {' · '}
-        <a href={viewerHref(header.host, header.repoPath, { ref: header.ref, want: header.commit, filter: 'blob:none' })}>blob:none pack</a>
-      </p>
+      <div class="meta-row">
+        <Protocol header={header} />
+        <nav class="pack-links" aria-label="Pack maps">
+          <a href={viewerHref(header.host, header.repoPath, { ref: header.ref, want: header.commit, filter: 'tree:0' })}>tree:0 pack</a>
+          <span aria-hidden="true">·</span>
+          <a href={viewerHref(header.host, header.repoPath, { ref: header.ref, want: header.commit, filter: 'blob:none' })}>blob:none pack</a>
+        </nav>
+      </div>
       <section class={KUMO_SURFACE}>
         <CommitBlock commit={props.loaded.commit} header={header} now={props.now} />
         {more}
@@ -244,7 +246,7 @@ function PackPage(props: { loaded: PackLoaded; trace: TraceModel; now: number })
       <h1 class="repo">Pack map</h1>
       <Protocol header={header} />
       <div class="stats">
-        <span><strong>{map.count}</strong> objects</span>
+        <span><strong>{map.count}</strong> {map.count === 1 ? 'object' : 'objects'}</span>
         <span><strong>{formatBytes(map.bytes)}</strong></span>
         <span>version {map.version}</span>
         <span>max chain {map.maxChain}</span>
@@ -277,7 +279,7 @@ function PackPage(props: { loaded: PackLoaded; trace: TraceModel; now: number })
             const object = obj.oid ? shortOid(obj.oid) : obj.baseOid ? `base ${shortOid(obj.baseOid)}` : obj.baseOffset !== null ? `@${obj.baseOffset}` : ''
             return (
               <div id={`o${obj.offset}`} data-base={obj.baseOffset !== null ? String(obj.baseOffset) : undefined} class={selected?.offset === obj.offset ? 'pack-row on' : 'pack-row'}>
-                <a href={`#o${obj.offset}`}>{obj.offset}</a>
+                <a class="pack-off" href={`#o${obj.offset}`}><span class="meta-k">offset</span>{obj.offset}</a>
                 <span>{wire}{resolved ? ` · ${resolved}` : ''}</span>
                 <span class="oid">{object}</span>
                 <span class="sub">{formatBytes(obj.compressed)} compressed · {formatBytes(obj.inflated)} inflated · chain {obj.chain}</span>
