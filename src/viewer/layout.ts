@@ -35,6 +35,8 @@ export const LAYOUT = Object.freeze({
   selectChevronPx: 12,
   targetGapPx: 8,
   primaryHoverOpacity: 0.88,
+  switchFormMaxRem: 24,
+  packOffsetRem: 4.25,
 })
 
 export const RELATIVE_TIME = Object.freeze({

@@ -273,23 +273,22 @@ function PackPage(props: { loaded: PackLoaded; trace: TraceModel; now: number })
         <PackSegment cls={PACK_SWATCH.trailer ?? ''} width={widths[widths.length - 1] ?? 0} offset={null} tip={`checksum trailer · ${formatBytes(map.trailerLength)}`} />
       </div>
       {selected ? <ObjectDetail obj={selected} /> : <p class="note">Select a region to inspect that object.</p>}
-      <section class={`${KUMO_SURFACE} scroll-x`}>
-        <table class="files">
-          <thead><tr><th>Offset</th><th>Wire</th><th>Resolved</th><th>Compressed</th><th>Inflated</th><th>Chain</th><th class="oid">Object</th></tr></thead>
-          <tbody>
-            {map.objects.map(obj => (
-              <tr id={`o${obj.offset}`} data-base={obj.baseOffset !== null ? String(obj.baseOffset) : undefined} class={selected?.offset === obj.offset ? 'on' : undefined}>
-                <td><a href={`#o${obj.offset}`}>{obj.offset}</a></td>
-                <td>{obj.wireType.replaceAll('_', ' ')}</td>
-                <td>{obj.resolvedType ?? ''}</td>
-                <td>{formatBytes(obj.compressed)}</td>
-                <td>{formatBytes(obj.inflated)}</td>
-                <td>{obj.chain}</td>
-                <td class="oid">{obj.oid ? shortOid(obj.oid) : obj.baseOid ? `base ${shortOid(obj.baseOid)}` : obj.baseOffset !== null ? `@${obj.baseOffset}` : ''}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <section class={KUMO_SURFACE}>
+        <div class="pack-list">
+          {map.objects.map(obj => {
+            const wire = obj.wireType.replaceAll('_', ' ')
+            const resolved = obj.resolvedType && obj.resolvedType !== obj.wireType ? obj.resolvedType : ''
+            const object = obj.oid ? shortOid(obj.oid) : obj.baseOid ? `base ${shortOid(obj.baseOid)}` : obj.baseOffset !== null ? `@${obj.baseOffset}` : ''
+            return (
+              <div id={`o${obj.offset}`} data-base={obj.baseOffset !== null ? String(obj.baseOffset) : undefined} class={selected?.offset === obj.offset ? 'pack-row on' : 'pack-row'}>
+                <a href={`#o${obj.offset}`}>{obj.offset}</a>
+                <span>{wire}{resolved ? ` · ${resolved}` : ''}</span>
+                <span class="oid">{object}</span>
+                <span class="sub">{formatBytes(obj.compressed)} compressed · {formatBytes(obj.inflated)} inflated · chain {obj.chain}</span>
+              </div>
+            )
+          })}
+        </div>
       </section>
       <h2 class="section-label">Delta chains</h2>
       <ul class="log">

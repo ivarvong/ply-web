@@ -85,9 +85,13 @@ export function Crumbs(props: { host: string; repoPath: string; ref: string; pat
   )
 }
 
+function shortRef(ref: string): string {
+  return ref.replace(/^refs\/heads\//, '').replace(/^refs\/tags\//, '')
+}
+
 export function RefSwitcher(props: { header: RepoHeader; path: string; branches: readonly BranchInfo[] }) {
   const action = viewerHref(props.header.host, props.header.repoPath, {})
-  const known = props.branches.some(branch => branch.name === props.header.ref || branch.name.replace(/^refs\/heads\//, '') === props.header.ref)
+  const known = props.branches.some(branch => branch.name === props.header.ref || shortRef(branch.name) === props.header.ref)
   return (
     <div class="switchers">
       <form class="switch-form" action={action} method="get">
@@ -95,9 +99,9 @@ export function RefSwitcher(props: { header: RepoHeader; path: string; branches:
           <span>Branch</span>
           <span class="select-wrap">
             <select class={`control viewer-select ${KUMO_INPUT}`} name="ref" aria-label="Branch">
-              {known ? null : <option value={props.header.ref} selected>{props.header.ref}</option>}
+              {known ? null : <option value={props.header.ref} selected>{shortRef(props.header.ref)}</option>}
               {props.branches.map(branch => {
-                const label = branch.name.replace(/^refs\/heads\//, '')
+                const label = shortRef(branch.name)
                 const selected = branch.name === props.header.ref || label === props.header.ref
                 return <option value={branch.name} selected={selected}>{label}{branch.head ? ' (default)' : ''}</option>
               })}
@@ -105,7 +109,7 @@ export function RefSwitcher(props: { header: RepoHeader; path: string; branches:
           </span>
         </label>
         {props.path ? <input type="hidden" name="path" value={props.path} /> : null}
-        <Button variant="secondary" size="sm">Switch</Button>
+        <Button variant="secondary" size="base">Switch</Button>
       </form>
       <form class="switch-form" action={action} method="get">
         <label class="switch-label">
@@ -113,7 +117,7 @@ export function RefSwitcher(props: { header: RepoHeader; path: string; branches:
           <input class={`control ${KUMO_INPUT}`} type="text" name="ref" placeholder="v1.0.0" aria-label="Tag or commit" autocomplete="off" spellcheck={false} />
         </label>
         {props.path ? <input type="hidden" name="path" value={props.path} /> : null}
-        <Button variant="secondary" size="sm">Open</Button>
+        <Button variant="secondary" size="base">Open</Button>
       </form>
     </div>
   )
@@ -169,7 +173,6 @@ export function Trace(props: { trace: TraceModel; host: string; repoPath: string
     <details class="disclosure">
       <summary>
         <span class={KUMO_BADGE}>{pill}</span>
-        <span class="note">cf-ray {trace.cfRay || 'n/a'} · request {trace.requestId || 'n/a'}</span>
       </summary>
       {fallbacks > 0 ? <Banner tone="alert">filter tree:0 was rejected. ply retried with blob:none. The calls are serial, which is why the waterfall is a staircase.</Banner> : null}
       {trace.bars.map(bar => {
