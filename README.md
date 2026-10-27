@@ -186,6 +186,35 @@ Nothing else in this config asks for a permission:
 
 ### Companion workflow in ivarvong/ply
 
-ply's `main` should wake ply-web on every push, so the pin updates without waiting for the cron. The workflow file is `.github/workflows/notify-ply-web.yml` in ivarvong/ply. On push to ply `main` it POSTs `repository_dispatch` (`event_type: ply-main-updated`, `client_payload.sha` set to that commit) to `ivarvong/ply-web`. When the secret is missing it prints a notice and exits successfully.
+ply's `main` should wake ply-web on every push, so the pin updates without waiting for the cron. Add this file as `.github/workflows/notify-ply-web.yml` in ivarvong/ply. On push to ply `main` it POSTs `repository_dispatch` (`event_type: ply-main-updated`, `client_payload.sha` set to that commit) to `ivarvong/ply-web`. When the secret is missing it prints a notice and exits successfully. ply-web resolves ply `main` itself when it wakes up; the payload sha is the commit that was pushed.
 
-Secret, on **ivarvong/ply** (the sender, not ply-web): `PLY_WEB_DISPATCH_TOKEN`. A fine-grained personal access token restricted to the `ivarvong/ply-web` repository, with **Contents: Read and write**. That is the permission GitHub requires for `repository_dispatch`. ply-web resolves ply `main` itself when it wakes up; the payload sha is the commit that was pushed.
+```yaml
+name: Notify ply-web
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Dispatch ply-main-updated
+        env:
+          PLY_WEB_DISPATCH_TOKEN: ${{ secrets.PLY_WEB_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PLY_WEB_DISPATCH_TOKEN}" ]; then
+            echo "::notice title=ply-web not notified::PLY_WEB_DISPATCH_TOKEN is not set. Add a fine-grained PAT with Contents: Read and write on ivarvong/ply-web. This push did not send repository_dispatch."
+            exit 0
+          fi
+          # GITHUB_SHA is the commit just pushed. ply-web resolves main itself.
+          GH_TOKEN="${PLY_WEB_DISPATCH_TOKEN}" gh api --method POST repos/ivarvong/ply-web/dispatches --input - <<EOF
+          {"event_type":"ply-main-updated","client_payload":{"sha":"${GITHUB_SHA}"}}
+          EOF
+```
+
+Secret, on **ivarvong/ply** (the sender, not ply-web): `PLY_WEB_DISPATCH_TOKEN`. A fine-grained personal access token restricted to the `ivarvong/ply-web` repository, with **Contents: Read and write**. That is the permission GitHub requires for `repository_dispatch`.
