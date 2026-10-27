@@ -1,0 +1,194 @@
+name: Bump ply
+
+on:
+  repository_dispatch:
+    types: [ply-main-updated]
+  workflow_dispatch:
+  schedule:
+    # Daily fallback when ply's repository_dispatch does not arrive. 16:00 UTC.
+    - cron: '0 16 * * *'
+
+# contents: write pushes the pin to main.
+# issues: write files a failed bump.
+# actions: write starts deploy.yml. A GITHUB_TOKEN push does not trigger on: push.
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: bump-ply
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      # package-lock resolves ply as git+ssh. Actions has no SSH key; the repo is public.
+      - name: Fetch GitHub git dependencies over HTTPS
+        run: |
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/"
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+      # Annotated tags in the suite need a committer. The runner has none. Do not sign.
+      - name: Git identity for the test suite
+        run: |
+          git config --global user.name "ply-web"
+          git config --global user.email "ply-web@example.com"
+          git config --global commit.gpgsign false
+      - name: Resolve ply main and update the pin
+        id: pin
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout -B main origin/main
+          sha=$(git ls-remote https://github.com/ivarvong/ply.git refs/heads/main | awk '{print $1}')
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ply main did not resolve to a 40-hex sha" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          current=$(node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const spec = JSON.parse(readFileSync("package.json", "utf8")).dependencies.ply ?? "";
+            const match = /^github:ivarvong\/ply#([0-9a-f]{40})$/.exec(spec);
+            if (!match) {
+              console.error("package.json ply dependency is not an exact commit pin");
+              process.exit(1);
+            }
+            console.log(match[1]);
+          ')
+          if [ "$sha" = "$current" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "ply pin is already $sha"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          # shellcheck disable=SC2016 # JS template literal; the shell must not expand it
+          node --input-type=module -e '
+            import { readFileSync, writeFileSync } from "node:fs";
+            const sha = process.argv[1];
+            const path = "package.json";
+            const text = readFileSync(path, "utf8");
+            const next = text.replace(
+              /("ply"\s*:\s*")github:ivarvong\/ply#[0-9a-f]{40}(")/,
+              `$1github:ivarvong/ply#${sha}$2`,
+            );
+            if (next === text) {
+              console.error("package.json pin was not updated");
+              process.exit(1);
+            }
+            writeFileSync(path, next);
+          ' "$sha"
+          echo "pin moved to $sha"
+      - name: Install, test, and dry-run the Worker build
+        id: verify
+        if: steps.pin.outputs.changed == 'true'
+        env:
+          PLY_SHA: ${{ steps.pin.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # wrangler deploy --dry-run builds the Worker and exits before upload.
+          # npm run worker:deploy is the real upload and stays in deploy.yml.
+          {
+            npm install --no-audit --no-fund
+            node --input-type=module -e '
+              import { readFileSync } from "node:fs";
+              const sha = process.env.PLY_SHA;
+              const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
+              const resolved = lock.packages?.["node_modules/ply"]?.resolved ?? "";
+              if (!resolved.endsWith("#" + sha)) {
+                console.error("lockfile resolved ply to " + resolved);
+                process.exit(1);
+              }
+            '
+            npm test
+            npx oxlint
+            npx tsc --noEmit
+            npx wrangler deploy --dry-run
+          } 2>&1 | tee "$RUNNER_TEMP/bump.log"
+      - name: Commit the pin to main
+        if: steps.pin.outputs.changed == 'true' && steps.verify.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLY_SHA: ${{ steps.pin.outputs.sha }}
+        run: |
+          set -euo pipefail
+          extra=$(git status --porcelain | awk '{print $2}' | grep -vxE 'package.json|package-lock.json' || true)
+          if [ -n "$extra" ]; then
+            echo "refusing to commit unexpected paths:" >&2
+            printf '%s\n' "$extra" >&2
+            exit 1
+          fi
+          git add package.json package-lock.json
+          git diff --cached --quiet && { echo "pin change produced no diff" >&2; exit 1; }
+          subject=$(curl -fsSL -H "Accept: application/vnd.github+json" "https://api.github.com/repos/ivarvong/ply/commits/${PLY_SHA}" | node --input-type=module -e '
+            let raw = "";
+            process.stdin.on("data", (chunk) => { raw += chunk; });
+            process.stdin.on("end", () => {
+              try {
+                const line = (JSON.parse(raw).commit?.message ?? "").split("\n")[0];
+                console.log(line);
+              } catch {
+                console.log("");
+              }
+            });
+          ' || true)
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "$(printf 'Pin ply to %s.\n\n%s\n' "$PLY_SHA" "$subject")"
+          git push origin HEAD:main
+          gh workflow run deploy.yml --ref main
+      - name: Open an issue when the bump fails
+        if: steps.verify.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLY_SHA: ${{ steps.pin.outputs.sha }}
+          TITLE: ply bump failed for ${{ steps.pin.outputs.sha }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'JS'
+          import { readFileSync, writeFileSync } from "node:fs";
+          // GitHub issue bodies cap at 65536 characters. The tail leaves room for the header.
+          const maxLogChars = 20000;
+          const sha = process.env.PLY_SHA ?? "";
+          let log = "";
+          try {
+            const raw = readFileSync(`${process.env.RUNNER_TEMP}/bump.log`);
+            log = raw.subarray(Math.max(0, raw.length - maxLogChars)).toString("utf8");
+          } catch {
+            log = "(no log was written)";
+          }
+          const fence = "````";
+          const body = [
+            `The ply pin update to \`${sha}\` failed the test suite, Oxlint, \`tsc --noEmit\`, or \`wrangler deploy --dry-run\`.`,
+            "",
+            "`main` was left unchanged, and deploy.yml was not started.",
+            "",
+            fence,
+            log,
+            fence,
+            "",
+          ].join("\n");
+          writeFileSync(`${process.env.RUNNER_TEMP}/issue.md`, body);
+          JS
+          existing=$(gh issue list --state open --limit 100 --json number,title | node --input-type=module -e '
+            let raw = "";
+            process.stdin.on("data", (chunk) => { raw += chunk; });
+            process.stdin.on("end", () => {
+              const title = process.env.TITLE;
+              const hit = JSON.parse(raw).find((issue) => issue.title === title);
+              if (hit) process.stdout.write(String(hit.number));
+            });
+          ')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file "$RUNNER_TEMP/issue.md"
+          else
+            gh issue create --title "$TITLE" --body-file "$RUNNER_TEMP/issue.md"
+          fi
