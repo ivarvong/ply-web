@@ -24,7 +24,7 @@
   "dependencies": {
     "@cloudflare/kumo": "^2.15.0",
     "hono": "^4.13.14",
-    "ply": "github:ivarvong/ply#6091579f81a9abec0414ba79693aad5bb40eb0b9"
+    "ply": "github:ivarvong/ply#d9e805f1bce4f0d86f0d8b4da658252541a286e0"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "2.0.0-beta.v.5",
