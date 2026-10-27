@@ -33,6 +33,14 @@ export function routeOptsFromEnv(env: { VIEWER_EXTRA_HOSTS?: string }): RouteOpt
   return { allowedHosts: allowlistFromEnv(env.VIEWER_EXTRA_HOSTS) };
 }
 
+function chosenRef(url: URL, fallback: string | null = null): string | null {
+  const at = url.searchParams.get('at')
+  if (at !== null && at !== '') return parseRef(at)
+  const ref = url.searchParams.get('ref')
+  if (ref !== null && ref !== '') return parseRef(ref)
+  return fallback
+}
+
 function parseRef(raw: string | null): string | null {
   if (raw === null || raw === '') return null;
   if (raw.length > 1024) bad('ref is too long');
@@ -79,8 +87,7 @@ export function parseViewerRoute(url: URL, opts: RouteOpts): ViewerRoute {
     if (!remote) return { kind: 'home' };
     const pasted = interpretRemote(remote);
     const loc = validatePublicRepoUrl(pasted.remote, { allowedHosts: opts.allowedHosts, maxLength: VIEWER_CAPS.maxUrlLength });
-    const explicit = url.searchParams.get('ref');
-    const ref = parseRef(explicit !== null && explicit !== '' ? explicit : pasted.ref ?? null);
+    const ref = chosenRef(url, pasted.ref ?? null);
     return { kind: 'redirect', location: viewerPathFor(loc, { ref: ref ?? undefined, path: pasted.path || undefined }) };
   }
   if (!url.pathname.startsWith('/view/')) bad('not a viewer route');
@@ -108,5 +115,5 @@ export function parseViewerRoute(url: URL, opts: RouteOpts): ViewerRoute {
   } else if (url.searchParams.get('filter') || url.searchParams.get('offset')) bad('filter and offset need a want');
   const raw = url.searchParams.get('raw') === '1';
   if (raw && pack) bad('raw is a file view');
-  return { kind: 'repo', loc, ref: parseRef(url.searchParams.get('ref')), path: parsePath(url.searchParams.get('path')), raw, pack };
+  return { kind: 'repo', loc, ref: chosenRef(url), path: parsePath(url.searchParams.get('path')), raw, pack };
 }
