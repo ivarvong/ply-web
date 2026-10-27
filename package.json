@@ -20,7 +20,7 @@
   "dependencies": {
     "@cloudflare/kumo": "^2.15.0",
     "hono": "^4.13.14",
-    "ply": "github:ivarvong/ply#fda093a41f4dd0441ee9a8d3d99ff699a979b97c"
+    "ply": "github:ivarvong/ply#6091579f81a9abec0414ba79693aad5bb40eb0b9"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
