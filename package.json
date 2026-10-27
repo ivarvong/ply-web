@@ -9,7 +9,7 @@
   },
   "scripts": {
     "smoke": "node src/smoke.mjs",
-    "worker:deploy": "env -u CLOUDFLARE_API_TOKEN wrangler deploy",
+    "worker:deploy": "wrangler deploy",
     "test": "node --test test/worker.test.js && node --experimental-strip-types --test test/viewer.test.ts",
     "test:worker": "node --test test/worker.test.js",
     "worker:test": "node --test test/worker.test.js",
