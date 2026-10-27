@@ -9,14 +9,15 @@ permissions:
 
 jobs:
   check:
-    # Noble's git package is 2.43. The runner image ships 2.55, which reports a
-    # stale branch delete as push_rejected. The suite matches 2.43.
+    # git >= 2.50 reports a stale old oid as "incorrect old value provided".
+    # ply classifies that string as cas_conflict, same as git 2.43's
+    # "failed to update ref", so the suite runs on the image's git.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -26,22 +27,12 @@ jobs:
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
           git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/"
           git config --global url."https://github.com/".insteadOf "git@github.com:"
-      - name: Use git 2.43
-        run: |
-          curl -fsSL -o "$RUNNER_TEMP/git.deb" http://archive.ubuntu.com/ubuntu/pool/main/g/git/git_2.43.0-1ubuntu7.4_amd64.deb
-          echo "c79b7948ef9860c97ec74293a90178676e63368a0711c95c28a55af4edf1adab  $RUNNER_TEMP/git.deb" | sha256sum -c -
-          dpkg-deb -x "$RUNNER_TEMP/git.deb" "$RUNNER_TEMP/git"
-          echo "$RUNNER_TEMP/git/usr/bin" >> "$GITHUB_PATH"
-          echo "GIT_EXEC_PATH=$RUNNER_TEMP/git/usr/lib/git-core" >> "$GITHUB_ENV"
-          "$RUNNER_TEMP/git/usr/bin/git" --version
       # Annotated tags in the suite need a committer. The runner has none. Do not sign.
       - name: Git identity for the test suite
         run: |
           git config --global user.name "ply-web"
           git config --global user.email "ply-web@example.com"
           git config --global commit.gpgsign false
-          git --version
-          test "$(git --version)" = "git version 2.43.0"
       - run: npm ci
       - run: npm test
       - run: npx oxlint
