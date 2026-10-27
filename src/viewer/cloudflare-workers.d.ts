@@ -1,5 +1,5 @@
-// Minimal types for the Workers runtime modules this viewer imports. The project does not run
-// `wrangler types` as part of tests; these declarations cover only what rate.ts touches.
+// Minimal types for the Workers runtime modules this viewer imports. tsconfig.json does not load the generated
+// runtime types (`cf workers types`); these declarations cover only what rate.ts touches.
 declare module 'cloudflare:workers' {
   export abstract class DurableObject<Env = unknown> {
     ctx: DurableObjectState;

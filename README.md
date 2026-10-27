@@ -7,7 +7,7 @@ that rate-limits by client. `GET /` prints the usage text.
 ## Auth
 
 - **Gate**: `Authorization: Bearer <PLY_TOKEN>` on `/v1`. `GET /`, `GET /view`, and `GET /view.css` are public. The token is a Worker secret
-  (`wrangler secret put PLY_TOKEN`) and is compared in constant time (SHA-256 of both sides,
+  (`cf workers secrets update PLY_TOKEN --worker ply --type secret_text`) and is compared in constant time (SHA-256 of both sides,
   then `crypto.subtle.timingSafeEqual`). A missing or wrong token returns 401 `{code: "unauthorized"}`.
 - **Git credential** (optional; public repos need none):
   - `Git-Authorization: <value>` is sent upstream verbatim as `Authorization`.
@@ -51,7 +51,7 @@ that rate-limits by client. `GET /` prints the usage text.
 - `head` on edit is a **precondition**: if the branch is not at `head`, the response is 409 `cas_conflict` and nothing
   is pushed. `hint` is ply's soft head hint, which saves a round trip when it is right and is corrected when it is
   stale.
-- JSON request bodies are capped at 1 MiB (413 above that). `WRITES` (wrangler var) must be `on` for the
+- JSON request bodies are capped at 1 MiB (413 above that). `WRITES` (a text binding in `cloudflare.config.ts`) must be `on` for the
   POST/DELETE endpoints; otherwise they return 501 `unsupported`.
 
 ## Errors
@@ -151,44 +151,51 @@ Immutable upload-pack responses are cached in the Workers Cache by SHA-256 of ur
 budget. HTML is `no-store` and escaped. CSP is `default-src 'none'; style-src 'self'; script-src 'none'; img-src 'none'`,
 plus `X-Content-Type-Options: nosniff`. There is no inline script and `unsafe-inline` is not allowed.
 
-Deploying this Worker creates the `ViewerRateLimit` migration. This repository does not deploy it.
+`cloudflare.config.ts` declares `ViewerRateLimit` as a live SQLite class in `worker.exports`. The namespace already exists (created by migration tag `v1-viewer-rate`, namespace id `656fdd50f0d6428393eb2d9250ceee67`). Declaring it keeps that namespace and its data.
 
 ## Develop / deploy
 
 ```sh
 npm test                                 # /v1 workerd suite, then the viewer suite (includes a live Hello-World fetch when GitHub answers)
-npm run worker:deploy                    # wrangler deploy
+npm run dev                              # cf dev: Vite + the Cloudflare plugin on local workerd
+npm run typecheck                        # tsc for the app, then cf workers types + tsc for cloudflare.config.ts
+npm run worker:deploy:dry-run            # cf deploy --dry-run: build and validate, no credentials, no upload
+npm run worker:deploy                    # cf deploy
 node src/smoke.mjs https://ply.ivar.workers.dev read --out smoke.json
 ```
 
-`npm run worker:deploy` runs `wrangler deploy`. When `CLOUDFLARE_API_TOKEN` is set, wrangler uses it. When it is unset, wrangler uses the OAuth session from `wrangler login`. The command uploads the Worker named `ply` from `wrangler.jsonc`: vars `WRITES` and `PACK_CACHE`, the `ViewerRateLimit` Durable Object, observability, and `workers_dev`. Worker secrets survive a deploy. `PLY_TOKEN` stays a secret (`wrangler secret put PLY_TOKEN`).
+The Worker is built and deployed with the Cloudflare CLI, [`cf`](https://developers.cloudflare.com/cf/), pinned as a dev dependency. `cloudflare.config.ts` is the Worker config (name, compatibility date, bindings, Durable Object exports, observability, limits). `vite.config.ts` holds build settings only: `cf build` delegates bundling to Vite and the Cloudflare Vite plugin and writes Build Output to `.cloudflare/output`. The workerd suites in `npm test` run that same bundle (`test/cf-bundle.js`).
+
+`npm run worker:deploy` runs `cf deploy`. When `CLOUDFLARE_API_TOKEN` is set, cf uses it. When it is unset, cf uses the OAuth session from `cf auth login`. The command uploads the Worker named `ply`: text bindings `WRITES` and `PACK_CACHE`, the `ViewerRateLimit` Durable Object, observability, `limits.cpuMs`, and `workersDev`. Worker secrets survive a deploy (the upload sends `keep_bindings: ["secret_text", "secret_key"]`). `PLY_TOKEN` stays a secret. Set or rotate it with `cf workers secrets update PLY_TOKEN --worker ply --type secret_text`. cf prompts for the value, so it never lands in shell history.
+
+cf has no live log stream yet (no equivalent of `tail`). Use the dashboard's live logs, or Workers Logs, which this Worker sends through `observability.logs`.
 
 ### GitHub Actions
 
-`bump-ply.yml` moves the `ply` git pin to the current `main` of [ivarvong/ply](https://github.com/ivarvong/ply). It runs on `repository_dispatch` (`ply-main-updated`), `workflow_dispatch`, and a daily cron (`0 16 * * *` UTC) for a dispatch that never arrived. It resolves `refs/heads/main` over the public git protocol, writes that 40-hex SHA into `package.json` and `package-lock.json`, then runs `npm test`, Oxlint, `tsc --noEmit`, and `wrangler deploy --dry-run`. The dry run builds the Worker and stops before upload. When the pin is already that commit, the job stops. When the checks pass, it commits the pin straight to `main`. This repository's `main` is not a protected branch (`protected: false`, no rulesets), so a direct push is the whole publish step. A pull request would wait on a review that `GITHUB_TOKEN` cannot approve. A ruleset that later rejects the Actions token fails this job before `deploy.yml` starts. When the checks fail, the workflow opens an issue titled `ply bump failed for <sha>` (or comments, when that issue is already open) and leaves `main` unchanged.
+`bump-ply.yml` moves the `ply` git pin to the current `main` of [ivarvong/ply](https://github.com/ivarvong/ply). It runs on `repository_dispatch` (`ply-main-updated`), `workflow_dispatch`, and a daily cron (`0 16 * * *` UTC) for a dispatch that never arrived. It resolves `refs/heads/main` over the public git protocol, writes that 40-hex SHA into `package.json` and `package-lock.json`, then runs `npm test`, Oxlint, `npm run typecheck`, and `cf deploy --dry-run`. The dry run builds the Worker and validates it without credentials or API calls. When the pin is already that commit, the job stops. When the checks pass, it commits the pin straight to `main`. This repository's `main` is not a protected branch (`protected: false`, no rulesets), so a direct push is the whole publish step. A pull request would wait on a review that `GITHUB_TOKEN` cannot approve. A ruleset that later rejects the Actions token fails this job before `deploy.yml` starts. When the checks fail, the workflow opens an issue titled `ply bump failed for <sha>` (or comments, when that issue is already open) and leaves `main` unchanged.
 
 A push made with `GITHUB_TOKEN` does not start `on: push` workflows. After the bump commit lands, `bump-ply.yml` starts `deploy.yml` with `workflow_dispatch`. Any other push to `main` starts `deploy.yml` from `on: push`.
 
-`deploy.yml` runs the same checks, then `npm run worker:deploy`. When `CLOUDFLARE_API_TOKEN` or `CLOUDFLARE_ACCOUNT_ID` is unset, the deploy job prints a notice and exits successfully, before wrangler runs.
+`deploy.yml` runs the same checks, then `cf build --mode production` once, `cf deploy --prebuilt --mode production --dry-run` on that Build Output, and `cf deploy --prebuilt --mode production` to upload exactly what was checked. Only the upload step sees the secrets. The version is tagged with the 12-hex commit prefix. When `CLOUDFLARE_API_TOKEN` or `CLOUDFLARE_ACCOUNT_ID` is unset, the deploy job prints a notice and exits successfully, before cf runs.
 
 ### Cloudflare token
 
-`wrangler.jsonc` has no `account_id`. Wrangler, in a non-interactive job, requires one: set `CLOUDFLARE_ACCOUNT_ID`, or it stops before upload. Add both values as Actions secrets on **ivarvong/ply-web** (Settings → Secrets and variables → Actions).
+`cloudflare.config.ts` has no `accountId`. In a non-interactive job, cf takes the account from `CLOUDFLARE_ACCOUNT_ID`. Without it, a token that can see more than one account stops before upload. Add both values as Actions secrets on **ivarvong/ply-web** (Settings → Secrets and variables → Actions).
 
 | Secret | Where | What it is |
 |---|---|---|
 | `CLOUDFLARE_API_TOKEN` | ply-web Actions secret | Account → **Workers Scripts: Edit** |
 | `CLOUDFLARE_ACCOUNT_ID` | ply-web Actions secret | Account id of the account that owns the `ply` Worker |
 
-Workers Scripts Edit is the user-token permission name. An account-owned token lists the same grant as **Workers Scripts Write**. The [script upload API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/methods/update/) and [`GET /accounts/:account_id/workers/subdomain`](https://developers.cloudflare.com/api/resources/workers/subresources/subdomains/methods/get/) (wrangler calls that because `workers_dev` is true, and `ply.ivar.workers.dev` already exists) both accept it. Scope the token to this account. The Worker already exists, so the deploy is an update: Editor on the `ply` Worker is enough for a per-Worker token. Creating the Worker the first time would need Admin at the Workers product scope.
+Workers Scripts Edit is the user-token permission name. An account-owned token lists the same grant as **Workers Scripts Write**. The [script upload API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/methods/update/) and [`GET /accounts/:account_id/workers/subdomain`](https://developers.cloudflare.com/api/resources/workers/subresources/subdomains/methods/get/) (cf calls that because `workersDev` is true, and `ply.ivar.workers.dev` already exists) both accept it. Scope the token to this account. The Worker already exists, so the deploy is an update: Editor on the `ply` Worker is enough for a per-Worker token. Creating the Worker the first time would need Admin at the Workers product scope.
 
 Nothing else in this config asks for a permission:
 
 - No routes and no custom domains, so no Zone → Workers Routes → Edit.
 - No KV, R2, D1, Queues, or Secrets Store bindings.
 - Durable Objects have no token permission of their own. `ViewerRateLimit` follows the Worker.
-- Observability, `limits.cpu_ms`, and the `WRITES` / `PACK_CACHE` vars travel in the script upload.
-- Workers Tail Read is the permission for `wrangler tail`, which this workflow does not run.
+- Observability, `limits.cpuMs`, and the `WRITES` / `PACK_CACHE` text bindings travel in the script upload.
+- Workers Tail Read is the permission for live log streaming, which this workflow does not use.
 
 ### Companion workflow in ivarvong/ply
 

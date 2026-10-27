@@ -1,4 +1,4 @@
-// The ply Worker (src/index.js), bundled with esbuild as wrangler would and run under workerd, against git
+// The ply Worker (src/index.js), bundled by `cf build` exactly as `cf deploy` uploads it and run under workerd, against git
 // http-backend (test/server.js). Every endpoint is judged by git; plus the bearer gate, the remote allowlist, the
 // credential forwarding (verbatim and per host), credential non-leakage (responses, traces, error bodies, logs) and the
 // writes switch. Skipped if workerd is not installed.
@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { build } from 'esbuild';
+import { copyCfBundle } from './cf-bundle.js';
 import { git, gitBuf, tmpRoot, makeBareRepo, startGitServer, commitFiles } from './server.js';
 import { startProxy } from './proxy.js';
 
@@ -49,7 +49,7 @@ before(async () => {
   const filterOf = b => /filter ([^\n]+)\n/.exec(Buffer.from(b).toString('latin1'))?.[1] ?? null;
   artProxy = await startProxy(srv.url, ctx => (ctx.stage === 'fetch' && filterOf(ctx.reqBody) && filterOf(ctx.reqBody) !== 'blob:none' ? { type: 'status', status: 400, contentType: 'text/plain', body: 'Unsupported Git fetch filter; only blob:none is supported.' } : { type: 'pass' }));
   const out = join(root, 'wk'); mkdirSync(out, { recursive: true });
-  await build({ entryPoints: [fileURLToPath(new URL('../src/index.js', import.meta.url))], bundle: true, format: 'esm', outfile: join(out, 'worker.mjs'), logLevel: 'silent', external: ['cloudflare:workers'], jsx: 'automatic', jsxImportSource: 'hono/jsx' });
+  copyCfBundle(join(out, 'worker.mjs'));
   const allow = [srv.url, authSrv.url, echoSrv.url, artProxy.url].join(',');
   const worker = writes => `(modules = [ (name = "worker.mjs", esModule = embed "worker.mjs") ], compatibilityDate = "2026-10-18", globalOutbound = "internet",
     bindings = [ (name = "PLY_TOKEN", text = "${PLY}"), (name = "WRITES", text = "${writes}"), (name = "ALLOW_REMOTE_ORIGINS", text = "${allow}") ])`;

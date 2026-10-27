@@ -7,7 +7,7 @@ import { mkdtempSync, readFileSync, copyFileSync, mkdirSync, writeFileSync, rmSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { build } from 'esbuild';
+import { copyCfBundle } from './cf-bundle.js';
 import { concat } from 'ply';
 import { Sha1 } from 'ply';
 import { TYPE } from 'ply';
@@ -556,7 +556,7 @@ test('workerd: sqlite rate limit, and /v1 still requires the bearer', { skip: WO
   const { root, cleanup } = tmpRoot();
   const out = join(root, 'wk');
   mkdirSync(out);
-  await build({ entryPoints: [fileURLToPath(new URL('../src/index.js', import.meta.url))], bundle: true, format: 'esm', outfile: join(out, 'worker.mjs'), logLevel: 'silent', external: ['cloudflare:workers'], jsx: 'automatic', jsxImportSource: 'hono/jsx' });
+  copyCfBundle(join(out, 'worker.mjs'));
   const port = 19100 + (process.pid % 40);
   const ply = 'test-ply-token-' + 'x'.repeat(20);
   writeFileSync(join(out, 'config.capnp'), `using Workerd = import "/workerd/workerd.capnp";
