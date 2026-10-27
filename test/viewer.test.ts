@@ -494,7 +494,7 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
     const ssrf = await handleViewer(new Request('https://ply.ivar.workers.dev/view/169.254.169.254/latest'), env, {}, { fetchImpl: async () => { throw new Error('ssrf fetched'); } });
     assert.equal(ssrf.status, 400);
     assert.match(await ssrf.text(), /Supported hosts: github.com, gitlab.com, codeberg.org, bitbucket.org, git.sr.ht/);
-    const hostile = await handleViewer(new Request(`https://ply.ivar.workers.dev${repoPath}?path=${encodeURIComponent('<script>alert(1)</script>')}`), env, {}, { fetchImpl });
+    const hostile = await handleViewer(new Request(`https://ply.ivar.workers.dev${repoPath}?path=${encodeURIComponent('<script>alert(1)<script>')}`), env, {}, { fetchImpl });
     assert.equal(hostile.status, 404);
     const hostileHtml = await hostile.text();
     assert.equal(hostileHtml.includes('<script>alert'), false);

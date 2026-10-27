@@ -87,10 +87,42 @@ test('GET / is public usage text; everything else needs the PLY bearer (missing 
   assert.equal((await W('/v1/read', { method: 'POST' })).status, 405);
 });
 
+function assertSecurityHeaders(headers, where) {
+  assert.equal(headers.get('x-content-type-options'), 'nosniff', where);
+  assert.equal(headers.get('referrer-policy'), 'no-referrer', where);
+  const csp = headers.get('content-security-policy') ?? '';
+  assert.match(csp, /frame-ancestors 'none'/, where);
+  assert.match(csp, /script-src 'none'/, where);
+  assert.equal(csp.includes('unsafe-inline'), false, where);
+}
+
+test('security headers are set on every route', { skip }, async () => {
+  const routes = [
+    ['GET', '/', false],
+    ['GET', '/nope', true],
+    ['GET', '/v1/refs', false],
+    ['GET', `/v1/refs?${qs({ remote: 'https://127.0.0.1.nip.io/x.git' })}`, true],
+    ['POST', '/v1/edit', true],
+    ['GET', '/view', false],
+    ['HEAD', '/view', false],
+    ['GET', '/view.css', false],
+    ['GET', '/view/evil.example/a/b', false],
+    ['GET', '/view/github.com/a/%2f../b', false],
+    ['POST', '/view', false],
+  ];
+  for (const [method, path, auth] of routes) {
+    const res = await W(path, { method, auth, body: method === 'POST' && path === '/v1/edit' ? { remote: 'https://127.0.0.1/x.git' } : undefined });
+    assertSecurityHeaders(res.headers, `${method} ${path}`);
+    await res.arrayBuffer();
+  }
+});
+
 test('remote allowlist: https only, no IP literals / private names / userinfo / ports / query; nothing is fetched', { skip }, async () => {
   const bad = ['http://example.com/x.git', 'https://127.0.0.1/x.git', 'https://10.0.0.1/x.git', 'https://169.254.169.254/x.git', 'https://192.168.1.1/x.git', 'https://[::1]/x.git', 'https://[fd00::1]/x.git',
     'https://2130706433/x.git', 'https://0x7f000001/x.git', 'https://localhost/x.git', 'https://foo.localhost/x.git', 'https://git.internal/x.git', 'https://intranet/x.git', 'https://user:pw@github.com/x.git',
-    'https://github.com:8443/x.git', 'https://github.com/x.git?a=b', 'ftp://github.com/x.git', 'not a url', ''];
+    'https://github.com:8443/x.git', 'https://github.com/x.git?a=b', 'ftp://github.com/x.git', 'not a url', '',
+    'https://127.0.0.1.nip.io/x.git', 'https://169.254.169.254.nip.io/latest', 'https://foo.localtest.me/x.git',
+    'https://127-0-0-1.sslip.io/x.git', 'https://github.com./x.git', 'https://0177.0.0.1/x.git', 'https://[::ffff:127.0.0.1]/x.git'];
   for (const remote of bad) {
     const r = await W(`/v1/refs?${qs({ remote, trace: '1' })}`);
     const b = await r.json();

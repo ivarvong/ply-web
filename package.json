@@ -10,7 +10,7 @@
   "scripts": {
     "smoke": "node src/smoke.mjs",
     "worker:deploy": "wrangler deploy",
-    "test": "node --test test/worker.test.js && node --experimental-strip-types --import ./test/register-tsx.mjs --test test/viewer.test.ts",
+    "test": "node --test test/worker.test.js && node --experimental-strip-types --import ./test/register-tsx.mjs --test test/viewer.test.ts test/security.test.ts",
     "test:worker": "node --test test/worker.test.js",
     "worker:test": "node --test test/worker.test.js",
     "test:viewer": "node --experimental-strip-types --import ./test/register-tsx.mjs --test test/viewer.test.ts",
@@ -26,6 +26,7 @@
     "@types/node": "^26.6.5",
     "esbuild": "^0.24.0",
     "oxlint": "^1.22.0",
+    "parse5": "^7.3.0",
     "typescript": "^7.0.2",
     "workerd": "1.20261018.1",
     "wrangler": "^4.152.0"

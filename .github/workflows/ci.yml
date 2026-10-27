@@ -9,6 +9,8 @@ permissions:
 
 jobs:
   check:
+    permissions:
+      contents: read
     # git >= 2.50 reports a stale old oid as "incorrect old value provided".
     # ply classifies that string as cas_conflict, same as git 2.43's
     # "failed to update ref", so the suite runs on the image's git.
@@ -37,3 +39,31 @@ jobs:
       - run: npm test
       - run: npx oxlint
       - run: npx tsc --noEmit
+
+  actions:
+    name: actionlint and zizmor
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/actionlint.tar.gz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  /tmp/actionlint.tar.gz" | sha256sum -c -
+          tar -C /tmp -xzf /tmp/actionlint.tar.gz actionlint
+      - name: Install zizmor
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/zizmor.tar.gz https://github.com/zizmorcore/zizmor/releases/download/v1.31.1/zizmor-x86_64-unknown-linux-gnu.tar.gz
+          echo "d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99  /tmp/zizmor.tar.gz" | sha256sum -c -
+          mkdir -p /tmp/zizmor-extract
+          tar -C /tmp/zizmor-extract -xzf /tmp/zizmor.tar.gz
+          install -m 0755 /tmp/zizmor-extract/zizmor /tmp/zizmor
+      - name: actionlint
+        run: /tmp/actionlint
+      - name: zizmor
+        run: /tmp/zizmor --offline .github/workflows

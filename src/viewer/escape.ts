@@ -1,12 +1,4 @@
-/** Escape every character that could break out of HTML text or a double-quoted attribute. */
-export function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
+export { escapeHtml } from './safehtml.ts';
 
 export function safeFilename(name: string): string {
   const base = name.split('/').pop() ?? 'file';
