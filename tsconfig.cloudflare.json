@@ -1,0 +1,23 @@
+{
+  // Type-checks the cf project files against the Workers runtime types that `cf workers types`
+  // writes to .cloudflare/types. The app keeps tsconfig.json (Node + DOM lib for the test suite).
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "target": "es2024",
+    "lib": ["es2024"],
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "types": [],
+    "allowJs": true,
+    "checkJs": false,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["cloudflare.config.ts", "vite.config.ts", ".cloudflare/types"]
+}

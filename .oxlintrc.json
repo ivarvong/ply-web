@@ -3,5 +3,5 @@
   "plugins": ["typescript", "oxc"],
   "categories": { "correctness": "error" },
   "env": { "builtin": true, "browser": true, "node": true },
-  "ignorePatterns": ["node_modules"]
+  "ignorePatterns": ["node_modules", ".cloudflare"]
 }
