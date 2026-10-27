@@ -3,6 +3,7 @@ import { validatePath } from 'ply';
 import { VIEWER_CAPS, VIEWER_GIT_LIMITS } from './limits.ts';
 import type { FilterName } from './model.ts';
 import { interpretRemote } from './paste.ts';
+import { extractRequestPath, rawPathHasUnsafeSegment, rawQueryPathUnsafe } from '../pathguard.ts';
 import { allowlistFromEnv, validatePublicRepoUrl, viewerPathFor, type AllowedHost, type RepoLocation } from './url.ts';
 
 export type ViewerRoute =
@@ -78,8 +79,20 @@ function locate(host: string, repoPath: string, opts: RouteOpts): RepoLocation {
   return validatePublicRepoUrl(`https://${host}/${repoPath}`, { allowedHosts: opts.allowedHosts, maxLength: VIEWER_CAPS.maxUrlLength });
 }
 
+/** Parse a viewer URL from the raw request target, before `new URL` collapses dot segments. */
+export function parseViewerRequest(raw: string, opts: RouteOpts): ViewerRoute {
+  if (typeof raw !== 'string' || raw.length > VIEWER_CAPS.maxUrlLength * 2) bad('URL is too long');
+  if (raw.includes('\\') || rawPathHasUnsafeSegment(extractRequestPath(raw)) || rawQueryPathUnsafe(raw)) bad('remote path is not allowed');
+  let url: URL;
+  try { url = new URL(raw); }
+  catch { bad('remote path is not allowed'); }
+  if (rawPathHasUnsafeSegment(url.pathname)) bad('remote path is not allowed');
+  return parseViewerRoute(url, opts);
+}
+
 export function parseViewerRoute(url: URL, opts: RouteOpts): ViewerRoute {
   if (url.pathname.length > VIEWER_CAPS.maxUrlLength || url.href.length > VIEWER_CAPS.maxUrlLength * 2) bad('URL is too long');
+  if (url.href.includes('\\') || rawPathHasUnsafeSegment(url.pathname) || rawQueryPathUnsafe(url.href)) bad('remote path is not allowed');
   for (const key of url.searchParams.keys()) if (SECRET_QUERY.test(key)) bad('query must not carry credentials');
   if (url.pathname === '/view.css') return { kind: 'css' };
   if (url.pathname === '/view' || url.pathname === '/view/') {
@@ -94,6 +107,9 @@ export function parseViewerRoute(url: URL, opts: RouteOpts): ViewerRoute {
   let decoded: string;
   try { decoded = decodeURIComponent(url.pathname.slice('/view/'.length)); } catch { bad('remote path is not allowed'); }
   if (decoded.includes('%') || decoded.includes('\\') || decoded.includes('\0') || decoded.includes('..')) bad('remote path is not allowed');
+  for (const segment of decoded.split('/')) {
+    if (segment === '.' || segment === '..') bad('remote path is not allowed');
+  }
   const parts = decoded.split('/').filter(part => part.length > 0);
   if (parts.length < 2) bad('remote path is not allowed');
   const host = parts[0] ?? '';

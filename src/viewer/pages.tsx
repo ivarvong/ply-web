@@ -1,4 +1,4 @@
-import { raw } from 'hono/html'
+import { rawSafe } from './safehtml.ts'
 import { ALLOWED_HOSTS, viewerHref } from './url.ts'
 import { VIEWER_CAPS } from './limits.ts'
 import { renderMarkdown } from './markdown.ts'
@@ -154,7 +154,7 @@ function Readme(props: { loaded: TreeLoaded }) {
   return (
     <section class={KUMO_SURFACE}>
       <div class="pad"><h2 class="subject">{readme.name}</h2></div>
-      <div class="md">{raw(renderMarkdown(readme.text))}</div>
+      <div class="md">{rawSafe(renderMarkdown(readme.text))}</div>
     </section>
   )
 }

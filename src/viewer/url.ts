@@ -5,6 +5,8 @@
 // Host policy is an exact allowlist. There is no suffix match, no wildcard, and no IP-literal
 // folding: a hostname is accepted only when it is one of the allowed hosts, character for character.
 import { fail } from 'ply';
+import { extractRequestPath, rawPathHasUnsafeSegment } from '../pathguard.ts';
+import { authorityHasTrailingDot } from '../remote.ts';
 
 declare const validatedPublicRepoUrl: unique symbol;
 export type ValidatedPublicRepoUrl = string & { readonly [validatedPublicRepoUrl]: 'ValidatedPublicRepoUrl' };
@@ -88,17 +90,8 @@ function reject(allowed: readonly AllowedHost[], message: string): never {
   throw fail('bad_request', `${message} ${supported(allowed)}`);
 }
 
-/** True when the raw authority's host ends in `.`, even if a URL parser would drop that dot. */
 function authorityEndsWithDot(raw: string): boolean {
-  const match = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(raw.trim());
-  if (!match?.[1]) return false;
-  let authority = match[1];
-  const at = authority.lastIndexOf('@');
-  if (at >= 0) authority = authority.slice(at + 1);
-  if (authority.startsWith('[')) return false;
-  const colon = authority.lastIndexOf(':');
-  if (colon >= 0 && /^\d+$/.test(authority.slice(colon + 1))) authority = authority.slice(0, colon);
-  return authority.endsWith('.');
+  return authorityHasTrailingDot(raw);
 }
 
 function checkPath(pathname: string, allowed: readonly AllowedHost[]): string {
@@ -127,6 +120,7 @@ export function validatePublicRepoUrl(raw: string, opts: ValidateOpts = {}): Rep
   if (raw.length > maxLength) reject(allowed, 'remote is too long.');
   // oxlint-disable-next-line no-control-regex -- a remote with controls is not a URL
   if (/[\u0000-\u001f\u007f\s]/.test(raw)) reject(allowed, 'remote is not a URL.');
+  if (raw.includes('\\') || rawPathHasUnsafeSegment(extractRequestPath(raw))) reject(allowed, 'remote path is not allowed.');
   let u: URL;
   try { u = new URL(raw); }
   catch { reject(allowed, 'remote is not a URL.'); }
@@ -150,6 +144,7 @@ function repoVariants(repoPath: string): string[] {
 
 /** A fetch the transport is about to make must be this repo's smart-HTTP endpoint on an allowlisted host. */
 export function assertUpstreamUrl(raw: string, repo: ValidatedPublicRepoUrl, allowed: readonly AllowedHost[]): ValidatedPublicRepoUrl {
+  if (raw.includes('\\') || rawPathHasUnsafeSegment(extractRequestPath(raw))) reject(allowed, 'upstream path is not a git smart-HTTP endpoint.');
   let u: URL;
   try { u = new URL(raw); }
   catch { reject(allowed, 'upstream URL rejected.'); }

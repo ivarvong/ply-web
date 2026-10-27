@@ -25,6 +25,11 @@ import { withLimits } from 'ply';
 import { cachingFetch } from 'ply';
 import { validateRef, validateIdent } from 'ply';
 import { handleViewer } from './viewer/handle.ts';
+import { checkRemote, createGuardedFetch } from './remote.ts';
+import { applySecurityHeaders } from './security-headers.ts';
+import { viewerErrorDocument } from './viewer/safehtml.ts';
+
+export { checkRemote };
 
 export { ViewerRateLimit } from './viewer/rate.ts';
 
@@ -75,24 +80,7 @@ Public read-only viewer (no token, no git credential):  GET /view   and   GET /v
 
 // ---- pure helpers ----
 
-const IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
-const BLOCKED_SUFFIX = /(^|\.)(localhost|local|localdomain|internal|intranet|lan|home\.arpa|corp|private)\.?$/i;
-
-// Pure: the caller's remote, or a bad_request saying why not. `allow` lists origins exempt from the rules (tests).
-export function checkRemote(raw, allow = []) {
-  if (typeof raw !== 'string' || !raw) throw fail('bad_request', 'remote is required');
-  if (raw.length > 2048) throw fail('bad_request', 'remote too long');
-  let u; try { u = new URL(raw); } catch { throw fail('bad_request', 'remote is not a URL'); }
-  if (u.username || u.password) throw fail('bad_request', 'remote must not carry credentials; use Git-Authorization or Git-Token');
-  if (u.search || u.hash) throw fail('bad_request', 'remote must not have a query or fragment');
-  if (allow.includes(u.origin)) return u;
-  if (u.protocol !== 'https:') throw fail('bad_request', 'remote must be https');
-  if (u.port !== '') throw fail('bad_request', 'remote must use the default port');
-  const h = u.hostname;
-  if (IPV4.test(h) || h.startsWith('[')) throw fail('bad_request', 'remote must be a host name, not an IP address');
-  if (!h.includes('.') || BLOCKED_SUFFIX.test(h)) throw fail('bad_request', 'remote host is not a public name');
-  return u;
-}
+// checkRemote lives in remote.ts. It returns an AllowedRemote; createGuardedFetch will not take a bare string.
 
 // Pure: the git credential from the request headers, as ply's `auth`, plus every string form to scrub.
 export function gitAuth(headers, host) {
@@ -248,11 +236,16 @@ export default {
     const t0 = Date.now();
     const url = new URL(req.url);
     const id = crypto.randomUUID();
-    if (req.method === 'GET' && url.pathname === '/') return new Response(USAGE, { headers: { 'content-type': 'text/plain; charset=utf-8' } });
     let scrub = s => String(s);
     const record = { msg: 'ply.request', id, method: req.method, path: url.pathname, colo: req.cf?.colo ?? '' };
     const log = extra => console.log(scrub(JSON.stringify({ ...record, ...extra })));
-    const done = (res, extra = {}) => { res.headers.set('x-ply-request-id', id); log({ status: res.status, ms: Date.now() - t0, ...extra }); return res; };
+    const done = (res, extra = {}) => {
+      res.headers.set('x-ply-request-id', id);
+      applySecurityHeaders(res.headers);
+      log({ status: res.status, ms: Date.now() - t0, ...extra });
+      return res;
+    };
+    if (req.method === 'GET' && url.pathname === '/') return done(new Response(USAGE, { headers: { 'content-type': 'text/plain; charset=utf-8' } }));
     // Public viewer. Before the token gate, and it never reads Authorization / Git-Token / Cookie.
     if (url.pathname === '/view.css' || url.pathname === '/view' || url.pathname.startsWith('/view/')) {
       if (url.pathname.includes('@') || url.pathname.toLowerCase().includes('%40')) record.path = '/view/redacted';
@@ -262,8 +255,7 @@ export default {
       } catch (e) {
         const code = isPlyCode(e?.code) ? e.code : 'internal';
         const message = code === 'internal' ? 'The viewer hit an internal error.' : String(e?.message ?? e).slice(0, 500);
-        const safe = message.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
-        const res = new Response(`<!doctype html><meta charset="utf-8"><title>${code}</title><p>${safe}</p>`, { status: STATUS[code] ?? 500, headers: { 'content-type': 'text/html; charset=utf-8', 'x-content-type-options': 'nosniff', 'cache-control': 'no-store' } });
+        const res = new Response(viewerErrorDocument(code, message), { status: STATUS[code] ?? 500, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
         return done(res, { viewer: 1, code });
       }
     }
@@ -283,13 +275,14 @@ export default {
       const body = WRITES[key] ? await readJson(req) : {};
       const allow = (env.ALLOW_REMOTE_ORIGINS ?? '').split(',').map(s => s.trim()).filter(Boolean);
       const remoteUrl = checkRemote(WRITES[key] ? body.remote : url.searchParams.get('remote'), allow);
-      const remote = remoteUrl.toString();
+      const remote = remoteUrl.href;
       record.host = remoteUrl.host;
       const cred = gitAuth(req.headers, remoteUrl.hostname);
       scrub = scrubber(cred.secrets);
       const tracer = new Tracer({ exporter, resource: { 'service.name': 'ply-worker', 'cloudflare.colo': req.cf?.colo ?? '' } });
-      const fetchImpl = env.PACK_CACHE === 'off' || typeof caches === 'undefined' ? undefined : cachingFetch(globalThis.fetch, caches.default, { waitUntil: p => ctx.waitUntil(p) });
-      const opts = { auth: cred.auth, tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), ...(fetchImpl ? { fetchImpl } : {}) };
+      const guarded = createGuardedFetch(globalThis.fetch.bind(globalThis), remoteUrl, allow);
+      const fetchImpl = env.PACK_CACHE === 'off' || typeof caches === 'undefined' ? guarded : cachingFetch(guarded, caches.default, { waitUntil: p => ctx.waitUntil(p) });
+      const opts = { auth: cred.auth, tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), fetchImpl };
       const out = await handler({ remote, q: url.searchParams, body, opts, spans, ctx, log });
       const s = spans();
       const stats = { spans: s.length, rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length, wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length, cache_hits: s.filter(x => x.attrs['git.response.cache'] === 'HIT').length };

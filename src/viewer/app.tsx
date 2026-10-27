@@ -7,7 +7,7 @@ import { htmlResponse, SECURITY, statusOf, textResponse } from './http.ts'
 import { VIEWER_CAPS, rateLimitFor, type RateBucket } from './limits.ts'
 import type { RateDecision, TraceModel, ViewerEnv } from './model.ts'
 import { cachedFetch, makeTracer, plyCode, spanCollector } from './ply.ts'
-import { parseViewerRoute, routeOptsFromEnv, type ViewerRoute } from './route.ts'
+import { parseViewerRequest, routeOptsFromEnv, type ViewerRoute } from './route.ts'
 import { renderError, renderHome, renderLoaded } from './render.tsx'
 import { VIEWER_CSS } from './styles.ts'
 import { loadRepo } from './session.ts'
@@ -164,7 +164,7 @@ viewerApp.use('*', async (c, next) => {
     return textResponse(405, 'method not allowed', { allow: 'GET, HEAD' })
   }
   try {
-    call.route = parseViewerRoute(new URL(c.req.url), routeOptsFromEnv(c.env))
+    call.route = parseViewerRequest(c.req.url, routeOptsFromEnv(c.env))
   } catch (err) {
     return headless(c.req.raw, routeError(call, err))
   }

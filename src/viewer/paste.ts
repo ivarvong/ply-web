@@ -1,10 +1,13 @@
 // Turn a pasted locator into an https remote the allowlist can accept or reject.
 // This does not widen the host check: validatePublicRepoUrl still runs on the result.
+import { extractRequestPath, rawPathHasUnsafeSegment } from '../pathguard.ts';
+
 export type PastedRepo = { remote: string; ref?: string; path?: string };
 
 const OWNER_REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/;
 
 function webPath(remote: string): PastedRepo {
+  if (remote.includes('\\') || rawPathHasUnsafeSegment(extractRequestPath(remote))) return { remote };
   let u: URL;
   try { u = new URL(remote); }
   catch { return { remote }; }

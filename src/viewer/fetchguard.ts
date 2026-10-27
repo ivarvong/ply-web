@@ -4,6 +4,7 @@
 import { fail } from 'ply';
 import type { Budget } from './budget.ts';
 import { VIEWER_CAPS, VIEWER_UA } from './limits.ts';
+import { extractRequestPath, rawPathHasUnsafeSegment } from '../pathguard.ts';
 import { assertUpstreamUrl, type AllowedHost, type ValidatedPublicRepoUrl } from './url.ts';
 
 declare const credentialFree: unique symbol;
@@ -72,6 +73,12 @@ export function createViewerFetch(inner: FetchLike, repo: ValidatedPublicRepoUrl
         await res.body?.cancel().catch(() => {});
         if (!location) throw fail('http', 'redirect without location');
         if (hop === VIEWER_CAPS.maxRedirects) throw fail('bad_request', 'too many redirects');
+        // oxlint-disable-next-line no-control-regex -- controls in a Location are not a URL
+        if (/[\u0000-\u001f\u007f]/.test(location) || location.includes('\\') || /%(?:2e|2f|5c)/i.test(location)) throw fail('bad_request', 'redirect host is not an allowlisted host');
+        const locationPath = location.split(/[?#]/)[0] ?? '';
+        if (rawPathHasUnsafeSegment(locationPath.startsWith('/') || /^[a-z][a-z0-9+.-]*:/i.test(location) ? extractRequestPath(location.startsWith('/') ? `https://reject.invalid${locationPath}` : location) : locationPath)) {
+          throw fail('bad_request', 'redirect host is not an allowlisted host');
+        }
         const next = new URL(location, current).href;
         current = assertUpstreamUrl(next, repo, allowed);
         continue;

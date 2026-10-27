@@ -1,5 +1,6 @@
 import { LAYOUT } from './layout.ts'
 import { VIEWER_CSP } from './script.ts'
+import type { SafeHtml } from './safehtml.ts'
 import { traceHeader } from './traceview.ts'
 import type { TraceModel } from './model.ts'
 
@@ -24,7 +25,7 @@ export function statusOf(err: { code?: string; status?: number }): number {
   return STATUS[err?.code ?? ''] ?? 500
 }
 
-export function htmlResponse(status: number, body: string, trace: TraceModel, requestId: string, extra: Record<string, string> = {}): Response {
+export function htmlResponse(status: number, body: SafeHtml, trace: TraceModel, requestId: string, extra: Record<string, string> = {}): Response {
   const timing = [`total;dur=${Math.max(0, trace.totalMs)}`, traceHeader(trace)].filter(Boolean).join(', ').slice(0, LAYOUT.serverTimingChars)
   const headers = new Headers({
     ...SECURITY,

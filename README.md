@@ -18,10 +18,15 @@ that rate-limits by client. `GET /` prints the usage text.
   - Neither credential appears in a response, trace, error message or log line. ply never records them, and the
     Worker scrubs every outgoing string as a second layer (`test/worker.test.js` greps all of these, including a
     hostile upstream that echoes the header back).
-- **Remote rules**: `remote` must be `https:`, on the default port, with no userinfo, query or fragment. IP literals
-  are refused (including normalised forms such as `https://2130706433/`), as are single-label hosts and
-  `localhost`/`.local`/`.internal`/`.lan`/`.home.arpa`/… names. The check runs before any I/O. `ALLOW_REMOTE_ORIGINS`
-  (comma-separated origins) exempts listed origins from these rules. Only the tests use it.
+- **Remote rules**: `remote` must be `https:`, on the default port, with no userinfo, query, or fragment. The host is
+  canonicalised (lowercase, no trailing dot — `github.com.` is rejected rather than stripped). IP literals are refused
+  in every encoding the URL parser accepts (dotted, zero-padded, octal, hex, decimal `2130706433`, IPv6, IPv4-mapped,
+  IPv4-compatible). So are single-label hosts, `localhost`/`.local`/`.internal`/`.lan`/`.home.arpa`/… names, and
+  wildcard-DNS names (`nip.io`, `sslip.io`, `localtest.me`, and the same shape of zone). A path segment of `.` or `..`,
+  or an encoded slash, backslash, or dot (`%2f`, `%5c`, `%2e`), is rejected before normalisation. Redirects are
+  followed manually, at most three hops, and only when the next URL passes the same check and stays on the same origin.
+  `ALLOW_REMOTE_ORIGINS` (comma-separated origins) exempts those origins from the public-host rules (http, an IP, a
+  non-default port). Only the tests use it.
 
 ## Endpoints
 
@@ -97,7 +102,7 @@ turned into a credential. `/v1` is unchanged: same gate, same credential headers
 The viewer keeps a fresh `quirks` object per request, so a server that rejects `filter tree:0` shows that 400 and
 the `blob:none` retry on every page (the `/v1` path still learns it once per isolate).
 
-The home form accepts an https URL, `github.com/owner/repo`, `owner/repo` (github.com), or `git@host:path` (the ssh user is dropped, then the allowlist runs). Shareable URLs: `/view/<host>/<repo path>?ref=&path=`. `?raw=1` returns the file as `text/plain` or
+The home form accepts an https URL, `github.com/owner/repo`, `owner/repo` (github.com), or `git@host:path` (the ssh user is dropped, then the allowlist runs). Shareable URLs: `/view/<host>/<repo path>?ref=&path=`. A path segment of `.` or `..`, a backslash, or an encoded slash, backslash, or dot is rejected on the raw URL, before the URL parser collapses it. `?raw=1` returns the file as `text/plain` or
 `application/octet-stream` (never `text/html`). `?want=<oid>&filter=tree:0|blob:none&offset=` is the pack map.
 Every HTML page includes a waterfall of the git round trips that produced it (method, filter, wants, HTTP status,
 cache HIT/MISS, server agent, pkt-line counters) plus the `cf-ray` when the platform sends one. The Workers trace
@@ -112,7 +117,7 @@ do not match. Everything else is rejected before a fetch, and the error lists th
 or trailing dot is skipped, not treated as a suffix. Cloudflare Artifacts is off unless that variable names the
 exact public git host. `ALLOW_REMOTE_ORIGINS` is a `/v1` test hook and does not apply to `/view`. Redirects are
 manual, re-checked against the same allowlist, and limited to that repo's `info/refs` and `git-upload-pack`
-paths (plus a `.git` suffix). A redirect to any other host is not followed. Upstream `User-Agent` is
+paths (plus a `.git` suffix). A redirect whose raw `Location` contains `.`, `..`, `%2e`, `%2f`, or `%5c` is not followed, and a redirect to any other host is not followed. Upstream `User-Agent` is
 `ply-viewer/0.1.0`.
 
 **Caps** (not raised by environment; rate limits can be lowered and are clamped to 1…1000):
