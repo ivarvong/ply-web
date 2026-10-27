@@ -1,4 +1,4 @@
-// Class strings taken from @cloudflare/kumo 2.15.0 component variants
+// Class strings taken from @cloudflare/kumo 2.16.0 component variants
 // (button secondary/sm, input base, badge, banner). They only do anything
 // because /view.css serves kumo-standalone.css. Kumo's primary button also
 // sets inline --kumo-button-emphasis-* styles; style-src 'self' would drop
