@@ -33,9 +33,32 @@ export { checkRemote };
 
 export { ViewerRateLimit } from './viewer/rate.ts';
 
-// A Worker isolate has 128 MB: keep every buffered pack well under it (the blob is streamed and never counts).
-const LIMITS = withLimits({ maxPackBytes: 32 << 20, maxObjectSize: 16 << 20, maxHarvestBytes: 16 << 20, requestTimeoutMs: 30_000 });
-const MAX_BODY = 1 << 20;
+// A Worker isolate has 128 MiB. A buffered pack holds the wire bytes and every inflated object,
+// including delta results resolvePack allocates on top of the instructions (ply #9). Four
+// maximum-sized objects cover a merge-base triple plus the commit that names them, and
+// wire + inflated stays under the isolate. The blob itself is streamed and is not in this total.
+const KIB = 1024;
+const MIB = KIB * KIB;
+const API_OBJECT_BYTES = 16 * MIB;
+const API_PACK_WIRE_BYTES = 32 * MIB;
+const API_HARVEST_BYTES = 16 * MIB;
+const API_INFLATED_OBJECTS = 4;
+const API_INFLATED_TOTAL = API_OBJECT_BYTES * API_INFLATED_OBJECTS;
+// ply's buffered-pack object ceiling. The inflated-byte cap above is the memory bound.
+const API_PACK_OBJECTS = 100_000;
+const API_REQUEST_TIMEOUT_MS = 30_000;
+const MAX_BODY = MIB;
+const MS_PER_SECOND = 1000;
+
+const LIMITS = withLimits({
+  maxPackBytes: API_PACK_WIRE_BYTES,
+  maxObjectSize: API_OBJECT_BYTES,
+  maxHarvestBytes: API_HARVEST_BYTES,
+  maxInflatedTotal: API_INFLATED_TOTAL,
+  maxPackObjects: API_PACK_OBJECTS,
+  maxLsRefsBytes: API_PACK_WIRE_BYTES,
+  requestTimeoutMs: API_REQUEST_TIMEOUT_MS,
+});
 
 // Learned server properties (ply's `quirks`: e.g. "refuses tree:0, use blob:none"), per origin, for the isolate's life.
 // Not request state: a fact about a server, learned from its own answer, the same for every caller.
@@ -183,7 +206,19 @@ const READS = {
   },
 };
 
-const ident = (body, k) => validateIdent(need(body, k));
+const unixSeconds = () => Math.floor(Date.now() / MS_PER_SECOND);
+
+// validateIdent requires a non-negative unix time and a civil zone, then brands the result.
+// The HTTP body is still {name, email, tz?}. This stamp exists only so a bad name, email, or
+// zone is bad_request before any fetch; ply stamps the commit with its own time.
+function checkedIdent(raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw fail('bad_request', 'identity must be {name, email}');
+  validateIdent({ name: raw.name, email: raw.email, time: unixSeconds(), tz: raw.tz });
+  if (raw.tz === undefined) return { name: raw.name, email: raw.email };
+  return { name: raw.name, email: raw.email, tz: raw.tz };
+}
+
+const ident = (body, k) => checkedIdent(need(body, k));
 
 const WRITES = {
   'POST /v1/edit': async ({ remote, body, opts }) => {
@@ -213,12 +248,12 @@ const WRITES = {
   },
   'POST /v1/merge': async ({ remote, body, opts }) => {
     const ref = body.ref ? fullRef(body.ref) : await headBranch(remote, opts);
-    const r = await mergeBranch(remote, { ref, from: fullRef(need(body, 'from')), author: body.author ? validateIdent(body.author) : undefined, message: body.message, fastForwardOnly: !!body.fastForwardOnly, noFastForward: !!body.noFastForward }, opts);
+    const r = await mergeBranch(remote, { ref, from: fullRef(need(body, 'from')), author: body.author ? checkedIdent(body.author) : undefined, message: body.message, fastForwardOnly: !!body.fastForwardOnly, noFastForward: !!body.noFastForward }, opts);
     return { body: r };
   },
   'POST /v1/rebase': async ({ remote, body, opts }) => {
     const onto = body.onto ? fullRef(body.onto) : await headBranch(remote, opts);
-    const r = await rebaseBranch(remote, { ref: fullRef(need(body, 'ref')), onto, committer: ident(body, 'committer'), author: body.author ? validateIdent(body.author) : undefined, squash: !!body.squash, message: body.message ?? null }, opts);
+    const r = await rebaseBranch(remote, { ref: fullRef(need(body, 'ref')), onto, committer: ident(body, 'committer'), author: body.author ? checkedIdent(body.author) : undefined, squash: !!body.squash, message: body.message ?? null }, opts);
     return { body: r };
   },
   'POST /v1/cherry-pick': async ({ remote, body, opts }) => {

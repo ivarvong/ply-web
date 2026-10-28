@@ -97,19 +97,19 @@ function isText(bytes: Uint8Array): boolean {
   catch { return false; }
 }
 
-function previewOf(type: number, data: Uint8Array): ObjectPreview | null {
+function previewOf(type: number, data: Uint8Array, limits: object): ObjectPreview | null {
   if (data.length > VIEWER_CAPS.maxPreviewChars * 4 && type === TYPE.BLOB) {
     return { kind: 'blob', binary: !isText(data.subarray(0, 512)), text: null };
   }
   try {
     if (type === TYPE.COMMIT) {
-      const commit = parseCommit(data);
+      const commit = parseCommit(data, limits);
       const message = commit.message ?? '';
       const summary = message.split('\n')[0] ?? '';
       return { kind: 'commit', summary: clampText(summary, 200), tree: commit.tree ?? '', parents: commit.parents.slice(0, 8) };
     }
     if (type === TYPE.TREE) {
-      const entries = parseTree(data);
+      const entries = parseTree(data, limits);
       return { kind: 'tree', names: entries.slice(0, 40).map((entry: { name: string }) => entry.name) };
     }
     if (type === TYPE.BLOB) {
@@ -169,7 +169,7 @@ export function mapParsed(parsed: ParsedPack, limits = VIEWER_GIT_LIMITS): PackM
       baseOffset: obj.baseOffset ?? null,
       baseOid: obj.baseOid ?? null,
       chain: resolvedObj?.chain ?? (full ? 0 : 0),
-      preview: data ? previewOf(resolvedObj?.type ?? obj.type, data) : (wire === 'ofs_delta' || wire === 'ref_delta' ? { kind: 'unresolved' } : null),
+      preview: data ? previewOf(resolvedObj?.type ?? obj.type, data, limits) : (wire === 'ofs_delta' || wire === 'ref_delta' ? { kind: 'unresolved' } : null),
     };
   });
   const links: DeltaLink[] = objects.filter(obj => obj.baseOffset !== null || obj.baseOid !== null).map(obj => ({

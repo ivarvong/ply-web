@@ -19,6 +19,7 @@ export const VIEWER_CAPS = Object.freeze({
   maxRedirects: 2,
   maxRefs: 2_000,
   maxBranchesShown: 200,
+  maxTreeEntries: 2_000,
   maxTreeShown: 500,
   maxLogCommits: 5,
   maxPreviewChars: 2_000,
@@ -37,10 +38,12 @@ export const VIEWER_GIT_LIMITS = withLimits({
   maxDeltaResult: VIEWER_CAPS.maxDeltaResult,
   maxDeltaChain: VIEWER_CAPS.maxDeltaChain,
   maxRefs: VIEWER_CAPS.maxRefs,
-  maxTreeEntries: 2_000,
+  maxTreeEntries: VIEWER_CAPS.maxTreeEntries,
   requestTimeoutMs: VIEWER_CAPS.requestTimeoutMs,
   maxPackObjects: VIEWER_CAPS.maxPackObjects,
   maxInflatedTotal: VIEWER_CAPS.maxInflatedTotal,
+  // One ref listing is buffered, so it shares the pack byte cap.
+  maxLsRefsBytes: VIEWER_CAPS.maxPackBytes,
 });
 
 export type RateBucket = 'page' | 'pack';

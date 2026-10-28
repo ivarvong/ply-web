@@ -1,6 +1,6 @@
 # ply Worker — `https://ply.ivar.workers.dev`
 
-A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#d9e805f1bce4f0d86f0d8b4da658252541a286e0` (an exact commit of ply `main`; `bump-ply.yml` moves the pin). The `/v1` API has no
+A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#ae56cedfc94d87317fe1de3443db6850cc2b6210` (an exact commit of ply `main`; `bump-ply.yml` moves the pin). The `/v1` API has no
 bindings and no storage. `GET /view` is a public repository viewer; its only binding is a SQLite Durable Object
 that rate-limits by client. `GET /` prints the usage text.
 
