@@ -38,7 +38,7 @@ export type DiscoverInfo = {
   filter: boolean;
 };
 
-export type PackCursor = { phase: string; type: number; size: number };
+export type PackCursor = { phase: string; type: number; size: number; bytes: number };
 
 type Fetched = { type: number; data: Uint8Array; oid: string; size: number };
 type CommitView = {
@@ -63,7 +63,7 @@ export function createGitTransport(url: string, opts: {
 export const discoverRepo: (transport: GitTransport) => Promise<DiscoverInfo> = loose(discoverJs);
 export const listRefs: (transport: GitTransport, prefixes: string[]) => Promise<{ refs: Map<string, { oid: string; peeled?: string }>; head: string | null }> = loose(lsRefsJs);
 export const candidates: (ref: string | null) => string[] = loose(refCandidatesJs);
-export const viewCommit: (data: Uint8Array) => CommitView = loose(commitViewJs);
+export const viewCommit: (data: Uint8Array, limits: object) => CommitView = loose(commitViewJs);
 export const treeEntryType: (mode: string) => string = loose(entryTypeJs);
 export const treeMode: (mode: string) => string = loose(lsModeJs);
 export const readObject: (transport: GitTransport, opts: { oid: string; filter?: string; deepen?: number; expectType?: number | null }) => Promise<Fetched> = loose(fetchObjectJs);

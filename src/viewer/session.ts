@@ -11,7 +11,7 @@ import type { FetchLike } from './fetchguard.ts';
 import { VIEWER_CAPS, VIEWER_GIT_LIMITS, VIEWER_UA } from './limits.ts';
 import { mapParsed } from './packmap.ts';
 import type { CommitInfo, FilterName, Loaded, RepoHeader, ServerInfo, TreeEntry } from './model.ts';
-import { candidates, createGitTransport, cursorFinish, cursorInit, cursorStep, discoverRepo, filterRejected, inflateObject, listRefs, readObject, readPack, streamPack, treeEntryType, treeMode, viewCommit, type GitTransport, type ViewerTracer } from './ply.ts';
+import { candidates, createGitTransport, cursorFinish, cursorInit, cursorStep, discoverRepo, filterRejected, inflateObject, listRefs, readObject, readPack, streamPack, treeEntryType, treeMode, viewCommit, type GitTransport, type PackCursor, type ViewerTracer } from './ply.ts';
 import type { ViewerRoute } from './route.ts';
 import type { RepoLocation, ValidatedPublicRepoUrl } from './url.ts';
 import { viewerHref } from './url.ts';
@@ -52,7 +52,7 @@ function serverOf(info: { version: number; agent: string; objectFormat: string; 
 }
 
 function toCommit(oid: string, data: Uint8Array): CommitInfo {
-  const view = viewCommit(data);
+  const view = viewCommit(data, VIEWER_GIT_LIMITS);
   const author = view.author ?? { name: '', email: '', time: '', tz: '' };
   return {
     oid,
@@ -107,6 +107,14 @@ function listed(entries: { name: string; mode: string; oid: string }[]): { shown
   return { shown: mapped.slice(0, VIEWER_CAPS.maxTreeShown), truncated: Math.max(0, mapped.length - VIEWER_CAPS.maxTreeShown) };
 }
 
+// zlib can be a little larger than the inflated file cap. Same slack ply uses before inflate.
+const COMPRESSED_SLACK_BYTES = 64 * 1024;
+
+function refuseOversizedChunk(cursor: PackCursor, chunk: Uint8Array): void {
+  const next = cursor.bytes + chunk.byteLength;
+  if (next > VIEWER_CAPS.maxPackBytes) throw limitError('pack bytes', next, VIEWER_CAPS.maxPackBytes);
+}
+
 async function readBlob(transport: GitTransport, tracer: ViewerTracer, oid: string): Promise<{ size: number; bytes: Uint8Array | null; tooBig: boolean }> {
   const span = tracer.start('git.viewer.blob', { attrs: { 'git.read.blob.oid': oid } });
   const fetchSpan = tracer.start('git.upload-pack fetch', { parent: span, kind: 3 });
@@ -117,6 +125,7 @@ async function readBlob(transport: GitTransport, tracer: ViewerTracer, oid: stri
     while (sp.phase !== 'body') {
       const step = await it.next();
       if (step.done) throw fail('pack_corrupt', 'pack ended before the object header');
+      refuseOversizedChunk(sp, step.value);
       const r = cursorStep(sp, step.value);
       sp = r.state;
       early.push(...r.zlib);
@@ -135,10 +144,11 @@ async function readBlob(transport: GitTransport, tracer: ViewerTracer, oid: stri
     for (;;) {
       const step = await it.next();
       if (step.done) break;
+      refuseOversizedChunk(sp, step.value);
       const r = cursorStep(sp, step.value);
       sp = r.state;
       for (const z of r.zlib) { zlibParts.push(z); zlibLen += z.byteLength; }
-      if (zlibLen > VIEWER_CAPS.maxFileDisplayBytes + 64 * 1024) throw limitError('compressed object bytes', zlibLen, VIEWER_CAPS.maxFileDisplayBytes);
+      if (zlibLen > VIEWER_CAPS.maxFileDisplayBytes + COMPRESSED_SLACK_BYTES) throw limitError('compressed object bytes', zlibLen, VIEWER_CAPS.maxFileDisplayBytes);
     }
     sp = cursorFinish(sp);
     const { out } = inflateObject(concat(zlibParts), 0, { expectedSize: sp.size, maxOutput: VIEWER_CAPS.maxFileDisplayBytes });
@@ -194,7 +204,7 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
   for (let depth = 0; depth < comps.length; depth++) {
     const name = comps[depth] ?? '';
     const data = await loadTreeBytes(transport, treeOid, cache);
-    const entries = parseTree(data);
+    const entries = parseTree(data, VIEWER_GIT_LIMITS);
     if (entries.length > VIEWER_GIT_LIMITS.maxTreeEntries) throw limitError('tree entries', entries.length, VIEWER_GIT_LIMITS.maxTreeEntries);
     const entry = entries.find((item: { name: string }) => item.name === name);
     if (!entry) throw fail('not_found', `path component ${name} not found`);
@@ -224,7 +234,7 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
   }
   if (route.raw) throw fail('bad_request', 'raw is a file view');
   const data = await loadTreeBytes(transport, treeOid, cache);
-  const parsed = parseTree(data);
+  const parsed = parseTree(data, VIEWER_GIT_LIMITS);
   const entries = listed(parsed);
   let readme: { name: string; text: string } | { name: string; tooBig: true } | null = null;
   if (!route.path && budget.canSpend()) {

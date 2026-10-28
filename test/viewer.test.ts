@@ -296,7 +296,7 @@ test('pack fixture matches git verify-pack; bombs and long chains fail closed', 
   tooMany.set([0x50, 0x41, 0x43, 0x4b]);
   new DataView(tooMany.buffer).setUint32(4, 2);
   new DataView(tooMany.buffer).setUint32(8, 401);
-  assert.throws(() => parsePack(tooMany, { maxObjects: 400 }), (err: { code?: string }) => err.code === 'limit_exceeded');
+  assert.throws(() => parsePack(tooMany, { limits: VIEWER_GIT_LIMITS, maxObjects: VIEWER_CAPS.maxPackObjects, maxInflatedTotal: VIEWER_CAPS.maxInflatedTotal }), (err: { code?: string }) => err.code === 'limit_exceeded');
 
   const short = mapPack(await ofsChain(1));
   assert.equal(short.ofsDelta, 1);
