@@ -75,6 +75,13 @@ export function allowlistFromEnv(raw: string | undefined): readonly AllowedHost[
   return Object.freeze([...ALLOWED_HOSTS, ...extras]);
 }
 
+/** `allowed` plus one exact hostname (the public namespace's Artifacts host), branded only if it passes the grammar. */
+export function withHost(allowed: readonly AllowedHost[], host: string): readonly AllowedHost[] {
+  const item = host.toLowerCase();
+  if (!EXTRA_HOST.test(item) || allowed.some(h => h === item)) return allowed;
+  return Object.freeze([...allowed, brandExtra(item)]);
+}
+
 /** Case-insensitive exact match. A trailing dot is not stripped, and a suffix never matches. */
 export function hostAllowed(hostname: string, allowed: readonly AllowedHost[]): boolean {
   const host = hostname.toLowerCase();

@@ -1,6 +1,7 @@
 // The ply Worker: the /v1 git API and the public /view repository viewer, served at ply.ivar.workers.dev.
 // `cf build`, `cf dev`, `cf deploy` and `cf workers types` read this file. vite.config.ts holds build settings only.
 import { bindings, defineConfig, exports } from "cf/config";
+import { PUBLIC_NAMESPACE } from "./src/public-namespace.ts";
 
 const MILLISECONDS_PER_SECOND = 1_000;
 const SECONDS_PER_MINUTE = 60;
@@ -55,6 +56,9 @@ export default defineConfig({
 			PACK_CACHE: bindings.text("on"),
 			// /view rate limits. One SQLite Durable Object class, defined by this Worker.
 			VIEWER_RATE: bindings.durableObject({ worker: WORKER_NAME, exportName: VIEWER_RATE_CLASS }),
+			// The public namespace, served read-only with no token (src/public.ts). The binding is scoped to this one
+			// namespace; the Worker calls only get(<repo>).createToken("read", 3600) and list(). No stored secret.
+			PUBLIC_REPOS: bindings.artifacts({ namespace: PUBLIC_NAMESPACE }),
 		},
 		exports: durableObjects,
 	},

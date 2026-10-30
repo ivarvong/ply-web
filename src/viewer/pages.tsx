@@ -9,6 +9,7 @@ import { commitProse, formatBytes, percentClass, portions, shortOid } from './fo
 import { LAYOUT } from './layout.ts'
 import { KUMO_INPUT, KUMO_SURFACE } from './kumo-classes.ts'
 import { Banner, Button, Document, Footer, IconFile, IconFolder, Protocol, Signed, Time, Toolbar } from './ui.tsx'
+import { PUBLIC_NAMESPACE } from '../public.ts'
 
 const EXAMPLES = [
   ['octocat/Hello-World', '/view/github.com/octocat/Hello-World'],
@@ -31,7 +32,19 @@ function repoName(repoPath: string): string {
   return repoPath.replace(/\.git$/, '')
 }
 
-function Home(props: { error: string | null }) {
+function PublicRepos(props: { repos: readonly string[] }) {
+  return (
+    <section class={`${KUMO_SURFACE} pad`} id="public">
+      <h2>Public repositories</h2>
+      <p class="note">Served read-only from the <span class="mono">{PUBLIC_NAMESPACE}</span> Artifacts namespace. No token needed: <span class="mono">/r/&lt;repo&gt;</span>.</p>
+      {props.repos.length
+        ? <ul class="host-list">{props.repos.map(name => <li><a href={`/r/${encodeURIComponent(name)}`}>{name}</a></li>)}</ul>
+        : <p class="note">The repository list is unavailable right now. Try <a href="/r/ply">/r/ply</a>.</p>}
+    </section>
+  )
+}
+
+function Home(props: { error: string | null; publicRepos: readonly string[] }) {
   const caps = VIEWER_CAPS
   return (
     <>
@@ -46,6 +59,7 @@ function Home(props: { error: string | null }) {
       <nav class="chips" aria-label="Example repositories">
         {EXAMPLES.map(([label, href]) => <a class="chip" href={href}>{label}</a>)}
       </nav>
+      <PublicRepos repos={props.publicRepos} />
       <div class="steps">
         <div class="step"><strong>Paste</strong><span>A public https URL on an allowlisted host.</span></div>
         <div class="step"><strong>Browse</strong><span>Branches, trees, and files, rendered on the server.</span></div>
@@ -385,7 +399,7 @@ export function ViewerPage(props: { doc: ViewerDocument }) {
   if (doc.kind === 'home') {
     return (
       <Document title="ply viewer">
-        <Home error={doc.error} />
+        <Home error={doc.error} publicRepos={doc.publicRepos ?? []} />
       </Document>
     )
   }

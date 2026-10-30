@@ -1,12 +1,14 @@
 # ply Worker — `https://ply.ivar.workers.dev`
 
 A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#16609b3546394f6ae66375bbfa092319ef41e182` (an exact commit of ply `main`; `bump-ply.yml` moves the pin). The `/v1` API has no
-bindings and no storage. `GET /view` is a public repository viewer; its only binding is a SQLite Durable Object
-that rate-limits by client. `GET /` prints the usage text.
+storage. `GET /view` is a public repository viewer, rate-limited by client through a SQLite Durable Object. One Artifacts
+namespace, `public-v0`, is served read-only with no token (`/r/<repo>`, see [Public namespace](#public-namespace-public-v0));
+its binding is the Worker's only other binding. `GET /` prints the usage text.
 
 ## Auth
 
-- **Gate**: `Authorization: Bearer <PLY_TOKEN>` on `/v1`. `GET /`, `GET /view`, and `GET /view.css` are public. The token is a Worker secret
+- **Gate**: `Authorization: Bearer <PLY_TOKEN>` on `/v1`. `GET /`, `GET /view`, `GET /view.css`, `GET /r/<repo>`, and the
+  `/v1` reads of the [public namespace](#public-namespace-public-v0) are public. The token is a Worker secret
   (`cf workers secrets update PLY_TOKEN --worker ply --type secret_text`) and is compared in constant time (SHA-256 of both sides,
   then `crypto.subtle.timingSafeEqual`). A missing or wrong token returns 401 `{code: "unauthorized"}`.
 - **Git credential** (optional; public repos need none):
@@ -76,6 +78,7 @@ back first). Merge conflicts add `conflicts` and `reasons`. `match_count` adds `
 | `upstream_5xx`, `network`, `protocol`, `pack_corrupt`, `not_git`, `remote_error`, `http`, `ambiguous` | 502 | the upstream misbehaved. Check `retry` before retrying: `ambiguous` is `read` |
 | `timeout` | 504 | |
 | `unsupported` | 501 | including writes when they are disabled |
+| `read_only` | 403 | a write whose remote is in the public namespace, with or without a bearer or git credential |
 | `internal` | 500 | |
 
 ## Tracing
@@ -155,10 +158,68 @@ plus `X-Content-Type-Options: nosniff`. There is no inline script and `unsafe-in
 
 `cloudflare.config.ts` declares `ViewerRateLimit` as a live SQLite class in `worker.exports`. The namespace already exists (created by migration tag `v1-viewer-rate`, namespace id `656fdd50f0d6428393eb2d9250ceee67`). Declaring it keeps that namespace and its data.
 
+## Public namespace (`public-v0`)
+
+One Cloudflare Artifacts namespace is served publicly and read-only. Its name is one constant,
+`PUBLIC_NAMESPACE` in `src/public-namespace.ts`; `cloudflare.config.ts` binds that namespace and `src/public.ts` matches
+URLs under it, so moving to `public-v1` is a one-line change (plus creating the namespace and publishing into it).
+
+- **URLs.** `GET /r/<repo>` 302s to the viewer's canonical page,
+  `/view/5ad2236b39de4c8bd8f6270ea63f3ea9.artifacts.cloudflare.net/git/public-v0/<repo>.git`, keeping `ref`, `at`, `path`
+  and `raw`. The home page (`/view`) lists the namespace (binding `list()`, cached a minute per isolate). The viewer
+  accepts that Artifacts host without `VIEWER_EXTRA_HOSTS`, but only for one repo directly under `/git/public-v0/`; any
+  other path on the host (another namespace, a nested path, `..` or an encoded separator) is a 400 before any fetch.
+- **`/v1` reads.** `refs`, `discover`, `tree`, `read`, and `commit` need no bearer when the request has **no
+  `Authorization` header at all** and `remote` is exactly `https://<that host>/git/public-v0/<repo>(.git)`. These requests
+  share the viewer's per-client page bucket (60/min, `ViewerRateLimit`). A caller git credential on such a request is a
+  400 (send none, or use the bearer). A wrong bearer is still a 401. With a valid bearer nothing changes from the
+  rules above: no rate limit, and the public token is used when the caller sends no git credential of their own.
+  Rationale: the content is public by construction, the remote can only be one of our own repos, the Worker holds only
+  a read credential for it, and the rate limit bounds cost. Every other `/v1` request still needs the bearer.
+- **Writes.** Every write endpoint whose `remote` is anywhere under `/git/public-v0/` on that host (compared
+  case-insensitively, any depth) returns 403 `read_only`. That holds with a valid bearer and with a caller's own write
+  credential, and nothing is sent upstream. Without a bearer a write is the usual 401.
+- **Credential.** No stored secret. The Worker has an Artifacts binding `PUBLIC_REPOS` scoped to `public-v0` and calls
+  only `get(<repo>).createToken("read", 3600)` and `list()`. Artifacts tokens are per repo; there is no namespace-wide or
+  non-expiring read token (TTL 60 s … 1 year, default 24 h). Tokens are cached per isolate per repo and re-minted with
+  less than 5 minutes left, so rotation is automatic and an isolate holds at most one live token per repo (plus
+  retired ones, kept only so the scrubber still removes them). A read token is refused by `git-receive-pack` (403,
+  checked 2026-10-30).
+- **Where the token goes.** `withPublicReadCredential` (`src/public.ts`) is the innermost fetch, below
+  `createGuardedFetch` and `createViewerFetch`, so it runs on every request and on every redirect hop. It adds
+  `Authorization: Bearer <token>` only when the raw URL's origin is exactly `https://<that host>` (no `:443`, no
+  uppercase, no trailing dot, no userinfo), the raw path is exactly `/git/public-v0/<repo>(.git)/info/refs` with query
+  `?service=git-upload-pack` and method GET, or `…/git-upload-pack` with no query and method POST, and the path has no
+  `.`/`..` segment, `%`, backslash or control character. `receive-pack` never matches. When the request already carries
+  an `Authorization` (a caller's `Git-Token` or `Git-Authorization`), the caller's credential is used and the Worker's
+  token is not added. The pack cache sits above the guard, so its key has no Authorization and survives rotation.
+- **Scrubbing.** Every minted token (full, without `?expires=`, Basic-encoded, URL-encoded) is scrubbed from every
+  `/v1` JSON body, every viewer HTML/text body and header, and every log line. Blob bodies are not rewritten: they are
+  git objects whose hash ply checked. `test/public-worker.test.js` greps every response and the workerd log for each
+  form, including against a host that echoes the header back.
+- **Revocation.** Tokens expire within an hour. To cut every Worker token off at once, revoke them per repo
+  (`cf artifacts namespaces repos tokens list --namespace public-v0 --name <repo>` and
+  `cf artifacts namespaces tokens revoke <id> --namespace public-v0 --force`); the Worker mints new ones on the next
+  request. To take the namespace offline, remove the binding and deploy.
+
+### Publish a repo
+
+```sh
+env -u CLOUDFLARE_API_TOKEN node scripts/publish.mjs <repo> <source> [--branch main] [--tags]
+# e.g. the ply mirror:
+env -u CLOUDFLARE_API_TOKEN node scripts/publish.mjs ply https://github.com/ivarvong/ply.git
+```
+
+The script uses your `cf` login (OAuth). It creates `public-v0/<repo>` if missing (and revokes the 24 h write token that
+creation returns), clones the one branch bare, mints a **write token for that repo only, with a 10-minute TTL**, and
+force-pushes the branch (and tags with `--tags`) with stock git. The token reaches git only through `GIT_CONFIG_*`
+environment variables, never argv, a file, or stdout. The script revokes it afterwards. The Worker never holds a write
+token. Re-run the same command to update a mirror. Artifacts limits apply (64 MiB per push, 1 GB per repo).
+
 ## Develop / deploy
 
 ```sh
-npm test                                 # /v1 workerd suite, then the viewer suite (includes a live Hello-World fetch when GitHub answers)
+npm test                                 # /v1 + public-namespace workerd suites, then the viewer/security/public unit suites
 npm run dev                              # cf dev: Vite + the Cloudflare plugin on local workerd
 npm run typecheck                        # tsc for the app, then cf workers types + tsc for cloudflare.config.ts
 npm run worker:deploy:dry-run            # cf deploy --dry-run: build and validate, no credentials, no upload
@@ -195,6 +256,8 @@ Nothing else in this config asks for a permission:
 
 - No routes and no custom domains, so no Zone → Workers Routes → Edit.
 - No KV, R2, D1, Queues, or Secrets Store bindings.
+- The Artifacts binding `PUBLIC_REPOS` (namespace `public-v0`). The OAuth deploy of 2026-10-30 uploaded it; whether a
+  scoped CI token needs an Artifacts permission on top of Workers Scripts Edit has not been checked.
 - Durable Objects have no token permission of their own. `ViewerRateLimit` follows the Worker.
 - Observability, `limits.cpuMs`, and the `WRITES` / `PACK_CACHE` text bindings travel in the script upload.
 - Workers Tail Read is the permission for live log streaming, which this workflow does not use.

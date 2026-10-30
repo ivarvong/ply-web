@@ -28,6 +28,9 @@ import { handleViewer } from './viewer/handle.ts';
 import { checkRemote, createGuardedFetch } from './remote.ts';
 import { applySecurityHeaders } from './security-headers.ts';
 import { viewerErrorDocument } from './viewer/safehtml.ts';
+import { admitClient } from './viewer/app.tsx';
+import { viewerHref } from './viewer/url.ts';
+import { PUBLIC_GIT_HOST, PUBLIC_NAMESPACE, isPublicNamespaceRemote, isPublicRepoName, publicRepoOfRemote, scrubSecrets, tokenSourceFor, withPublicReadCredential } from './public.ts';
 
 export { checkRemote };
 
@@ -99,6 +102,10 @@ Errors: {code, message, retry} with retry in yes|fresh|no|read. ?trace=1 adds pl
 (and an x-ply-trace timing summary header on /v1/read).
 
 Public read-only viewer (no token, no git credential):  GET /view   and   GET /view/<host>/<owner>/<repo>?ref=&path=
+
+Public namespace (read-only, no token):  GET /r/<repo>  redirects to the viewer for ${PUBLIC_NAMESPACE}/<repo>, and
+  GET /v1/{refs,discover,tree,read,commit}?remote=https://${PUBLIC_GIT_HOST}/git/${PUBLIC_NAMESPACE}/<repo>.git
+  need no Authorization (rate-limited per client). Writes to that namespace are 403 read_only, with or without a bearer.
 `;
 
 // ---- pure helpers ----
@@ -126,6 +133,34 @@ export const scrubber = secrets => {
   const list = [...new Set(secrets.filter(s => typeof s === 'string' && s.length >= 4))].sort((a, b) => b.length - a.length);
   return text => list.reduce((s, x) => s.split(x).join('[redacted]'), String(text));
 };
+
+// True when `raw` passes the /v1 remote rules and is exactly one repo directly under the public namespace.
+function isPublicReadRemote(raw) {
+  if (typeof raw !== 'string' || !raw) return false;
+  try { return publicRepoOfRemote(checkRemote(raw).href) !== null; } catch { return false; }
+}
+
+const PUBLIC_REDIRECT_QUERY = ['ref', 'at', 'path', 'raw'];
+
+function publicRedirect(req, url) {
+  const name = url.pathname.slice('/r/'.length);
+  const headers = { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' };
+  if (req.method !== 'GET' && req.method !== 'HEAD') return new Response('method not allowed\n', { status: 405, headers: { ...headers, allow: 'GET, HEAD' } });
+  if (!isPublicRepoName(name)) return new Response(`not a repository in ${PUBLIC_NAMESPACE}\n`, { status: 404, headers });
+  const query = {};
+  for (const k of PUBLIC_REDIRECT_QUERY) { const v = url.searchParams.get(k); if (v) query[k] = v; }
+  return new Response(null, { status: 302, headers: { location: viewerHref(PUBLIC_GIT_HOST, `git/${PUBLIC_NAMESPACE}/${name}.git`, query), 'cache-control': 'no-store' } });
+}
+
+// Viewer responses are HTML or text and at most a few hundred KiB. Each text body and each header passes the public
+// token scrub. A non-text body (a raw binary file) is a git blob the viewer verified by hash, so it is passed through.
+async function scrubResponse(res, scrub) {
+  const headers = new Headers();
+  for (const [k, v] of res.headers) if (k !== 'content-length') headers.set(k, scrub(v));
+  const type = res.headers.get('content-type') ?? '';
+  if (!res.body || !/^(text\/|application\/json)/.test(type)) return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  return new Response(scrub(await res.text()), { status: res.status, statusText: res.statusText, headers });
+}
 
 const fullRef = r => (typeof r === 'string' && !r.startsWith('refs/') ? `refs/heads/${r}` : r);
 const need = (body, k) => { if (body[k] === undefined || body[k] === null || body[k] === '') throw fail('bad_request', `${k} is required`); return body[k]; };
@@ -271,7 +306,10 @@ export default {
     const t0 = Date.now();
     const url = new URL(req.url);
     const id = crypto.randomUUID();
-    let scrub = s => String(s);
+    // Read tokens minted for the public namespace live in this isolate. Every outgoing string drops all of them.
+    const publicTokens = tokenSourceFor(env.PUBLIC_REPOS);
+    const publicScrub = text => (publicTokens ? scrubSecrets(publicTokens.secrets())(text) : String(text));
+    let scrub = publicScrub;
     const record = { msg: 'ply.request', id, method: req.method, path: url.pathname, colo: req.cf?.colo ?? '' };
     const log = extra => console.log(scrub(JSON.stringify({ ...record, ...extra })));
     const done = (res, extra = {}) => {
@@ -281,12 +319,14 @@ export default {
       return res;
     };
     if (req.method === 'GET' && url.pathname === '/') return done(new Response(USAGE, { headers: { 'content-type': 'text/plain; charset=utf-8' } }));
+    // Friendly name for a public-namespace repo: /r/<repo> → the viewer's canonical URL. No fetch, so no rate limit.
+    if (url.pathname === '/r' || url.pathname.startsWith('/r/')) return done(publicRedirect(req, url));
     // Public viewer. Before the token gate, and it never reads Authorization / Git-Token / Cookie.
     if (url.pathname === '/view.css' || url.pathname === '/view' || url.pathname.startsWith('/view/')) {
       if (url.pathname.includes('@') || url.pathname.toLowerCase().includes('%40')) record.path = '/view/redacted';
       try {
         const res = await handleViewer(req, env, ctx, { requestId: id, note: extra => Object.assign(record, extra) });
-        return done(res, { viewer: 1 });
+        return done(await scrubResponse(res, publicScrub), { viewer: 1 });
       } catch (e) {
         const code = isPlyCode(e?.code) ? e.code : 'internal';
         const message = code === 'internal' ? 'The viewer hit an internal error.' : String(e?.message ?? e).slice(0, 500);
@@ -294,12 +334,26 @@ export default {
         return done(res, { viewer: 1, code });
       }
     }
-    // gate
-    const token = env.PLY_TOKEN;
-    if (!token) return done(json(500, { code: 'internal', message: 'PLY_TOKEN is not configured', retry: 'no' }, scrub));
-    const presented = /^Bearer\s+(.+)$/i.exec(req.headers.get('authorization') ?? '')?.[1] ?? '';
-    if (!presented || !(await timingSafeTokenEqual(presented, token))) return done(json(401, { code: 'unauthorized', message: 'Authorization: Bearer <PLY_TOKEN> required', retry: 'no' }, scrub, { 'www-authenticate': 'Bearer realm="ply"' }));
     const key = `${req.method} ${url.pathname}`;
+    // Public mode: a read endpoint, no Authorization header at all, and a remote that is exactly one public-namespace
+    // repo. No PLY_TOKEN, no caller git credential, the viewer's per-client rate limit (page bucket).
+    const publicRead = !req.headers.has('authorization') && !!READS[key] && isPublicReadRemote(url.searchParams.get('remote'));
+    if (publicRead) {
+      record.public = 1;
+      if (req.headers.has('git-token') || req.headers.has('git-authorization')) return done(json(400, { code: 'bad_request', message: `the ${PUBLIC_NAMESPACE} namespace is read without git credentials; send none, or send Authorization: Bearer <PLY_TOKEN>`, retry: 'no' }, scrub));
+      const decision = await admitClient(req, env, 'page', Date.now());
+      if (decision === 'unconfigured' || decision === 'unavailable') return done(json(503, { code: 'unavailable', message: 'the rate limiter is unavailable', retry: 'yes' }, scrub));
+      if (!decision.ok) {
+        const retryAfter = String(Math.max(1, Math.ceil(decision.retryAfterMs / MS_PER_SECOND)));
+        return done(json(429, { code: 'rate_limited', message: `too many requests; retry after ${retryAfter}s`, retry: 'yes' }, scrub, { 'retry-after': retryAfter }));
+      }
+    } else {
+      // gate
+      const token = env.PLY_TOKEN;
+      if (!token) return done(json(500, { code: 'internal', message: 'PLY_TOKEN is not configured', retry: 'no' }, scrub));
+      const presented = /^Bearer\s+(.+)$/i.exec(req.headers.get('authorization') ?? '')?.[1] ?? '';
+      if (!presented || !(await timingSafeTokenEqual(presented, token))) return done(json(401, { code: 'unauthorized', message: 'Authorization: Bearer <PLY_TOKEN> required', retry: 'no' }, scrub, { 'www-authenticate': 'Bearer realm="ply"' }));
+    }
     const writes = env.WRITES === 'on';
     const handler = READS[key] ?? WRITES[key];
     if (!handler) return done(json(Object.keys({ ...READS, ...WRITES }).some(k => k.endsWith(` ${url.pathname}`)) ? 405 : 404, { code: 'not_found', message: `no route ${key}`, retry: 'no' }, scrub));
@@ -312,10 +366,15 @@ export default {
       const remoteUrl = checkRemote(WRITES[key] ? body.remote : url.searchParams.get('remote'), allow);
       const remote = remoteUrl.href;
       record.host = remoteUrl.host;
+      // Read-only means read-only: no write reaches the public namespace, whatever bearer or git credential came with it.
+      if (WRITES[key] && isPublicNamespaceRemote(remote)) return done(json(403, { code: 'read_only', message: `the ${PUBLIC_NAMESPACE} namespace is read-only`, retry: 'no' }, scrub));
       const cred = gitAuth(req.headers, remoteUrl.hostname);
-      scrub = scrubber(cred.secrets);
+      const callerScrub = scrubber(cred.secrets);
+      scrub = text => callerScrub(publicScrub(text));
       const tracer = new Tracer({ exporter, resource: { 'service.name': 'ply-worker', 'cloudflare.colo': req.cf?.colo ?? '' } });
-      const guarded = createGuardedFetch(globalThis.fetch.bind(globalThis), remoteUrl, allow);
+      // The public read token is attached below the redirect guard, so each hop is re-validated before it is considered,
+      // and only when the request carries no credential of its own (a caller's Git-Token or Git-Authorization wins).
+      const guarded = createGuardedFetch(withPublicReadCredential(globalThis.fetch.bind(globalThis), publicTokens), remoteUrl, allow);
       const fetchImpl = env.PACK_CACHE === 'off' || typeof caches === 'undefined' ? guarded : cachingFetch(guarded, caches.default, { waitUntil: p => ctx.waitUntil(p) });
       const opts = { auth: cred.auth, tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), fetchImpl };
       const out = await handler({ remote, q: url.searchParams, body, opts, spans, ctx, log });

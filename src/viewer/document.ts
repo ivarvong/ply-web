@@ -5,7 +5,7 @@ export type FileLoaded = Extract<Loaded, { kind: 'file' }>
 export type PackLoaded = Extract<Loaded, { kind: 'pack' }>
 
 export type ViewerDocument =
-  | { kind: 'home'; error: string | null; now: number }
+  | { kind: 'home'; error: string | null; now: number; publicRepos?: readonly string[] }
   | { kind: 'tree'; loaded: TreeLoaded; trace: TraceModel; now: number }
   | { kind: 'file'; loaded: FileLoaded; trace: TraceModel; now: number }
   | { kind: 'pack'; loaded: PackLoaded; trace: TraceModel; now: number }
