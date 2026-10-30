@@ -13,6 +13,7 @@ import { Sha1 } from 'ply';
 import { TYPE } from 'ply';
 import { encodeObjHeader, spliceDelta, zlibDeflate } from 'ply';
 import { parsePack } from 'ply';
+import { createTransport, lsRefs, Tracer } from 'ply';
 import { git, makeBareRepo, startGitServer, tmpRoot, commitFiles } from './server.js';
 import { startProxy } from './proxy.js';
 import { createBudget } from '../src/viewer/budget.ts';
@@ -638,4 +639,71 @@ test('a public GitHub repository renders when the network can reach it', { timeo
   const packHtml = await pack.text();
   assert.match(packHtml, /Pack map/);
   assert.match(packHtml, /agent /);
+});
+
+// ply (since #26) never follows a redirect: any 3xx reaching it is an `http` error. The viewer's documented behaviour is
+// that createViewerFetch follows same-repo redirects itself (manual, ≤ VIEWER_CAPS.maxRedirects hops, re-validated), so ply
+// only ever sees the final response. This pins both halves against a real git http-backend.
+test('same-repo redirects are resolved by the viewer fetch before ply sees them; ply alone refuses them', async () => {
+  const { root, cleanup } = tmpRoot();
+  const srv = await startGitServer(root);
+  try {
+    const name = 'moved';
+    const bare = makeBareRepo(root, name);
+    const work = join(root, 'work');
+    mkdirSync(work);
+    git(work, ['init', '-q', '-b', 'main']);
+    const head = commitFiles(work, bare, { 'README.md': 'redirected\n' }, 'seed');
+    const dial = rewriteAllowlisted(srv.url);
+    // The host answers `/moved/...` (GET advertisement and POST upload-pack alike) with a 301 to `/moved.git/...`.
+    const hops: { method: string; url: string; status: number }[] = [];
+    const redirecting: typeof fetch = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      const method = init?.method ?? 'GET';
+      if (url.pathname.startsWith(`/${name}/`)) {
+        hops.push({ method, url: url.href, status: 301 });
+        return new Response(null, { status: 301, headers: { location: url.href.replace(`/${name}/`, `/${name}.git/`) } });
+      }
+      const res = await dial(input, init);
+      hops.push({ method, url: url.href, status: res.status });
+      return res;
+    };
+    const expected = git(bare, ['rev-parse', 'refs/heads/main']).trim();
+    assert.equal(expected, head);
+
+    // ply alone: the 301 is a typed http error naming where the server pointed; nothing is followed.
+    hops.length = 0;
+    const bareTransport = createTransport(`https://github.com/${name}`, { fetchImpl: redirecting, limits: VIEWER_GIT_LIMITS, tracer: new Tracer() });
+    await assert.rejects(lsRefs(bareTransport, ['refs/heads/']), (err: { code?: string; status?: number; location?: string; message?: string }) =>
+      err.code === 'http' && err.status === 301 && err.location === `https://github.com/${name}.git/git-upload-pack` && /does not follow redirects/.test(err.message ?? ''));
+    assert.deepEqual(hops.map(h => h.status), [301]);
+
+    // Through createViewerFetch: every request is redirected once and then answered; ply gets the refs.
+    hops.length = 0;
+    const guarded = createViewerFetch(redirecting, loc(`https://github.com/${name}`).url, ALLOWED_HOSTS, createBudget(), AbortSignal.timeout(10_000));
+    const t = createTransport(`https://github.com/${name}`, { fetchImpl: guarded, limits: VIEWER_GIT_LIMITS, tracer: new Tracer() });
+    const { refs } = await lsRefs(t, ['refs/heads/']);
+    assert.equal(refs.get('refs/heads/main')?.oid, expected);
+    assert.ok(hops.some(h => h.method === 'POST' && h.status === 301), 'the POST was redirected too');
+    for (let i = 0; i < hops.length; i += 2) {
+      assert.equal(hops[i]?.status, 301);
+      assert.equal(hops[i + 1]?.status, 200);
+      assert.equal(hops[i + 1]?.method, hops[i]?.method, 'a redirect keeps the method');
+      assert.equal(hops[i + 1]?.url, hops[i]?.url.replace(`/${name}/`, `/${name}.git/`));
+    }
+
+    // End to end: /view on the redirecting spelling renders the repository.
+    const page = await handleViewer(new Request(`https://ply.ivar.workers.dev/view/github.com/${name}?path=README.md`), viewerEnv(), {}, { fetchImpl: redirecting });
+    assert.equal(page.status, 200, await page.clone().text());
+    assert.match(await page.text(), /redirected/);
+
+    // A redirect loop is cut at the hop cap by the viewer fetch, not handed to ply.
+    let loops = 0;
+    const loop = createViewerFetch(async () => { loops++; return new Response(null, { status: 302, headers: { location: `https://github.com/${name}/info/refs?service=git-upload-pack` } }); }, loc(`https://github.com/${name}`).url, ALLOWED_HOSTS, createBudget(), AbortSignal.timeout(1000));
+    await assert.rejects(lsRefs(createTransport(`https://github.com/${name}`, { fetchImpl: loop, limits: VIEWER_GIT_LIMITS, tracer: new Tracer() }), ['refs/heads/']), (err: { code?: string; message?: string }) => err.code === 'bad_request' && /too many redirects/.test(err.message ?? ''));
+    assert.equal(loops, VIEWER_CAPS.maxRedirects + 1);
+  } finally {
+    await srv.close();
+    cleanup();
+  }
 });

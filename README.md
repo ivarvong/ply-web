@@ -1,6 +1,6 @@
 # ply Worker — `https://ply.ivar.workers.dev`
 
-A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#ae56cedfc94d87317fe1de3443db6850cc2b6210` (an exact commit of ply `main`; `bump-ply.yml` moves the pin). The `/v1` API has no
+A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#16609b3546394f6ae66375bbfa092319ef41e182` (an exact commit of ply `main`; `bump-ply.yml` moves the pin). The `/v1` API has no
 bindings and no storage. `GET /view` is a public repository viewer; its only binding is a SQLite Durable Object
 that rate-limits by client. `GET /` prints the usage text.
 
@@ -25,6 +25,8 @@ that rate-limits by client. `GET /` prints the usage text.
   wildcard-DNS names (`nip.io`, `sslip.io`, `localtest.me`, and the same shape of zone). A path segment of `.` or `..`,
   or an encoded slash, backslash, or dot (`%2f`, `%5c`, `%2e`), is rejected before normalisation. Redirects are
   followed manually, at most three hops, and only when the next URL passes the same check and stays on the same origin.
+  The Worker's fetch wrapper (`createGuardedFetch`, `src/remote.ts`) follows them, so ply only sees the final response;
+  ply itself never follows a 3xx and would report it as an `http` error (`test/worker.test.js`, "redirects").
   `ALLOW_REMOTE_ORIGINS` (comma-separated origins) exempts those origins from the public-host rules (http, an IP, a
   non-default port). Only the tests use it.
 
@@ -117,7 +119,7 @@ do not match. Everything else is rejected before a fetch, and the error lists th
 or trailing dot is skipped, not treated as a suffix. Cloudflare Artifacts is off unless that variable names the
 exact public git host. `ALLOW_REMOTE_ORIGINS` is a `/v1` test hook and does not apply to `/view`. Redirects are
 manual, re-checked against the same allowlist, and limited to that repo's `info/refs` and `git-upload-pack`
-paths (plus a `.git` suffix). A redirect whose raw `Location` contains `.`, `..`, `%2e`, `%2f`, or `%5c` is not followed, and a redirect to any other host is not followed. Upstream `User-Agent` is
+paths (plus a `.git` suffix). `createViewerFetch` follows them before ply sees the response (ply refuses any 3xx). A redirect whose raw `Location` contains `.`, `..`, `%2e`, `%2f`, or `%5c` is not followed, and a redirect to any other host is not followed. Upstream `User-Agent` is
 `ply-viewer/0.1.0`.
 
 **Caps** (not raised by environment; rate limits can be lowered and are clamped to 1…1000):
