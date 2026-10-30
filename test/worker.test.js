@@ -19,7 +19,7 @@ const PORT = 18900 + (process.pid % 50), PORT_RO = PORT + 50;
 const PLY = 'test-ply-token-' + 'x'.repeat(20);
 const SECRET = 'gitcred_' + 'S3cr3tT0k3n'.repeat(3);          // the git credential the auth proxy expects
 const EXPECT = `Bearer ${SECRET}`;
-let root, cleanup, srv, authSrv, echoSrv, artProxy, proc, logs = '';
+let root, cleanup, srv, authSrv, echoSrv, artProxy, redirSrv, proc, logs = '';
 const A = { name: 'w', email: 'w@x' };
 
 // a git host that requires `Authorization: Bearer SECRET` (401 without, 403 with a wrong one) in front of http-backend
@@ -40,17 +40,37 @@ function echoServer() {
   return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({ url: `http://127.0.0.1:${s.address().port}`, close: () => new Promise(r => { s.closeAllConnections?.(); s.close(r); }) })));
 }
 
+// A host that has moved repositories: `/moved/<p>` 307s to `/<p>` (same origin, relative Location), `/away/<p>` 307s to
+// another allowlisted origin, `/loop/<p>` 307s to itself; anything else is proxied to http-backend. `hits` records each
+// request (path, method, whether it carried Authorization) so a test can see what was and was not dialled.
+function redirector(upstream) {
+  const up = new URL(upstream);
+  const hits = [];
+  const s = http.createServer((req, res) => {
+    hits.push({ path: req.url, method: req.method, auth: !!req.headers.authorization });
+    const m = /^\/(moved|away|loop)(\/.*)$/.exec(req.url);
+    if (m) {
+      const location = m[1] === 'moved' ? m[2] : m[1] === 'away' ? `${upstream}${m[2]}` : req.url;
+      req.resume(); res.writeHead(307, { location }); return void res.end();
+    }
+    const u = http.request({ host: up.hostname, port: up.port, path: req.url, method: req.method, headers: { ...req.headers, host: up.host } }, r => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
+    req.pipe(u);
+  });
+  return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({ url: `http://127.0.0.1:${s.address().port}`, hits, close: () => new Promise(r => { s.closeAllConnections?.(); s.close(r); }) })));
+}
+
 before(async () => {
   if (!WORKERD) return;
   ({ root, cleanup } = tmpRoot());
   srv = await startGitServer(root);
   authSrv = await authProxy(srv.url);
   echoSrv = await echoServer();
+  redirSrv = await redirector(srv.url);
   const filterOf = b => /filter ([^\n]+)\n/.exec(Buffer.from(b).toString('latin1'))?.[1] ?? null;
   artProxy = await startProxy(srv.url, ctx => (ctx.stage === 'fetch' && filterOf(ctx.reqBody) && filterOf(ctx.reqBody) !== 'blob:none' ? { type: 'status', status: 400, contentType: 'text/plain', body: 'Unsupported Git fetch filter; only blob:none is supported.' } : { type: 'pass' }));
   const out = join(root, 'wk'); mkdirSync(out, { recursive: true });
   copyCfBundle(join(out, 'worker.mjs'));
-  const allow = [srv.url, authSrv.url, echoSrv.url, artProxy.url].join(',');
+  const allow = [srv.url, authSrv.url, echoSrv.url, artProxy.url, redirSrv.url].join(',');
   const worker = writes => `(modules = [ (name = "worker.mjs", esModule = embed "worker.mjs") ], compatibilityDate = "2026-10-18", globalOutbound = "internet",
     bindings = [ (name = "PLY_TOKEN", text = "${PLY}"), (name = "WRITES", text = "${writes}"), (name = "ALLOW_REMOTE_ORIGINS", text = "${allow}") ])`;
   writeFileSync(join(out, 'config.capnp'), `using Workerd = import "/workerd/workerd.capnp";
@@ -63,7 +83,7 @@ const config :Workerd.Config = (
   proc.stdout.on('data', d => { logs += d; }); proc.stderr.on('data', d => { logs += d; });
   for (let i = 0; i < 80; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/`)).ok) break; } catch { } await new Promise(r => setTimeout(r, 100)); }
 });
-after(async () => { if (!WORKERD) return; proc.kill(); await Promise.all([srv.close(), authSrv.close(), echoSrv.close(), artProxy.close()]); cleanup(); });
+after(async () => { if (!WORKERD) return; proc.kill(); await Promise.all([srv.close(), authSrv.close(), echoSrv.close(), artProxy.close(), redirSrv.close()]); cleanup(); });
 
 const W = (path, { method = 'GET', body, headers = {}, port = PORT, auth = true } = {}) => fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { ...(auth ? { authorization: `Bearer ${PLY}` } : {}), ...(body ? { 'content-type': 'application/json' } : {}), ...headers }, body: body ? JSON.stringify(body) : undefined });
 const qs = o => new URLSearchParams(Object.entries(o).filter(([, v]) => v !== undefined)).toString();
@@ -319,4 +339,37 @@ test('git credentials: Git-Authorization verbatim, Git-Token mapped; upstream 40
   for (const [where, text] of Object.entries(haystack)) for (const f of forms) assert.ok(!text.includes(f), `credential form ${f.slice(0, 6)}… found in ${where}`);
   assert.match(logs, /"msg":"ply.request"/, 'the structured request log lines were captured (the grep is not vacuous)');
   assert.ok(!logs.includes(PLY), 'the PLY token is not logged');
+});
+
+// ply (since #26) refuses every 3xx with a typed `http` error. The README promises /v1 follows redirects manually, at most
+// three hops, same origin only: createGuardedFetch (src/remote.ts) does that before ply sees a response. Under workerd, end
+// to end, with the credential attached: reads and a push through a moved path equal git; another origin and a loop are 400.
+test('redirects: same-origin hops followed by the Worker (reads and a push), cross-origin and loops refused before ply', { skip }, async () => {
+  const r = repo({ 'f.txt': 'one MARK\n' });
+  const moved = `${redirSrv.url}/moved/${r.name}.git`;
+  const token = 'redirtoken_' + 'Z9'.repeat(10);
+  const H = { 'git-token': token };
+  redirSrv.hits.length = 0;
+  let res = await W(`/v1/refs?${qs({ remote: moved })}`, { headers: H });
+  let body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body)); assert.equal(body.refs['refs/heads/main'], r.head);
+  assert.deepEqual(redirSrv.hits.map(h => [h.method, h.path.replace(/\?.*/, '')]), [['POST', `/moved/${r.name}.git/git-upload-pack`], ['POST', `/${r.name}.git/git-upload-pack`]]);
+  assert.ok(redirSrv.hits.every(h => h.auth), 'the same-origin hop keeps the credential');
+  res = await W(`/v1/read?${qs({ remote: moved, path: 'f.txt' })}`, { headers: H });
+  assert.equal(res.status, 200); assert.equal(await res.text(), 'one MARK\n');
+  res = await W('/v1/edit', { method: 'POST', headers: H, body: { remote: moved, path: 'f.txt', find: 'MARK', replace: 'MOVED', author: A, message: 'via redirect' } });
+  body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body)); assert.equal(git(r.bare, ['rev-parse', 'main']).trim(), body.newCommit);
+  assert.equal(gitBuf(r.bare, ['show', 'main:f.txt']).toString(), 'one MOVED\n');
+  assert.ok(redirSrv.hits.some(h => h.method === 'POST' && h.path === `/${r.name}.git/git-receive-pack`), 'the push followed the redirect');
+
+  for (const [kind, msg, dials] of [['away', /redirect host is not an allowlisted host/, 1], ['loop', /too many redirects/, 4]]) {
+    redirSrv.hits.length = 0;
+    res = await W(`/v1/refs?${qs({ remote: `${redirSrv.url}/${kind}/${r.name}.git`, trace: '1' })}`, { headers: H });
+    body = await res.json();
+    assert.equal(res.status, 400, `${kind}: ${JSON.stringify(body)}`); assert.equal(body.code, 'bad_request'); assert.match(body.message, msg);
+    assert.equal(redirSrv.hits.length, dials, `${kind}: hops dialled`);
+    assert.equal(JSON.stringify(body).includes(token), false);
+  }
+  assert.equal(logs.includes(token), false);
 });
