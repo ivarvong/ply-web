@@ -222,17 +222,31 @@ const LIST_TTL_MS = 60_000;
 const LIST_LIMIT = 100;
 let listed: { at: number; names: string[] } | null = null;
 
-/** Repo names in the public namespace for the home page, cached for a minute per isolate. Empty when unavailable. */
-export async function listPublicRepos(binding: ArtifactsNamespace | undefined | null, now: number = Date.now()): Promise<string[]> {
-  if (!binding || typeof binding.list !== 'function') return [];
-  if (listed && now - listed.at < LIST_TTL_MS) return listed.names;
+/** Names from `binding.list()`. `/view` and `/r/` both render this value. */
+export type PublicRepoList = {
+  names: readonly string[];
+  /** True only when `list()` threw and this isolate has no cached page to show. */
+  unavailable: boolean;
+};
+
+export const EMPTY_PUBLIC_REPOS: PublicRepoList = { names: [], unavailable: false };
+
+/**
+ * Repo names in the public namespace, cached for a minute per isolate.
+ * A missing binding or an empty namespace is an empty list, not a failure.
+ * `unavailable` is set only when the upstream `list()` call throws and nothing is cached.
+ */
+export async function listPublicRepos(binding: ArtifactsNamespace | undefined | null, now: number = Date.now()): Promise<PublicRepoList> {
+  if (!binding || typeof binding.list !== 'function') return EMPTY_PUBLIC_REPOS;
+  if (listed && now - listed.at < LIST_TTL_MS) return { names: listed.names, unavailable: false };
   try {
     const page = await binding.list({ limit: LIST_LIMIT });
     const names = (page?.repos ?? []).filter(r => !r.status || r.status === 'ready').map(r => String(r.name)).filter(isPublicRepoName).sort();
     listed = { at: now, names };
-    return names;
+    return { names, unavailable: false };
   } catch {
-    return listed?.names ?? [];
+    if (listed) return { names: listed.names, unavailable: false };
+    return { names: [], unavailable: true };
   }
 }
 

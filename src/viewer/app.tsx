@@ -4,6 +4,7 @@ import { viewerCalls, type ViewerCall } from './call.ts'
 import { safeFilename } from './escape.ts'
 import { createViewerFetch, type FetchLike } from './fetchguard.ts'
 import { describeFailure } from './failure.ts'
+import { hintFromError } from './hint.ts'
 import { htmlResponse, SECURITY, statusOf, textResponse } from './http.ts'
 import { VIEWER_CAPS, rateLimitFor, type RateBucket } from './limits.ts'
 import type { RateDecision, TraceModel, ViewerEnv } from './model.ts'
@@ -169,7 +170,7 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
     call.fields['http.status_code'] = view.status
     call.fields['error.type'] = code
     call.fields['server.address'] = route.loc.host
-    return headless(req, htmlResponse(view.status, renderError(upstream, code, message, trace, route.loc.host, route.loc.repoPath, route.ref, call.now, route.path), trace, call.requestId))
+    return headless(req, htmlResponse(view.status, renderError(upstream, code, message, trace, route.loc.host, route.loc.repoPath, route.ref, call.now, route.path, hintFromError(err)), trace, call.requestId))
   }
 }
 

@@ -350,6 +350,7 @@ ${phone} {
 .diag-box[open] .diag-chev { transform: rotate(180deg); }
 .diag-body { padding: 0 ${S.md} ${S.md}; display: grid; gap: ${S.md}; min-width: 0; }
 .diag-body .banner { margin: 0; }
+.banner a { color: inherit; text-decoration: underline; }
 .kv { margin: 0; display: grid; gap: 4px; font-size: var(--text-xs); min-width: 0; }
 .kv div { display: grid; grid-template-columns: 6.5rem minmax(0, 1fr); gap: ${S.sm}; align-items: baseline; }
 .kv dt { color: var(--text-color-kumo-subtle); }

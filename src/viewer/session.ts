@@ -18,6 +18,7 @@ import { viewerHref } from './url.ts';
 
 import { quirksFor, type Quirks } from '../quirks.ts';
 import { isAbbreviatedOid, matchAbbreviatedOid } from '../abbrev.ts';
+import { nearbyRefs } from './hint.ts';
 import { tagsFromRefs } from './tags.ts';
 
 type NoCredential = { auth?: never };
@@ -82,20 +83,27 @@ function refPrefixes(ref: string | null): string[] {
   return [...prefixes];
 }
 
-function resolveRef(refs: Map<string, RefRec>, head: string | null, ref: string | null): { name: string; commit: string } {
+function refMiss(listedRefs: { refs: Map<string, RefRec>; head: string | null }, wanted: string, code: 'not_found' | 'bad_request', message: string): never {
+  const catalog = refCatalog(listedRefs);
+  throw fail(code, message, { viewerHint: { nearby: nearbyRefs(wanted, catalog.branches, catalog.tags), path: null } });
+}
+
+function resolveRef(listedRefs: { refs: Map<string, RefRec>; head: string | null }, ref: string | null): { name: string; commit: string } {
+  const refs = listedRefs.refs;
   const cands = candidates(ref);
   if (!cands.length) return { name: ref ?? '', commit: ref ?? '' };
   for (const cand of cands) {
     const rec = refs.get(cand);
     if (!rec) continue;
-    return { name: cand === 'HEAD' ? (head ?? 'HEAD') : cand, commit: rec.peeled ?? rec.oid };
+    return { name: cand === 'HEAD' ? (listedRefs.head ?? 'HEAD') : cand, commit: rec.peeled ?? rec.oid };
   }
   if (ref && isAbbreviatedOid(ref)) {
     const match = matchAbbreviatedOid(ref, refs);
     if (match.kind === 'unique') return { name: match.oid, commit: match.oid };
-    throw fail('bad_request', match.message);
+    refMiss(listedRefs, ref, 'bad_request', match.message);
   }
-  throw fail('not_found', cands[0] === 'HEAD' ? 'remote HEAD is unborn or absent; pass ref explicitly' : `ref ${ref} not found`);
+  const message = cands[0] === 'HEAD' ? 'remote HEAD is unborn or absent; pass ref explicitly' : `ref ${ref} not found`;
+  refMiss(listedRefs, ref ?? '', 'not_found', message);
 }
 
 function refCatalog(listedRefs: { refs: Map<string, RefRec>; head: string | null }) {
@@ -243,7 +251,7 @@ function historyOf(first: CommitInfo, held: Map<string, Held> | null): { log: Co
 
 async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { kind: 'repo' }>, server: ServerInfo, quirks: Quirks, budget: Budget, tracer: ViewerTracer): Promise<Loaded> {
   const listedRefs = await listRefs(transport, refPrefixes(route.ref));
-  const resolved = resolveRef(listedRefs.refs, listedRefs.head, route.ref);
+  const resolved = resolveRef(listedRefs, route.ref);
   const catalog = refCatalog(listedRefs);
   // Raw bytes need no history: read the commit alone. Every page reads the window (it replaces the commit read).
   const held = route.raw ? null : await loadWindow(transport, resolved.commit, quirks);
@@ -264,10 +272,11 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
     const entries = parseTree(data, VIEWER_GIT_LIMITS);
     if (entries.length > VIEWER_GIT_LIMITS.maxTreeEntries) throw limitError('tree entries', entries.length, VIEWER_GIT_LIMITS.maxTreeEntries);
     const entry = entries.find((item: { name: string }) => item.name === name);
-    if (!entry) throw fail('not_found', `path component ${name} not found`);
+    const existingPath = comps.slice(0, depth).join('/');
+    if (!entry) throw fail('not_found', `path component ${name} not found`, { viewerHint: { nearby: [], path: { missing: name, existingPath, notDirectory: false } } });
     const last = depth === comps.length - 1;
     if (!last) {
-      if (entry.mode !== '40000') throw fail('not_found', `${name} is not a directory`);
+      if (entry.mode !== '40000') throw fail('not_found', `${name} is not a directory`, { viewerHint: { nearby: [], path: { missing: name, existingPath, notDirectory: true } } });
       treeOid = entry.oid;
       continue;
     }

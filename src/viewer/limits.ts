@@ -20,6 +20,7 @@ export const VIEWER_CAPS = Object.freeze({
   maxRefs: 2_000,
   maxBranchesShown: 200,
   maxTagsShown: 100,
+  hintNearbyRefs: 4,
   // Back to 2,000 (it was 10,000 while ply's blob:none fallback checked every tree in the wide pack against it; ply #47
   // checks only what was asked for and skips an over-limit extra). test/public-worker.test.js keeps a 2,135-entry sibling.
   maxTreeEntries: 2_000,

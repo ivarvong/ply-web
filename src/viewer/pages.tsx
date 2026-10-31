@@ -10,7 +10,8 @@ import { LAYOUT } from './layout.ts'
 import { KUMO_BUTTON_FOCUS, KUMO_BUTTON_SECONDARY, KUMO_BUTTON_SIZE_SM, KUMO_INPUT, KUMO_SURFACE } from './kumo-classes.ts'
 import { repoIdentity } from './identity.ts'
 import { Badge, Banner, Button, Card, Diagnostics, Document, Footer, Icon, PathCrumbs, RepoIdentity, RepoTitle, Signed, Time } from './ui.tsx'
-import { PUBLIC_NAMESPACE } from '../public.ts'
+import { PUBLIC_NAMESPACE, type PublicRepoList } from '../public.ts'
+import type { ViewerHint } from './hint.ts'
 
 const EXAMPLES = [
   ['octocat/Hello-World', '/view/github.com/octocat/Hello-World'],
@@ -29,18 +30,21 @@ const PACK_SWATCH: Record<string, string> = {
   trailer: 'bg-kumo-fill',
 }
 
-function PublicRepos(props: { repos: readonly string[] }) {
+function PublicRepos(props: { list: PublicRepoList }) {
+  const names = props.list.names
   return (
     <Card id="public" head={<><Icon name="book" /><span class="card-title">Public repositories</span><span class="card-count">{PUBLIC_NAMESPACE}</span></>}>
-      {props.repos.length
-        ? <ul class="repo-list">{props.repos.map(name => <li><a href={`/r/${encodeURIComponent(name)}`}><Icon name="dir" />{name}<span class="go">/r/{name}</span></a></li>)}</ul>
-        : <p class="empty">The repository list is unavailable right now. Try <a href="/r/ply">/r/ply</a>.</p>}
+      {names.length
+        ? <ul class="repo-list">{names.map(name => <li><a href={`/r/${encodeURIComponent(name)}`}><Icon name="dir" />{name}<span class="go">/r/{name}</span></a></li>)}</ul>
+        : props.list.unavailable
+          ? <p class="empty">The repository list is unavailable right now.</p>
+          : <p class="empty">No repositories are published in this namespace yet.</p>}
       <p class="empty">Served read-only from the <span class="mono">{PUBLIC_NAMESPACE}</span> Artifacts namespace. No token needed.</p>
     </Card>
   )
 }
 
-function Home(props: { error: string | null; publicRepos: readonly string[] }) {
+function Home(props: { error: string | null; publicRepos: PublicRepoList }) {
   const caps = VIEWER_CAPS
   return (
     <>
@@ -57,7 +61,7 @@ function Home(props: { error: string | null; publicRepos: readonly string[] }) {
           {EXAMPLES.map(([label, href]) => <a class="chip" href={href}>{label}</a>)}
         </nav>
       </div>
-      <PublicRepos repos={props.publicRepos} />
+      <PublicRepos list={props.publicRepos} />
       <div class="steps">
         <div class="step"><strong>Paste</strong><span>A public https URL on an allowlisted host. A username or password in the URL is rejected and never forwarded.</span></div>
         <div class="step"><strong>Browse</strong><span>Branches, trees, files and READMEs, rendered on the server.</span></div>
@@ -447,10 +451,50 @@ function errorHint(code: string, status: number, message: string): string {
   if (code === 'unavailable' || status === 503) return 'The rate limiter is not available, so the viewer stops rather than fetching without a limit.'
   if (code === 'limit_exceeded' || status === 413) return 'Open a smaller path or a single file. Huge repositories and packs are refused on purpose.'
   if (code === 'timeout' || status === 504) return 'The git host did not answer in time. Try the same URL again.'
-  if (code === 'not_found' || status === 404 || code === 'auth' || status === 401 || status === 403) return 'Check the owner, repository, branch, and path. Private repositories are not visible here (GitHub answers 401 for both).'
   if (/credentials/.test(message)) return 'Remove the username and password from the URL and paste it again. Credentials are never forwarded.'
   if (/allowlisted|Supported hosts/.test(message)) return 'Use one of the supported hosts. owner/repo by itself means github.com.'
   return 'Go back to the viewer and paste a public repository URL.'
+}
+
+const PRIVATE_HINT = 'Private repositories are not visible here. GitHub answers 401 for a missing repository and a private one.'
+
+function RefHint(props: { host: string; repoPath: string; hint: ViewerHint }) {
+  const links = props.hint.nearby
+  const intro = 'That name is not a branch or tag. Open the ref picker on the repository root'
+  if (!links.length) return <>{intro}.</>
+  return (
+    <>
+      {intro}, or try{' '}
+      {links.map((item, index) => (
+        <>
+          {index > 0 ? ', ' : null}
+          <a href={viewerHref(props.host, props.repoPath, { ref: item.ref })}>{item.label}</a>
+        </>
+      ))}
+      .
+    </>
+  )
+}
+
+function PathHint(props: { host: string; repoPath: string; ref: string | null; hint: ViewerHint }) {
+  const cue = props.hint.path
+  const missing = cue?.missing ?? 'that entry'
+  const existing = cue?.existingPath ?? ''
+  const where = existing.length > 0 ? existing : 'the repository root'
+  const href = viewerHref(props.host, props.repoPath, { ref: props.ref ?? undefined, path: existing || undefined })
+  if (cue?.notDirectory) return <>{missing} is a file, not a directory. Open <a href={href}>{where}</a>.</>
+  return <>No entry named {missing}. The deepest directory that exists is <a href={href}>{where}</a>.</>
+}
+
+function FailureBanner(props: Extract<ViewerDocument, { kind: 'error' }>) {
+  const tone = errorTone(props.code, props.status)
+  // The banner is a flex row (Kumo's icon + text). One span keeps the sentence and its links on the same line.
+  if (props.code === 'auth') return <Banner tone="info"><span>{PRIVATE_HINT}</span></Banner>
+  if (props.part === 'ref') return <Banner tone="info"><span><RefHint host={props.host} repoPath={props.repoPath} hint={props.hint} /></span></Banner>
+  if (props.part === 'path') return <Banner tone="info"><span><PathHint host={props.host} repoPath={props.repoPath} ref={props.ref} hint={props.hint} /></span></Banner>
+  if (props.part === 'repo' && /no repository |not a repository/.test(props.message)) return <Banner tone="info"><span>That name is not in this namespace. Open the <a href="/r">repository index</a>.</span></Banner>
+  if (props.part === 'repo') return <Banner tone="info"><span>This repository could not be opened.</span></Banner>
+  return <Banner tone={tone}><span>{errorHint(props.code, props.status, props.message)}</span></Banner>
 }
 
 function errorTone(code: string, status: number): 'alert' | 'info' {
@@ -482,7 +526,7 @@ function ErrorPage(props: Extract<ViewerDocument, { kind: 'error' }>) {
       <article class={`${KUMO_SURFACE} error-card`}>
         <p class="error-kicker">HTTP {props.status} · {props.part}</p>
         <h1 class="display">{headline}</h1>
-        <Banner tone={errorTone(props.code, props.status)}>{errorHint(props.code, props.status, props.message)}</Banner>
+        <FailureBanner {...props} />
         {hosts.length ? <ul class="host-list" aria-label="Supported hosts">{hosts.map(host => <li>{host}</li>)}</ul> : null}
         <p class="lede">{knownRepo ? <><a href={viewerHref(props.host, props.repoPath, {})}>Repository root</a> · </> : null}<a href="/view">Back to the viewer</a></p>
         <details class="reason">
@@ -500,7 +544,7 @@ export function ViewerPage(props: { doc: ViewerDocument }) {
   if (doc.kind === 'home') {
     return (
       <Document title="ply viewer">
-        <Home error={doc.error} publicRepos={doc.publicRepos ?? []} />
+        <Home error={doc.error} publicRepos={doc.publicRepos} />
       </Document>
     )
   }
@@ -515,7 +559,7 @@ export function ViewerPage(props: { doc: ViewerDocument }) {
           <h1 class="display">{PUBLIC_NAMESPACE}</h1>
           <p class="lede">Read-only repositories in this namespace. Open one below, or paste any public repository on <a href="/view">the viewer</a>.</p>
         </div>
-        <PublicRepos repos={doc.publicRepos} />
+        <PublicRepos list={doc.publicRepos} />
       </Document>
     )
   }

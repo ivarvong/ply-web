@@ -21,7 +21,8 @@ import { createBudget } from '../src/viewer/budget.ts';
 import { escapeHtml } from '../src/viewer/escape.ts';
 import { credentialFreeHeaders, createViewerFetch } from '../src/viewer/fetchguard.ts';
 import { handleViewer } from '../src/viewer/handle.ts';
-import { renderError, renderHome, renderLoaded } from '../src/viewer/html.ts';
+import { renderError, renderHome, renderLoaded, renderNamespace } from '../src/viewer/html.ts';
+import { nearbyRefs } from '../src/viewer/hint.ts';
 import { KUMO_USED, VIEWER_CSS, cssNodes, selectorClasses } from '../src/viewer/styles.ts';
 import { commitProse } from '../src/viewer/format.ts';
 import { repoIdentity } from '../src/viewer/identity.ts';
@@ -207,8 +208,47 @@ test('abbreviated oids, failure copy, tag order, cache headers, and version text
   assert.match(String(renderLoaded(file, trace)), /Wrap lines/);
   const refused = renderError(401, 'auth', 'authentication failed', trace, 'github.com', 'nope/missing', null, 1, '');
   assert.match(String(refused), /not found, or private/);
+  assert.match(String(refused), /GitHub answers 401/);
   assert.match(String(refused), /HTTP 404/);
   assert.match(String(refused), /href="\/view\/github\.com\/nope\/missing"/);
+  assert.equal(String(refused).includes('Check the owner'), false);
+  assert.equal(String(refused).includes('No ref'), false);
+  const refPage = String(renderError(404, 'not_found', 'ref v99.0.0 not found', trace, 'github.com', 'shot/shot', 'v99.0.0', 1, '', {
+    nearby: [{ label: 'main', ref: 'refs/heads/main' }, { label: 'v1.10.0', ref: 'refs/tags/v1.10.0' }],
+    path: null,
+  }));
+  assert.match(refPage, /No ref v99\.0\.0 in shot\/shot/);
+  assert.match(refPage, /<p class="banner[^"]*"><span>That name is not a branch or tag/);
+  assert.match(refPage, /ref picker/);
+  assert.match(refPage, /href="\/view\/github\.com\/shot\/shot\?ref=refs\/heads\/main"/);
+  assert.match(refPage, />v1\.10\.0</);
+  assert.equal(refPage.includes('Check the owner'), false);
+  assert.equal(refPage.includes('401'), false);
+  const pathPage = String(renderError(404, 'not_found', 'path component missing not found', trace, 'github.com', 'o/r', 'main', 1, 'src/missing', {
+    nearby: [],
+    path: { missing: 'missing', existingPath: 'src', notDirectory: false },
+  }));
+  assert.match(pathPage, /No path src\/missing in o\/r/);
+  assert.match(pathPage, /No entry named missing/);
+  assert.match(pathPage, /href="\/view\/github\.com\/o\/r\?ref=main&amp;path=src"/);
+  assert.equal(pathPage.includes('401'), false);
+  assert.equal(pathPage.includes('Check the owner'), false);
+  const repos = { names: ['curl', 'deepfile', 'ply', 'ply-web'], unavailable: false };
+  const listedHome = String(renderHome(null, 1, repos));
+  const listedNamespace = String(renderNamespace(repos, 1));
+  const listMarkup = (html: string) => /<ul class="repo-list">[\s\S]*?<\/ul>/.exec(html)?.[0] ?? '';
+  assert.equal(listMarkup(listedHome), listMarkup(listedNamespace));
+  assert.match(listMarkup(listedNamespace), /href="\/r\/ply"/);
+  assert.equal(listedNamespace.includes('unavailable'), false);
+  assert.match(String(renderNamespace({ names: [], unavailable: true }, 1)), /unavailable right now/);
+  assert.equal(String(renderNamespace({ names: [], unavailable: false }, 1)).includes('unavailable'), false);
+  assert.deepEqual(nearbyRefs('v99.0.0', [
+    { name: 'refs/heads/main', head: true },
+    { name: 'refs/heads/feature', head: false },
+  ], [
+    { name: 'refs/tags/v1.10.0' },
+    { name: 'refs/tags/v1.2.0' },
+  ]).map(item => item.label), ['v1.10.0', 'v1.2.0', 'main', 'feature']);
 });
 
 test('ssr markup uses Kumo classes, prose commits, and a strict CSP', () => {
@@ -611,7 +651,23 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
     assert.equal(missingRef.status, 404);
     const missingHtml = await missingRef.text();
     assert.match(missingHtml, /No ref v99\.0\.0 in demo/);
+    assert.match(missingHtml, /ref picker/);
+    assert.match(missingHtml, /href="\/view\/github\.com\/demo\.git\?ref=refs\/heads\/main"/);
+    assert.equal(missingHtml.includes('Check the owner'), false);
+    assert.equal(missingHtml.includes('401'), false);
     assert.match(missingHtml, /href="\/view\/github\.com\/demo\.git"/);
+    const missingPath = await handleViewer(new Request(`https://ply.ivar.workers.dev${repoPath}?path=missing`), env, {}, { fetchImpl });
+    assert.equal(missingPath.status, 404);
+    const missingPathHtml = await missingPath.text();
+    assert.match(missingPathHtml, /No path missing in demo/);
+    assert.match(missingPathHtml, /No entry named missing/);
+    assert.match(missingPathHtml, /the repository root/);
+    assert.equal(missingPathHtml.includes('401'), false);
+    const fileAsDir = await handleViewer(new Request(`https://ply.ivar.workers.dev${repoPath}?path=README.md/extra`), env, {}, { fetchImpl });
+    assert.equal(fileAsDir.status, 404);
+    const fileAsDirHtml = await fileAsDir.text();
+    assert.match(fileAsDirHtml, /README\.md is a file, not a directory/);
+    assert.match(fileAsDirHtml, /the repository root/);
     const tip = git(bare, ['rev-parse', 'refs/heads/main']).trim();
     const short = await handleViewer(new Request(`https://ply.ivar.workers.dev${repoPath}?ref=${tip.slice(0, 8)}`), env, {}, { fetchImpl });
     assert.equal(short.status, 200, await short.clone().text());
