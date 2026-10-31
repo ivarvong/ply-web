@@ -239,7 +239,8 @@ eyeball ─▶ default entrypoint (cache OFF: always runs → rate limit, ply.re
   | `pack` | `command=fetch` with wants only (no have / shallow / want-ref / deepen-since / deepen-not) | `public, max-age=31536000, immutable`: objects are named by their hash |
   | `refs` | `command=ls-refs` | `public, max-age=5, stale-while-revalidate=10`: a ref change shows within 15 s |
   | `discover` | `GET info/refs?service=git-upload-pack` | v2 capability list: `public, max-age=300, stale-while-revalidate=3600`; a v0 advertisement (carries refs): the refs policy |
-  | — | any non-200, any 3xx | `no-store` (3xx goes back to the guard; GitCache never follows) |
+  | `pack` | a 400 whose text is a partial-clone filter refusal (Artifacts: `only blob:none is supported`) | `public, max-age=3600`: a fact about the server; uncached, every fresh isolate paid it (11 of 13 GitCache runs in a 20-request cold burst, e021776d) |
+  | — | any other non-200, any 3xx | `no-store` (3xx goes back to the guard; GitCache never follows) |
 
 - **Keys:** `/v<CACHE_VERSION>/<kind>/<sha256(kind, url, git-protocol, body)>`. The upstream request travels in headers
   (not part of a Workers Cache key); GitCache recomputes the hash and refuses a mismatch, so no request can store an
