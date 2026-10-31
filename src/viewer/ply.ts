@@ -12,6 +12,7 @@ import { Tracer as TracerJs, arrayExporter as arrayExporterJs } from 'ply';
 import { commitView as commitViewJs, entryType as entryTypeJs, lsMode as lsModeJs, refCandidates as refCandidatesJs } from 'ply';
 import type { FetchLike } from './fetchguard.ts';
 import type { ParsedPack } from './packmap.ts';
+import type { Quirks } from '../quirks.ts';
 
 function loose<T>(fn: unknown): T {
   return fn as T;
@@ -55,7 +56,7 @@ export function createGitTransport(url: string, opts: {
   userAgent: string;
   limits: object;
   signal: AbortSignal;
-  quirks: { treeFilter?: 'blob:none' };
+  quirks: Quirks;
 }): GitTransport {
   return loose<(url: string, opts: object) => GitTransport>(createTransportJs)(url, opts);
 }

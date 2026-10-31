@@ -34,11 +34,8 @@ export type SyncResult = {
   pushBytes?: number; ms: number; code?: string; message?: string;
 };
 
-// ply's .d.ts types Tracer's exporter as `() => void`; it is called with each span line, which arrayExporter takes.
-type TracerExporter = NonNullable<NonNullable<ConstructorParameters<typeof Tracer>[0]>['exporter']>;
-
 function tracer() {
-  return new Tracer({ exporter: arrayExporter() as unknown as TracerExporter, resource: { 'service.name': 'ply-mirror' } });
+  return new Tracer({ exporter: arrayExporter(), resource: { 'service.name': 'ply-mirror' } });
 }
 
 async function tip(t: Transport, branch: string): Promise<string | null> {
@@ -62,9 +59,7 @@ export async function syncMirror(m: Mirror, deps: { binding: ArtifactsNamespace;
     if (!want) return { repo: m.repo, outcome: 'error', code: 'not_found', message: `source has no ${m.branch}`, ms: Date.now() - t0 };
     if (want === have) return { repo: m.repo, outcome: 'in-sync', from: have, to: want, ms: Date.now() - t0 };
     const r = await fetchPack(srcT, { wants: [want], haves: have ? [have] : [], ofsDelta: true, thinPack: false, done: true }, { resolve: true });
-    // fetchPack's objects carry Uint8Array<ArrayBufferLike>; push's PackInput declares Uint8Array<ArrayBuffer>. ply allocates
-    // every object buffer itself (never a SharedArrayBuffer), so the narrowing holds.
-    const objects = (r.objects ? [...r.objects.values()] : []) as NonNullable<Parameters<typeof push>[1]['objects']>;
+    const objects = r.objects ? [...r.objects.values()] : [];
     const handle = await deps.binding.get(m.repo);
     let writeToken = '';
     try {
