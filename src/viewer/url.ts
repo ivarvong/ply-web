@@ -6,6 +6,7 @@
 // folding: a hostname is accepted only when it is one of the allowed hosts, character for character.
 import { fail } from 'ply';
 import { extractRequestPath, rawPathHasUnsafeSegment } from '../pathguard.ts';
+import { publicRepoShortName } from '../public.ts';
 import { authorityHasTrailingDot } from '../remote.ts';
 
 declare const validatedPublicRepoUrl: unique symbol;
@@ -172,7 +173,10 @@ export function assertUpstreamUrl(raw: string, repo: ValidatedPublicRepoUrl, all
 }
 
 export function viewerHref(host: string, repoPath: string, query: Record<string, string | undefined> = {}): string {
-  const path = `/view/${encodeURIComponent(host)}/${repoPath.split('/').map(part => encodeURIComponent(part)).join('/')}`;
+  const short = publicRepoShortName(host, repoPath);
+  const path = short
+    ? `/r/${encodeURIComponent(short)}`
+    : `/view/${encodeURIComponent(host)}/${repoPath.split('/').map(part => encodeURIComponent(part)).join('/')}`;
   const qs = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) if (value) qs.set(key, value);
   // `/` is legal in a query value (RFC 3986 §3.4); keep paths and refs readable.

@@ -9,14 +9,18 @@ export type ViewerDocument =
   | { kind: 'tree'; loaded: TreeLoaded; trace: TraceModel; now: number }
   | { kind: 'file'; loaded: FileLoaded; trace: TraceModel; now: number }
   | { kind: 'pack'; loaded: PackLoaded; trace: TraceModel; now: number }
+  | { kind: 'namespace'; now: number; publicRepos: readonly string[] }
   | {
       kind: 'error'
       status: number
       code: string
       message: string
+      summary: string
+      part: 'repo' | 'ref' | 'path' | 'request'
       trace: TraceModel
       host: string
       repoPath: string
       ref: string | null
+      path: string
       now: number
     }

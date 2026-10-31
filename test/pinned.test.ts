@@ -34,6 +34,9 @@ test('pinnedViewKey: raw files at a pinned commit on a public repo only', () => 
   const view = `/view/${PUBLIC_GIT_HOST}/git/public-v0/ply.git`;
   assert.match(pinnedViewKey(u(`${view}?raw=1&ref=${OID}&path=README.md`), 'GET', anyPublic) ?? '', new RegExp(`^/v${CACHE_VERSION}/pinned/view/`));
   assert.ok(pinnedViewKey(u(`${view}?raw=1&at=${OID}&path=README.md`), 'HEAD', anyPublic));
+  assert.match(pinnedViewKey(u(`/r/ply?raw=1&ref=${OID}&path=README.md`), 'GET', anyPublic) ?? '', new RegExp(`^/v${CACHE_VERSION}/pinned/r/ply\\?`));
+  assert.equal(pinnedViewKey(u(`/r/ply?ref=${OID}&path=README.md`), 'GET', anyPublic), null, 'html is not pinned');
+  assert.equal(pinnedViewKey(u(`/r/not a name?raw=1&ref=${OID}&path=README.md`), 'GET', anyPublic), null);
   for (const s of [`${view}?ref=${OID}&path=README.md`, `${view}?raw=1&ref=main&path=README.md`, `${view}?raw=1&ref=${OID}`, `${view}?raw=1&ref=${OID}&path=a&x=1`, `${view}?raw=1&ref=${OID}&at=${'b'.repeat(40)}&path=a`]) {
     assert.equal(pinnedViewKey(u(s), 'GET', anyPublic), null, s);
   }

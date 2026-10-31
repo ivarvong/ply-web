@@ -30,6 +30,36 @@ export function isPublicRepoName(name: string): boolean {
   return typeof name === 'string' && REPO_NAME.test(name) && !name.includes('..') && !/\.git$/i.test(name);
 }
 
+const GIT_SUFFIX = '.git';
+
+/**
+ * The public-namespace repo name when `host` + `repoPath` is exactly one repo under PUBLIC_NAMESPACE.
+ * That name is the short viewer URL `/r/<name>`.
+ */
+export function publicRepoShortName(host: string, repoPath: string): string | null {
+  if (host !== PUBLIC_GIT_HOST) return null;
+  const prefix = `git/${PUBLIC_NAMESPACE}/`;
+  if (!repoPath.startsWith(prefix) || !repoPath.endsWith(GIT_SUFFIX)) return null;
+  const name = repoPath.slice(prefix.length, -GIT_SUFFIX.length);
+  return isPublicRepoName(name) ? name : null;
+}
+
+export type RepoPresence = true | false | 'unknown';
+
+/** True when the namespace binding has the repo. `unknown` when the binding is missing or errors for another reason. */
+export async function publicRepoExists(binding: ArtifactsNamespace | undefined | null, name: string): Promise<RepoPresence> {
+  if (!isPublicRepoName(name)) return false;
+  if (!binding || typeof binding.get !== 'function') return 'unknown';
+  try {
+    const handle = await binding.get(name);
+    try { handle[Symbol.dispose]?.(); } catch { /* releasing the RPC stub is best effort */ }
+    return true;
+  } catch (e) {
+    if (/not.?found|does not exist|no such/i.test(String((e as { message?: string })?.message ?? e))) return false;
+    return 'unknown';
+  }
+}
+
 /** The canonical remote for a repo in the public namespace. */
 export function publicRemote(name: string, origin: string = PUBLIC_GIT_ORIGIN): string {
   if (!isPublicRepoName(name)) throw fail('bad_request', 'not a public repository name');

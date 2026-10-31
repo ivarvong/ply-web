@@ -135,7 +135,8 @@ const remote = name => `${ORIGIN}/git/${NS}/${name}.git`;
 const q = o => new URLSearchParams(o).toString();
 const mark = () => hits.length;
 const since = i => hits.slice(i);
-const publicView = (name, query = '') => `/view/${HOST}/git/${NS}/${name}.git${query}`;
+const publicView = (name, query = '') => `/r/${name}${query}`;
+const longView = (name, query = '') => `/view/${HOST}/git/${NS}/${name}.git${query}`;
 
 test('viewer: public-v0/ply renders (tree, file, raw) with no token; every upstream call is upload-pack and carries the read token', { skip }, async () => {
   const i = mark();
@@ -232,18 +233,31 @@ test('pinned to a commit: /v1 reads and viewer raw files go through Pinned (cach
   assert.equal((await W(publicView('ply', `?raw=1&ref=${head}&path=README.md`), { port: PORT_TIGHT, ip })).status, 429);
 });
 
-test('/r/<repo> redirects to the canonical viewer URL; bad names are 404 with no fetch; the home page lists the namespace', { skip }, async () => {
+test('/r is the public namespace index; /r/<repo> is canonical; a missing repo is a styled 404 with no fetch', { skip }, async () => {
   const i = mark();
-  const r = await W('/r/ply');
-  assert.equal(r.status, 302);
-  assert.equal(r.headers.get('location'), publicView('ply'));
-  const deep = await W('/r/ply?path=README.md&raw=1&evil=1');
-  assert.equal(deep.headers.get('location'), publicView('ply', '?path=README.md&raw=1'));
-  for (const bad of ['/r/', '/r/a%2fb', '/r/a/b', '/r/.git', '/r/ply.git', '/r/-x', '/r/a%00b']) assert.equal((await W(bad)).status, 404, bad);
+  const index = await W('/r/');
+  assert.equal(index.status, 200, index.text.slice(0, 400));
+  assert.match(index.text, /public-v0/);
+  assert.match(index.text, /href="\/r\/ply"/);
+  assert.equal(since(i).length, 0, 'the index fetches no git');
+  const missing = await W('/r/no-such-repo');
+  assert.equal(missing.status, 404);
+  assert.match(missing.text, /no repository no-such-repo/);
+  assert.match(missing.text, /<html/);
+  const page = await W('/r/ply');
+  assert.equal(page.status, 200, page.text.slice(0, 400));
+  assert.match(page.text, /README\.md/);
+  const long = await W(longView('ply'));
+  assert.equal(long.status, 302);
+  assert.equal(long.headers.get('location'), '/r/ply');
+  const alias = await W('/r/ply?at=main&path=README.md');
+  assert.equal(alias.status, 302);
+  assert.equal(alias.headers.get('location'), '/r/ply?ref=main&path=README.md');
+  for (const bad of ['/r/a/b', '/r/.git', '/r/ply.git', '/r/-x']) assert.equal((await W(bad)).status, 404, bad);
+  for (const rejected of ['/r/a%2fb', '/r/a%00b']) assert.equal((await W(rejected)).status, 400, rejected);
   // `..` and `%2e%2e` are dot segments to the URL parser: the request becomes `/` (usage text), never a redirect
   for (const dots of ['/r/%2e%2e', '/r/%2E%2E/ply']) { const r = await W(dots); assert.equal(r.headers.get('location'), null, dots); assert.notEqual(r.status, 302, dots); }
   assert.equal((await W('/r/ply', { method: 'POST' })).status, 405);
-  assert.equal(since(i).length, 0, 'a redirect fetches nothing');
   const home = await W('/view');
   assert.equal(home.status, 200);
   assert.match(home.text, /Public repositories/);

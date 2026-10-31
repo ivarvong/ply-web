@@ -9,7 +9,7 @@ import { commitProse, formatBytes, percentClass, portions, shortOid } from './fo
 import { LAYOUT } from './layout.ts'
 import { KUMO_BUTTON_FOCUS, KUMO_BUTTON_SECONDARY, KUMO_BUTTON_SIZE_SM, KUMO_INPUT, KUMO_SURFACE } from './kumo-classes.ts'
 import { repoIdentity } from './identity.ts'
-import { Badge, Banner, Button, Card, Diagnostics, Document, Footer, Icon, PathCrumbs, RepoTitle, Signed, Time } from './ui.tsx'
+import { Badge, Banner, Button, Card, Diagnostics, Document, Footer, Icon, PathCrumbs, RepoIdentity, RepoTitle, Signed, Time } from './ui.tsx'
 import { PUBLIC_NAMESPACE } from '../public.ts'
 
 const EXAMPLES = [
@@ -170,7 +170,7 @@ function TreePage(props: { loaded: TreeLoaded; trace: TraceModel; now: number })
   const count = props.loaded.entries.length + props.loaded.entriesTruncated
   return (
     <Document title={path ? `${path} · ${id.name}` : `${id.scope ? `${id.scope}/` : ''}${id.name}`}>
-      <RepoTitle header={header} path={path} branches={props.loaded.branches} />
+      <RepoTitle header={header} path={path} branches={props.loaded.branches} tags={props.loaded.tags} />
       <PathCrumbs header={header} path={path} />
       <Card head={<CommitHead commit={props.loaded.commit} header={header} now={props.now} />} class="tree-card">
         {props.loaded.entries.length === 0 && !path ? <p class="empty">This directory is empty.</p> : (
@@ -294,7 +294,7 @@ function FilePage(props: { loaded: FileLoaded; trace: TraceModel; now: number })
   )
   return (
     <Document title={`${name} · ${id.name}`}>
-      <RepoTitle header={header} path={props.loaded.path} branches={[]} />
+      <RepoTitle header={header} path={props.loaded.path} branches={props.loaded.branches} tags={props.loaded.tags} />
       <PathCrumbs header={header} path={props.loaded.path} />
       <Card head={head} class={md ? 'file-card has-md' : 'file-card'}>
         {md ? <span id="preview" class="anchor"></span> : null}
@@ -318,7 +318,10 @@ function FileBody(props: { loaded: FileLoaded; rawHref: string }) {
   return (
     <div class="code-wrap">
       {lines.length > shown.length ? <p class="empty">Showing {shown.length} of {lines.length} lines.</p> : null}
-      <div class="code" role="table" aria-label="File contents">
+      <div class="code-bar">
+        <label class="wrap-toggle"><input type="checkbox" /> Wrap lines</label>
+      </div>
+      <div class="code" tabIndex={0} role="table" aria-label="File contents">
         {shown.map((line, index) => {
           const n = index + 1
           return (
@@ -345,7 +348,7 @@ function PackPage(props: { loaded: PackLoaded; trace: TraceModel; now: number })
   const legend = ['header', 'commit', 'tree', 'blob', 'tag', 'ofs_delta', 'ref_delta', 'trailer'] as const
   return (
     <Document title={`pack ${shortOid(props.loaded.want)}`}>
-      <RepoTitle header={header} path="" branches={[]} />
+      <RepoTitle header={header} path="" branches={[]} tags={[]} />
       <h2 class="section-title">Pack map</h2>
       <div class="stats">
         <span><strong>{map.count}</strong> {map.count === 1 ? 'object' : 'objects'}</span>
@@ -465,14 +468,23 @@ function supportedHosts(message: string): readonly string[] {
 function ErrorPage(props: Extract<ViewerDocument, { kind: 'error' }>) {
   const title = errorTitle(props.code, props.status)
   const hosts = supportedHosts(props.message)
+  const specific = props.part === 'repo' || props.part === 'ref' || props.part === 'path'
+  const headline = specific ? props.summary : title
+  const knownRepo = props.host.length > 0 && props.repoPath.length > 0
   return (
-    <Document title={title}>
+    <Document title={headline}>
+      {knownRepo ? (
+        <header class="repo-head">
+          <RepoIdentity host={props.host} repoPath={props.repoPath} />
+        </header>
+      ) : null}
+      {knownRepo && props.part !== 'ref' && props.ref ? <PathCrumbs header={{ host: props.host, repoPath: props.repoPath, ref: props.ref }} path={props.path} /> : null}
       <article class={`${KUMO_SURFACE} error-card`}>
-        <p class="error-kicker">HTTP {props.status}</p>
-        <h1 class="display">{title}</h1>
+        <p class="error-kicker">HTTP {props.status} · {props.part}</p>
+        <h1 class="display">{headline}</h1>
         <Banner tone={errorTone(props.code, props.status)}>{errorHint(props.code, props.status, props.message)}</Banner>
         {hosts.length ? <ul class="host-list" aria-label="Supported hosts">{hosts.map(host => <li>{host}</li>)}</ul> : null}
-        <p class="lede"><a href="/view">Back to the viewer</a></p>
+        <p class="lede">{knownRepo ? <><a href={viewerHref(props.host, props.repoPath, {})}>Repository root</a> · </> : null}<a href="/view">Back to the viewer</a></p>
         <details class="reason">
           <summary>Why this was refused</summary>
           <p>{props.message}</p>
@@ -495,5 +507,17 @@ export function ViewerPage(props: { doc: ViewerDocument }) {
   if (doc.kind === 'tree') return <TreePage loaded={doc.loaded} trace={doc.trace} now={doc.now} />
   if (doc.kind === 'file') return <FilePage loaded={doc.loaded} trace={doc.trace} now={doc.now} />
   if (doc.kind === 'pack') return <PackPage loaded={doc.loaded} trace={doc.trace} now={doc.now} />
+  if (doc.kind === 'namespace') {
+    return (
+      <Document title={`${PUBLIC_NAMESPACE} repositories`}>
+        <div class="hero">
+          <p class="kicker">Public namespace</p>
+          <h1 class="display">{PUBLIC_NAMESPACE}</h1>
+          <p class="lede">Read-only repositories in this namespace. Open one below, or paste any public repository on <a href="/view">the viewer</a>.</p>
+        </div>
+        <PublicRepos repos={doc.publicRepos} />
+      </Document>
+    )
+  }
   return <ErrorPage {...doc} />
 }

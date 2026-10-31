@@ -26,6 +26,12 @@ import { KUMO_USED, VIEWER_CSS, cssNodes, selectorClasses } from '../src/viewer/
 import { commitProse } from '../src/viewer/format.ts';
 import { repoIdentity } from '../src/viewer/identity.ts';
 import { PUBLIC_GIT_HOST } from '../src/public.ts';
+import { matchAbbreviatedOid, MIN_ABBREV_HEX } from '../src/abbrev.ts';
+import { describeFailure } from '../src/viewer/failure.ts';
+import { JSON_PINNED_REF_CACHE, jsonCacheControl } from '../src/json-cache.ts';
+import { compareTagNames, tagsFromRefs } from '../src/viewer/tags.ts';
+import { plyVersionValue } from '../src/version.ts';
+import { LAYOUT } from '../src/viewer/layout.ts';
 import { VIEWER_CAPS, VIEWER_GIT_LIMITS, VIEWER_UA, rateLimitFor } from '../src/viewer/limits.ts';
 import type { Loaded, RateNamespace, TraceModel } from '../src/viewer/model.ts';
 import { renderMarkdown } from '../src/viewer/markdown.ts';
@@ -54,6 +60,7 @@ function treeFixture(over: { message?: string; host?: string; repoPath?: string 
     commit: { oid: 'a'.repeat(40), tree: 'b'.repeat(40), parents: [], authorName: 'Ada', authorEmail: 'a@b', authorTime: '2020-01-02T03:04:05Z', authorTz: '+0000', message: over.message ?? 'subject', signed: false },
     log: [], logStopped: false,
     branches: [{ name: 'refs/heads/main', oid: 'a'.repeat(40), head: true }], branchesTruncated: 0,
+    tags: [{ name: 'refs/tags/v1.0.0', oid: 'd'.repeat(40) }], tagsTruncated: 0,
     entries: [{ name: 'a.txt', mode: '100644', oid: 'c'.repeat(40), type: 'blob' }], entriesTruncated: 0,
     readme: null,
   }
@@ -129,8 +136,16 @@ test('paste parsing stays inside the allowlist', () => {
   assert.equal(route.kind, 'redirect');
   if (route.kind === 'redirect') assert.equal(route.location, '/view/github.com/octocat/Hello-World');
   const tagged = parseViewerRoute(new URL('https://ply.example/view/github.com/octocat/Hello-World?ref=refs/heads/main&at=v1.0.0'), routeOptsFromEnv({}));
-  assert.equal(tagged.kind, 'repo');
-  if (tagged.kind === 'repo') assert.equal(tagged.ref, 'v1.0.0');
+  assert.equal(tagged.kind, 'redirect');
+  if (tagged.kind === 'redirect') assert.equal(tagged.location, '/view/github.com/octocat/Hello-World?ref=v1.0.0');
+  const namespaced = parseViewerRoute(new URL('https://ply.example/r/'), routeOptsFromEnv({}));
+  assert.equal(namespaced.kind, 'namespace');
+  const shortRepo = parseViewerRoute(new URL(`https://ply.example/r/ply?path=README.md`), routeOptsFromEnv({}));
+  assert.equal(shortRepo.kind, 'repo');
+  if (shortRepo.kind === 'repo') assert.equal(shortRepo.loc.repoPath, 'git/public-v0/ply.git');
+  const longPublic = parseViewerRoute(new URL(`https://ply.example/view/${PUBLIC_GIT_HOST}/git/public-v0/ply.git?path=README.md`), routeOptsFromEnv({}));
+  assert.equal(longPublic.kind, 'redirect');
+  if (longPublic.kind === 'redirect') assert.equal(longPublic.location, '/r/ply?path=README.md');
   assert.throws(() => parseViewerRoute(new URL('https://ply.example/view?remote=evil.example/a/b'), routeOptsFromEnv({})), /Supported hosts/);
   assert.throws(() => parseViewerRoute(new URL('https://ply.example/view?remote=' + encodeURIComponent('https://user:super-secret-token@github.com/a/b')), routeOptsFromEnv({})), (err: { message?: string }) => /credentials/.test(String(err?.message)) && !String(err?.message).includes('super-secret-token'));
   const md = renderMarkdown('# Hi\n\n<script>alert(1)</script>\n\n[x](javascript:alert(1))\n\n[ok](https://github.com/octocat/Hello-World)\n');
@@ -142,6 +157,57 @@ test('paste parsing stays inside the allowlist', () => {
   assert.equal(VIEWER_CSP.includes('unsafe-inline'), false);
   assert.match(VIEWER_CSP, /script-src 'none'/);
   assert.match(VIEWER_CSP, /style-src 'self'/);
+});
+
+test('abbreviated oids, failure copy, tag order, cache headers, and version text', () => {
+  const oid = '705bd639' + 'a'.repeat(32);
+  const other = '705bd639' + 'b'.repeat(32);
+  const refs = new Map<string, { oid: string; peeled?: string }>([
+    ['refs/heads/main', { oid }],
+    ['refs/heads/other', { oid: other }],
+    ['refs/tags/v1', { oid: 'c'.repeat(40), peeled: oid }],
+  ]);
+  assert.equal(MIN_ABBREV_HEX, 7);
+  assert.deepEqual(matchAbbreviatedOid('705bd639a', refs), { kind: 'unique', oid });
+  const ambiguous = matchAbbreviatedOid('705bd639', refs);
+  assert.equal(ambiguous.kind, 'ambiguous');
+  assert.match(ambiguous.message, /40-hex/);
+  assert.equal(matchAbbreviatedOid('deadbee', refs).kind, 'none');
+  assert.equal(matchAbbreviatedOid(other.slice(0, 12), refs).kind, 'unique');
+  const missing = describeFailure({ code: 'auth', status: 401, message: 'authentication failed', host: 'github.com', repoPath: 'ivarvong/ply', ref: null, path: '' });
+  assert.equal(missing.status, 404);
+  assert.equal(missing.part, 'repo');
+  assert.equal(missing.summary, 'Repository ivarvong/ply not found, or private');
+  const badRef = describeFailure({ code: 'not_found', status: 404, message: 'ref v99.0.0 not found', host: 'github.com', repoPath: 'ivarvong/ply', ref: 'v99.0.0', path: '' });
+  assert.equal(badRef.part, 'ref');
+  assert.equal(badRef.summary, 'No ref v99.0.0 in ivarvong/ply');
+  const badPath = describeFailure({ code: 'not_found', status: 404, message: 'path component missing not found', host: 'github.com', repoPath: 'o/r', ref: 'main', path: 'src/missing' });
+  assert.equal(badPath.part, 'path');
+  assert.match(badPath.summary, /No path src\/missing in o\/r/);
+  assert.equal(jsonCacheControl(200, oid), JSON_PINNED_REF_CACHE);
+  assert.equal(jsonCacheControl(200, 'main'), 'no-store');
+  assert.equal(jsonCacheControl(404, oid), 'no-store');
+  assert.ok(compareTagNames('refs/tags/v2.0.0', 'refs/tags/v1.9.0') < 0);
+  assert.deepEqual(tagsFromRefs(refs, 10).tags.map(tag => tag.name), ['refs/tags/v1']);
+  assert.match(plyVersionValue('a'.repeat(40), 'b'.repeat(40)), /^ply=[0-9a-f]{40} ply-web=[0-9a-f]{40}$/);
+  assert.match(VIEWER_CSS, new RegExp(`\\.files \\.oid \\{[^}]*color: var\\(--text-color-kumo-default\\)`));
+  assert.match(VIEWER_CSS, new RegExp(`font-size: ${LAYOUT.codeFontPx}px`));
+  assert.match(VIEWER_CSS, new RegExp(`font-size: ${LAYOUT.monoFontPx}px`));
+  assert.match(VIEWER_CSS, /scrollbar-width: thin/);
+  const trace: TraceModel = { bars: [], totalMs: 0, cfRay: '', requestId: '' };
+  const page = renderLoaded(treeFixture({ message: 'Subject line\n\nBody that should span the card.\n' }), trace);
+  assert.match(String(page), /refs\/tags\/v1\.0\.0/);
+  assert.match(String(page), /ply=/);
+  const tree = treeFixture({});
+  const file: Loaded = {
+    kind: 'file', header: tree.header, path: 'README.md', branches: tree.branches, branchesTruncated: 0,
+    tags: tree.tags, tagsTruncated: 0, mode: '100644', blob: 'c'.repeat(40), size: 6, note: 'text', text: 'hello\n',
+  };
+  assert.match(String(renderLoaded(file, trace)), /Wrap lines/);
+  const refused = renderError(401, 'auth', 'authentication failed', trace, 'github.com', 'nope/missing', null, 1, '');
+  assert.match(String(refused), /not found, or private/);
+  assert.match(String(refused), /HTTP 404/);
+  assert.match(String(refused), /href="\/view\/github\.com\/nope\/missing"/);
 });
 
 test('ssr markup uses Kumo classes, prose commits, and a strict CSP', () => {
@@ -169,6 +235,7 @@ test('ssr markup uses Kumo classes, prose commits, and a strict CSP', () => {
     },
     log: [], logStopped: false,
     branches: [{ name: 'refs/heads/main', oid: 'a'.repeat(40), head: true }], branchesTruncated: 0,
+    tags: [{ name: 'refs/tags/v1.0.0', oid: 'd'.repeat(40) }], tagsTruncated: 0,
     entries: [], entriesTruncated: 0,
     readme: null,
   }
@@ -242,13 +309,13 @@ test('commit bodies keep their lines; trailers are split out and shown quietly',
 
 test('header identity: public-v0 leads with namespace / repo; GitHub with owner / repo; hosts live in Diagnostics', () => {
   const pub = repoIdentity(PUBLIC_GIT_HOST, 'git/public-v0/ply.git')
-  assert.deepEqual({ scope: pub.scope, name: pub.name, hostLabel: pub.hostLabel, scopeHref: pub.scopeHref }, { scope: 'public-v0', name: 'ply', hostLabel: 'Artifacts', scopeHref: '/view#public' })
+  assert.deepEqual({ scope: pub.scope, name: pub.name, hostLabel: pub.hostLabel, scopeHref: pub.scopeHref }, { scope: 'public-v0', name: 'ply', hostLabel: 'Artifacts', scopeHref: '/r' })
   const gh = repoIdentity('github.com', 'octocat/Hello-World')
   assert.deepEqual({ scope: gh.scope, name: gh.name, hostLabel: gh.hostLabel }, { scope: 'octocat', name: 'Hello-World', hostLabel: 'GitHub' })
   const trace: TraceModel = { bars: [], totalMs: 0, cfRay: 'r', requestId: 'q' }
   const html = String(renderLoaded(treeFixture({ host: PUBLIC_GIT_HOST, repoPath: 'git/public-v0/ply.git' }), trace))
   assert.match(html, /<title>public-v0\/ply<\/title>/)
-  assert.match(html, /<p class="repo-scope"><span class="repo-host" title="https:\/\/[0-9a-f]{32}\.artifacts\.cloudflare\.net\/git\/public-v0\/ply\.git">Artifacts<\/span><a href="\/view#public">public-v0<\/a><span class="repo-slash" aria-hidden="true">\/<\/span><\/p><h1 class="repo-name"><a href="[^"]+">ply<\/a><\/h1>/)
+  assert.match(html, /<p class="repo-scope"><span class="repo-host" title="https:\/\/[0-9a-f]{32}\.artifacts\.cloudflare\.net\/git\/public-v0\/ply\.git">Artifacts<\/span><a href="\/r">public-v0<\/a><span class="repo-slash" aria-hidden="true">\/<\/span><\/p><h1 class="repo-name"><a href="\/r\/ply\?ref=refs\/heads\/main">ply<\/a><\/h1>/)
   // The raw host appears only in hrefs, the title attribute, and the collapsed Diagnostics section.
   const visible = html.replace(/<section class="diag"[\s\S]*$/, '').replace(/<[^>]+>/g, ' ')
   assert.equal(visible.includes(PUBLIC_GIT_HOST), false)
@@ -288,6 +355,7 @@ test('escapeHtml and the page renderer keep repository text out of HTML', () => 
     commit: { oid: 'a'.repeat(40), tree: 'b'.repeat(40), parents: [], authorName: '<b>', authorEmail: 'a@b', authorTime: 't', authorTz: '+0000', message: '<script>alert(1)</script>', signed: false },
     log: [], logStopped: false,
     branches: [{ name: 'refs/heads/main', oid: 'a'.repeat(40), head: true }], branchesTruncated: 0,
+    tags: [{ name: 'refs/tags/v1.0.0', oid: 'd'.repeat(40) }], tagsTruncated: 0,
     entries: [{ name: '<script>.txt', mode: '100644', oid: 'c'.repeat(40), type: 'blob' }], entriesTruncated: 0,
     readme: null,
   };
@@ -535,12 +603,25 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
       assert.equal(hop.gitToken, null);
       assert.equal(hop.ua, VIEWER_UA);
     }
+    const alias = await handleViewer(new Request(`https://ply.ivar.workers.dev${repoPath}?at=v99.0.0`), env, {}, { fetchImpl });
+    assert.equal(alias.status, 302);
+    assert.equal(alias.headers.get('location'), `${repoPath}?ref=v99.0.0`);
+    const missingRef = await handleViewer(new Request(`https://ply.ivar.workers.dev${repoPath}?ref=v99.0.0`), env, {}, { fetchImpl });
+    assert.equal(missingRef.status, 404);
+    const missingHtml = await missingRef.text();
+    assert.match(missingHtml, /No ref v99\.0\.0 in demo/);
+    assert.match(missingHtml, /href="\/view\/github\.com\/demo\.git"/);
+    const tip = git(bare, ['rev-parse', 'refs/heads/main']).trim();
+    const short = await handleViewer(new Request(`https://ply.ivar.workers.dev${repoPath}?ref=${tip.slice(0, 8)}`), env, {}, { fetchImpl });
+    assert.equal(short.status, 200, await short.clone().text());
     const file = await handleViewer(new Request(`https://ply.ivar.workers.dev${repoPath}?ref=main&path=README.md`), env, {}, { fetchImpl });
     assert.equal(file.status, 200);
     const fileHtml = await file.text();
     assert.match(fileHtml, /class="ln"/);
     assert.match(fileHtml, /id="L1"/);
     assert.match(fileHtml, /hello viewer/);
+    assert.match(fileHtml, /Wrap lines/);
+    assert.match(fileHtml, /class="code"/);
     const raw = await handleViewer(new Request(`https://ply.ivar.workers.dev${repoPath}?path=README.md&raw=1`), env, {}, { fetchImpl });
     assert.equal(raw.status, 200);
     assert.match(raw.headers.get('content-type') ?? '', /^text\/plain/);
@@ -558,6 +639,8 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
     assert.equal(css.status, 200);
     assert.match(css.headers.get('content-type') ?? '', /text\/css/);
     const home = await handleViewer(new Request('https://ply.ivar.workers.dev/view'), env, {});
+    assert.equal(home.headers.get('x-ply-trace'), null);
+    assert.match(home.headers.get('x-ply-version') ?? '', /^ply=/);
     const homeHtml = await home.text();
     assert.match(homeHtml, /octocat\/Hello-World/);
     assert.match(homeHtml, /bitbucket\.org/);

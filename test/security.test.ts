@@ -173,6 +173,7 @@ test('hostile markdown, filenames, commits, refs, and authors do not break out o
       },
       log: [], logStopped: false,
       branches: [{ name: ref, oid: 'a'.repeat(40), head: true }], branchesTruncated: 0,
+      tags: [], tagsTruncated: 0,
       entries: [{ name, mode: '100644', oid: 'c'.repeat(40), type: 'blob' }], entriesTruncated: 0,
       readme: { name: 'README.md', text: `# ${name}\n\n[${author}](${message})\n` },
     };

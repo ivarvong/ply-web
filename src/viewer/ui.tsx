@@ -1,5 +1,6 @@
 import type { Child } from 'hono/jsx'
-import type { BranchInfo, RepoHeader, TraceBar, TraceModel } from './model.ts'
+import type { BranchInfo, RepoHeader, TagInfo, TraceBar, TraceModel } from './model.ts'
+import { plyVersionValue } from '../version.ts'
 import { viewerHref } from './url.ts'
 import {
   bannerClass, buttonClass, KUMO_BADGE_DANGER, KUMO_BADGE_INFO, KUMO_BADGE_NEUTRAL, KUMO_BADGE_OUTLINE, KUMO_BADGE_SUCCESS,
@@ -109,27 +110,33 @@ function shortRef(ref: string): string {
   return ref.replace(/^refs\/heads\//, '').replace(/^refs\/tags\//, '')
 }
 
-export function RepoTitle(props: { header: RepoHeader; path: string; branches: readonly BranchInfo[] }) {
-  const id = repoIdentity(props.header.host, props.header.repoPath)
-  const root = viewerHref(props.header.host, props.header.repoPath, { ref: props.header.ref })
+export function RepoIdentity(props: { host: string; repoPath: string; ref?: string | null }) {
+  const id = repoIdentity(props.host, props.repoPath)
+  const root = viewerHref(props.host, props.repoPath, props.ref ? { ref: props.ref } : {})
+  return (
+    <div class="repo-id">
+      <p class="repo-scope">
+        <span class="repo-host" title={id.remote}>{id.hostLabel}</span>
+        {id.scope ? <>{id.scopeHref ? <a href={id.scopeHref}>{id.scope}</a> : <span>{id.scope}</span>}<span class="repo-slash" aria-hidden="true">/</span></> : null}
+      </p>
+      <h1 class="repo-name"><a href={root}>{id.name}</a></h1>
+    </div>
+  )
+}
+
+export function RepoTitle(props: { header: RepoHeader; path: string; branches: readonly BranchInfo[]; tags: readonly TagInfo[] }) {
   return (
     <header class="repo-head">
-      <div class="repo-id">
-        <p class="repo-scope">
-          <span class="repo-host" title={id.remote}>{id.hostLabel}</span>
-          {id.scope ? <>{id.scopeHref ? <a href={id.scopeHref}>{id.scope}</a> : <span>{id.scope}</span>}<span class="repo-slash" aria-hidden="true">/</span></> : null}
-        </p>
-        <h1 class="repo-name"><a href={root}>{id.name}</a></h1>
-      </div>
+      <RepoIdentity host={props.header.host} repoPath={props.header.repoPath} ref={props.header.ref} />
       <div class="repo-tools">
-        <RefSwitcher header={props.header} path={props.path} branches={props.branches} />
+        <RefSwitcher header={props.header} path={props.path} branches={props.branches} tags={props.tags} />
       </div>
     </header>
   )
 }
 
 /** Kumo Breadcrumbs (sm) for the path inside the repository. The repository name is the first crumb. */
-export function PathCrumbs(props: { header: RepoHeader; path: string }) {
+export function PathCrumbs(props: { header: { host: string; repoPath: string; ref: string }; path: string }) {
   if (!props.path) return null
   const id = repoIdentity(props.header.host, props.header.repoPath)
   const parts = props.path.split('/')
@@ -154,9 +161,15 @@ export function PathCrumbs(props: { header: RepoHeader; path: string }) {
   )
 }
 
-export function RefSwitcher(props: { header: RepoHeader; path: string; branches: readonly BranchInfo[] }) {
+function refOption(name: string, current: string, label: string, note: string) {
+  const selected = name === current || shortRef(name) === current
+  return <option value={name} selected={selected}>{label}{note}</option>
+}
+
+export function RefSwitcher(props: { header: RepoHeader; path: string; branches: readonly BranchInfo[]; tags: readonly TagInfo[] }) {
   const action = viewerHref(props.header.host, props.header.repoPath, {})
   const known = props.branches.some(branch => branch.name === props.header.ref || shortRef(branch.name) === props.header.ref)
+    || props.tags.some(tag => tag.name === props.header.ref || shortRef(tag.name) === props.header.ref)
   const current = /^[0-9a-f]{40}$/.test(props.header.ref) ? props.header.ref.slice(0, LAYOUT.shortOid) : shortRef(props.header.ref)
   return (
     <details class="refbox">
@@ -165,21 +178,30 @@ export function RefSwitcher(props: { header: RepoHeader; path: string; branches:
         <span class="ref-v">{current}</span>
         <Icon name="chevron" class="i-sm" />
       </summary>
-      <form class="ref-pop" action={action} method="get">
-        <label class="ref-label" for="ref-branch">Branch</label>
-        <select id="ref-branch" class={`ref-field ${KUMO_INPUT_SM}`} name="ref">
-          {known ? null : <option value={props.header.ref} selected>{current}</option>}
-          {props.branches.map(branch => {
-            const label = shortRef(branch.name)
-            const selected = branch.name === props.header.ref || label === props.header.ref
-            return <option value={branch.name} selected={selected}>{label}{branch.head ? ' (default)' : ''}</option>
-          })}
-        </select>
-        <label class="ref-label" for="ref-at">Tag or commit</label>
-        <input id="ref-at" class={`ref-field ${KUMO_INPUT_SM}`} type="text" name="at" placeholder="v1.2.0 or 40-hex sha" autocomplete="off" spellcheck={false} />
-        {props.path ? <input type="hidden" name="path" value={props.path} /> : null}
-        <button class={`ref-go ${buttonClass('primary', 'sm')}`} type="submit">Switch</button>
-      </form>
+      <div class="ref-pop">
+        <form action={action} method="get">
+          <label class="ref-label" for="ref-branch">Branch or tag</label>
+          <select id="ref-branch" class={`ref-field ${KUMO_INPUT_SM}`} name="ref">
+            {known ? null : <option value={props.header.ref} selected>{current}</option>}
+            <optgroup label="Branches">
+              {props.branches.map(branch => refOption(branch.name, props.header.ref, shortRef(branch.name), branch.head ? ' (default)' : ''))}
+            </optgroup>
+            {props.tags.length ? (
+              <optgroup label="Tags">
+                {props.tags.map(tag => refOption(tag.name, props.header.ref, shortRef(tag.name), ''))}
+              </optgroup>
+            ) : null}
+          </select>
+          {props.path ? <input type="hidden" name="path" value={props.path} /> : null}
+          <button class={`ref-go ${buttonClass('primary', 'sm')}`} type="submit">Switch</button>
+        </form>
+        <form action={action} method="get">
+          <label class="ref-label" for="ref-oid">Commit</label>
+          <input id="ref-oid" class={`ref-field ${KUMO_INPUT_SM}`} type="text" name="ref" placeholder="name or oid" autocomplete="off" spellcheck={false} />
+          {props.path ? <input type="hidden" name="path" value={props.path} /> : null}
+          <button class={`ref-go ${buttonClass('primary', 'sm')}`} type="submit">Go</button>
+        </form>
+      </div>
     </details>
   )
 }
@@ -325,6 +347,7 @@ export function Diagnostics(props: { trace: TraceModel; header?: RepoHeader; hos
       </details>
       <footer class="site-footer">
         <span>ply · read-only, no credentials</span>
+        <span class="mono" title="ply commit and ply-web commit this deploy was built from">{plyVersionValue()}</span>
         <a href="/view#limits">Limits</a>
       </footer>
     </section>

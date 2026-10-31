@@ -1,5 +1,6 @@
 import type { Loaded, TraceModel } from './model.ts'
 import type { ViewerDocument } from './document.ts'
+import { describeFailure } from './failure.ts'
 import { ViewerPage } from './pages.tsx'
 import { trustRendered, type SafeHtml } from './safehtml.ts'
 
@@ -11,8 +12,16 @@ export function renderHome(error: string | null, now = Date.now(), publicRepos: 
   return renderDocument({ kind: 'home', error, now, publicRepos })
 }
 
-export function renderError(status: number, code: string, message: string, trace: TraceModel, host = '', repoPath = '', ref: string | null = null, now = Date.now()): SafeHtml {
-  return renderDocument({ kind: 'error', status, code, message, trace, host, repoPath, ref, now })
+export function renderNamespace(publicRepos: readonly string[], now = Date.now()): SafeHtml {
+  return renderDocument({ kind: 'namespace', now, publicRepos })
+}
+
+export function renderError(status: number, code: string, message: string, trace: TraceModel, host = '', repoPath = '', ref: string | null = null, now = Date.now(), path = ''): SafeHtml {
+  const view = describeFailure({ code, status, message, host, repoPath, ref, path })
+  return renderDocument({
+    kind: 'error', status: view.status, code, message, summary: view.summary, part: view.part,
+    trace, host, repoPath, ref, path, now,
+  })
 }
 
 export function renderLoaded(loaded: Exclude<Loaded, { kind: 'raw' }>, trace: TraceModel, now = Date.now()): SafeHtml {

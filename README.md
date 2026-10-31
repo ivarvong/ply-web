@@ -38,7 +38,7 @@ its binding is the Worker's only other binding. `GET /` prints the usage text.
 |---|---|---|---|
 | GET | `/v1/refs` | `remote`, `prefix?` | `{refs: {name: oid}, head, peeled: {tag: commit}}` |
 | GET | `/v1/discover` | `remote` | protocol v2 capabilities (`agent`, `fetch`, `filter`, `caps`, …) |
-| GET | `/v1/read` | `remote`, `ref?`, `path` | the blob, streamed. Headers: `content-length`, `x-ply-ref`, `x-ply-commit`, `x-ply-blob`, `x-ply-mode`, `x-ply-size` |
+| GET | `/v1/read` | `remote`, `ref?`, `path` | the blob, streamed. Headers: `content-length`, `x-ply-ref`, `x-ply-commit`, `x-ply-blob`, `x-ply-mode`, `x-ply-size`. A directory is `400` `bad_request` (list it with `GET /v1/tree`), not `404` |
 | GET | `/v1/tree` | `remote`, `ref?`, `path?` | `{ref, commit, tree, entries: [{name, mode, oid, type}]}` (modes as `git ls-tree` prints them) |
 | GET | `/v1/commit` | `remote`, `ref?` | `{ref, oid, tree, parents: [oid], author, committer, message, signed}`. `author`/`committer` are `{name, email, time, epoch, tz}`: `time` ISO-8601 UTC, `epoch` the raw seconds, `tz` the offset as written (`+0530`). `message` is the raw body (UTF-8, trailing newline kept). `signed` means a `gpgsig`/`gpgsig-sha256` header is present (not verified). Other headers (`encoding`, `mergetag`, …) are not returned. Fetches the commit object only (`tree:0`, deepen 1; `blob:none` on servers that refuse that) |
 | POST | `/v1/edit` | `{remote, ref?, base?, path, find, replace, author, message, head?, hint?}` | `{ref, newCommit, oldCommit, pushBytes, noop, …}` |
@@ -51,7 +51,12 @@ its binding is the Worker's only other binding. `GET /` prints the usage text.
 - `ref` defaults to the remote's HEAD branch. If HEAD is unborn (Artifacts can leave it pointing at a deleted branch),
   the response is 404 asking for an explicit `ref`.
 - On reads, short names resolve the way `git rev-parse` does: tags win over branches, and a 40-hex commit oid is also
-  accepted. On writes, short names mean `refs/heads/<name>`.
+  accepted. An abbreviated oid (7–39 hex) resolves only when it matches one advertised ref (a branch tip, a tag tip, or
+  a peeled tag commit); otherwise the response is `400` `bad_request` asking for the full oid. On writes, short names
+  mean `refs/heads/<name>`.
+- JSON responses send `cache-control: no-store`, except a successful read whose `ref` is a full oid: `private, max-age=60`.
+  Every response carries `x-ply-version` (`ply=<commit> ply-web=<commit>`, injected at build time). `x-ply-trace` is
+  omitted when it would be empty.
 - `head` on edit is a **precondition**: if the branch is not at `head`, the response is 409 `cas_conflict` and nothing
   is pushed. `hint` is ply's soft head hint, which saves a round trip when it is right and is corrected when it is
   stale.
@@ -189,9 +194,11 @@ One Cloudflare Artifacts namespace is served publicly and read-only. Its name is
 `PUBLIC_NAMESPACE` in `src/public-namespace.ts`; `cloudflare.config.ts` binds that namespace and `src/public.ts` matches
 URLs under it, so moving to `public-v1` is a one-line change (plus creating the namespace and publishing into it).
 
-- **URLs.** `GET /r/<repo>` 302s to the viewer's canonical page,
-  `/view/5ad2236b39de4c8bd8f6270ea63f3ea9.artifacts.cloudflare.net/git/public-v0/<repo>.git`, keeping `ref`, `at`, `path`
-  and `raw`. The home page (`/view`) lists the namespace (binding `list()`, cached a minute per isolate). The viewer
+- **URLs.** `GET /r` and `GET /r/` are the styled index of the namespace. `GET /r/<repo>` is the canonical viewer page
+  for that repo (`ref` is the only ref parameter; `at` and `commit` redirect to it). A name that is not in the namespace
+  is a styled 404 and is not redirected. The long
+  `/view/5ad2236b39de4c8bd8f6270ea63f3ea9.artifacts.cloudflare.net/git/public-v0/<repo>.git` form redirects to `/r/<repo>`.
+  The home page (`/view`) also lists the namespace (binding `list()`, cached a minute per isolate). The viewer
   accepts that Artifacts host without `VIEWER_EXTRA_HOSTS`, but only for one repo directly under `/git/public-v0/`; any
   other path on the host (another namespace, a nested path, `..` or an encoded separator) is a 400 before any fetch.
 - **`/v1` reads.** `refs`, `discover`, `tree`, `read`, and `commit` need no bearer when the request has **no
@@ -289,7 +296,7 @@ eyeball ─▶ default entrypoint (cache OFF: always runs → rate limit, ply.re
   never runs GitCache, so it leaves no GitCache invocation.
 - **Whole responses pinned to a commit** (`src/pinned.ts`, cache-enabled `Pinned` entrypoint): `/v1/tree`, `/v1/read`,
   `/v1/commit` with `ref=<40-hex>` on a public-v0 remote, no Authorization, no `trace=1`; and viewer raw files
-  (`?raw=1&ref|at=<40-hex>&path=`) on public-v0 or a built-in forge. The front door rate-limits and logs, then fetches the
+  (`?raw=1&ref|at=<40-hex>&path=`) on `/view/…` or `/r/<repo>`, for public-v0 or a built-in forge. The front door rate-limits and logs, then fetches the
   canonical key `/v<CACHE_VERSION>/pinned<path>?<allowed params, sorted>` from Pinned. Pinned rebuilds the request from
   the key alone (it reads no header, so no credential can reach it), runs the same handler, and answers `immutable` on a
   200, `no-store` otherwise. Responses carry `x-ply-pinned-cache` (the tier). HTML pages are not cached whole: they render
