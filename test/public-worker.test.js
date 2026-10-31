@@ -103,7 +103,13 @@ const config :Workerd.Config = (
   proc.stdout.on('data', d => { logs += d; }); proc.stderr.on('data', d => { logs += d; });
   for (let i = 0; i < 80; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/`)).ok) break; } catch { } await new Promise(r => setTimeout(r, 100)); }
 });
-after(async () => { if (!WORKERD) return; proc.kill(); await Promise.all([srv.close(), router.close()]); cleanup(); });
+// Each step on its own: a before() that failed half way must still release every server, or node --test never exits.
+after(async () => {
+  if (!WORKERD) return;
+  try { proc?.kill('SIGKILL'); } catch { /* not started */ }
+  await Promise.allSettled([srv?.close(), router?.close()]);
+  try { cleanup?.(); } catch { /* nothing to remove */ }
+});
 
 async function W(path, { method = 'GET', body, headers = {}, port = PORT, ip = '198.51.100.1' } = {}) {
   const res = await fetch(`http://127.0.0.1:${port}${path}`, { method, redirect: 'manual', headers: { 'cf-connecting-ip': ip, ...(body ? { 'content-type': 'application/json' } : {}), ...headers }, body: body ? JSON.stringify(body) : undefined });

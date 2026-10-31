@@ -22,7 +22,12 @@ const CF = join(ROOT, 'node_modules', '.bin', 'cf');
 const WRITE_TTL_S = 600;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 
-function die(msg) { console.error(`publish: ${msg}`); process.exit(1); }
+// Throws, so the `finally` that revokes minted tokens always runs.
+class Die extends Error {}
+// git's stderr without progress lines (they are separated by \r), last part only.
+const gitTail = text => String(text).split(/[\r\n]+/).filter(l => l.trim() && !/(Processing|Resolving|Counting|Compressing|Writing|Enumerating) objects|^remote: *$/.test(l)).join('\n').slice(-800);
+function die(msg) { throw new Die(`publish: ${msg}`); }
+process.on('uncaughtException', e => { console.error(e instanceof Die ? e.message : e); process.exit(1); });
 
 function parseArgs(argv) {
   const out = { branch: 'main', tags: false, positional: [] };
@@ -49,8 +54,8 @@ function json(text) {
 }
 
 function git(args, { env = {}, cwd } = {}) {
-  const r = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env } });
-  if (r.status !== 0) die(`git ${args[0]} exited ${r.status}: ${(r.stderr || '').slice(0, 400)}`);
+  const r = spawnSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 1 << 28, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env } });
+  if (r.status !== 0) die(`git ${args[0]} exited ${r.status}: ${gitTail(r.stderr || r.error || '')}`);
   return r.stdout;
 }
 
@@ -80,32 +85,67 @@ if (!/^https:\/\/[a-z0-9]+\.artifacts\.cloudflare\.net\/git\//.test(String(remot
 
 // 2. A local bare copy of just that branch (and its tags when asked).
 const work = mkdtempSync(join(tmpdir(), 'ply-publish-'));
-let tokenId = null;
-try {
-  git(['clone', '--quiet', '--bare', '--single-branch', '--branch', branch, ...(tags ? [] : ['--no-tags']), source, join(work, 'src.git')]);
-  const sha = git(['rev-parse', `refs/heads/${branch}`], { cwd: join(work, 'src.git') }).trim();
-
-  // 3. A write token for this repo only, 10 minutes.
+const tokenIds = [];
+let current = null; // { token, at }
+// A write token for this repo only, 10 minutes. Re-minted after 8 minutes for a long chunked publish.
+function writeToken() {
+  if (current && Date.now() - current.at < (WRITE_TTL_S - 120) * 1000) return current.token;
   const minted = json(cf(['artifacts', 'namespaces', 'tokens', 'create', PUBLIC_NAMESPACE, '--repo', repo, '--scope', 'write', '--ttl', String(WRITE_TTL_S)]).stdout);
-  tokenId = minted.id;
-  const token = String(minted.plaintext ?? '');
-  if (!token) die('cf returned no token');
-
-  // 4. Push. The Authorization header goes to git through the environment only.
-  const env = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.extraHeader', GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}` };
-  const refspecs = [`+refs/heads/${branch}:refs/heads/${branch}`, ...(tags ? ['+refs/tags/*:refs/tags/*'] : [])];
-  git(['push', '--quiet', remote, ...refspecs], { env, cwd: join(work, 'src.git') });
+  tokenIds.push(minted.id);
+  if (!minted.plaintext) die('cf returned no token');
+  current = { token: String(minted.plaintext), at: Date.now() };
+  return current.token;
+}
+// Push. The Authorization header goes to git through the environment only. Returns null or git's stderr.
+function push(refspecs, cwd) {
+  const env = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.extraHeader', GIT_CONFIG_VALUE_0: `Authorization: Bearer ${writeToken()}` };
+  const r = spawnSync('git', ['push', '--quiet', remote, ...refspecs], { cwd, encoding: 'utf8', maxBuffer: 1 << 28, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env } });
+  return r.status === 0 ? null : String(r.stderr || 'push failed');
+}
+// Artifacts refuses a push over 64 MiB or 50,000 objects (developers.cloudflare.com/artifacts/platform/limits).
+const TOO_BIG = /maximum size|too.large|limit is|exceeds|too many objects|413|object limit|object count/i;
+try {
+  const cwd = join(work, 'src.git');
+  git(['clone', '--quiet', '--bare', '--single-branch', '--branch', branch, ...(tags ? [] : ['--no-tags']), source, cwd]);
+  const sha = git(['rev-parse', `refs/heads/${branch}`], { cwd }).trim();
+  const target = `refs/heads/${branch}`;
+  let err = push([`+${target}:${target}`], cwd);
+  if (err) console.log(`full push refused: ${gitTail(err)}`);
+  if (err && TOO_BIG.test(err)) {
+    // Over the per-push limit: walk the first-parent chain oldest → newest and push prefixes of history, each one a
+    // fast-forward of the last, halving the stride when a push is still too big.
+    const chain = git(['rev-list', '--first-parent', '--reverse', target], { cwd }).trim().split('\n');
+    // Resume from what the remote already has, so a re-run never rewinds the branch.
+    const auth = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.extraHeader', GIT_CONFIG_VALUE_0: `Authorization: Bearer ${writeToken()}` };
+    const have = (git(['ls-remote', remote, target], { cwd, env: auth }).split('\t')[0] ?? '').trim();
+    let done = have ? chain.indexOf(have) : -1, stride = Math.max(1, Math.floor(chain.length / 8)), pushes = 0;
+    while (done < chain.length - 1) {
+      const next = Math.min(chain.length - 1, done + stride);
+      const e = push([`+${chain[next]}:${target}`], cwd);
+      if (e) {
+        if (!TOO_BIG.test(e) || stride === 1) die(`chunked push failed at ${next}/${chain.length}: ${gitTail(e)}`);
+        stride = Math.max(1, Math.floor(stride / 2));
+        continue;
+      }
+      done = next; pushes++;
+      console.log(`pushed ${done + 1}/${chain.length} first-parent commits (${pushes} pushes)`);
+      stride = Math.ceil(stride * 1.5);
+    }
+    err = null;
+  }
+  if (err) die(`push failed: ${gitTail(err)}`);
+  if (tags) { const e = push(['+refs/tags/*:refs/tags/*'], cwd); if (e) die(`tag push failed: ${e.slice(0, 300)}`); }
   console.log(`published ${PUBLIC_NAMESPACE}/${repo} ${branch} = ${sha}`);
   console.log(`view: https://ply.ivar.workers.dev/r/${repo}`);
 } finally {
   rmSync(work, { recursive: true, force: true });
   // Revocation is eventually consistent (cf: a revoke within ~1 s of create can 404), so retry briefly.
-  if (tokenId) {
+  for (const tokenId of tokenIds) {
     let ok = false;
     for (let i = 0; i < 5 && !ok; i++) {
       ok = cf(['artifacts', 'namespaces', 'tokens', 'revoke', String(tokenId), '--namespace', PUBLIC_NAMESPACE, '--force'], { allowFail: true }).status === 0;
       if (!ok) spawnSync('sleep', ['1']);
     }
-    console.log(ok ? 'write token revoked' : `write token ${tokenId} not revoked; it expires in ${WRITE_TTL_S / 60} min`);
+    console.log(ok ? `write token ${tokenId} revoked` : `write token ${tokenId} not revoked; it expires in ${WRITE_TTL_S / 60} min`);
   }
 }
