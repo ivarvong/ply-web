@@ -2,6 +2,8 @@ import { PIN_ATTEMPTS, PIN_CONFIRMATIONS, PIN_INTERVAL_MS } from './baseline.ts'
 import { cfOk, ROOT } from './cf.ts'
 import { isTrafficSplit, planCanary, trafficSplit, versionByTag } from './deploy-plan.ts'
 import { extractJson } from './json.ts'
+import { activeLog } from './log.ts'
+import { originMainReason, requireOriginMain } from './preflight.ts'
 import { errorMessage, run } from './proc.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import type { CdConfig } from './config.ts'
@@ -30,6 +32,15 @@ async function pinReady(config: CdConfig, version: string): Promise<boolean> {
 }
 
 export async function stageDeploy(config: CdConfig): Promise<StageResult<DeployValue>> {
+  const mainRef = await requireOriginMain(ROOT)
+  if (!mainRef.ok) {
+    const reason = originMainReason(mainRef)
+    const context = mainRef.kind === 'not-on-origin-main'
+      ? { kind: mainRef.kind, head: mainRef.head, main: mainRef.main }
+      : { kind: mainRef.kind, reason: mainRef.reason }
+    await activeLog()?.error(reason, context)
+    return fail('deploy-canary', reason)
+  }
   const status = await run('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: ROOT })
   if (status.code !== 0) return fail('deploy-canary', `git status failed: ${status.stderr.slice(0, 300)}`)
   if (status.stdout.trim()) return fail('deploy-canary', 'tracked files are modified; deploy a commit')

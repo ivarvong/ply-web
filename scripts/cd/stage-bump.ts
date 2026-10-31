@@ -1,6 +1,7 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { planBump, pinSpec } from './bump-plan.ts'
 import { ROOT } from './cf.ts'
+import { fetchOriginMain, originMainReason } from './preflight.ts'
 import { errorMessage, run } from './proc.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import type { CdConfig } from './config.ts'
@@ -47,47 +48,46 @@ async function restorePinFiles(): Promise<void> {
   await git(['checkout', '--', 'package.json', 'package-lock.json'])
 }
 
-export async function stageBump(config: CdConfig, shaArg: string | null): Promise<StageResult<BumpValue>> {
+async function returnTo(branch: string, head: string): Promise<string | null> {
+  const target = branch || head
+  if (!target) return null
+  const back = await git(['checkout', target])
+  return back.code === 0 ? null : (back.stderr || back.stdout).trim().slice(0, 300)
+}
+
+/** Commit the pin onto `branch`, whose parent is `base` (origin/main), not the checkout we started on. */
+async function commitOnMain(branch: string, base: string, sha: string, spec: string, from: string): Promise<StageResult<BumpValue>> {
+  const current = await git(['branch', '--show-current'])
+  const startedBranch = current.stdout.trim()
+  const started = await git(['rev-parse', 'HEAD'])
+  const startedHead = started.stdout.trim()
+  const onBump = startedBranch === branch
+  if (onBump) {
+    const reset = await git(['reset', '--hard', base])
+    if (reset.code !== 0) return fail('bump', `could not reset ${branch} onto origin/main: ${reset.stderr.slice(0, 300)}`)
+  } else {
+    const detached = await git(['checkout', '--detach', base])
+    if (detached.code !== 0) return fail('bump', `could not detach at origin/main: ${detached.stderr.slice(0, 300)}`)
+  }
+  let failure: string | null = null
+  let removeHttps: (() => Promise<void>) | null = null
   try {
-    const sha = await resolvePlySha(shaArg ?? config.sha)
     const pkgText = await readFile(`${ROOT}/package.json`, 'utf8')
-    const spec = (JSON.parse(pkgText) as { dependencies?: { ply?: string } }).dependencies?.ply
-    if (typeof spec !== 'string') return fail('bump', 'package.json has no dependencies.ply')
-    const plan = planBump(spec, sha)
-    if (plan.kind === 'invalid') return fail('bump', plan.reason)
-    if (plan.kind === 'unchanged') return pass('bump', { sha, from: null, committed: false, branch: null })
-    const dirty = await git(['status', '--porcelain', '--untracked-files=no'])
-    if (dirty.code !== 0) return fail('bump', `git status failed: ${dirty.stderr.slice(0, 300)}`)
-    if (dirty.stdout.trim()) return fail('bump', 'tracked files are modified; bump wants a clean tree')
-    const name = await git(['config', 'user.name'])
-    const email = await git(['config', 'user.email'])
-    if (name.code !== 0 || !name.stdout.trim() || email.code !== 0 || !email.stdout.trim()) {
-      return fail('bump', 'git user.name and user.email must be set')
-    }
-    const current = await git(['branch', '--show-current'])
-    if (current.stdout.trim() !== config.bumpBranch) {
-      const exists = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${config.bumpBranch}`])
-      if (exists.code === 0) return fail('bump', `branch ${config.bumpBranch} already exists`)
-      const created = await git(['checkout', '-b', config.bumpBranch])
-      if (created.code !== 0) return fail('bump', `could not create ${config.bumpBranch}: ${created.stderr.slice(0, 300)}`)
-    }
-    if (!pkgText.includes(spec)) return fail('bump', 'dependencies.ply text was not found in package.json')
-    await writeFile(`${ROOT}/package.json`, pkgText.replace(spec, pinSpec(sha)))
-    const removeHttps = await ensureHttps()
-    try {
+    if (!pkgText.includes(spec)) failure = 'dependencies.ply text was not found in package.json'
+    if (!failure) await writeFile(`${ROOT}/package.json`, pkgText.replace(spec, pinSpec(sha)))
+    if (!failure) removeHttps = await ensureHttps()
+    if (!failure) {
       const installed = await run('npm', ['install'], { cwd: ROOT })
-      if (installed.code !== 0) {
-        await restorePinFiles()
-        return fail('bump', `npm install failed: ${installed.stderr.slice(0, 400)}`)
-      }
+      if (installed.code !== 0) failure = `npm install failed: ${installed.stderr.slice(0, 400)}`
+    }
+    if (!failure) {
       const lock = JSON.parse(await readFile(`${ROOT}/package-lock.json`, 'utf8')) as {
         packages?: { 'node_modules/ply'?: { resolved?: string } }
       }
       const resolved = lock.packages?.['node_modules/ply']?.resolved ?? ''
-      if (!resolved.endsWith(`#${sha}`)) {
-        await restorePinFiles()
-        return fail('bump', 'package-lock.json did not record the ply pin')
-      }
+      if (!resolved.endsWith(`#${sha}`)) failure = 'package-lock.json did not record the ply pin'
+    }
+    if (!failure) {
       const gateEnv = {
         ...process.env,
         GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME || 'ply-web',
@@ -102,18 +102,66 @@ export async function stageBump(config: CdConfig, shaArg: string | null): Promis
       ] as const) {
         const gate = await run(cmd, args, { cwd: ROOT, env: gateEnv })
         if (gate.code !== 0) {
-          await restorePinFiles()
-          return fail('bump', `${cmd} ${args.join(' ')} failed: ${gate.stderr.slice(-400) || gate.stdout.slice(-400)}`)
+          failure = `${cmd} ${args.join(' ')} failed: ${gate.stderr.slice(-400) || gate.stdout.slice(-400)}`
+          break
         }
       }
-    } finally {
-      await removeHttps()
     }
-    const added = await git(['add', 'package.json', 'package-lock.json'])
-    if (added.code !== 0) return fail('bump', `git add failed: ${added.stderr.slice(0, 300)}`)
-    const committed = await git(['commit', '-m', `Pin ply to ${sha}.`])
-    if (committed.code !== 0) return fail('bump', `git commit failed: ${committed.stderr.slice(0, 300)}`)
-    return pass('bump', { sha, from: plan.from, committed: true, branch: config.bumpBranch })
+    if (!failure) {
+      const added = await git(['add', 'package.json', 'package-lock.json'])
+      if (added.code !== 0) failure = `git add failed: ${added.stderr.slice(0, 300)}`
+    }
+    if (!failure) {
+      const committed = await git(['commit', '-m', `Pin ply to ${sha}.`])
+      if (committed.code !== 0) failure = `git commit failed: ${committed.stderr.slice(0, 300)}`
+    }
+  } catch (error) {
+    failure = errorMessage(error)
+  } finally {
+    if (removeHttps) await removeHttps()
+  }
+  if (failure) {
+    await restorePinFiles()
+    if (!onBump) {
+      const back = await returnTo(startedBranch, startedHead)
+      if (back) failure = `${failure}; also could not return to the previous checkout: ${back}`
+    }
+    return fail('bump', failure)
+  }
+  if (!onBump) {
+    const forced = await git(['branch', '-f', branch, 'HEAD'])
+    if (forced.code !== 0) {
+      const back = await returnTo(startedBranch, startedHead)
+      const reason = `could not point ${branch} at the pin commit: ${forced.stderr.slice(0, 300)}`
+      return fail('bump', back ? `${reason}; also could not return to the previous checkout: ${back}` : reason)
+    }
+    const onto = await git(['checkout', branch])
+    if (onto.code !== 0) return fail('bump', `pin is committed but checkout ${branch} failed: ${onto.stderr.slice(0, 300)}`)
+  }
+  return pass('bump', { sha, from, committed: true, branch })
+}
+
+export async function stageBump(config: CdConfig, shaArg: string | null): Promise<StageResult<BumpValue>> {
+  try {
+    const sha = await resolvePlySha(shaArg ?? config.sha)
+    const dirty = await git(['status', '--porcelain', '--untracked-files=no'])
+    if (dirty.code !== 0) return fail('bump', `git status failed: ${dirty.stderr.slice(0, 300)}`)
+    if (dirty.stdout.trim()) return fail('bump', 'tracked files are modified; bump wants a clean tree')
+    const name = await git(['config', 'user.name'])
+    const email = await git(['config', 'user.email'])
+    if (name.code !== 0 || !name.stdout.trim() || email.code !== 0 || !email.stdout.trim()) {
+      return fail('bump', 'git user.name and user.email must be set')
+    }
+    const base = await fetchOriginMain(ROOT)
+    if (!base.ok) return fail('bump', originMainReason(base))
+    const shown = await git(['show', `${base.sha}:package.json`])
+    if (shown.code !== 0) return fail('bump', 'origin/main has no package.json')
+    const spec = (JSON.parse(shown.stdout) as { dependencies?: { ply?: string } }).dependencies?.ply
+    if (typeof spec !== 'string') return fail('bump', 'package.json has no dependencies.ply')
+    const plan = planBump(spec, sha)
+    if (plan.kind === 'invalid') return fail('bump', plan.reason)
+    if (plan.kind === 'unchanged') return pass('bump', { sha, from: null, committed: false, branch: null })
+    return await commitOnMain(config.bumpBranch, base.sha, sha, spec, plan.from)
   } catch (error) {
     return fail('bump', errorMessage(error))
   }

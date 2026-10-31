@@ -14,6 +14,7 @@ On the box:
 - `npm ci` in this repo. Node matches `package.json` `engines`. `npm run cd` also refuses Node older than 22.18, which is what `cloudflare.config.ts` needs when `cf` loads it.
 - `git config user.name` and `user.email` set. The bump stage commits with them and does not push.
 - A clean work tree. Deploy refuses a dirty one.
+- `HEAD` equal to `origin/main` after `git fetch origin main`. Deploy refuses any other commit (`not-on-origin-main`) and uploads nothing.
 - `PLY_TOKEN_FILE` pointing at the same bearer the Worker secret `PLY_TOKEN` uses, mode `0600` (no group or other bits). The file is read, never printed.
 - Namespace `ply-loadgen` already exists. The smoke does not create it.
 
@@ -88,7 +89,7 @@ npm run cd -- bump
 npm run cd -- bump --sha <40 hex>
 ```
 
-Resolves ply `main` (or the sha you passed) and writes `github:ivarvong/ply#<sha>` into `package.json` and the lockfile. Then it runs `npm run typecheck`, `npx oxlint`, and `npm test` on that tree and commits **only** those two files on `bump-ply`. It does not push.
+Fetches `origin main` and reads that commit's `package.json`. Resolves ply `main` (or the sha you passed). When the pin already matches, it leaves your checkout where it is. When it does not, it commits **only** `package.json` and the lockfile on `bump-ply`, whose parent is `origin/main`, and checks that branch out. The pull request is that one commit. It is not stacked on the branch you were on. It does not push. If you were already on `bump-ply`, that branch is reset to `origin/main` before the commit.
 
 Pass, already pinned:
 
@@ -109,7 +110,7 @@ cd: FAIL bump: tracked files are modified; bump wants a clean tree
 cd: FAIL bump: npm test failed: …
 ```
 
-You push `bump-ply` yourself if you want a pull request for the pin. The rest of `npm run cd` deploys the checkout you are on, which is this new commit only after you check it out.
+You push `bump-ply` yourself if you want a pull request for the pin. Deploy runs only when `HEAD` is `origin/main`, so the pin commit is not uploaded until it has been merged there.
 
 ## 2. Deploy the canary
 
@@ -117,7 +118,7 @@ You push `bump-ply` yourself if you want a pull request for the pin. The rest of
 npm run cd -- deploy-canary
 ```
 
-Builds and uploads a version with `cf workers versions create`. The version id is the row in `cf workers versions list` whose tag is the 12-character HEAD sha. The create command's own text is not parsed. A missing tag stops before traffic changes. It then routes that version to **0%** beside the single version that is at 100%, and only when the deployment is still the split it just read. A mismatch stops with `state_conflict` and leaves the split alone. It will not upload into a 50/50 split, a deployment with more than two versions, or a version that is already the live one. If a different version is already sitting at 0%, that slot is replaced. The new version is never given traffic here.
+Fetches `origin main` first. Unless `HEAD` is that commit, it stops with `not-on-origin-main` (or `origin-main-unavailable` when the fetch fails), writes that typed error on the run, and uploads nothing. Otherwise it builds and uploads a version with `cf workers versions create`. The version id is the row in `cf workers versions list` whose tag is the 12-character HEAD sha. The create command's own text is not parsed. A missing tag stops before traffic changes. It then routes that version to **0%** beside the single version that is at 100%, and only when the deployment is still the split it just read. A mismatch stops with `state_conflict` and leaves the split alone. It will not upload into a 50/50 split, a deployment with more than two versions, or a version that is already the live one. If a different version is already sitting at 0%, that slot is replaced. The new version is never given traffic here.
 
 Pass:
 
@@ -370,7 +371,8 @@ cd: FAIL rollback: rollback to 1aa0bb11-… failed: …
 
 | You see | Traffic now | What you do |
 | --- | --- | --- |
-| `cd: FAIL bump:` | Unchanged | Fix the tree or the gate. Nothing was uploaded. |
+| `cd: FAIL bump:` | Unchanged | Fix the tree or the gate. Nothing was uploaded. A failed pin does not move `bump-ply` unless you were already on it. |
+| `cd: FAIL deploy-canary: not-on-origin-main` | Unchanged | Check out `origin/main`. A pin commit on `bump-ply` is not deployed from there. |
 | `cd: FAIL deploy-canary:` and the line says the canary was left at 0% | Old at 100%, new at 0% | Read the pin failure. Rollback only if you want the 0% slot cleared: `npm run cd -- rollback --to <previous>`. |
 | `cd: FAIL deploy-canary:` after a bad split | Previous at 100% if the rollback landed | Confirm with `cf workers deployments list --worker ply`. |
 | `cd: FAIL smoke:` or `cd: FAIL telemetry:` before any ramp line | Still 0% / 100% | The ramp did not start. The scratch repo name is in the smoke failure. |
