@@ -5,7 +5,9 @@
 declare const __PLY_SHA__: string;
 declare const __PLY_WEB_SHA__: string;
 
-export const VERSION_HEADER = 'x-ply-version';
+// x-ply-version is the Workers version id (src/index.js, env.VERSION); scripts/deploy.sh and the smokes compare it
+// exactly. The build identity is a separate header so the canary check keeps working.
+export const BUILD_HEADER = 'x-ply-build';
 
 const SHA1_HEX = /^[0-9a-f]{40}$/;
 const UNKNOWN_SHA = 'unknown';
@@ -20,7 +22,7 @@ export const PLY_SHA: string = injectedSha(typeof __PLY_SHA__ === 'string' ? __P
 /** The ply-web commit this Worker was built from, or `unknown` outside a Vite build. */
 export const PLY_WEB_SHA: string = injectedSha(typeof __PLY_WEB_SHA__ === 'string' ? __PLY_WEB_SHA__ : '');
 
-/** `x-ply-version` value: `ply=<sha> ply-web=<sha>`. */
-export function plyVersionValue(ply: string = PLY_SHA, web: string = PLY_WEB_SHA): string {
+/** `x-ply-build` value: `ply=<sha> ply-web=<sha>`. */
+export function plyBuildValue(ply: string = PLY_SHA, web: string = PLY_WEB_SHA): string {
   return `ply=${ply} ply-web=${web}`;
 }

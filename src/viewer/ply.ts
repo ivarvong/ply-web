@@ -1,5 +1,6 @@
-// ply's library is JavaScript. TypeScript infers an unannotated default as that default's literal
-// type (`signal = null` becomes `null`), so legal callers fail to typecheck. These wrappers are the boundary.
+// The viewer's narrowed view of ply. ply now ships .d.ts types, but these signatures predate them and are looser
+// (opaque transport, `object` options, a partial pack cursor), so loose() still casts at this one boundary. Replacing
+// them with ply's own types (Transport, FetchOpts, SpState, Limits) is the follow-up.
 import { discover as discoverJs } from 'ply';
 import { isPlyCode as isPlyCodeJs } from 'ply';
 import { fetchObject as fetchObjectJs, isFilterRejection as isFilterRejectionJs, packStream as packStreamJs, spFinish as spFinishJs, spInit as spInitJs, spStep as spStepJs } from 'ply';

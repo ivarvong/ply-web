@@ -1,6 +1,6 @@
 import type { Child } from 'hono/jsx'
 import type { BranchInfo, RepoHeader, TagInfo, TraceBar, TraceModel } from './model.ts'
-import { plyVersionValue } from '../version.ts'
+import { plyBuildValue } from '../version.ts'
 import { viewerHref } from './url.ts'
 import {
   bannerClass, buttonClass, KUMO_BADGE_DANGER, KUMO_BADGE_INFO, KUMO_BADGE_NEUTRAL, KUMO_BADGE_OUTLINE, KUMO_BADGE_SUCCESS,
@@ -347,7 +347,7 @@ export function Diagnostics(props: { trace: TraceModel; header?: RepoHeader; hos
       </details>
       <footer class="site-footer">
         <span>ply · read-only, no credentials</span>
-        <span class="mono" title="ply commit and ply-web commit this deploy was built from">{plyVersionValue()}</span>
+        <span class="mono" title="ply commit and ply-web commit this deploy was built from">{plyBuildValue()}</span>
         <a href="/view#limits">Limits</a>
       </footer>
     </section>

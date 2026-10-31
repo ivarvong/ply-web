@@ -7,6 +7,9 @@ export const JSON_CACHE_NO_STORE = 'no-store';
 /** Seconds a successful JSON read of a full oid may sit in a private cache. */
 export const JSON_PINNED_REF_MAX_AGE_S = 60;
 
+/** Sent with JSON_PINNED_REF_CACHE: every header that can carry a credential to /v1. */
+export const JSON_CACHE_VARY = 'authorization, git-token, git-authorization';
+
 export const JSON_PINNED_REF_CACHE = `private, max-age=${JSON_PINNED_REF_MAX_AGE_S}`;
 
 export function jsonCacheControl(status: number, ref: string | null): string {

@@ -95,7 +95,9 @@ before(async () => {
   // curl's shape: one directory over the viewer's old 2,000-entry cap, next to a small one three levels down.
   const wideFiles = { 'README.md': 'wide\n', 'docs/lib/opts/A.md': 'a\n', 'docs/lib/opts/B.md': 'b\n' };
   for (let k = 0; k < 2135; k++) wideFiles[`tests/data/test${k}`] = `t${k}\n`;
-  seed(`git/${NS}/wide`, wideFiles);
+  const wide = seed(`git/${NS}/wide`, wideFiles);
+  // More tags than the viewer's ls-refs cap (maxRefs 2,000): the tag picker must not cost the page.
+  git(wide.bare, ['update-ref', '--stdin'], { input: Array.from({ length: 2100 }, (_, k) => `create refs/tags/t${k} ${wide.head}\n`).join('') });
   const out = join(root, 'wk'); mkdirSync(out, { recursive: true });
   copyCfBundle(join(out, 'worker.mjs'));
   writeFileSync(join(out, 'fake-artifacts.mjs'), FAKE_ARTIFACTS);
@@ -159,6 +161,15 @@ test('viewer: public-v0/ply renders (tree, file, raw) with no token; every upstr
     assert.ok((h.method === 'GET' && h.path.endsWith('/info/refs?service=git-upload-pack')) || (h.method === 'POST' && h.path.endsWith('/git-upload-pack')), `${h.method} ${h.path}`);
     assert.equal(h.auth, `Bearer ${TOKEN}`);
   }
+});
+
+test('more tags than the ls-refs cap: the page still opens (no tag picker), and a tag by name still resolves', { skip }, async () => {
+  const page = await W(publicView('wide'));
+  assert.equal(page.status, 200, page.text.slice(0, 400));
+  assert.doesNotMatch(page.text, /optgroup label="Tags"/);
+  const tag = await W(publicView('wide', '?ref=t2099&path=README.md'));
+  assert.equal(tag.status, 200, tag.text.slice(0, 400));
+  assert.match(tag.text, /wide/);
 });
 
 test('a server that refuses tree:0: the viewer learns it once per isolate, a 2,135-entry sibling tree is no 413, and its own nested links work', { skip }, async () => {
@@ -342,7 +353,7 @@ test('/v1 without a bearer: another namespace, another host, traversal, unknown 
     assert.equal(res.status, 401, `${r} → ${res.status}`);
     assert.equal(res.json().code, 'unauthorized');
   }
-  for (const [m, p] of [['POST', '/v1/edit'], ['POST', '/v1/branch'], ['DELETE', '/v1/branch'], ['POST', '/v1/merge'], ['POST', '/v1/rebase'], ['POST', '/v1/cherry-pick'], ['POST', '/v1/revert']]) {
+  for (const [m, p] of [['POST', '/v1/edit'], ['POST', '/v1/branch'], ['DELETE', '/v1/branch'], ['POST', '/v1/merge'], ['POST', '/v1/rebase'], ['POST', '/v1/cherry-pick'], ['POST', '/v1/revert'], ['POST', '/v1/tag'], ['DELETE', '/v1/tag']]) {
     assert.equal((await W(p, { method: m, body: { remote: remote('ply'), ref: 'main', path: 'README.md', find: 'ply', replace: 'x', from: 'main', commit: plyRepo.head, author: { name: 'a', email: 'a@x' }, committer: { name: 'a', email: 'a@x' }, message: 'm' } })).status, 401, `${m} ${p}`);
   }
   assert.deepEqual(since(i), [], 'nothing was fetched');
@@ -395,7 +406,7 @@ test('writes to public-v0 are 403 read_only with a bearer, with a caller git cre
   const i = mark();
   const body = { ref: 'main', path: 'README.md', find: 'ply', replace: 'x', from: 'main', commit: plyRepo.head, author: { name: 'a', email: 'a@x' }, committer: { name: 'a', email: 'a@x' }, message: 'm' };
   for (const r of [remote('ply'), `${ORIGIN}/git/${NS}/ply`, `${ORIGIN}/git/${NS.toUpperCase()}/ply.git`, `${ORIGIN}/git/${NS}/new.git`, `${ORIGIN}/git/${NS}/a/b.git`]) {
-    for (const [m, p] of [['POST', '/v1/edit'], ['POST', '/v1/branch'], ['DELETE', '/v1/branch'], ['POST', '/v1/merge'], ['POST', '/v1/rebase'], ['POST', '/v1/cherry-pick'], ['POST', '/v1/revert']]) {
+    for (const [m, p] of [['POST', '/v1/edit'], ['POST', '/v1/branch'], ['DELETE', '/v1/branch'], ['POST', '/v1/merge'], ['POST', '/v1/rebase'], ['POST', '/v1/cherry-pick'], ['POST', '/v1/revert'], ['POST', '/v1/tag'], ['DELETE', '/v1/tag']]) {
       for (const headers of [bearer, { ...bearer, 'git-token': OTHER }, { ...bearer, 'git-authorization': `Bearer ${OTHER}` }]) {
         const res = await W(p, { method: m, body: { ...body, remote: r }, headers });
         assert.equal(res.status, 403, `${m} ${p} ${r}`);

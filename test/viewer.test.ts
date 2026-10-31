@@ -31,7 +31,7 @@ import { matchAbbreviatedOid, MIN_ABBREV_HEX } from '../src/abbrev.ts';
 import { describeFailure } from '../src/viewer/failure.ts';
 import { JSON_PINNED_REF_CACHE, jsonCacheControl } from '../src/json-cache.ts';
 import { compareTagNames, tagsFromRefs } from '../src/viewer/tags.ts';
-import { plyVersionValue } from '../src/version.ts';
+import { plyBuildValue } from '../src/version.ts';
 import { LAYOUT } from '../src/viewer/layout.ts';
 import { VIEWER_CAPS, VIEWER_GIT_LIMITS, VIEWER_UA, rateLimitFor } from '../src/viewer/limits.ts';
 import type { Loaded, RateNamespace, TraceModel } from '../src/viewer/model.ts';
@@ -190,7 +190,7 @@ test('abbreviated oids, failure copy, tag order, cache headers, and version text
   assert.equal(jsonCacheControl(404, oid), 'no-store');
   assert.ok(compareTagNames('refs/tags/v2.0.0', 'refs/tags/v1.9.0') < 0);
   assert.deepEqual(tagsFromRefs(refs, 10).tags.map(tag => tag.name), ['refs/tags/v1']);
-  assert.match(plyVersionValue('a'.repeat(40), 'b'.repeat(40)), /^ply=[0-9a-f]{40} ply-web=[0-9a-f]{40}$/);
+  assert.match(plyBuildValue('a'.repeat(40), 'b'.repeat(40)), /^ply=[0-9a-f]{40} ply-web=[0-9a-f]{40}$/);
   assert.match(VIEWER_CSS, new RegExp(`\\.files \\.oid \\{[^}]*color: var\\(--text-color-kumo-default\\)`));
   assert.match(VIEWER_CSS, new RegExp(`font-size: ${LAYOUT.codeFontPx}px`));
   assert.match(VIEWER_CSS, new RegExp(`font-size: ${LAYOUT.monoFontPx}px`));
@@ -233,6 +233,16 @@ test('abbreviated oids, failure copy, tag order, cache headers, and version text
   assert.match(pathPage, /href="\/view\/github\.com\/o\/r\?ref=main&amp;path=src"/);
   assert.equal(pathPage.includes('401'), false);
   assert.equal(pathPage.includes('Check the owner'), false);
+  // Names from the URL (ref, path) and from the remote (nearby refs, path cue) are text, never markup.
+  const evil = '"><img src=x onerror=alert(1)>'
+  const hostile = [
+    String(renderError(404, 'not_found', `ref ${evil} not found`, trace, 'github.com', 'o/r', evil, 1, '', { nearby: [{ label: evil, ref: `refs/tags/${evil}` }], path: null })),
+    String(renderError(404, 'not_found', `path component ${evil} not found`, trace, 'github.com', 'o/r', 'main', 1, `src/${evil}`, { nearby: [], path: { missing: evil, existingPath: `src/${evil}`, notDirectory: false } })),
+  ]
+  for (const page of hostile) {
+    assert.equal(page.includes('<img'), false, 'a reflected name became markup')
+    assert.match(page, /&lt;img src=x onerror=alert\(1\)&gt;/)
+  }
   const repos = { names: ['curl', 'deepfile', 'ply', 'ply-web'], unavailable: false };
   const listedHome = String(renderHome(null, 1, repos));
   const listedNamespace = String(renderNamespace(repos, 1));
@@ -423,7 +433,8 @@ async function ofsChain(deltaCount: number): Promise<Uint8Array> {
   const payload = new TextEncoder().encode('x');
   const baseZ = await zlibDeflate(payload);
   const delta = spliceDelta({ baseLen: payload.length, off: 0, oldLen: 0, insert: new Uint8Array() }).delta;
-  const deltaZ = await zlibDeflate(delta);
+  // ply types spliceDelta's output as Uint8Array<ArrayBufferLike> and zlibDeflate's input as Uint8Array<ArrayBuffer>.
+  const deltaZ = await zlibDeflate(delta as Uint8Array<ArrayBuffer>);
   const header = new Uint8Array(12);
   header.set([0x50, 0x41, 0x43, 0x4b]);
   new DataView(header.buffer).setUint32(4, 2);
@@ -697,7 +708,7 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
     assert.match(css.headers.get('content-type') ?? '', /text\/css/);
     const home = await handleViewer(new Request('https://ply.ivar.workers.dev/view'), env, {});
     assert.equal(home.headers.get('x-ply-trace'), null);
-    assert.match(home.headers.get('x-ply-version') ?? '', /^ply=/);
+    assert.match(home.headers.get('x-ply-build') ?? '', /^ply=/);
     const homeHtml = await home.text();
     assert.match(homeHtml, /octocat\/Hello-World/);
     assert.match(homeHtml, /bitbucket\.org/);

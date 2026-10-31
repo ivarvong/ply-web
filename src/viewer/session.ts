@@ -18,7 +18,7 @@ import { viewerHref } from './url.ts';
 
 import { quirksFor, type Quirks } from '../quirks.ts';
 import { isAbbreviatedOid, matchAbbreviatedOid } from '../abbrev.ts';
-import { nearbyRefs } from './hint.ts';
+import { nearbyRefs, type ViewerHint } from './hint.ts';
 import { tagsFromRefs } from './tags.ts';
 
 type NoCredential = { auth?: never };
@@ -74,8 +74,13 @@ function headerFor(loc: RepoLocation, ref: string, commit: string, server: Serve
   return { host: loc.host, repoPath: loc.repoPath, ref, commit, treeHref: viewerHref(loc.host, loc.repoPath, { ref }), server };
 }
 
-function refPrefixes(ref: string | null): string[] {
-  const prefixes = new Set<string>(['HEAD', 'refs/heads/', 'refs/tags/']);
+/** A viewer failure carrying the error page's hint (src/viewer/hint.ts reads it back); ply's Extra has no such field. */
+function withHint<E extends object>(err: E, viewerHint: ViewerHint): E & { viewerHint: ViewerHint } {
+  return Object.assign(err, { viewerHint });
+}
+
+function refPrefixes(ref: string | null, allTags = true): string[] {
+  const prefixes = new Set<string>(allTags ? ['HEAD', 'refs/heads/', 'refs/tags/'] : ['HEAD', 'refs/heads/']);
   for (const cand of candidates(ref)) {
     if (cand === 'HEAD') continue;
     prefixes.add(cand);
@@ -85,7 +90,7 @@ function refPrefixes(ref: string | null): string[] {
 
 function refMiss(listedRefs: { refs: Map<string, RefRec>; head: string | null }, wanted: string, code: 'not_found' | 'bad_request', message: string): never {
   const catalog = refCatalog(listedRefs);
-  throw fail(code, message, { viewerHint: { nearby: nearbyRefs(wanted, catalog.branches, catalog.tags), path: null } });
+  throw withHint(fail(code, message), { nearby: nearbyRefs(wanted, catalog.branches, catalog.tags), path: null });
 }
 
 function resolveRef(listedRefs: { refs: Map<string, RefRec>; head: string | null }, ref: string | null): { name: string; commit: string } {
@@ -249,8 +254,22 @@ function historyOf(first: CommitInfo, held: Map<string, Held> | null): { log: Co
   return { log, logStopped: false };
 }
 
+/**
+ * Branches and every tag (for the picker). A repository whose tags alone pass maxRefs (or the ls-refs byte cap) still
+ * opens: one more ls-refs lists branches and the asked-for name only, and the picker shows no tags.
+ */
+export async function listPageRefs(transport: GitTransport, ref: string | null): Promise<{ refs: Map<string, RefRec>; head: string | null }> {
+  try {
+    return await listRefs(transport, refPrefixes(ref));
+  } catch (err) {
+    const e = err as { code?: string; what?: string; message?: string };
+    if (e?.code !== 'limit_exceeded' || !/^ls-refs /.test(String(e.what ?? e.message ?? ''))) throw err;
+    return await listRefs(transport, refPrefixes(ref, false));
+  }
+}
+
 async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { kind: 'repo' }>, server: ServerInfo, quirks: Quirks, budget: Budget, tracer: ViewerTracer): Promise<Loaded> {
-  const listedRefs = await listRefs(transport, refPrefixes(route.ref));
+  const listedRefs = await listPageRefs(transport, route.ref);
   const resolved = resolveRef(listedRefs, route.ref);
   const catalog = refCatalog(listedRefs);
   // Raw bytes need no history: read the commit alone. Every page reads the window (it replaces the commit read).
@@ -273,10 +292,10 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
     if (entries.length > VIEWER_GIT_LIMITS.maxTreeEntries) throw limitError('tree entries', entries.length, VIEWER_GIT_LIMITS.maxTreeEntries);
     const entry = entries.find((item: { name: string }) => item.name === name);
     const existingPath = comps.slice(0, depth).join('/');
-    if (!entry) throw fail('not_found', `path component ${name} not found`, { viewerHint: { nearby: [], path: { missing: name, existingPath, notDirectory: false } } });
+    if (!entry) throw withHint(fail('not_found', `path component ${name} not found`), { nearby: [], path: { missing: name, existingPath, notDirectory: false } });
     const last = depth === comps.length - 1;
     if (!last) {
-      if (entry.mode !== '40000') throw fail('not_found', `${name} is not a directory`, { viewerHint: { nearby: [], path: { missing: name, existingPath, notDirectory: true } } });
+      if (entry.mode !== '40000') throw withHint(fail('not_found', `${name} is not a directory`), { nearby: [], path: { missing: name, existingPath, notDirectory: true } });
       treeOid = entry.oid;
       continue;
     }

@@ -9,7 +9,10 @@
 // browser that cached an old unversioned sheet does. A hashed href never hits it, so the run must still pass.
 //
 // usage: node scripts/visual-smoke.mjs [base=https://ply.ivar.workers.dev] [outdir=<tmp>] [-- url ...]
-// env:   CHROME (default: macOS Google Chrome), STALE_CSS, STALE_CSS_URL
+// env:   CHROME (default: macOS Google Chrome), STALE_CSS, STALE_CSS_URL,
+//        PLY_VERSION=<version id>: every request carries Cloudflare-Workers-Version-Overrides: ply="<id>" (a 0% canary).
+// The last line lists every x-ply-request-id the Worker answered with; with PLY_VERSION, a response from another version
+// (x-ply-version) fails the run.
 // Run after every deploy, next to `node src/smoke.mjs <base> gate`.
 import { spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
@@ -25,7 +28,7 @@ const PUBLIC = '5ad2236b39de4c8bd8f6270ea63f3ea9.artifacts.cloudflare.net/git/pu
 const urls = dash !== -1 ? args.slice(dash + 1) : [
   `${base}/view`,
   `${base}/r/ply`,
-  `${base}/view/${PUBLIC}/ply.git?path=src/fetchpack.js`,
+  `${base}/view/${PUBLIC}/ply.git?path=src/fetchpack.ts`,
 ];
 const CHROME = process.env.CHROME ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const stale = process.env.STALE_CSS ? readFileSync(process.env.STALE_CSS).toString('base64') : null;
@@ -55,6 +58,15 @@ const once = name => new Promise(r => { const h = m => { if (m.method === name) 
 
 await send('Page.enable'); await send('Runtime.enable'); await send('Network.enable');
 await send('Network.setCacheDisabled', { cacheDisabled: true });
+const VERSION = process.env.PLY_VERSION ?? '';
+if (VERSION) await send('Network.setExtraHTTPHeaders', { headers: { 'Cloudflare-Workers-Version-Overrides': `ply="${VERSION}"` } });
+const requestIds = []; const wrongVersion = [];
+handlers.push(m => {
+  if (m.method !== 'Network.responseReceived') return;
+  const h = Object.fromEntries(Object.entries(m.params.response.headers ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
+  if (h['x-ply-request-id']) requestIds.push(h['x-ply-request-id']);
+  if (VERSION && h['x-ply-request-id'] && h['x-ply-version'] !== VERSION) wrongVersion.push(`${m.params.response.url} → ${h['x-ply-version']}`);
+});
 const cssRequested = new Set(); const staleServed = new Set();
 await send('Fetch.enable', { patterns: [{ urlPattern: '*.css*', requestStage: 'Request' }] });
 handlers.push(m => {
@@ -100,6 +112,7 @@ for (const url of urls) for (const [w, h, mobile] of [[375, 812, true], [1280, 8
   if (problems.length) failed = true;
   console.log(JSON.stringify({ ok: !problems.length, url, w, scheme, problems, shot: join(outdir, name), maxSvgPx: r.maxSvgPx, iconPx: r.iconPx, overflowPx: r.overflowPx, rows: r.rows, sheets: r.sheets }));
 }
-console.log(JSON.stringify({ cssRequested: [...cssRequested], staleCss: stale ? { url: staleUrl, servedFor: [...staleServed] } : null, failed }));
+if (wrongVersion.length) failed = true;
+console.log(JSON.stringify({ cssRequested: [...cssRequested], staleCss: stale ? { url: staleUrl, servedFor: [...staleServed] } : null, version: VERSION || null, requestIds, wrongVersion, failed }));
 ws.close(); chrome.kill();
 process.exit(failed ? 1 : 0);
