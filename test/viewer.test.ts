@@ -29,7 +29,6 @@ import { repoIdentity } from '../src/viewer/identity.ts';
 import { PUBLIC_GIT_HOST } from '../src/public.ts';
 import { matchAbbreviatedOid, MIN_ABBREV_HEX } from '../src/abbrev.ts';
 import { describeFailure } from '../src/viewer/failure.ts';
-import { JSON_PINNED_REF_CACHE, jsonCacheControl } from '../src/json-cache.ts';
 import { compareTagNames, tagsFromRefs } from '../src/viewer/tags.ts';
 import { plyBuildValue } from '../src/version.ts';
 import { LAYOUT } from '../src/viewer/layout.ts';
@@ -185,9 +184,6 @@ test('abbreviated oids, failure copy, tag order, cache headers, and version text
   const badPath = describeFailure({ code: 'not_found', status: 404, message: 'path component missing not found', host: 'github.com', repoPath: 'o/r', ref: 'main', path: 'src/missing' });
   assert.equal(badPath.part, 'path');
   assert.match(badPath.summary, /No path src\/missing in o\/r/);
-  assert.equal(jsonCacheControl(200, oid), JSON_PINNED_REF_CACHE);
-  assert.equal(jsonCacheControl(200, 'main'), 'no-store');
-  assert.equal(jsonCacheControl(404, oid), 'no-store');
   assert.ok(compareTagNames('refs/tags/v2.0.0', 'refs/tags/v1.9.0') < 0);
   assert.deepEqual(tagsFromRefs(refs, 10).tags.map(tag => tag.name), ['refs/tags/v1']);
   assert.match(plyBuildValue('a'.repeat(40), 'b'.repeat(40)), /^ply=[0-9a-f]{40} ply-web=[0-9a-f]{40}$/);

@@ -218,20 +218,23 @@ test('GET /v1/commit equals git log / cat-file (HEAD, short, full, tag, oid, mer
   assert.equal(shortRes.status, 200, JSON.stringify(shortBody));
   assert.equal(shortBody.oid, side);
   assert.equal(shortRes.headers.get('cache-control'), 'no-store', 'an abbreviated oid is not a full oid');
-  const pinnedRes = await W(`/v1/commit?${qs({ remote: r.remote, ref: side })}`);
-  assert.equal(pinnedRes.status, 200);
-  assert.equal(pinnedRes.headers.get('cache-control'), 'private, max-age=60');
-  assert.equal(pinnedRes.headers.get('vary'), 'authorization, git-token, git-authorization', 'a browser must not answer another credential from this entry');
-  await pinnedRes.json();
-  // refs and discover ignore ref=, so a full oid there neither caches a moving answer nor costs an abbrev ls-refs
+  // /v1 is a credentialed API: every response is no-store with no Vary, even tree/read/commit at a full oid (an
+  // immutable answer), errors included
+  for (const [path, extra] of [['/v1/commit', {}], ['/v1/tree', {}], ['/v1/read', { path: 's.txt' }], ['/v1/read', { path: 's.txt', trace: '1' }], ['/v1/refs', {}], ['/v1/discover', {}], ['/v1/read', { path: 'no-such-file' }], ['/v1/commit', { ref: 'f'.repeat(40) }]]) {
+    const res = await W(`${path}?${qs({ remote: r.remote, ref: side, ...extra })}`); await res.arrayBuffer();
+    const what = `${path} ${JSON.stringify(extra)} → ${res.status}`;
+    if (!extra.ref && extra.path !== 'no-such-file') assert.equal(res.status, 200, what);
+    assert.equal(res.headers.get('cache-control'), 'no-store', what); assert.equal(res.headers.get('vary'), null, what);
+  }
+  const noAuth = await W(`/v1/read?${qs({ remote: r.remote, ref: side, path: 's.txt' })}`, { auth: false }); await noAuth.arrayBuffer();
+  assert.equal(noAuth.status, 401); assert.equal(noAuth.headers.get('cache-control'), 'no-store');
+  // refs and discover ignore ref=, so an abbreviated oid there does not cost them an abbrev ls-refs
   for (const path of ['/v1/refs', '/v1/discover']) {
-    const res = await W(`${path}?${qs({ remote: r.remote, ref: side })}`); await res.arrayBuffer();
-    assert.equal(res.status, 200, path); assert.equal(res.headers.get('cache-control'), 'no-store', path);
     const abbrev = await W(`${path}?${qs({ remote: r.remote, ref: 'abcdef1' })}`); await abbrev.arrayBuffer();
     assert.equal(abbrev.status, 200, `${path} ignores an abbreviated ref`);
   }
   const failRes = await W(`/v1/commit?${qs({ remote: r.remote, ref: 'f'.repeat(40) })}`); await failRes.arrayBuffer();
-  assert.equal(failRes.headers.get('cache-control'), 'no-store', 'only a 200 is storable');
+  assert.equal(failRes.headers.get('cache-control'), 'no-store', 'an error is no-store');
   const noneRes = await W(`/v1/commit?${qs({ remote: r.remote, ref: 'abcdef1' })}`);
   const noneBody = await noneRes.json();
   assert.equal(noneRes.status, 400, JSON.stringify(noneBody));

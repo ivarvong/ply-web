@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CACHE_VERSION } from '../src/cache-version.ts';
-import { IMMUTABLE, asPinned, isInternal, pinnedV1Key, pinnedViewKey, requestForKey } from '../src/pinned.ts';
+import { IMMUTABLE, asPinned, isInternal, pinnedViewKey, requestForKey } from '../src/pinned.ts';
 import { PUBLIC_GIT_HOST, PUBLIC_GIT_ORIGIN } from '../src/public.ts';
 
 const OID = 'c2ccba2c554e8a18ac438cfbc53725d4b593811b';
@@ -11,24 +11,6 @@ const REMOTE = `${PUBLIC_GIT_ORIGIN}/git/public-v0/ply.git`;
 const u = (s: string) => new URL(s, 'https://ply.ivar.workers.dev');
 const q = (o: Record<string, string>) => new URLSearchParams(o).toString();
 const anyPublic = () => true;
-
-test('pinnedV1Key: only tree/read/commit, a 40-hex ref, a public-v0 remote, known params; canonical (sorted) key', () => {
-  const k = pinnedV1Key(u(`/v1/read?${q({ path: 'README.md', ref: OID, remote: REMOTE })}`), 'GET');
-  assert.equal(k, `/v${CACHE_VERSION}/pinned/v1/read?${q({ remote: REMOTE, ref: OID, path: 'README.md' })}`);
-  assert.equal(pinnedV1Key(u(`/v1/read?${q({ remote: REMOTE, ref: OID, path: 'README.md' })}`), 'GET'), k, 'parameter order does not matter');
-  for (const [path, params] of [
-    ['/v1/read', { remote: REMOTE, ref: 'main', path: 'README.md' }],
-    ['/v1/read', { remote: REMOTE, path: 'README.md' }],
-    ['/v1/read', { remote: REMOTE, ref: OID.toUpperCase(), path: 'README.md' }],
-    ['/v1/read', { remote: REMOTE, ref: OID, path: 'README.md', trace: '1' }],
-    ['/v1/read', { remote: `${PUBLIC_GIT_ORIGIN}/git/default/ply.git`, ref: OID, path: 'README.md' }],
-    ['/v1/read', { remote: 'https://github.com/ivarvong/ply.git', ref: OID, path: 'README.md' }],
-    ['/v1/refs', { remote: REMOTE, ref: OID }],
-    ['/v1/discover', { remote: REMOTE, ref: OID }],
-  ] as const) assert.equal(pinnedV1Key(u(`${path}?${q(params as Record<string, string>)}`), 'GET'), null, `${path} ${JSON.stringify(params)}`);
-  assert.equal(pinnedV1Key(u(`/v1/read?remote=${encodeURIComponent(REMOTE)}&ref=${OID}&ref=${OID}&path=x`), 'GET'), null, 'a repeated param');
-  assert.equal(pinnedV1Key(u(`/v1/read?${q({ remote: REMOTE, ref: OID, path: 'x' })}`), 'POST'), null);
-});
 
 test('pinnedViewKey: raw files at a pinned commit on a public repo only', () => {
   const view = `/view/${PUBLIC_GIT_HOST}/git/public-v0/ply.git`;
@@ -44,14 +26,16 @@ test('pinnedViewKey: raw files at a pinned commit on a public repo only', () => 
 });
 
 test('requestForKey: Pinned accepts only canonical keys it would issue, and marks the request internal', () => {
-  const k = pinnedV1Key(u(`/v1/tree?${q({ remote: REMOTE, ref: OID, path: 'src' })}`), 'GET') as string;
+  const k = pinnedViewKey(u(`/r/ply?${q({ raw: '1', ref: OID, path: 'src/a.js' })}`), 'GET', anyPublic) as string;
   const r = requestForKey(k, anyPublic);
   assert.ok(r);
   assert.equal(isInternal(r as Request), true);
-  assert.equal(new URL((r as Request).url).pathname, '/v1/tree');
+  assert.equal(new URL((r as Request).url).pathname, '/r/ply');
   assert.equal([...(r as Request).headers].length, 0, 'no header, so no credential, reaches the handler');
   assert.equal(isInternal(new Request((r as Request).url)), false, 'a copy is not internal');
-  for (const bad of [k.replace(`/v${CACHE_VERSION}/`, `/v${CACHE_VERSION + 1}/`), k.replace('ref=', 'zzz=').replace('zzz=', 'ref=') + '&x=1', `/v${CACHE_VERSION}/pinned/v1/tree?ref=${OID}&remote=${encodeURIComponent(REMOTE)}&path=src`, `/v${CACHE_VERSION}/pinned/v1/refs?${q({ remote: REMOTE })}`, '/v1/tree']) {
+  // /v1 is never cached whole (every /v1 response is no-store): a /v1 key, even a canonical full-oid public one, is refused
+  const v1 = (path: string) => `/v${CACHE_VERSION}/pinned${path}?${q({ remote: REMOTE, ref: OID, path: 'src' })}`;
+  for (const bad of [k.replace(`/v${CACHE_VERSION}/`, `/v${CACHE_VERSION + 1}/`), k + '&x=1', `/v${CACHE_VERSION}/pinned/r/ply?path=src/a.js&raw=1&ref=${OID}`, v1('/v1/tree'), v1('/v1/read'), v1('/v1/commit'), `/v${CACHE_VERSION}/pinned/v1/refs?${q({ remote: REMOTE })}`, '/v1/tree']) {
     assert.equal(requestForKey(bad, anyPublic), null, bad);
   }
 });

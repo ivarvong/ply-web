@@ -211,18 +211,19 @@ test('Workers Cache routing: anonymous public reads reach upstream through GitCa
   for (const h of since(i)) { assert.equal(h.via, 'gitcache'); assert.equal(h.auth, `Bearer ${TOKEN}`); }
 });
 
-test('pinned to a commit: /v1 reads and viewer raw files go through Pinned (cached whole); ref-relative, traced and bearer reads do not', { skip }, async () => {
+test('pinned to a commit: viewer raw files go through Pinned (cached whole); /v1 never does and is always no-store', { skip }, async () => {
   const head = plyRepo.head;
+  // /v1 is a credentialed API: a public-v0 read at a full oid, with no credential, is still answered live and no-store
+  for (const path of [`/v1/read?${q({ remote: remote('ply'), ref: head, path: 'README.md' })}`, `/v1/tree?${q({ path: 'src', ref: head, remote: remote('ply') })}`, `/v1/commit?${q({ ref: head, remote: remote('ply') })}`]) {
+    const r = await W(path, { ip: '198.51.100.40' });
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.headers.get('x-ply-pinned-cache'), null, `${path} is not served by Pinned`);
+    assert.equal(r.headers.get('cache-control'), 'no-store', path);
+    assert.equal(r.headers.get('vary'), null, path);
+  }
   const read = await W(`/v1/read?${q({ remote: remote('ply'), ref: head, path: 'README.md' })}`, { ip: '198.51.100.40' });
-  assert.equal(read.status, 200, read.text);
   assert.deepEqual(read.buf, gitBuf(plyRepo.bare, ['show', `${head}:README.md`]));
-  assert.ok(read.headers.get('x-ply-pinned-cache'), 'served by Pinned');
   assert.equal(read.headers.get('x-ply-commit'), head);
-  assert.ok(read.headers.get('x-ply-request-id'), 'the front door still stamps its own request id');
-  const tree = await W(`/v1/tree?${q({ path: 'src', ref: head, remote: remote('ply') })}`, { ip: '198.51.100.40' });
-  assert.equal(tree.status, 200);
-  assert.ok(tree.headers.get('x-ply-pinned-cache'));
-  assert.deepEqual(tree.json().entries.map(e => e.name), ['a.js']);
   const raw = await W(publicView('ply', `?raw=1&ref=${head}&path=README.md`), { ip: '198.51.100.40' });
   assert.equal(raw.status, 200);
   assert.ok(raw.headers.get('x-ply-pinned-cache'));
@@ -237,7 +238,7 @@ test('pinned to a commit: /v1 reads and viewer raw files go through Pinned (cach
     assert.equal(r.status, 200, path);
     assert.equal(r.headers.get('x-ply-pinned-cache'), null, path);
   }
-  // the front door still rate-limits pinned requests (tight service: 3 per minute)
+  // the front door rate-limits public reads, pinned or not (tight service: 3 per minute)
   const ip = '203.0.113.90';
   for (let i = 0; i < 3; i++) assert.equal((await W(`/v1/read?${q({ remote: remote('ply'), ref: head, path: 'README.md' })}`, { port: PORT_TIGHT, ip })).status, 200);
   assert.equal((await W(`/v1/read?${q({ remote: remote('ply'), ref: head, path: 'README.md' })}`, { port: PORT_TIGHT, ip })).status, 429);
