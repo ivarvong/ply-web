@@ -90,7 +90,8 @@ if (phase === 'read') {
     try { return sameCommit(json, gitCommitView(SEED, json.oid)); } catch { return `commit ${json.oid} not in the seeded clone to compare`; }
   } });
   await call('Artifacts scratch commit ref=no-such-branch → 404', 'GET', '/v1/commit' + q({ remote: art, ref: 'no-such-branch' }), { headers: artH('token'), expect: 404, check: ({ json }) => json.code === 'not_found' || json.code });
-  await call('Artifacts scratch read src/ (dir) → 404', 'GET', '/v1/read' + q({ remote: art, path: 'src' }), { headers: artH('token'), expect: 404 });
+  // #29: a directory is 400 bad_request pointing at /v1/tree, not 404.
+  await call('Artifacts scratch read src/ (dir) → 400 bad_request', 'GET', '/v1/read' + q({ remote: art, path: 'src' }), { headers: artH('token'), expect: 400, check: ({ json }) => (json?.code === 'bad_request' && /GET \/v1\/tree/.test(json?.message ?? '')) || `code=${json?.code}` });
   await call('Artifacts scratch wrong credential → 401/403', 'GET', '/v1/refs' + q({ remote: art }), { headers: { 'git-token': 'art_v1_' + 'x'.repeat(40) }, expect: [401, 403], check: ({ json }) => ({ info: `upstreamStatus=${json.upstreamStatus}` }) });
   await call('Artifacts scratch no credential → 401', 'GET', '/v1/refs' + q({ remote: art }), { expect: 401 });
   await call('Artifacts discover', 'GET', '/v1/discover' + q({ remote: art }), { headers: artH('token'), expect: 200, check: ({ json }) => ({ info: `agent=${json.agent} fetch=${json.fetch.join(' ')}` }) });
