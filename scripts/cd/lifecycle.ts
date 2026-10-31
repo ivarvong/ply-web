@@ -299,7 +299,7 @@ export function lifecycle(): readonly HttpStep[] {
       method: 'POST',
       path: '/v1/revert',
       body: saved => ({ ref: 'rwide', commit: saved.picked, committer: author(T + 340) }),
-      expect: { kind: 'code', status: 409, code: 'merge_conflict' },
+      expect: { kind: 'outcome', status: 200, outcome: 'revert' },
       ray: 'required',
     },
     {

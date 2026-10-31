@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { parseArgs } from '../scripts/cd/main.ts'
+import { noBumpSha, parseArgs } from '../scripts/cd/main.ts'
 import { nextPhase, pipelineStart, type PhaseOutcome, type PipelineState } from '../scripts/cd/pipeline-plan.ts'
 
 function run(state: PipelineState, outcome: PhaseOutcome) {
@@ -50,7 +50,14 @@ test('usage and a bad version exit as argument errors', () => {
   assert.deepEqual(parseArgs(['--sha', sha]), { kind: 'cd', sha, noBump: false })
   assert.deepEqual(parseArgs(['--no-bump']), { kind: 'cd', sha: null, noBump: true })
   assert.deepEqual(parseArgs(['cd', '--no-bump']), { kind: 'cd', sha: null, noBump: true })
+  assert.deepEqual(parseArgs(['--no-bump', '--sha', sha], sha), { kind: 'cd', sha, noBump: true })
+  assert.deepEqual(parseArgs(['--sha', sha, '--no-bump'], sha), { kind: 'cd', sha, noBump: true })
+  assert.equal(parseArgs(['cd', '--sha', sha, '--no-bump'], sha).kind, 'cd')
+  const other = 'a'.repeat(40)
   assert.equal(parseArgs(['--no-bump', '--sha', sha]).kind, 'error')
+  assert.equal(parseArgs(['--no-bump', '--sha', sha], other).kind, 'error')
+  assert.equal(noBumpSha(sha, other), '--no-bump deploys the checkout; --sha must equal the current pin')
+  assert.equal(noBumpSha(sha, sha), null)
   assert.equal(parseArgs(['smoke']).kind, 'error')
   const version = '8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e'
   assert.deepEqual(parseArgs(['smoke', '--version', version]), { kind: 'smoke', version, expectVersion: null })
