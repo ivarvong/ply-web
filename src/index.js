@@ -29,6 +29,10 @@ import { applySecurityHeaders } from './security-headers.ts';
 import { quirksFor } from './quirks.ts';
 import { createLoopbackFetch } from './gitcache.ts';
 import { syncAll } from './mirror.ts';
+import { WorkerEntrypoint } from 'cloudflare:workers';
+import { asPinned, isInternal, pinnedV1Key, pinnedViewKey, requestForKey, viaPinned } from './pinned.ts';
+import { parseViewerRoute, routeOptsFromEnv } from './viewer/route.ts';
+import { ALLOWED_HOSTS } from './viewer/url.ts';
 import { viewerErrorDocument } from './viewer/safehtml.ts';
 import { admitClient } from './viewer/app.tsx';
 import { viewerHref } from './viewer/url.ts';
@@ -301,7 +305,14 @@ const WRITES = {
   },
 };
 
-export default {
+// A viewer URL whose repo is public by construction: public-v0 or a built-in forge (never a VIEWER_EXTRA_HOSTS host).
+const PINNABLE_HOSTS = new Set([...ALLOWED_HOSTS, PUBLIC_GIT_HOST]);
+const isPublicViewLoc = env => url => {
+  try { const r = parseViewerRoute(url, routeOptsFromEnv(env)); return r.kind === 'repo' && !r.pack && PINNABLE_HOSTS.has(r.loc.host); } catch { return false; }
+};
+const pinnedBinding = (env, ctx) => (env.PACK_CACHE === 'off' ? null : ctx?.exports?.Pinned ?? null);
+
+const worker = {
   // Cron (cloudflare.config.ts): keep the public-v0 mirrors on their GitHub branch (src/mirror.ts). One log line per mirror.
   async scheduled(controller, env, ctx) {
     if (env.MIRROR_SYNC !== 'on' || !env.PUBLIC_REPOS) return;
@@ -333,8 +344,18 @@ export default {
     // Public viewer. Before the token gate, and it never reads Authorization / Git-Token / Cookie.
     if (url.pathname === '/view.css' || url.pathname === '/view' || url.pathname.startsWith('/view/')) {
       if (url.pathname.includes('@') || url.pathname.toLowerCase().includes('%40')) record.path = '/view/redacted';
+      // A raw file at a pinned commit is cached whole (src/pinned.ts): rate-limit here, then ask Pinned.
+      const pinKey = isInternal(req) ? null : pinnedViewKey(url, req.method, isPublicViewLoc(env));
+      const pin = pinKey ? pinnedBinding(env, ctx) : null;
+      if (pinKey && pin) {
+        const decision = await admitClient(req, env, 'page', Date.now());
+        if (decision === 'unconfigured' || decision === 'unavailable') return done(new Response('rate limiter unavailable\n', { status: 503, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } }), { viewer: 1 });
+        if (!decision.ok) { const ra = String(Math.max(1, Math.ceil(decision.retryAfterMs / MS_PER_SECOND))); return done(new Response(`Too many viewer requests. Retry after ${ra}s.\n`, { status: 429, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'retry-after': ra } }), { viewer: 1, code: 'rate_limited' }); }
+        const res = await viaPinned(pin, pinKey);
+        return done(await scrubResponse(res, publicScrub), { viewer: 1, pinned: res.headers.get('x-ply-pinned-cache') ?? '' });
+      }
       try {
-        const res = await handleViewer(req, env, ctx, { requestId: id, note: extra => Object.assign(record, extra) });
+        const res = await handleViewer(req, env, ctx, { requestId: id, note: extra => Object.assign(record, extra), skipRate: isInternal(req) });
         return done(await scrubResponse(res, publicScrub), { viewer: 1 });
       } catch (e) {
         const code = isPlyCode(e?.code) ? e.code : 'internal';
@@ -350,11 +371,19 @@ export default {
     if (publicRead) {
       record.public = 1;
       if (req.headers.has('git-token') || req.headers.has('git-authorization')) return done(json(400, { code: 'bad_request', message: `the ${PUBLIC_NAMESPACE} namespace is read without git credentials; send none, or send Authorization: Bearer <PLY_TOKEN>`, retry: 'no' }, scrub));
-      const decision = await admitClient(req, env, 'page', Date.now());
+      // An internal request (Pinned filling the cache) was rate-limited at the front door already.
+      const decision = isInternal(req) ? { ok: true, retryAfterMs: 0 } : await admitClient(req, env, 'page', Date.now());
       if (decision === 'unconfigured' || decision === 'unavailable') return done(json(503, { code: 'unavailable', message: 'the rate limiter is unavailable', retry: 'yes' }, scrub));
       if (!decision.ok) {
         const retryAfter = String(Math.max(1, Math.ceil(decision.retryAfterMs / MS_PER_SECOND)));
         return done(json(429, { code: 'rate_limited', message: `too many requests; retry after ${retryAfter}s`, retry: 'yes' }, scrub, { 'retry-after': retryAfter }));
+      }
+      // A read pinned to a commit oid (no trace) is cached whole (src/pinned.ts).
+      const pinKey = isInternal(req) ? null : pinnedV1Key(url, req.method);
+      const pin = pinKey ? pinnedBinding(env, ctx) : null;
+      if (pinKey && pin) {
+        const res = await viaPinned(pin, pinKey);
+        return done(await scrubResponse(res, publicScrub), { pinned: res.headers.get('x-ply-pinned-cache') ?? '' });
       }
     } else {
       // gate
@@ -402,3 +431,18 @@ export default {
     }
   },
 };
+
+export default worker;
+
+/**
+ * Cache-enabled (cloudflare.config.ts). Rebuilds the public request from the key alone, runs the same handler, and
+ * labels the answer immutable when it is a 200 (src/pinned.ts). Reached only over ctx.exports from the front door.
+ */
+export class Pinned extends WorkerEntrypoint {
+  async fetch(req) {
+    const u = new URL(req.url);
+    const internal = requestForKey(`${u.pathname}${u.search}`, isPublicViewLoc(this.env));
+    if (!internal) return new Response('not a pinned key\n', { status: 404, headers: { 'cache-control': 'no-store' } });
+    return asPinned(await worker.fetch(internal, this.env, this.ctx));
+  }
+}

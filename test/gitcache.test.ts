@@ -176,7 +176,7 @@ test('guardrails: no Cache API in src/, and only src/gitcache.ts calls the GitCa
   for (const f of files(src).filter(f => /\.(ts|tsx|js|mjs)$/.test(f))) {
     const text = readFileSync(f, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
     assert.equal(/\bcaches\s*\.|cachingFetch|caches\.default/.test(text), false, `${f} uses the Cache API`);
-    if (!f.endsWith('gitcache.ts')) assert.equal(/GitCache\??\.fetch\s*\(|binding\.fetch\s*\(/.test(text), false, `${f} calls the GitCache binding directly`);
+    if (!f.endsWith('gitcache.ts') && !f.endsWith('pinned.ts')) assert.equal(/GitCache\??\.fetch\s*\(|binding\.fetch\s*\(/.test(text), false, `${f} calls the GitCache binding directly`);
     if (/\.exports\??\.GitCache/.test(text)) assert.ok(/createLoopbackFetch/.test(text), `${f} reads ctx.exports.GitCache but not through createLoopbackFetch`);
   }
 });

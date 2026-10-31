@@ -69,6 +69,7 @@ function routeError(call: ViewerCall, err: unknown): Response {
 }
 
 async function rateGate(req: Request, env: ViewerEnv, call: ViewerCall, route: Extract<ViewerRoute, { kind: 'repo' }> | { kind: 'home' } | { kind: 'redirect' }): Promise<Response | null> {
+  if (call.opts.skipRate) return null
   const bucket: RateBucket = route.kind === 'repo' && route.pack ? 'pack' : 'page'
   const decision = await admitClient(req, env, bucket, call.now)
   if (decision === 'unconfigured' || decision === 'unavailable') {

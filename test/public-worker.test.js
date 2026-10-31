@@ -199,6 +199,39 @@ test('Workers Cache routing: anonymous public reads reach upstream through GitCa
   for (const h of since(i)) { assert.equal(h.via, 'gitcache'); assert.equal(h.auth, `Bearer ${TOKEN}`); }
 });
 
+test('pinned to a commit: /v1 reads and viewer raw files go through Pinned (cached whole); ref-relative, traced and bearer reads do not', { skip }, async () => {
+  const head = plyRepo.head;
+  const read = await W(`/v1/read?${q({ remote: remote('ply'), ref: head, path: 'README.md' })}`, { ip: '198.51.100.40' });
+  assert.equal(read.status, 200, read.text);
+  assert.deepEqual(read.buf, gitBuf(plyRepo.bare, ['show', `${head}:README.md`]));
+  assert.ok(read.headers.get('x-ply-pinned-cache'), 'served by Pinned');
+  assert.equal(read.headers.get('x-ply-commit'), head);
+  assert.ok(read.headers.get('x-ply-request-id'), 'the front door still stamps its own request id');
+  const tree = await W(`/v1/tree?${q({ path: 'src', ref: head, remote: remote('ply') })}`, { ip: '198.51.100.40' });
+  assert.equal(tree.status, 200);
+  assert.ok(tree.headers.get('x-ply-pinned-cache'));
+  assert.deepEqual(tree.json().entries.map(e => e.name), ['a.js']);
+  const raw = await W(publicView('ply', `?raw=1&ref=${head}&path=README.md`), { ip: '198.51.100.40' });
+  assert.equal(raw.status, 200);
+  assert.ok(raw.headers.get('x-ply-pinned-cache'));
+  assert.deepEqual(raw.buf, gitBuf(plyRepo.bare, ['show', `${head}:README.md`]));
+  for (const [path, headers] of [
+    [`/v1/read?${q({ remote: remote('ply'), ref: 'main', path: 'README.md' })}`, {}],
+    [`/v1/read?${q({ remote: remote('ply'), ref: head, path: 'README.md', trace: '1' })}`, {}],
+    [`/v1/read?${q({ remote: remote('ply'), ref: head, path: 'README.md' })}`, bearer],
+    [publicView('ply', `?ref=${head}&path=README.md`), {}],
+  ]) {
+    const r = await W(path, { headers, ip: '198.51.100.41' });
+    assert.equal(r.status, 200, path);
+    assert.equal(r.headers.get('x-ply-pinned-cache'), null, path);
+  }
+  // the front door still rate-limits pinned requests (tight service: 3 per minute)
+  const ip = '203.0.113.90';
+  for (let i = 0; i < 3; i++) assert.equal((await W(`/v1/read?${q({ remote: remote('ply'), ref: head, path: 'README.md' })}`, { port: PORT_TIGHT, ip })).status, 200);
+  assert.equal((await W(`/v1/read?${q({ remote: remote('ply'), ref: head, path: 'README.md' })}`, { port: PORT_TIGHT, ip })).status, 429);
+  assert.equal((await W(publicView('ply', `?raw=1&ref=${head}&path=README.md`), { port: PORT_TIGHT, ip })).status, 429);
+});
+
 test('/r/<repo> redirects to the canonical viewer URL; bad names are 404 with no fetch; the home page lists the namespace', { skip }, async () => {
   const i = mark();
   const r = await W('/r/ply');
