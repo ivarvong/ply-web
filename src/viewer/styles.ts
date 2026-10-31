@@ -146,7 +146,7 @@ summary::-webkit-details-marker { display: none; }
 
 /* repository header */
 .repo-head { display: flex; align-items: flex-end; justify-content: space-between; gap: ${S.md}; min-width: 0; }
-${phone} { .repo-head { flex-wrap: wrap; align-items: flex-start; } .repo-tools { flex: 1 1 auto; min-width: 0; } .ref-pop { left: 0; right: auto; } }
+${phone} { .repo-head { flex-wrap: wrap; align-items: flex-start; } .repo-tools { flex: 1 1 auto; min-width: 0; } }
 .repo-id { min-width: 0; flex: 1 1 auto; }
 .repo-scope { margin: 0 0 2px; font-size: var(--text-sm); color: var(--text-color-kumo-subtle); display: flex; flex-wrap: wrap; gap: ${S.xs}; }
 .repo-host { color: var(--text-color-kumo-subtle); }
@@ -168,6 +168,7 @@ ${phone} { .repo-head { flex-wrap: wrap; align-items: flex-start; } .repo-tools 
 .ref-label { font-size: var(--text-xs); font-weight: 500; color: var(--text-color-kumo-subtle); }
 .ref-field { width: 100%; height: 34px; font-size: var(--text-base); }
 .ref-go { margin-top: ${S.xs}; height: 34px; width: 100%; }
+${phone} { .repo-head { position: relative; } .refbox { position: static; } .ref-pop { left: 0; right: 0; width: auto; } }
 .crumbs { margin-top: -${S.xs}; height: auto; min-height: 28px; flex-wrap: wrap; white-space: normal; row-gap: 2px; font-size: var(--text-sm); }
 .crumbs .crumb { color: var(--text-color-kumo-link); }
 .crumbs .sep { padding-inline: 4px; }

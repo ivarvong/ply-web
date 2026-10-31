@@ -194,6 +194,7 @@ test('abbreviated oids, failure copy, tag order, cache headers, and version text
   assert.match(VIEWER_CSS, new RegExp(`font-size: ${LAYOUT.codeFontPx}px`));
   assert.match(VIEWER_CSS, new RegExp(`font-size: ${LAYOUT.monoFontPx}px`));
   assert.match(VIEWER_CSS, /scrollbar-width: thin/);
+  assert.match(VIEWER_CSS, /\.refbox \{ position: static; \} \.ref-pop \{ left: 0; right: 0; width: auto; \}/);
   const trace: TraceModel = { bars: [], totalMs: 0, cfRay: '', requestId: '' };
   const page = renderLoaded(treeFixture({ message: 'Subject line\n\nBody that should span the card.\n' }), trace);
   assert.match(String(page), /refs\/tags\/v1\.0\.0/);
