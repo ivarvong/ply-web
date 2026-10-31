@@ -31,8 +31,8 @@ log() { echo "== $(date -u +%T) $*"; }
 active() { cf workers deployments list --worker $W | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const v=JSON.parse(s).deployments[0].versions;console.log(v.length===1&&v[0].percentage===100?v[0].version_id:"")})'; }
 # route <id>:<pct> [<id>:<pct>]
 route() {
-  local body; body=$(node -e 'const vs=process.argv.slice(2).map(a=>{const [id,p]=a.split(":");return {version_id:id,percentage:Number(p)}});console.log(JSON.stringify({strategy:"percentage",versions:vs,annotations:{"workers/message":process.env.M.slice(0,100)}}))' "$@")
-  M="$MSG [git $SHA]" cf workers deployments create --worker $W --body "$body" >/dev/null
+  local body; body=$(node -e 'const [m,...a]=process.argv.slice(1);const vs=a.map(x=>{const [id,p]=x.split(":");return {version_id:id,percentage:Number(p)}});console.log(JSON.stringify({strategy:"percentage",versions:vs,annotations:{"workers/message":m.slice(0,100)}}))' "$MSG [git $SHA]" "$@")
+  cf workers deployments create --worker $W --body "$body" >/dev/null
 }
 smokes() {  # smokes <label> [version]: gate, read, write, visual; request ids → $OUT/<label>.ids
   local label=$1 v=${2:-} rc=0 ph
