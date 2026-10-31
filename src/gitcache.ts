@@ -35,6 +35,15 @@ export const IMMUTABLE = 'public, max-age=31536000, immutable';
 export const REFS_CACHE = `public, max-age=${REFS_MAX_AGE_S}, stale-while-revalidate=${REFS_SWR_S}`;
 export const DISCOVER_V2_CACHE = 'public, max-age=300, stale-while-revalidate=3600';
 export const NO_STORE = 'no-store';
+/**
+ * A server's refusal of a partial-clone filter (Artifacts: `400 … only blob:none is supported`) is a fact about that
+ * server, the same for every caller. Uncached, every fresh isolate paid it upstream, and Workers Caching does not
+ * collapse an uncacheable answer: 11 of 13 GitCache invocations in a burst of 20 concurrent cold requests were this 400
+ * (e021776d, 2026-10-31T02:01:45Z). Cached for an hour, so a server that adds the filter is seen within the hour.
+ */
+export const REFUSAL_CACHE = 'public, max-age=3600';
+// The text ply recognises as a filter refusal (fetch.js isFilterRejection).
+const FILTER_REFUSAL = /only blob:none is supported|unsupported (git )?fetch filter|filter .* not (supported|allowed)/i;
 
 /** The request body travels base64 in a header; a larger body (many wants) is not routed through the cache. */
 export const MAX_ROUTED_BODY = 4096;
@@ -226,8 +235,8 @@ export async function serveGitCache(req: Request, tokens: TokenSource | null, ct
   if (!ok) {
     // Not stored. An error body is small; scrub it with this isolate's tokens before it leaves (the caller scrubs too,
     // but may be another isolate that never saw this token).
-    out.set('cache-control', NO_STORE);
     const text = res.body ? (await res.text()).slice(0, MAX_ERROR_BODY) : '';
+    out.set('cache-control', kind === 'pack' && res.status === 400 && FILTER_REFUSAL.test(text) ? REFUSAL_CACHE : NO_STORE);
     return new Response(res.status >= 300 && res.status < 400 ? null : scrubSecrets(tokens?.secrets() ?? [])(text), { status: res.status, headers: out });
   }
   if (kind === 'pack') {

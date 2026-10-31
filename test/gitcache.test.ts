@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CACHE_VERSION } from '../src/cache-version.ts';
 import {
-  DISCOVER_V2_CACHE, IMMUTABLE, MAX_ROUTED_BODY, NO_STORE, REFS_CACHE, REFS_MAX_AGE_S, REFS_SWR_S, VIA_HEADER,
+  DISCOVER_V2_CACHE, IMMUTABLE, REFUSAL_CACHE, MAX_ROUTED_BODY, NO_STORE, REFS_CACHE, REFS_MAX_AGE_S, REFS_SWR_S, VIA_HEADER,
   cacheableUpstream, classify, createLoopbackFetch, keyHash, keyPath, serveGitCache, type LoopbackBinding,
 } from '../src/gitcache.ts';
 import { PUBLIC_GIT_ORIGIN, PUBLIC_NAMESPACE, type TokenSource } from '../src/public.ts';
@@ -235,4 +235,18 @@ test('serveGitCache: a token mint that fails maps to the status ply turns back i
   const down = await serveGitCache(await gcRequest('refs', `${PUB}/git-upload-pack`, LSREFS), mint('upstream_5xx'), {}, up);
   assert.equal(down.status, 502);
   assert.equal(down.headers.get('cache-control'), NO_STORE);
+});
+
+test('a filter refusal (400 only blob:none is supported) is cached for an hour; any other 400 is not', async () => {
+  const filterBody = enc(`${pkt('command=fetch\n')}0001${pkt(`want ${OID}\n`)}${pkt('filter tree:0\n')}${pkt('deepen 1\n')}${pkt('done\n')}0000`);
+  let text = 'git-upload-pack: Unsupported Git fetch filter; only blob:none is supported.';
+  const up = async () => new Response(text, { status: 400, headers: { 'content-type': 'text/plain' } });
+  const refused = await serveGitCache(await gcRequest('pack', `${PUB}/git-upload-pack`, filterBody), tokens(), {}, up);
+  assert.equal(refused.status, 400);
+  assert.equal(refused.headers.get('cache-control'), REFUSAL_CACHE);
+  assert.match(await refused.text(), /only blob:none is supported/, 'the body reaches ply, which learns the quirk from it');
+  text = 'bad request';
+  assert.equal((await serveGitCache(await gcRequest('pack', `${PUB}/git-upload-pack`, filterBody), tokens(), {}, up)).headers.get('cache-control'), NO_STORE);
+  text = 'only blob:none is supported';
+  assert.equal((await serveGitCache(await gcRequest('refs', `${PUB}/git-upload-pack`, LSREFS), tokens(), {}, up)).headers.get('cache-control'), NO_STORE, 'only a pack fetch refusal');
 });
