@@ -18,6 +18,7 @@ import { Tracer, arrayExporter, flattenLine } from 'ply';
 import { RETRY, isPlyCode, fail } from 'ply';
 import { withLimits } from 'ply';
 import { isWorkerCode, WORKER_RETRY } from './write/errors.ts';
+import { statusOf } from './status.ts';
 import { handleEdit, handleBranchCreate, handleBranchDelete, handleMerge, handleRebase, handleCherryPick, handleRevert, handleTagCreate, handleTagDelete, readCommitOrEmpty, unbornFields } from './write/handle.ts';
 import { handleViewer } from './viewer/handle.ts';
 import { checkRemote, createGuardedFetch } from './remote.ts';
@@ -71,15 +72,6 @@ const LIMITS = withLimits({
 });
 
 // Learned server properties per origin, shared with the viewer (src/quirks.ts).
-
-// HTTP status for each ply error code (see README.md).
-export const STATUS = Object.freeze({
-  bad_request: 400, unsupported: 501, network: 502, timeout: 504, aborted: 499, http: 502, auth: 401, not_found: 404,
-  rate_limited: 429, upstream_5xx: 502, not_git: 502, ssh: 502, host_key_mismatch: 502, protocol: 502, pack_corrupt: 502,
-  remote_error: 502, limit_exceeded: 413, match_count: 422, lfs_pointer: 422, cas_conflict: 409, push_rejected: 409, push_partial: 409,
-  merge_conflict: 409, not_fast_forward: 409, not_linear: 422, unrelated_histories: 422, ambiguous: 502, internal: 500,
-  ref_exists: 409, stale_expected: 409,
-});
 
 const USAGE = `ply — a git client for anywhere, as an HTTP API (https://ply.ivar.workers.dev)
 
@@ -255,13 +247,16 @@ function errorBody(e) {
   if (e?.reasons && typeof e.reasons === 'object') body.reasons = e.reasons;
   if (Array.isArray(e?.bases)) body.bases = e.bases;
   if (typeof e?.matches === 'number') body.matches = e.matches;
-  if (typeof e?.expected === 'string') body.expected = e.expected;
-  if (typeof e?.actual === 'string') body.actual = e.actual;
+  // A cas_conflict's null is meaningful: expected null = the ref was to be absent; actual null = it is absent.
+  const nullable = code === 'cas_conflict';
+  if (typeof e?.expected === 'string' || (nullable && e?.expected === null)) body.expected = e.expected;
+  if (typeof e?.actual === 'string' || (nullable && e?.actual === null)) body.actual = e.actual;
+  if (code === 'push_partial' && Array.isArray(e?.landed)) body.landed = e.landed.slice(0, 200);
+  if (code === 'push_partial' && Array.isArray(e?.rejected)) body.rejected = e.rejected.slice(0, 200);
   if (typeof e?.oid === 'string') body.oid = e.oid;
   if (code === 'auth' && e?.status) body.upstreamStatus = e.status;
   return body;
 }
-const statusOf = e => (e?.code === 'auth' && (e.status === 401 || e.status === 403) ? e.status : STATUS[e?.code] ?? 500);
 
 const spanView = s => ({ name: s.name, ms: Math.round(s.durationMs * 10) / 10, status: s.status?.code === 2 ? 'error' : 'ok', attrs: s.attrs, events: s.events.filter(e => e.name !== 'exception').slice(0, 32) });
 const traceSummary = spans => spans.map(s => `${s.name.replace(/^git\.(upload-pack |receive-pack)/, '$1').replace(/ /g, '_')};dur=${Math.round(s.durationMs)}`).join(', ').slice(0, 4000);
@@ -370,7 +365,7 @@ const worker = {
       } catch (e) {
         const code = isPlyCode(e?.code) ? e.code : 'internal';
         const message = code === 'internal' ? 'The viewer hit an internal error.' : String(e?.message ?? e).slice(0, 500);
-        const res = new Response(viewerErrorDocument(code, message), { status: STATUS[code] ?? 500, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
+        const res = new Response(viewerErrorDocument(code, message), { status: statusOf({ code }), headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
         return done(res, { viewer: 1, code });
       }
     }
