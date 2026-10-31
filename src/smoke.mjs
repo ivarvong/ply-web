@@ -139,7 +139,7 @@ if (phase === 'write') {
   await W('edit zero matches → 422 match_count', 'POST', '/v1/edit', { path: 'notes/a.txt', find: 'NOT-THERE', replace: 'x', author: A, message: 'm' }, 422);
   await W('edit creating branch feat-edit from main', 'POST', '/v1/edit', { ref: 'feat-edit', base: 'main', path: 'merge/x.txt', find: 'x2', replace: 'x2 feat', author: A, message: 'smoke: feat' }, 200);
   await W('branch create tmp from main', 'POST', '/v1/branch', { ref: 'tmp', from: 'main' }, 201, ({ json }) => ({ info: `oid=${json.oid} pushBytes=${json.pushBytes}` }));
-  await W('branch create tmp again → 409', 'POST', '/v1/branch', { ref: 'tmp', from: 'main' }, 409, ({ json }) => json.code === 'cas_conflict' || json.code);
+  await W('branch create tmp again → 409', 'POST', '/v1/branch', { ref: 'tmp', from: 'main' }, 409, ({ json }) => (json.code === 'ref_exists' && json.retry === 'no' ? { info: `oid=${json.oid}` } : `code=${json.code} retry=${json.retry}`));
   await W('branch delete tmp stale oid → 409', 'DELETE', '/v1/branch', { ref: 'tmp', oid: head0 }, 409);
   await W('branch delete tmp (CAS = current)', 'DELETE', '/v1/branch', { ref: 'tmp' }, 200, ({ json }) => ({ info: `deleted=${json.deleted}` }));
   await W('edit main merge/y.txt (diverge)', 'POST', '/v1/edit', { path: 'merge/y.txt', find: 'y1', replace: 'y1 main', author: A, message: 'smoke: main y' }, 200);
