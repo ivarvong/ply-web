@@ -254,7 +254,9 @@ test('/r is the public namespace index; /r/<repo> is canonical; a missing repo i
   assert.equal(since(i).length, 0, 'the index fetches no git');
   const missing = await W('/r/no-such-repo');
   assert.equal(missing.status, 404);
-  assert.match(missing.text, /no repository no-such-repo/);
+  assert.match(missing.text, /<h1 class="display">No repository no-such-repo in public-v0<\/h1>/);
+  assert.match(missing.text, /<a href="\/r">Repository index<\/a>/);
+  assert.equal(missing.text.includes('Repository root'), false);
   assert.match(missing.text, /<html/);
   const page = await W('/r/ply');
   assert.equal(page.status, 200, page.text.slice(0, 400));

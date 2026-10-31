@@ -47,6 +47,11 @@ function failurePart(code: string, message: string, ref: string | null, path: st
   return 'request';
 }
 
+/** "no repository x …" → "No repository x …", like every other headline. */
+function sentenceCase(message: string): string {
+  return message.charAt(0).toUpperCase() + message.slice(1);
+}
+
 function inRepo(label: string): string {
   return label ? ` in ${label}` : '';
 }
@@ -70,7 +75,7 @@ export function describeFailure(input: {
   const label = input.host && input.repoPath ? repoLabel(input.host, input.repoPath) : '';
   let summary = input.message;
   if (part === 'repo' && missingOrPrivate) summary = label ? `Repository ${label} not found, or private` : 'Repository not found, or private';
-  else if (part === 'repo' && /no repository (\S+)/.exec(input.message)) summary = input.message;
+  else if (part === 'repo' && /no repository (\S+)/.exec(input.message)) summary = sentenceCase(input.message);
   else if (part === 'ref') summary = `No ref ${refNamed(input.message, input.ref)}${inRepo(label)}`;
   else if (part === 'path') summary = `No path ${pathNamed(input.message, input.path)}${inRepo(label)}`;
   else if (part === 'repo' && label) summary = `Repository ${label} not found`;
