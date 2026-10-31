@@ -33,6 +33,25 @@ export const TELEMETRY_POLLS_MS = [5_000, 10_000, 15_000] as const
 /** `to` is now plus this, matching scripts/canary-o11y.mjs, so the last events are inside the window. */
 export const QUERY_SLACK_MS = 60_000
 
+/**
+ * A span join that covers less than this share of the invocations the worker logged,
+ * compared with the smoke requests, is the harness. Half is well under the ingest-loss
+ * allowance, so a healthy loss still passes the gate.
+ */
+export const JOIN_MIN_SHARE = 0.5
+
+/** The share check starts at this many logged invocations, the floor of the loss allowance. */
+export const JOIN_MIN_LOGGED = 2
+
+/** A cf-ray is 16 hex digits, a hyphen, and a colo. A span `rayId` may omit the colo. */
+export const CF_RAY_HEX_LENGTH = 16
+
+/** Artifacts answers a revoked bearer with 403. */
+export const REVOKED_STATUS = 403
+
+/** How long the post-revoke Artifacts call may take. A dead token answers well inside this. */
+export const REVOKE_PROBE_MS = 15_000
+
 export const MESSAGE_MAX = 100
 
 export type LatencyCeiling = {

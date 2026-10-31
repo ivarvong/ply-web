@@ -1,5 +1,18 @@
+import { REVOKED_STATUS } from './baseline.ts'
+
 /** Artifacts' own 403 text when the bearer this stage minted is dead. */
 export const EXPIRED_TOKEN = 'Invalid or expired token'
+
+/** Git info/refs on the scratch remote. The bearer is not part of the URL. */
+export function artifactsProbeUrl(remote: string): string {
+  const base = remote.endsWith('/') ? remote.slice(0, -1) : remote
+  return `${base}/info/refs?service=git-upload-pack`
+}
+
+/** The post-revoke probe succeeded when Artifacts answered 403. */
+export function revokeConfirmed(status: number): boolean {
+  return status === REVOKED_STATUS
+}
 
 export type FailureClass = 'harness_fault' | 'worker'
 
@@ -19,6 +32,6 @@ export type CallEvidence = {
  */
 export function classifyCall(evidence: CallEvidence): FailureClass {
   if (evidence.timedOut || evidence.status === 0) return 'harness_fault'
-  if (evidence.status === 403 && evidence.mintedToken && evidence.body.includes(EXPIRED_TOKEN)) return 'harness_fault'
+  if (evidence.status === REVOKED_STATUS && evidence.mintedToken && evidence.body.includes(EXPIRED_TOKEN)) return 'harness_fault'
   return 'worker'
 }
