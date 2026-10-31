@@ -1,21 +1,19 @@
 // Whole responses pinned to a commit, cached as immutable (Workers Caching, cache-enabled `Pinned` entrypoint).
 //
-// What is cached whole: a response that is a pure function of its URL because it names a commit by its 40-hex oid, on
+// What is cached whole: a viewer raw file, a pure function of its URL because it names a commit by its 40-hex oid, on
 // a remote whose anonymous answer is public:
-//   /v1/tree, /v1/read, /v1/commit   ?remote=<public-v0 repo>&ref=<40-hex>[&path=]   (no Authorization, no trace=1)
-//   /view/<host>/<repo>?raw=1&ref|at=<40-hex>&path=<file>                            (public-v0 or a built-in forge)
-// Not cached whole: HTML pages (they render times relative to the request and carry that request's own waterfall,
-// cf-ray and id; their git parts are already immutable GitCache entries), anything ref-relative, anything traced.
+//   /view/<host>/<repo>?raw=1&ref|at=<40-hex>&path=<file>   and   /r/<repo>?raw=1&...   (public-v0 or a built-in forge)
+// Not cached whole: anything under /v1 (a credentialed API: every /v1 response is no-store, ivar 2026-10-31), HTML pages
+// (they render times relative to the request and carry that request's own waterfall, cf-ray and id; their git parts are
+// already immutable GitCache entries), anything ref-relative.
 //
 // The front door keeps its job: it rate-limits and logs, then asks Pinned for the canonical key
 // /v<CACHE_VERSION>/pinned<path>?<allowed params, sorted>. Pinned rebuilds the public request from that key alone (it
 // reads no header, so no credential can reach it), marks it internal, and runs the same handler. A non-200 is no-store.
 import { CACHE_VERSION } from './cache-version.ts';
-import { isPublicRepoName, publicRepoOfRemote } from './public.ts';
+import { isPublicRepoName } from './public.ts';
 
 const OID = /^[0-9a-f]{40}$/;
-export const PINNED_V1 = new Set(['/v1/tree', '/v1/read', '/v1/commit']);
-const V1_PARAMS = ['remote', 'ref', 'path'];
 const VIEW_PARAMS = ['raw', 'ref', 'at', 'path'];
 export const PINNED_ORIGIN = 'https://ply.ivar.workers.dev';
 export const IMMUTABLE = 'public, max-age=31536000, immutable';
@@ -33,15 +31,6 @@ function sorted(url: URL, allowed: string[]): string | null {
     if (all.length === 1) out.set(k, all[0] as string);
   }
   return out.toString();
-}
-
-/** The cache key for a /v1 read that may be cached whole, or null. */
-export function pinnedV1Key(url: URL, method: string): string | null {
-  if (method !== 'GET' || !PINNED_V1.has(url.pathname)) return null;
-  if (!OID.test(url.searchParams.get('ref') ?? '')) return null;
-  if (publicRepoOfRemote(url.searchParams.get('remote') ?? '') === null) return null;
-  const q = sorted(url, V1_PARAMS);
-  return q === null ? null : `/v${CACHE_VERSION}/pinned${url.pathname}?${q}`;
 }
 
 function shortPublicName(pathname: string): string | null {
@@ -72,7 +61,7 @@ export function requestForKey(path: string, isPublicLoc: (url: URL) => boolean):
   const prefix = `/v${CACHE_VERSION}/pinned`;
   if (!path.startsWith(prefix)) return null;
   const url = new URL(path.slice(prefix.length), PINNED_ORIGIN);
-  const key = pinnedV1Key(url, 'GET') ?? pinnedViewKey(url, 'GET', isPublicLoc);
+  const key = pinnedViewKey(url, 'GET', isPublicLoc);
   if (key !== path) return null;
   const req = new Request(url.href, { method: 'GET' });
   INTERNAL.add(req);

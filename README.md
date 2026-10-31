@@ -70,8 +70,8 @@ its binding is the Worker's only other binding. `GET /` prints the usage text.
 - `base` omitted on a missing ref is a root commit (no parent), pushed with compare-and-swap old oid all zeros.
   `base` as another branch, or as a 40-hex commit, starts a new ref whose parent is that commit. `base` of zeros is
   400 and nothing is fetched. On an existing branch, omit `base` to commit on the tip.
-- JSON responses send `cache-control: no-store`, except a successful `tree`/`read`/`commit` whose `ref` is a full oid:
-  `private, max-age=60` (never a shared cache). Every response carries `x-ply-version` (the Workers version id, which
+- Every `/v1` response is `cache-control: no-store` (a credentialed API: nothing it answers is stored, not even a
+  `tree`/`read`/`commit` at a full oid). Every response carries `x-ply-version` (the Workers version id, which
   `scripts/deploy.sh` checks) and `x-ply-build` (`ply=<commit> ply-web=<commit>`, injected at build time). `x-ply-trace`
   is omitted when it would be empty.
 - `head` on edit is a **precondition**: if the branch is not at `head`, the response is 409 `cas_conflict` and nothing
@@ -340,8 +340,7 @@ eyeball ─▶ default entrypoint (cache OFF: always runs → rate limit, ply.re
 - **Observability:** the tier (`cf-cache-status`: HIT, MISS, EXPIRED, …) reaches ply as `x-ply-pack-cache`, so every
   span carries `git.response.cache`, the viewer waterfall shows it, and `ply.request` logs count `cache_hits`. A HIT
   never runs GitCache, so it leaves no GitCache invocation.
-- **Whole responses pinned to a commit** (`src/pinned.ts`, cache-enabled `Pinned` entrypoint): `/v1/tree`, `/v1/read`,
-  `/v1/commit` with `ref=<40-hex>` on a public-v0 remote, no Authorization, no `trace=1`; and viewer raw files
+- **Whole responses pinned to a commit** (`src/pinned.ts`, cache-enabled `Pinned` entrypoint): viewer raw files
   (`?raw=1&ref|at=<40-hex>&path=`) on `/view/…` or `/r/<repo>`, for public-v0 or a built-in forge. The front door rate-limits and logs, then fetches the
   canonical key `/v<CACHE_VERSION>/pinned<path>?<allowed params, sorted>` from Pinned. Pinned rebuilds the request from
   the key alone (it reads no header, so no credential can reach it), runs the same handler, and answers `immutable` on a

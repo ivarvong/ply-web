@@ -26,14 +26,13 @@ import { quirksFor } from './quirks.ts';
 import { createLoopbackFetch } from './gitcache.ts';
 import { syncAll } from './mirror.ts';
 import { WorkerEntrypoint } from 'cloudflare:workers';
-import { PINNED_V1, asPinned, isInternal, pinnedV1Key, pinnedViewKey, requestForKey, viaPinned } from './pinned.ts';
+import { asPinned, isInternal, pinnedViewKey, requestForKey, viaPinned } from './pinned.ts';
 import { parseViewerRoute, routeOptsFromEnv } from './viewer/route.ts';
 import { ALLOWED_HOSTS } from './viewer/url.ts';
 import { viewerErrorDocument } from './viewer/safehtml.ts';
 import { admitClient } from './viewer/app.tsx';
 import { PUBLIC_GIT_HOST, PUBLIC_NAMESPACE, isPublicNamespaceRemote, publicRepoOfRemote, scrubSecrets, tokenSourceFor, withPublicReadCredential } from './public.ts';
 import { ADVERTISED_REF_PREFIXES, isAbbreviatedOid, matchAbbreviatedOid } from './abbrev.ts';
-import { JSON_CACHE_VARY, jsonCacheControl } from './json-cache.ts';
 import { directoryReadMessage, isDirectoryRead } from './read-status.ts';
 import { BUILD_HEADER, plyBuildValue } from './version.ts';
 import { holdLastChunk } from './hold-last.ts';
@@ -88,8 +87,8 @@ Git credential (optional, forwarded upstream):  Git-Authorization: <Authorizatio
 remote= is an https git URL (no userinfo, no IP literals, no private hosts, default port only).
 ref= defaults to the remote's HEAD. On reads, short names resolve like git rev-parse (tags before branches).
 An abbreviated oid (7–39 lowercase hex) on a read resolves when it matches exactly one advertised ref (branch tip, tag
-tip, or peeled tag commit). Otherwise the response is 400 bad_request: pass a full 40-hex oid. A tree/read/commit
-whose ref is a full oid is cache-control: private, max-age=60. Every other JSON response is no-store.
+tip, or peeled tag commit). Otherwise the response is 400 bad_request: pass a full 40-hex oid.
+Every /v1 response is cache-control: no-store.
 On writes, a short name is refs/heads/<name>. A 40-hex string is a commit id, never a branch of that name.
 author and committer are {name, email, tz?, time?}. tz is +HHMM or -HHMM (−12:00..+14:00). time is unix seconds.
 Omitted tz is +0000. Omitted time is now. The zero oid (40 zeros) is rejected: omit the field instead.
@@ -234,13 +233,10 @@ async function readJson(req) {
   try { const v = JSON.parse(text); if (!v || typeof v !== 'object' || Array.isArray(v)) throw 0; return v; } catch { throw fail('bad_request', 'body must be a JSON object'); }
 }
 
-// cache-control for a /v1 JSON answer (src/json-cache.ts). Anything storable is private and varies on every credential
-// header, so a browser never answers one caller's request from another credential's response.
-const cacheHeaders = (status, cacheRef) => {
-  const cc = jsonCacheControl(status, cacheRef);
-  return cc === 'no-store' ? { 'cache-control': cc } : { 'cache-control': cc, vary: JSON_CACHE_VARY };
-};
-const json = (status, obj, scrub, extra = {}, cacheRef = null) => new Response(scrub(JSON.stringify(obj)), { status, headers: { 'content-type': 'application/json; charset=utf-8', ...cacheHeaders(status, cacheRef), ...extra } });
+// /v1 is a credentialed API: nothing it answers is stored by a browser or a cache, whatever the ref names.
+const NO_STORE = 'no-store';
+const REF_READS = new Set(['/v1/tree', '/v1/read', '/v1/commit']);
+const json = (status, obj, scrub, extra = {}) => new Response(scrub(JSON.stringify(obj)), { status, headers: { 'content-type': 'application/json; charset=utf-8', ...extra, 'cache-control': NO_STORE } });
 
 function errorBody(e) {
   const worker = isWorkerCode(e?.code);
@@ -383,13 +379,6 @@ const worker = {
         const retryAfter = String(Math.max(1, Math.ceil(decision.retryAfterMs / MS_PER_SECOND)));
         return done(json(429, { code: 'rate_limited', message: `too many requests; retry after ${retryAfter}s`, retry: 'yes' }, scrub, { 'retry-after': retryAfter }));
       }
-      // A read pinned to a commit oid (no trace) is cached whole (src/pinned.ts).
-      const pinKey = isInternal(req) ? null : pinnedV1Key(url, req.method);
-      const pin = pinKey ? pinnedBinding(env, ctx) : null;
-      if (pinKey && pin) {
-        const res = await viaPinned(pin, pinKey);
-        return done(await scrubResponse(res, publicScrub), { pinned: res.headers.get('x-ply-pinned-cache') ?? '' });
-      }
     } else {
       // gate
       const token = env.PLY_TOKEN;
@@ -409,9 +398,8 @@ const worker = {
       const remoteUrl = checkRemote(WRITES[key] ? body.remote : url.searchParams.get('remote'), allow);
       const remote = remoteUrl.href;
       record.host = remoteUrl.host;
-      // Only tree/read/commit take ref; refs and discover ignore it, so it must neither cache them nor cost an ls-refs.
-      const presentedRef = PINNED_V1.has(url.pathname) && !WRITES[key] ? url.searchParams.get('ref') : null;
-      const cacheRef = presentedRef && /^[0-9a-fA-F]{40}$/.test(presentedRef) ? presentedRef.toLowerCase() : presentedRef;
+      // Only tree/read/commit take ref; refs and discover ignore it, so it must not cost them an ls-refs.
+      const presentedRef = REF_READS.has(url.pathname) && !WRITES[key] ? url.searchParams.get('ref') : null;
       // Read-only means read-only: no write reaches the public namespace, whatever bearer or git credential came with it.
       if (WRITES[key] && isPublicNamespaceRemote(remote)) return done(json(403, { code: 'read_only', message: `the ${PUBLIC_NAMESPACE} namespace is read-only`, retry: 'no' }, scrub));
       const cred = gitAuth(req.headers, remoteUrl.hostname);
@@ -440,11 +428,11 @@ const worker = {
       const s = spans();
       const stats = { spans: s.length, rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length, wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length, cache_hits: s.filter(x => x.attrs['git.response.cache'] === 'HIT').length };
       if (out instanceof Response) {
-        for (const [k, v] of Object.entries(cacheHeaders(out.status, cacheRef))) out.headers.set(k, v);
+        out.headers.set('cache-control', NO_STORE);
         return done(out, stats);
       }
       const payload = url.searchParams.get('trace') === '1' ? { ...out.body, trace: s.map(spanView) } : out.body;
-      return done(json(out.status ?? 200, payload, scrub, { 'server-timing': `total;dur=${Date.now() - t0}` }, cacheRef), stats);
+      return done(json(out.status ?? 200, payload, scrub, { 'server-timing': `total;dur=${Date.now() - t0}` }), stats);
     } catch (e) {
       const payload = errorBody(e);
       if (url.searchParams.get('trace') === '1') payload.trace = spans().map(spanView);
