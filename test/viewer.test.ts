@@ -13,7 +13,7 @@ import { Sha1 } from 'ply';
 import { TYPE } from 'ply';
 import { encodeObjHeader, spliceDelta, zlibDeflate } from 'ply';
 import { parsePack } from 'ply';
-import { createTransport, lsRefs, Tracer, memoryCache } from 'ply';
+import { createTransport, lsRefs, Tracer } from 'ply';
 import { git, makeBareRepo, startGitServer, tmpRoot, commitFiles } from './server.js';
 import { startProxy } from './proxy.js';
 import { createBudget } from '../src/viewer/budget.ts';
@@ -708,54 +708,3 @@ test('same-repo redirects are resolved by the viewer fetch before ply sees them;
   }
 });
 
-test('verified blob cache: the second view of a file makes no blob fetch; a poisoned entry is refetched, never served', async () => {
-  const { root, cleanup } = tmpRoot();
-  const srv = await startGitServer(root);
-  try {
-    const bare = makeBareRepo(root, 'blobs');
-    const work = join(root, 'w-blobs');
-    mkdirSync(work);
-    git(work, ['init', '-q', '-b', 'main']);
-    const big = 'x'.repeat(VIEWER_CAPS.maxFileDisplayBytes + 10);
-    commitFiles(work, bare, { 'README.md': 'cached readme\n', 'a.txt': 'alpha\n', 'big.txt': big }, 'seed');
-    const store = memoryCache();
-    const dial = rewriteAllowlisted(srv.url);
-    let blobFetches = 0;
-    const fetchImpl: typeof fetch = async (input, init) => {
-      const body = init?.body instanceof Uint8Array ? Buffer.from(init.body).toString('latin1') : '';
-      if (body.includes('command=fetch') && !body.includes('filter ')) blobFetches++;
-      return dial(input, init);
-    };
-    const env = viewerEnv();
-    const view = (q: string) => handleViewer(new Request(`https://ply.ivar.workers.dev/view/github.com/blobs.git${q}`), env, {}, { fetchImpl, cache: store });
-    const first = await view('?path=a.txt&raw=1');
-    assert.equal(first.status, 200);
-    assert.equal(await first.text(), 'alpha\n');
-    assert.equal(blobFetches, 1);
-    await new Promise(r => setTimeout(r, 20));
-    const second = await view('?path=a.txt&raw=1');
-    assert.equal(await second.text(), 'alpha\n');
-    assert.equal(blobFetches, 1, 'served from the verified blob cache');
-    const page = await view('');
-    assert.match(await page.text(), /cached readme/);
-    assert.equal(blobFetches, 2, 'README fetched once');
-    await view('');
-    assert.equal(blobFetches, 2, 'README cached');
-    // poison every blob entry: a hit is hashed again, so the viewer refetches and still shows the right bytes
-    const entries = (store as unknown as { entries: Map<string, { body: Uint8Array; headers: Record<string, string> }> }).entries;
-    let poisoned = 0;
-    for (const [k, e] of entries) if (k.startsWith('https://ply.blob/')) { entries.set(k, { ...e, body: new TextEncoder().encode('evil\n') }); poisoned++; }
-    assert.ok(poisoned >= 2);
-    const again = await view('?path=a.txt&raw=1');
-    assert.equal(await again.text(), 'alpha\n');
-    assert.equal(blobFetches, 3);
-    // a file over the display cap is never stored
-    const before = entries.size;
-    assert.equal((await view('?path=big.txt')).status, 200);
-    await new Promise(r => setTimeout(r, 20));
-    assert.equal([...entries.keys()].filter(k => k.startsWith('https://ply.blob/')).length, [...entries.keys()].slice(0, before).filter(k => k.startsWith('https://ply.blob/')).length);
-  } finally {
-    await srv.close();
-    cleanup();
-  }
-});

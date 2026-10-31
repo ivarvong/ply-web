@@ -23,6 +23,14 @@ const durableObjects = {
 	ViewerRateLimit: exports.durableObject({ storage: "sqlite" }),
 } as const;
 
+// Workers Caching (never the Cache API). The default entrypoint is uncached so it always runs (rate limit, logs, scrub,
+// traces). It sends public upload-pack exchanges to the cache-enabled GitCache over ctx.exports (src/gitcache.ts).
+// crossVersionCache keeps immutable packs across deploys; CACHE_VERSION (src/cache-version.ts) is in every key.
+const entrypoints = {
+	default: exports.worker({ cache: { enabled: false } }),
+	GitCache: exports.worker({ cache: { enabled: true } }),
+} as const;
+
 // A binding can only name a class declared live above. src/index.js re-exports it from src/viewer/rate.ts.
 const VIEWER_RATE_CLASS: keyof typeof durableObjects = "ViewerRateLimit";
 
@@ -36,6 +44,7 @@ export default defineConfig({
 		workersDev: true,
 		previewUrls: false,
 		limits: { cpuMs: CPU_LIMIT_MS },
+		cache: { enabled: false, crossVersionCache: true },
 		observability: {
 			enabled: true,
 			headSamplingRate: SAMPLE_EVERY_REQUEST,
@@ -52,7 +61,7 @@ export default defineConfig({
 			PLY_TOKEN: bindings.secret(),
 			// "on" enables the POST/DELETE endpoints. Anything else answers 501.
 			WRITES: bindings.text("on"),
-			// "off" bypasses the Cache API in front of upstream pack fetches.
+			// "off" sends every upstream exchange direct, past GitCache (Workers Caching).
 			PACK_CACHE: bindings.text("on"),
 			// /view rate limits. One SQLite Durable Object class, defined by this Worker.
 			VIEWER_RATE: bindings.durableObject({ worker: WORKER_NAME, exportName: VIEWER_RATE_CLASS }),
@@ -60,6 +69,6 @@ export default defineConfig({
 			// namespace; the Worker calls only get(<repo>).createToken("read", 3600) and list(). No stored secret.
 			PUBLIC_REPOS: bindings.artifacts({ namespace: PUBLIC_NAMESPACE }),
 		},
-		exports: durableObjects,
+		exports: { ...durableObjects, ...entrypoints },
 	},
 });

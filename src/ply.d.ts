@@ -118,7 +118,6 @@ declare module 'ply' {
   export const verifyRef: any;
   export const createTransport: any;
   export const redactUrl: any;
-  export const cachingFetch: any;
   export const memoryCache: any;
   export const isCacheableFetch: any;
   export const cacheKey: any;

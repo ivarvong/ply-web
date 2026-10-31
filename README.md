@@ -152,12 +152,7 @@ Over any cap the response is an HTML error (413 for a limit, 504 for a timeout),
 did finish. Rate limiting is a Durable Object, `ViewerRateLimit`, declared as a SQLite class. It is sharded by the
 SHA-256 of `CF-Connecting-IP` (clients with no header share one shard). Each shard stores a short list of
 timestamps per bucket, not addresses.
-Immutable upload-pack responses are cached in the Workers Cache by SHA-256 of url + body; the viewer sends no
-`Authorization`, so it cannot read a pack `/v1` cached under a credential. Cache hits do not spend the subrequest
-budget. ply's pack cache does not cache a blob fetch (it has no filter line), so the viewer keeps its own: verified blob
-bytes up to the 256 KiB display cap, keyed by SHA-256 of repo URL + blob oid, written only after the git hash check
-and hashed again on every hit (a bad entry is refetched, never served). A warm file, raw, or README view makes no
-blob round trip. HTML is `no-store` and escaped. CSP is `default-src 'none'; style-src 'self'; script-src 'none'; img-src 'none'`,
+Git reads are cached with Workers Caching (see [Caching](#caching-workers-cache)); there is no Cache API anything. HTML is `no-store` and escaped. CSP is `default-src 'none'; style-src 'self'; script-src 'none'; img-src 'none'`,
 plus `X-Content-Type-Options: nosniff`. There is no inline script and `unsafe-inline` is not allowed.
 
 `cloudflare.config.ts` declares `ViewerRateLimit` as a live SQLite class in `worker.exports`. The namespace already exists (created by migration tag `v1-viewer-rate`, namespace id `656fdd50f0d6428393eb2d9250ceee67`). Declaring it keeps that namespace and its data.
@@ -220,6 +215,43 @@ force-pushes the branch (and tags with `--tags`) with stock git. The token reach
 environment variables, never argv, a file, or stdout. The script revokes it afterwards. The Worker never holds a write
 token. Re-run the same command to update a mirror. Artifacts limits apply (64 MiB per push, 1 GB per repo).
 
+## Caching (Workers Cache)
+
+Workers Caching only, never the Cache API (`caches.default`): `test/gitcache.test.ts` fails on any `caches.` in `src/`.
+
+```
+eyeball ─▶ default entrypoint (cache OFF: always runs → rate limit, ply.request log, scrub, traces)
+             └─ ply ─▶ redirect guard (createGuardedFetch / createViewerFetch: every hop re-validated)
+                        └─ createLoopbackFetch (src/gitcache.ts)
+                             ├─ public + no Authorization + pure function of its request ─▶ ctx.exports.GitCache (cache ON) ─▶ upstream
+                             └─ anything else (every caller credential, haves, other hosts) ─────────────────────────▶ upstream
+```
+
+- **What may be cached:** an upload-pack exchange with **no Authorization header** whose URL is exactly a public-v0 repo
+  endpoint, or an upload-pack endpoint on a built-in viewer forge (github.com, gitlab.com, codeberg.org, bitbucket.org,
+  git.sr.ht). A caller's `Git-Token` / `Git-Authorization` becomes an Authorization header, so a credentialed read always
+  goes straight upstream and can never populate a key. GitCache re-checks the same rule, and attaches the public-v0 read
+  token itself.
+- **Policy** (`Cache-Control` from GitCache):
+
+  | kind | exchange | Cache-Control |
+  |---|---|---|
+  | `pack` | `command=fetch` with wants only (no have / shallow / want-ref / deepen-since / deepen-not) | `public, max-age=31536000, immutable`: objects are named by their hash |
+  | `refs` | `command=ls-refs` | `public, max-age=5, stale-while-revalidate=10`: a ref change shows within 15 s |
+  | `discover` | `GET info/refs?service=git-upload-pack` | v2 capability list: `public, max-age=300, stale-while-revalidate=3600`; a v0 advertisement (carries refs): the refs policy |
+  | — | any non-200, any 3xx | `no-store` (3xx goes back to the guard; GitCache never follows) |
+
+- **Keys:** `/v<CACHE_VERSION>/<kind>/<sha256(kind, url, git-protocol, body)>`. The upstream request travels in headers
+  (not part of a Workers Cache key); GitCache recomputes the hash and refuses a mismatch, so no request can store an
+  answer under another's key. `crossVersionCache` is on (deploys keep packs warm); `CACHE_VERSION` (`src/cache-version.ts`)
+  is the only partition: bump it when what GitCache stores changes.
+- **Poison:** ply re-verifies every object; after a corrupt cached pack it retries with `x-ply-cache: bust`, which purges
+  that key (`ctx.cache.purge({ pathPrefixes })` inside GitCache) before refetching.
+- **Observability:** the tier (`cf-cache-status`: HIT, MISS, EXPIRED, …) reaches ply as `x-ply-pack-cache`, so every
+  span carries `git.response.cache`, the viewer waterfall shows it, and `ply.request` logs count `cache_hits`. A HIT
+  never runs GitCache, so it leaves no GitCache invocation.
+- `PACK_CACHE=off` sends everything direct.
+
 ## Develop / deploy
 
 ```sh
@@ -263,7 +295,7 @@ Nothing else in this config asks for a permission:
 - The Artifacts binding `PUBLIC_REPOS` (namespace `public-v0`). The OAuth deploy of 2026-10-30 uploaded it; whether a
   scoped CI token needs an Artifacts permission on top of Workers Scripts Edit has not been checked.
 - Durable Objects have no token permission of their own. `ViewerRateLimit` follows the Worker.
-- Observability, `limits.cpuMs`, and the `WRITES` / `PACK_CACHE` text bindings travel in the script upload.
+- Observability, `limits.cpuMs`, the Worker cache settings (`cache`, per-entrypoint `exports`), and the `WRITES` / `PACK_CACHE` text bindings travel in the script upload.
 - Workers Tail Read is the permission for live log streaming, which this workflow does not use.
 
 ### Companion workflow in ivarvong/ply

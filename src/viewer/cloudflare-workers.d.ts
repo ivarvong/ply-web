@@ -1,6 +1,12 @@
 // Minimal types for the Workers runtime modules this viewer imports. tsconfig.json does not load the generated
 // runtime types (`cf workers types`); these declarations cover only what rate.ts touches.
 declare module 'cloudflare:workers' {
+  export abstract class WorkerEntrypoint<Env = unknown> {
+    ctx: unknown;
+    env: Env;
+    constructor(ctx: unknown, env: Env);
+    fetch?(req: Request): Promise<Response>;
+  }
   export abstract class DurableObject<Env = unknown> {
     ctx: DurableObjectState;
     env: Env;

@@ -1,9 +1,11 @@
 import type { FetchLike } from './fetchguard.ts'
+import type { LoopbackBinding } from '../gitcache.ts'
 import type { ViewerRoute } from './route.ts'
 import type { ViewerEnv } from './model.ts'
 
 export type ViewerCtx = {
   waitUntil?: (promise: Promise<unknown>) => void
+  exports?: { GitCache?: LoopbackBinding }
   tracing?: { enterSpan?: (name: string) => EdgeSpan }
 }
 
@@ -14,7 +16,8 @@ export type HandleOpts = {
   fetchImpl?: FetchLike
   now?: number
   note?: (extra: Record<string, string | number>) => void
-  cache?: { match: (key: string) => Promise<Response | undefined>; put: (key: string, res: Response) => Promise<void>; delete: (key: string) => Promise<boolean> } | null
+  /** Tests: the GitCache loopback to use (null: none). Default: ctx.exports.GitCache unless PACK_CACHE=off. */
+  loopback?: (() => LoopbackBinding | null | undefined) | null
 }
 
 export type SpanFields = Record<string, string | number | boolean>

@@ -36,7 +36,7 @@ function startRouter(upstream) {
   const s = http.createServer((req, res) => {
     const host = String(req.headers.host ?? '');
     const auth = req.headers.authorization ?? null;
-    hits.push({ host, method: req.method, path: req.url, auth });
+    hits.push({ host, method: req.method, path: req.url, auth, via: req.headers['x-ply-via'] ?? null });
     if (host !== HOST) { req.resume(); res.writeHead(404); return void res.end('no such host'); }
     const m = /^\/git\/public-v0\/(moved|away|hop|echo)\.git(\/.*)$/.exec(req.url);
     if (m) {
@@ -101,7 +101,7 @@ before(async () => {
   writeFileSync(join(out, 'fake-artifacts.mjs'), FAKE_ARTIFACTS);
   const worker = (key, rate) => `(modules = [ (name = "worker.mjs", esModule = embed "worker.mjs") ], compatibilityDate = "2026-10-18", globalOutbound = "router",
     durableObjectNamespaces = [ (className = "ViewerRateLimit", uniqueKey = "${key}", enableSql = true) ], durableObjectStorage = (inMemory = void),
-    bindings = [ (name = "PLY_TOKEN", text = "${PLY}"), (name = "WRITES", text = "on"), (name = "PACK_CACHE", text = "off"), (name = "VIEWER_RATE_PER_MIN", text = "${rate}"),
+    bindings = [ (name = "PLY_TOKEN", text = "${PLY}"), (name = "WRITES", text = "on"), (name = "PACK_CACHE", text = "on"), (name = "VIEWER_RATE_PER_MIN", text = "${rate}"),
       (name = "VIEWER_RATE", durableObjectNamespace = "ViewerRateLimit"), (name = "PUBLIC_REPOS", service = (name = "artifacts", entrypoint = "Ns")) ])`;
   writeFileSync(join(out, 'config.capnp'), `using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
@@ -175,6 +175,26 @@ test('a server that refuses tree:0: the viewer learns it once per isolate, a 2,1
   const refused = since(i).filter(h => h.filter === 'tree:0');
   assert.ok(refused.length <= 1, `tree:0 was refused ${refused.length} times; the isolate should learn it once`);
   assert.match(dir.text, /learned earlier in this isolate|was rejected/);
+});
+
+test('Workers Cache routing: anonymous public reads reach upstream through GitCache; a credentialed read never does', { skip }, async () => {
+  let i = mark();
+  assert.equal((await W(`/v1/read?${q({ remote: remote('ply'), path: 'README.md' })}`)).status, 200);
+  assert.equal((await W(publicView('ply', '?path=README.md'))).status, 200);
+  const anon = since(i).filter(h => h.path.startsWith(`/git/${NS}/ply.git/`));
+  assert.ok(anon.length > 0);
+  for (const h of anon) assert.equal(h.via, 'gitcache', `${h.method} ${h.path}`);
+  // the caller's credential (for public-v0 itself, and for another namespace): straight upstream, never through the cache
+  i = mark();
+  await W(`/v1/read?${q({ remote: remote('ply'), path: 'README.md' })}`, { headers: { ...bearer, 'git-token': OTHER } });
+  await W(`/v1/read?${q({ remote: `${ORIGIN}/git/other/secret.git`, path: 'SECRET.md' })}`, { headers: { ...bearer, 'git-token': OTHER } });
+  const cred = since(i);
+  assert.ok(cred.length > 0);
+  for (const h of cred) { assert.equal(h.via, null, `${h.method} ${h.path}`); assert.equal(h.auth, `Bearer ${OTHER}`); }
+  // with a bearer but no git credential, a public-v0 read is anonymous upstream-wise: cached path, Worker token
+  i = mark();
+  assert.equal((await W(`/v1/refs?${q({ remote: remote('ply') })}`, { headers: bearer })).status, 200);
+  for (const h of since(i)) { assert.equal(h.via, 'gitcache'); assert.equal(h.auth, `Bearer ${TOKEN}`); }
 });
 
 test('/r/<repo> redirects to the canonical viewer URL; bad names are 404 with no fetch; the home page lists the namespace', { skip }, async () => {

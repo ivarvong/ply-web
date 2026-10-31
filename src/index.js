@@ -22,12 +22,12 @@ import { createTransport } from 'ply';
 import { Tracer, arrayExporter, flattenLine } from 'ply';
 import { RETRY, isPlyCode, fail } from 'ply';
 import { withLimits } from 'ply';
-import { cachingFetch } from 'ply';
 import { validateRef, validateIdent } from 'ply';
 import { handleViewer } from './viewer/handle.ts';
 import { checkRemote, createGuardedFetch } from './remote.ts';
 import { applySecurityHeaders } from './security-headers.ts';
 import { quirksFor } from './quirks.ts';
+import { createLoopbackFetch } from './gitcache.ts';
 import { viewerErrorDocument } from './viewer/safehtml.ts';
 import { admitClient } from './viewer/app.tsx';
 import { viewerHref } from './viewer/url.ts';
@@ -36,6 +36,7 @@ import { PUBLIC_GIT_HOST, PUBLIC_NAMESPACE, isPublicNamespaceRemote, isPublicRep
 export { checkRemote };
 
 export { ViewerRateLimit } from './viewer/rate.ts';
+export { GitCache } from './gitcache-entry.ts';
 
 // A Worker isolate has 128 MiB. A buffered pack holds the wire bytes and every inflated object,
 // including delta results resolvePack allocates on top of the instructions (ply #9). Four
@@ -372,8 +373,11 @@ export default {
       const tracer = new Tracer({ exporter, resource: { 'service.name': 'ply-worker', 'cloudflare.colo': req.cf?.colo ?? '' } });
       // The public read token is attached below the redirect guard, so each hop is re-validated before it is considered,
       // and only when the request carries no credential of its own (a caller's Git-Token or Git-Authorization wins).
-      const guarded = createGuardedFetch(withPublicReadCredential(globalThis.fetch.bind(globalThis), publicTokens), remoteUrl, allow);
-      const fetchImpl = env.PACK_CACHE === 'off' || typeof caches === 'undefined' ? guarded : cachingFetch(guarded, caches.default, { waitUntil: p => ctx.waitUntil(p) });
+      // Under the guard: public, credential-free upload-pack exchanges go to the cache-enabled GitCache entrypoint
+      // (Workers Caching); everything else, every credentialed request included, goes straight upstream.
+      const direct = withPublicReadCredential(globalThis.fetch.bind(globalThis), publicTokens);
+      const loopback = env.PACK_CACHE === 'off' ? null : () => ctx.exports?.GitCache;
+      const fetchImpl = createGuardedFetch(createLoopbackFetch(direct, loopback), remoteUrl, allow);
       const opts = { auth: cred.auth, tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), fetchImpl };
       const out = await handler({ remote, q: url.searchParams, body, opts, spans, ctx, log });
       const s = spans();

@@ -6,11 +6,12 @@ import { createViewerFetch, type FetchLike } from './fetchguard.ts'
 import { htmlResponse, SECURITY, statusOf, textResponse } from './http.ts'
 import { VIEWER_CAPS, rateLimitFor, type RateBucket } from './limits.ts'
 import type { RateDecision, TraceModel, ViewerEnv } from './model.ts'
-import { cachedFetch, makeTracer, plyCode, spanCollector } from './ply.ts'
+import { makeTracer, plyCode, spanCollector } from './ply.ts'
+import { createLoopbackFetch } from '../gitcache.ts'
 import { parseViewerRequest, routeOptsFromEnv, type ViewerRoute } from './route.ts'
 import { renderError, renderHome, renderLoaded } from './render.tsx'
 import { VIEWER_CSS } from './styles.ts'
-import { blobStore, loadRepo } from './session.ts'
+import { loadRepo } from './session.ts'
 import { buildTrace, traceHeader } from './traceview.ts'
 import { LAYOUT } from './layout.ts'
 import { listPublicRepos, tokenSourceFor, withPublicReadCredential } from '../public.ts'
@@ -39,11 +40,6 @@ export async function admitClient(req: Request, env: ViewerEnv, bucket: RateBuck
   } catch {
     return 'unavailable'
   }
-}
-
-function defaultCache(): ViewerCall['opts']['cache'] {
-  const g = globalThis as { caches?: { default?: ViewerCall['opts']['cache'] } }
-  return g.caches?.default ?? null
 }
 
 function isText(bytes: Uint8Array): boolean {
@@ -115,13 +111,12 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
   const pageSignal = AbortSignal.timeout(VIEWER_CAPS.pageTimeoutMs)
   // The public namespace's read token is attached below the guard: every hop is validated by createViewerFetch first,
   // then checked again by withPublicReadCredential, and the pack cache above never sees it in its key.
-  const inner = withPublicReadCredential(call.opts.fetchImpl ?? globalThis.fetch, tokenSourceFor(env.PUBLIC_REPOS))
-  const guard = createViewerFetch(inner, route.loc.url, route.loc.allowedHosts, budget, pageSignal)
-  const cache = call.opts.cache === undefined ? (env.PACK_CACHE === 'off' ? null : defaultCache()) : call.opts.cache
-  const fetchImpl: FetchLike = cache ? cachedFetch(guard, cache, promise => { try { call.ctx.waitUntil?.(promise) } catch { /* already settled */ } }) : guard
+  // Public, credential-free exchanges go to the cache-enabled GitCache entrypoint (Workers Caching) under the guard.
+  const direct = withPublicReadCredential(call.opts.fetchImpl ?? globalThis.fetch, tokenSourceFor(env.PUBLIC_REPOS))
+  const loopback = call.opts.loopback !== undefined ? call.opts.loopback : env.PACK_CACHE === 'off' ? null : () => call.ctx.exports?.GitCache
+  const fetchImpl: FetchLike = createViewerFetch(createLoopbackFetch(direct, loopback), route.loc.url, route.loc.allowedHosts, budget, pageSignal)
   try {
-    const blobs = blobStore(cache, promise => { try { call.ctx.waitUntil?.(promise) } catch { /* already settled */ } })
-    const loaded = await loadRepo(route, { tracer, fetchImpl, signal: pageSignal, budget, blobs })
+    const loaded = await loadRepo(route, { tracer, fetchImpl, signal: pageSignal, budget })
     const trace = buildTrace(collected.lines, call.cfRay, call.requestId)
     call.opts.note?.({ host: route.loc.host, rtt: trace.bars.length, bytes: budget.bytes, code: 'ok' })
     if (loaded.kind === 'raw') {
