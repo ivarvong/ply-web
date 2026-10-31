@@ -46,6 +46,34 @@ function link(fromDir: string, file: string): string {
   return relative(fromDir, file).split('\\').join('/')
 }
 
+/** One point per state_change. The 0% canary is the version that was introduced at 0. */
+export function canarySplit(events: readonly CdEvent[]): { readonly percent: number; readonly seen: number }[] {
+  const changes = events.filter(event => event.kind === 'state_change')
+  let canary: string | null = null
+  for (const event of changes) {
+    if (event.kind !== 'state_change') continue
+    const zero = event.payload.after.find(share => share.percentage === 0)
+    if (zero) {
+      canary = zero.versionId
+      break
+    }
+  }
+  const seenAt = new Map<number, number>()
+  for (const step of rampSteps(events)) {
+    const percent = num(step.percent)
+    const seen = num(step.observedPercent)
+    if (percent !== null && seen !== null) seenAt.set(percent, seen)
+  }
+  return changes.flatMap(event => {
+    if (event.kind !== 'state_change') return []
+    const share = canary
+      ? event.payload.after.find(item => item.versionId === canary)
+      : event.payload.after.find(item => item.percentage !== 100) ?? event.payload.after[0]
+    const percent = share?.percentage ?? 0
+    return [{ percent, seen: seenAt.get(percent) ?? 0 }]
+  })
+}
+
 function rampSteps(events: readonly CdEvent[]): Measurement[] {
   return events.flatMap(event => {
     const value = measurement(event)
@@ -111,10 +139,16 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
   }
   const steps = rampSteps(events)
   const labels = steps.map((step, index) => String(num(step.percent) ?? index + 1))
-  const split: ChartSeries[] = [
-    { name: 'cfg', rgb: [194, 65, 12], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.percent) ?? 0 })) },
-    { name: 'seen', rgb: [15, 118, 110], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.observedPercent) ?? 0 })) },
-  ]
+  const splitPoints = canarySplit(events)
+  const split: ChartSeries[] = splitPoints.length > 0
+    ? [
+      { name: 'cfg', rgb: [194, 65, 12], points: splitPoints.map(point => ({ x: String(point.percent), y: point.percent })) },
+      { name: 'seen', rgb: [15, 118, 110], points: splitPoints.map(point => ({ x: String(point.percent), y: point.seen })) },
+    ]
+    : [
+      { name: 'cfg', rgb: [194, 65, 12], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.percent) ?? 0 })) },
+      { name: 'seen', rgb: [15, 118, 110], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.observedPercent) ?? 0 })) },
+    ]
   const latency: ChartSeries[] = [
     { name: 'new', rgb: [194, 65, 12], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.nextWallP99) ?? 0 })) },
     { name: 'old', rgb: [29, 78, 216], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.previousWallP99) ?? 0 })) },
@@ -135,7 +169,7 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
   await writeFile(join(outDir, 'latency.png'), chartPng({ title: 'wall p99 ms', series: latency }))
   await writeFile(join(outDir, 'burn.png'), chartPng({ title: 'burn rate', series: burn, hLine: { y: FAST_BURN, rgb: [185, 28, 28] } }))
   lines.push('', '## Charts', '')
-  lines.push('Configured split against the share of requests the new version actually received in that step window. Seen is blank when the window had no requests.', '')
+  lines.push('Every state_change, including the 0% canary, against the share of requests the new version received at that percentage. Seen is 0 when that change was not a ramp step.', '')
   lines.push('![Configured and observed split](split.png)', '')
   lines.push('Wall-time p99, new version and old version. A carried old sample is the last step that still had one.', '')
   lines.push('![Latency by version](latency.png)', '')

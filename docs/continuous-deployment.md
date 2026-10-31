@@ -12,7 +12,7 @@ On the box:
 
 - `cf auth login` already done. The login needs Workers Scripts Edit (versions and deployments; an account token calls this Workers Scripts Write), Workers Observability Read, and Artifacts Edit on the namespace below. It does not need routes, KV, R2, or tail.
 - `npm ci` in this repo. Node matches `package.json` `engines`. `npm run cd` also refuses Node older than 22.18, which is what `cloudflare.config.ts` needs when `cf` loads it.
-- `git config user.name` and `user.email` set. The bump stage commits with them and does not push.
+- `git config user.name` and `user.email` set only when a bump actually commits. An unchanged pin, and `--no-bump`, do not need them. The bump does not push.
 - A clean work tree. Deploy refuses a dirty one.
 - `HEAD` equal to `origin/main` after `git fetch origin main`. Deploy refuses any other commit (`not-on-origin-main`) and uploads nothing.
 - `PLY_TOKEN_FILE` pointing at the same bearer the Worker secret `PLY_TOKEN` uses, mode `0600` (no group or other bits). The file is read, never printed.
@@ -51,10 +51,18 @@ From a clean checkout of the commit you want to ship:
 npm run cd
 ```
 
-You can pin ply to a sha you already know:
+You can pin ply to a sha you already know. The command is `cd`; `--sha` on its own is the same run:
 
 ```sh
+npm run cd -- cd --sha 1274f2dd05b83d70f8d421cdcc79628692d848df
 npm run cd -- --sha 1274f2dd05b83d70f8d421cdcc79628692d848df
+```
+
+`--no-bump` skips the pin and deploys the checkout as it is. The run records that as a decision (`no_bump`, outcome `advance`):
+
+```sh
+npm run cd -- --no-bump
+npm run cd -- cd --no-bump
 ```
 
 What prints, in order:
@@ -74,7 +82,7 @@ cd: PASS 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 | --- | --- | --- |
 | `cd: PASS <version id>` | 0 | The new version is at 100%, and the live smoke and telemetry passed. |
 | `cd: FAIL <stage>: <reason>` | 1 | That stage stopped the run. If the line is from ramp or from the live checks, traffic is already back on `previous` unless the line says the rollback itself failed. |
-| `cd: harness_fault <stage>: <reason>` | 1 | A request got no response, or a 403 named the token this stage minted. The split is unchanged. |
+| `cd: harness_fault <stage>: <reason>` | 1 | A request got no response, a 403 named the token this stage minted, or the script failed before it could judge the version (bad cf output, a parse failure, a preflight miss). The split is unchanged. This is not a change failure. |
 | `cd: state_conflict <stage>: <reason>` | 1 | The deployment was not the expected prior split, so the write was skipped. The split is unchanged. |
 | a usage line, no `cd: PASS` / `cd: FAIL` | 2 | The arguments were wrong. Traffic was not touched. |
 
@@ -89,7 +97,7 @@ npm run cd -- bump
 npm run cd -- bump --sha <40 hex>
 ```
 
-Fetches `origin main` and reads that commit's `package.json`. Resolves ply `main` (or the sha you passed). When the pin already matches, it leaves your checkout where it is. When it does not, it commits **only** `package.json` and the lockfile on `bump-ply`, whose parent is `origin/main`, and checks that branch out. The pull request is that one commit. It is not stacked on the branch you were on. It does not push. If you were already on `bump-ply`, that branch is reset to `origin/main` before the commit.
+Fetches `origin main` and reads that commit's `package.json`. Resolves ply `main` (or the sha you passed). When the pin already matches, it leaves your checkout where it is. When it does not, it commits **only** `package.json` and the lockfile on `bump-ply`, whose parent is `origin/main`, and checks that branch out. The pull request is that one commit. It is not stacked on the branch you were on. It does not push. If you were already on `bump-ply`, that branch is reset to `origin/main` before the commit. `user.name` and `user.email` are read only when that commit is about to be made.
 
 Pass, already pinned:
 
@@ -431,7 +439,7 @@ npm run cd -- report
 | --- | --- |
 | Deployment frequency | deploys / days. A deploy is a `run_finished` with a version id. Days are the span from the first such timestamp to the last. One timestamp has no rate. |
 | Lead time | `liveAt − plyMergedAt` on a passing deploy. `liveAt` is when the ramp reached 100%. `plyMergedAt` is the ply commit's committer time from the GitHub API, or null if that fetch fails (the deploy still finishes). Report p50 and p90. |
-| Change failure rate | rollbacks / deploys |
+| Change failure rate | rollbacks / deploys, excluding a run whose `fault` is `harness_fault` |
 | Time to restore | `restoredAt − failedAt` for a rolled-back deploy. p50 and p90. |
 | Stage duration | p50 and p90 of each stage's `durationMs`, across runs. Percentile is `sorted[floor((n − 1) · p)]`. |
 
@@ -450,7 +458,7 @@ The event log is the record of the run. Every line is one JSON object:
 
 | Kind | Payload |
 | --- | --- |
-| `lifecycle` | `run_started` (config, node/cf/git versions, ply and ply-web shas, host) or `run_finished` (verdict, rollback, smoke counts, stage timings, per-step burns, live/fail/restore times) |
+| `lifecycle` | `run_started` (config, node/cf/git versions, ply and ply-web shas, host) or `run_finished` (verdict, rollback, smoke counts, stage timings, per-step burns, live/fail/restore times, `fault`) |
 | `command` | argv with secrets already replaced by `<redacted>`, cwd, exit code, duration, sha256 of stdout and stderr, and the paths of those captures |
 | `observation` | The measurement, the exact `cf o11y` query (or the smoke source) and its window, and `responsePath` of the raw body under `raw/` |
 | `decision` | `inputs` (one or more earlier observation seqs), `rules` (`name` and `value` from `slo.ts`, or the smoke rule), `outcome` (`advance`, `hold`, `insufficient_data`, `rollback`, `stop`), and `reason` |
@@ -458,7 +466,7 @@ The event log is the record of the run. Every line is one JSON object:
 | `request` | One smoke or probe call: method, url, status, version, latency, `cf-ray`, `x-ply-request-id`, `x-artifacts-ray` |
 | `error` | An unexpected failure and a JSON context |
 
-A decision cannot be written unless `inputs` cites an earlier `observation`. A `Secret` cannot be serialized: `JSON.stringify` throws, and command argv stores `<redacted>` instead of the value. Token text that still shows up in a captured stdout is replaced with `[redacted]` before the line is appended.
+A decision cannot be written unless `inputs` cites an earlier `observation`. A `Secret` cannot be serialized: `JSON.stringify` throws, and command argv stores `<redacted>` instead of the value. Each Secret's text is removed by exact match from every capture and event. An `art_v` plus a version plus `_` is removed the same way, as a backstop, whatever the version number is.
 
 The ramp does not emit `hold`. The outcome stays in the schema so a recorded decision can say it waited. `stop` is a gate that leaves traffic where it is (the pinned smoke failure). `rollback` is traffic returned to the previous version.
 
@@ -468,7 +476,7 @@ After `run_finished` the run writes `manifest.json` with the sha256 of every oth
 npm run cd -- debrief cd-runs/2026-10-31T21-05-00-123Z
 ```
 
-That prints `debrief: cd-runs/2026-10-31T21-05-00-123Z.debrief/debrief.md`. The markdown stands alone: a timeline, every decision with the rule and the observations it used, every traffic change, three charts (`split.png` configured percent against the share of requests the new version received, `latency.png` wall p99 by version, `burn.png` burn per SLO with a line at 14.4), and links back to `events.jsonl`, `raw/`, and `captures/`.
+That prints `debrief: cd-runs/2026-10-31T21-05-00-123Z.debrief/debrief.md`. The markdown stands alone: a timeline, every decision with the rule and the observations it used, every traffic change, three charts (`split.png` is every `state_change`, including the 0% canary, against the share of requests the new version received, `latency.png` wall p99 by version, `burn.png` burn per SLO with a line at 14.4), and links back to `events.jsonl`, `raw/`, and `captures/`.
 
 ## Later
 

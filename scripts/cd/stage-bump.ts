@@ -48,6 +48,10 @@ async function restorePinFiles(): Promise<void> {
   await git(['checkout', '--', 'package.json', 'package-lock.json'])
 }
 
+function bumpFail(reason: string) {
+  return fail('bump', reason, false, 'harness_fault')
+}
+
 async function returnTo(branch: string, head: string): Promise<string | null> {
   const target = branch || head
   if (!target) return null
@@ -62,12 +66,17 @@ async function commitOnMain(branch: string, base: string, sha: string, spec: str
   const started = await git(['rev-parse', 'HEAD'])
   const startedHead = started.stdout.trim()
   const onBump = startedBranch === branch
+  const name = await git(['config', 'user.name'])
+  const email = await git(['config', 'user.email'])
+  if (name.code !== 0 || !name.stdout.trim() || email.code !== 0 || !email.stdout.trim()) {
+    return bumpFail( 'git user.name and user.email must be set')
+  }
   if (onBump) {
     const reset = await git(['reset', '--hard', base])
-    if (reset.code !== 0) return fail('bump', `could not reset ${branch} onto origin/main: ${reset.stderr.slice(0, 300)}`)
+    if (reset.code !== 0) return bumpFail( `could not reset ${branch} onto origin/main: ${reset.stderr.slice(0, 300)}`)
   } else {
     const detached = await git(['checkout', '--detach', base])
-    if (detached.code !== 0) return fail('bump', `could not detach at origin/main: ${detached.stderr.slice(0, 300)}`)
+    if (detached.code !== 0) return bumpFail( `could not detach at origin/main: ${detached.stderr.slice(0, 300)}`)
   }
   let failure: string | null = null
   let removeHttps: (() => Promise<void>) | null = null
@@ -126,17 +135,17 @@ async function commitOnMain(branch: string, base: string, sha: string, spec: str
       const back = await returnTo(startedBranch, startedHead)
       if (back) failure = `${failure}; also could not return to the previous checkout: ${back}`
     }
-    return fail('bump', failure)
+    return bumpFail( failure)
   }
   if (!onBump) {
     const forced = await git(['branch', '-f', branch, 'HEAD'])
     if (forced.code !== 0) {
       const back = await returnTo(startedBranch, startedHead)
       const reason = `could not point ${branch} at the pin commit: ${forced.stderr.slice(0, 300)}`
-      return fail('bump', back ? `${reason}; also could not return to the previous checkout: ${back}` : reason)
+      return bumpFail( back ? `${reason}; also could not return to the previous checkout: ${back}` : reason)
     }
     const onto = await git(['checkout', branch])
-    if (onto.code !== 0) return fail('bump', `pin is committed but checkout ${branch} failed: ${onto.stderr.slice(0, 300)}`)
+    if (onto.code !== 0) return bumpFail( `pin is committed but checkout ${branch} failed: ${onto.stderr.slice(0, 300)}`)
   }
   return pass('bump', { sha, from, committed: true, branch })
 }
@@ -145,24 +154,19 @@ export async function stageBump(config: CdConfig, shaArg: string | null): Promis
   try {
     const sha = await resolvePlySha(shaArg ?? config.sha)
     const dirty = await git(['status', '--porcelain', '--untracked-files=no'])
-    if (dirty.code !== 0) return fail('bump', `git status failed: ${dirty.stderr.slice(0, 300)}`)
-    if (dirty.stdout.trim()) return fail('bump', 'tracked files are modified; bump wants a clean tree')
-    const name = await git(['config', 'user.name'])
-    const email = await git(['config', 'user.email'])
-    if (name.code !== 0 || !name.stdout.trim() || email.code !== 0 || !email.stdout.trim()) {
-      return fail('bump', 'git user.name and user.email must be set')
-    }
+    if (dirty.code !== 0) return bumpFail( `git status failed: ${dirty.stderr.slice(0, 300)}`)
+    if (dirty.stdout.trim()) return bumpFail( 'tracked files are modified; bump wants a clean tree')
     const base = await fetchOriginMain(ROOT)
-    if (!base.ok) return fail('bump', originMainReason(base))
+    if (!base.ok) return bumpFail( originMainReason(base))
     const shown = await git(['show', `${base.sha}:package.json`])
-    if (shown.code !== 0) return fail('bump', 'origin/main has no package.json')
+    if (shown.code !== 0) return bumpFail( 'origin/main has no package.json')
     const spec = (JSON.parse(shown.stdout) as { dependencies?: { ply?: string } }).dependencies?.ply
-    if (typeof spec !== 'string') return fail('bump', 'package.json has no dependencies.ply')
+    if (typeof spec !== 'string') return bumpFail( 'package.json has no dependencies.ply')
     const plan = planBump(spec, sha)
-    if (plan.kind === 'invalid') return fail('bump', plan.reason)
+    if (plan.kind === 'invalid') return bumpFail( plan.reason)
     if (plan.kind === 'unchanged') return pass('bump', { sha, from: null, committed: false, branch: null })
     return await commitOnMain(config.bumpBranch, base.sha, sha, spec, plan.from)
   } catch (error) {
-    return fail('bump', errorMessage(error))
+    return bumpFail( errorMessage(error))
   }
 }

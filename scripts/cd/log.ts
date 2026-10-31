@@ -4,6 +4,7 @@ import { appendFile, mkdir, readdir, readFile, writeFile } from 'node:fs/promise
 import { dirname, join, relative } from 'node:path'
 import { asRecord } from './json.ts'
 import { redact } from './redact.ts'
+import type { Fault } from './result.ts'
 import { isSecret, type Secret } from './secret.ts'
 import type { CommandNote } from './trace.ts'
 
@@ -68,6 +69,8 @@ export type LifecycleFinished = {
   readonly liveAt: string | null
   readonly failedAt: string | null
   readonly restoredAt: string | null
+  /** Null on a pass. `harness_fault` is a script or preflight error and is not a change failure. */
+  readonly fault: Fault | null
 }
 
 export type CdEvent =
@@ -140,11 +143,12 @@ export type RunFacts = {
   liveAt: string | null
   failedAt: string | null
   restoredAt: string | null
+  fault: Fault | null
 }
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$/
-const ARTIFACTS_TOKEN = /art_v1_[^\s"'\\]+/g
 const OUTCOMES = new Set<DecisionOutcome>(['advance', 'hold', 'insufficient_data', 'rollback', 'stop', 'harness_fault', 'state_conflict'])
+const FAULTS = new Set<Fault>(['worker', 'harness_fault', 'state_conflict'])
 
 export function isoOffset(date: Date): string {
   const pad = (value: number, width = 2) => String(Math.trunc(Math.abs(value))).padStart(width, '0')
@@ -230,6 +234,12 @@ function rules(value: unknown): RuleRef[] {
   })
 }
 
+function parseFault(value: unknown): Fault | null {
+  if (value === undefined || value === null) return null
+  if (typeof value === 'string' && FAULTS.has(value as Fault)) return value as Fault
+  throw new Error('fault is not a known kind')
+}
+
 function parseLifecycle(payload: Record<string, unknown>): LifecycleStarted | LifecycleFinished {
   const event = needString(payload, 'event')
   if (event === 'run_started') {
@@ -279,6 +289,7 @@ function parseLifecycle(payload: Record<string, unknown>): LifecycleStarted | Li
       liveAt: stringOrNull(payload.liveAt, 'liveAt'),
       failedAt: stringOrNull(payload.failedAt, 'failedAt'),
       restoredAt: stringOrNull(payload.restoredAt, 'restoredAt'),
+      fault: parseFault(payload.fault),
     }
   }
   throw new Error(`unknown lifecycle event ${event}`)
@@ -395,7 +406,7 @@ function isObservationRef(value: unknown): value is ObservationRef {
 }
 
 function scrub(text: string, secrets: readonly string[]): string {
-  return redact(text, secrets).replace(ARTIFACTS_TOKEN, '[redacted]')
+  return redact(text, secrets)
 }
 
 async function filesIn(dir: string, root = dir): Promise<string[]> {
@@ -435,6 +446,7 @@ export class RunLog {
     liveAt: null,
     failedAt: null,
     restoredAt: null,
+    fault: null,
   }
 
   private constructor(dir: string, ledger: string, runId: string) {
@@ -528,6 +540,7 @@ export class RunLog {
         liveAt: this.facts.liveAt,
         failedAt: this.facts.failedAt,
         restoredAt: this.facts.restoredAt,
+        fault: this.facts.fault,
       }
       await this.#append('lifecycle', payload, 'run')
     })
@@ -553,6 +566,7 @@ export class RunLog {
   async noteCommand(note: CommandNote): Promise<void> {
     await this.#enqueue(async () => {
       const seq = this.#seq
+      for (const part of note.argv) if (isSecret(part)) this.conceal(part.reveal())
       const argv = note.argv.map(part => (isSecret(part) ? '<redacted>' : part))
       const stdout = scrub(note.stdout, this.#concealed)
       const stderr = scrub(note.stderr, this.#concealed)

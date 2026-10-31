@@ -23,7 +23,7 @@ import { readTokenFile } from './token.ts'
 import { parseSince } from './config.ts'
 
 export type Parsed =
-  | { readonly kind: 'cd'; readonly sha: string | null }
+  | { readonly kind: 'cd'; readonly sha: string | null; readonly noBump: boolean }
   | { readonly kind: 'bump'; readonly sha: string | null }
   | { readonly kind: 'deploy-canary' }
   | { readonly kind: 'smoke'; readonly version: string | null; readonly expectVersion: string | null }
@@ -49,14 +49,36 @@ function uuid(value: string | null): string | null {
   return value
 }
 
+function parseCd(argv: readonly string[]): Parsed {
+  let sha: string | null = null
+  let noBump = false
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? ''
+    if (arg === '--no-bump') {
+      noBump = true
+      continue
+    }
+    if (arg === '--sha') {
+      const value = argv[i + 1]
+      if (!value || value.startsWith('--') || !/^[0-9a-f]{40}$/.test(value)) {
+        return { kind: 'error', reason: '--sha must be 40 hex characters' }
+      }
+      sha = value
+      i += 1
+      continue
+    }
+    return { kind: 'error', reason: arg.startsWith('--') ? `unknown option ${arg}` : `unknown command ${arg}` }
+  }
+  if (noBump && sha) return { kind: 'error', reason: '--no-bump deploys the checkout; it does not take --sha' }
+  return { kind: 'cd', sha, noBump }
+}
+
 export function parseArgs(argv: readonly string[]): Parsed {
   const [command, ...rest] = argv
-  if (!command || command === 'cd') {
-    const sha = flag(rest, 'sha')
-    if (sha !== null && !/^[0-9a-f]{40}$/.test(sha)) return { kind: 'error', reason: '--sha must be 40 hex characters' }
-    return { kind: 'cd', sha }
-  }
   if (command === 'help' || command === '--help' || command === '-h') return { kind: 'usage' }
+  if (!command || command === 'cd' || command.startsWith('--')) {
+    return parseCd(command === 'cd' ? rest : argv)
+  }
   if (command === 'bump') {
     const sha = flag(rest, 'sha')
     if (sha !== null && !/^[0-9a-f]{40}$/.test(sha)) return { kind: 'error', reason: '--sha must be 40 hex characters' }
@@ -101,7 +123,8 @@ export function parseArgs(argv: readonly string[]): Parsed {
 export function usageText(): string {
   return [
     'usage: npm run cd -- [command]',
-    '  cd [--sha <40 hex>]',
+    '  cd [--sha <40 hex>] [--no-bump]',
+    '  [--sha <40 hex>] [--no-bump]',
     '  bump [--sha <40 hex>]',
     '  deploy-canary',
     '  smoke --version <id> | --expect-version <id>',
@@ -144,7 +167,7 @@ async function identity(config: CdConfig) {
 
 export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: (line: string) => void = console.log): Promise<number> {
   const nodeError = checkNode(process.version)
-  if (nodeError) return finish(log, 1, `cd: FAIL preflight: ${nodeError}`)
+  if (nodeError) return finish(log, 1, `cd: harness_fault preflight: ${nodeError}`)
   const parsed = parseArgs(argv)
   if (parsed.kind === 'usage') return finish(log, 2, usageText())
   if (parsed.kind === 'error') return finish(log, 2, parsed.reason)
@@ -169,11 +192,11 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
   const needsToken = parsed.kind === 'cd' || parsed.kind === 'smoke' || parsed.kind === 'ramp'
   let token = ''
   if (needsToken) {
-    if (!config.tokenFile) return finish(log, 1, 'cd: FAIL preflight: PLY_TOKEN_FILE is not set')
+    if (!config.tokenFile) return finish(log, 1, 'cd: harness_fault preflight: PLY_TOKEN_FILE is not set')
     try {
       token = await readTokenFile(config.tokenFile)
     } catch (error) {
-      return finish(log, 1, `cd: FAIL preflight: ${errorMessage(error)}`)
+      return finish(log, 1, `cd: harness_fault preflight: ${errorMessage(error)}`)
     }
   }
   const runDir = await createRunDir(config.runRoot)
@@ -192,8 +215,9 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
       return code
     } catch (error) {
       reason = errorMessage(error)
-      await runLog.error(reason, { stage: 'run' })
-      log(`cd: FAIL run: ${reason}`)
+      runLog.patch({ fault: 'harness_fault' })
+      await runLog.error(reason, { stage: 'run', fault: 'harness_fault' })
+      log(`cd: harness_fault run: ${reason}`)
       return 1
     } finally {
       if (!runLog.finished) await runLog.finish(code, code === 0 ? null : reason)
@@ -213,14 +237,15 @@ async function dispatch(
   log: (line: string) => void,
 ): Promise<Outcome> {
   if (parsed.kind === 'cd') {
-    const exit = await runPipeline(config, { token, sha: parsed.sha, log, runDir, runLog })
+    const exit = await runPipeline(config, { token, sha: parsed.sha, noBump: parsed.noBump, log, runDir, runLog })
     return { code: exit.code, reason: exit.reason }
   }
   if (parsed.kind === 'bump') {
     const result = await stageBump(config, parsed.sha)
     await writeJson(runDir, 'bump.json', result)
     if (result.kind === 'fail') {
-      const line = `cd: FAIL bump: ${result.reason}`
+      runLog.patch({ fault: 'harness_fault' })
+      const line = `cd: harness_fault bump: ${result.reason}`
       log(line)
       return { code: 1, reason: line }
     }
@@ -232,7 +257,8 @@ async function dispatch(
     const result = await stageDeploy(config)
     await writeJson(runDir, 'deploy.json', result)
     if (result.kind === 'fail') {
-      const line = `cd: FAIL deploy-canary: ${result.reason}`
+      runLog.patch({ fault: result.fault })
+      const line = `cd: ${result.fault === 'worker' ? 'FAIL' : result.fault} deploy-canary: ${result.reason}`
       log(line)
       return { code: 1, reason: line }
     }
@@ -245,7 +271,8 @@ async function dispatch(
     const version = parsed.version ?? parsed.expectVersion
     const result = await stageSmoke(config, { version, pin: parsed.version !== null, token, runDir })
     if (result.kind === 'fail') {
-      const line = `cd: FAIL smoke: ${result.reason}`
+      runLog.patch({ fault: result.fault })
+      const line = `cd: ${result.fault === 'worker' ? 'FAIL' : result.fault} smoke: ${result.reason}`
       log(line)
       return { code: 1, reason: line }
     }

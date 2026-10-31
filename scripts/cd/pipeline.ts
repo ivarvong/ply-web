@@ -55,7 +55,14 @@ async function span<T>(log: RunLog, name: string, fn: () => Promise<T>): Promise
 
 export async function runPipeline(
   config: CdConfig,
-  opts: { readonly token: string; readonly sha: string | null; readonly log: (line: string) => void; readonly runDir: string; readonly runLog: RunLog },
+  opts: {
+    readonly token: string
+    readonly sha: string | null
+    readonly noBump: boolean
+    readonly log: (line: string) => void
+    readonly runDir: string
+    readonly runLog: RunLog
+  },
 ): Promise<PipelineExit> {
   const runDir = opts.runDir
   const runLog = opts.runLog
@@ -71,11 +78,30 @@ export async function runPipeline(
       if (result.rolledBack) {
         runLog.patch({ rolledBack: true, rollbackReason: result.reason, restoredAt: isoOffset(new Date()) })
       }
-      await runLog.error(result.reason, { stage: result.stage, rolledBack: result.rolledBack })
+      runLog.patch({ fault: result.fault })
+      await runLog.error(result.reason, { stage: result.stage, rolledBack: result.rolledBack, fault: result.fault })
     }
   }
   while (state.phase !== 'halt' && state.phase !== 'done') {
     if (state.phase === 'bump') {
+      if (opts.noBump) {
+        const at = Date.now()
+        const ref = await runLog.observation({
+          measurement: { source: 'bump', skipped: true },
+          query: { source: 'no-bump' },
+          from: at,
+          to: at,
+          raw: '{"noBump":true}',
+        })
+        await runLog.decision({
+          inputs: [ref],
+          rules: [{ name: 'no_bump', value: 1 }],
+          outcome: 'advance',
+          reason: 'no-bump: deploy the current main as it is',
+        })
+        state = nextPhase(state, 'pass')
+        continue
+      }
       const result = await span(runLog, 'bump', () => stageBump(config, opts.sha))
       await writeJson(runDir, 'bump.json', result)
       await note(result)
@@ -153,7 +179,7 @@ export async function runPipeline(
         const reason = failure ? `${failure.reason}; ${result.reason}` : result.reason
         const fault = result.fault === 'state_conflict' ? 'state_conflict' : 'worker'
         failure = fail(failure?.stage ?? 'rollback', reason, false, fault)
-        if (!runLog.facts.failedAt) runLog.patch({ failedAt: isoOffset(new Date()) })
+        runLog.patch({ fault, failedAt: runLog.facts.failedAt ?? isoOffset(new Date()) })
         await runLog.error(result.reason, { stage: 'rollback' })
         opts.log(`rollback: ${result.reason}`)
       }
