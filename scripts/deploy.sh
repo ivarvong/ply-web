@@ -12,10 +12,14 @@
 #      every request carries Cloudflare-Workers-Version-Overrides: ply="<new>" and fails if x-ply-version is not <new>.
 #   5. telemetry gate: scripts/canary-o11y.mjs proves every pinned smoke request id was logged by <new> (a request id is
 #      minted per request, so this shows which version answered) and that <new> has 0 non-ok invocations, 0 5xx, 0 error logs.
+#      Workers Observability loses ~1.4% of events: an id logged by no version is tolerated iff the smoke saw
+#      x-ply-version: <new> on it and at most max(2, 2%) of the phase's ids are lost (scripts/canary-verdict.mjs); an id
+#      logged by another version always fails. Each phase's verdict line goes into the DEPLOYED line.
 #   Any failure in 3-5: route 100% back to the previous version alone (removes the canary), exit 1.
 #   6. promote <new> to 100%, smoke again unpinned (gate/read/write + visual). A failure routes 100% back to the previous
 #      version, exit 1.
-# Prints `DEPLOYED <new> (previous <prev>)` and leaves artifacts (smoke JSON, request ids, screenshots) in $OUT.
+# Prints `DEPLOYED <new> (previous <prev>) git <sha>; canary telemetry: …; live telemetry: …` (e.g. `117/119 matched, 2 lost
+# (tolerated)`) and leaves artifacts (smoke JSON, request ids, screenshots) in $OUT.
 # Never `cf deploy` straight to 100%: that skips the canary. Tokens are never printed (smoke.mjs redacts its own).
 set -euo pipefail
 MSG=${1:?usage: scripts/deploy.sh "<message>"}
@@ -45,7 +49,8 @@ smokes() {  # smokes <label> [version]: gate, read, write, visual; request ids �
   mkdir -p "$OUT/$label-shots"
   PLY_VERSION="$v" node scripts/visual-smoke.mjs $BASE "$OUT/$label-shots" > "$OUT/$label-visual.log" 2>&1 || rc=1
   echo "   $label visual: $(grep -c '"ok":true' "$OUT/$label-visual.log")/$(grep -c '"ok":' "$OUT/$label-visual.log") ok; screenshots $OUT/$label-shots"
-  node -e 'const fs=require("fs");const [o,l]=process.argv.slice(1);const ids=[];for(const p of ["gate","read","write"]){try{for(const s of JSON.parse(fs.readFileSync(`${o}/${l}-${p}.json`)).steps)if(s.requestId)ids.push(s.requestId)}catch{}}try{const last=fs.readFileSync(`${o}/${l}-visual.log`,"utf8").trim().split("\n").pop();ids.push(...(JSON.parse(last).requestIds??[]))}catch{}fs.writeFileSync(`${o}/${l}.ids`,ids.join("\n")+"\n")' "$OUT" "$label"
+  # $OUT/<label>.ids: one { id, version (x-ply-version the smoke saw on the response), step } per line, for canary-o11y.mjs
+  node -e 'const fs=require("fs");const [o,l]=process.argv.slice(1);const rs=[];for(const p of ["gate","read","write"]){try{for(const s of JSON.parse(fs.readFileSync(`${o}/${l}-${p}.json`)).steps)if(s.requestId)rs.push({id:s.requestId,version:s.version??null,step:`${p}: ${s.name}`})}catch{}}try{const last=fs.readFileSync(`${o}/${l}-visual.log`,"utf8").trim().split("\n").pop();for(const r of JSON.parse(last).requests??[])rs.push({id:r.id,version:r.version??null,step:`visual: ${new URL(r.url).pathname}${new URL(r.url).search}`})}catch{}fs.writeFileSync(`${o}/${l}.ids`,rs.map(r=>JSON.stringify(r)).join("\n")+"\n")' "$OUT" "$label"
   return $rc
 }
 
@@ -98,4 +103,5 @@ done
 [ $ok -ge 5 ] || { log "unpinned requests not answered by $NEW after promotion: routing 100% back to $PREV"; route "$PREV:100"; exit 1; }
 if ! smokes live; then log "LIVE SMOKE FAILED: routing 100% back to $PREV"; route "$PREV:100"; echo "active now: $(active)"; exit 1; fi
 env -u CLOUDFLARE_API_TOKEN node scripts/canary-o11y.mjs "$NEW" "$T_LIVE" "$OUT/live.ids" | tee "$OUT/live-o11y.json" || { log "LIVE TELEMETRY FAILED: routing 100% back to $PREV"; route "$PREV:100"; exit 1; }
-echo "DEPLOYED $NEW (previous $PREV) git $SHA; artifacts $OUT"
+tel() { node -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).telemetry??"telemetry: ?")}catch{console.log("telemetry: ?")}' "$1"; }
+echo "DEPLOYED $NEW (previous $PREV) git $SHA; canary $(tel "$OUT/canary-o11y.json"); live $(tel "$OUT/live-o11y.json"); artifacts $OUT"
