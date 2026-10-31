@@ -124,7 +124,7 @@ function CommitHead(props: { commit: CommitInfo; header: RepoHeader; now: number
   const subject = prose.subject || '(no message)'
   const hasBody = prose.paragraphs.length > 0 || prose.trailers.length > 0
   return (
-    <div class="lc">
+    <div class="lc" data-commit={props.commit.oid}>
       <div class="lc-by">
         <Avatar name={props.commit.authorName} />
         <span class="lc-author">{props.commit.authorName || 'unknown'}</span>
@@ -174,7 +174,8 @@ function TreePage(props: { loaded: TreeLoaded; trace: TraceModel; now: number })
       <PathCrumbs header={header} path={path} />
       <Card head={<CommitHead commit={props.loaded.commit} header={header} now={props.now} />} class="tree-card">
         {props.loaded.entries.length === 0 && !path ? <p class="empty">This directory is empty.</p> : (
-          <ul class="files" aria-label={`${count} ${count === 1 ? 'entry' : 'entries'}`}>
+          // Stable scraping contract (README "Machine-readable markup"): one li[data-oid] per entry shown.
+          <ul class="files" aria-label={`${count} ${count === 1 ? 'entry' : 'entries'}`} data-path={path} data-entries={String(count)} data-shown={String(props.loaded.entries.length)}>
             {path ? (
               <li><a class="row" href={viewerHref(header.host, header.repoPath, { ref: header.ref, path: parentPath(path) || undefined })} aria-label="Parent directory">
                 <Icon name="up" /><span class="name">..</span>
@@ -183,7 +184,7 @@ function TreePage(props: { loaded: TreeLoaded; trace: TraceModel; now: number })
             {props.loaded.entries.map(entry => {
               const child = path ? `${path}/${entry.name}` : entry.name
               return (
-                <li><a class="row" href={viewerHref(header.host, header.repoPath, { ref: header.ref, path: child })}>
+                <li data-oid={entry.oid} data-mode={entry.mode} data-type={entry.type} data-name={entry.name}><a class="row" href={viewerHref(header.host, header.repoPath, { ref: header.ref, path: child })}>
                   <EntryIcon entry={entry} />
                   <span class="name">{entry.name}</span>
                   <EntryNote entry={entry} />

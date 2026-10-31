@@ -127,6 +127,19 @@ resolve to viewer URLs. Images render as links (the CSP is `img-src 'none'`; a R
 third-party pixels). `/view.css` is Kumo's theme and base plus only the Kumo utilities `kumo-classes.ts` emits
 (`kumoSubset`, 167.9 KB → 67 KB).
 
+**Machine-readable markup (stable interface).** Styling and layout may change; these attributes do not, and
+`test/viewer.test.ts` ("scraping contract") pins them against `git ls-tree`. Scrapers and monitors should use them, never
+class names or visible text:
+
+| Selector | Attributes | Meaning |
+|---|---|---|
+| `li[data-oid]` (tree page) | `data-oid` full 40-hex oid, `data-mode` as `git ls-tree` prints it (`100644`, `100755`, `120000`, `040000`, `160000`), `data-type` `blob`/`tree`/`commit`, `data-name` | one row per entry shown; the `..` row has none |
+| `ul.files` | `data-path`, `data-entries` (entries in the tree), `data-shown` (rows rendered; less than `data-entries` when capped) | the listing |
+| `[data-commit]` | full 40-hex oid | the commit the page shows |
+
+Example: `curl -s 'https://ply.ivar.workers.dev/view/github.com/ivarvong/ply?path=src' | grep -oE '<li data-oid="[0-9a-f]{40}"' | wc -l`
+matches `gh api repos/ivarvong/ply/git/trees/main:src --jq '.tree | length'`.
+
 **Allowlist.** An unauthenticated Worker that will `fetch` a caller-supplied URL is an SSRF proxy, so the viewer
 accepts https URLs whose hostname is an exact, case-insensitive match for `github.com`, `gitlab.com`,
 `codeberg.org`, `bitbucket.org`, or `git.sr.ht`. No suffix, no wildcard, no userinfo, default port only. A
