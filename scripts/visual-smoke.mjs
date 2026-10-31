@@ -4,7 +4,10 @@
 //   - horizontal page overflow,
 //   - no stylesheet with rules applied, or an icon whose computed width is not 16 px,
 //   - a stylesheet href that is not the content-hashed /view.<hash>.css (a stale cached sheet could pair with new HTML),
-//   - a tree page with no li[data-oid] rows (the scraping contract, README "Machine-readable markup").
+//   - a tree page with no li[data-oid] rows (the scraping contract, README "Machine-readable markup"),
+//   - a footer build token (ply=…, ply-web=…) broken across lines, an error-page headline that starts lowercase, or a
+//     missing-repo page whose "Repository root" link points back at the missing repo.
+// Default pages: home, /r/ply, a file, the /r index, and the failure pages (missing repo/ref/path, missing GitHub repo).
 // STALE_CSS=<file> fulfils every request for STALE_CSS_URL (default <base>/view.css) with that file, which is what a
 // browser that cached an old unversioned sheet does. A hashed href never hits it, so the run must still pass.
 //
@@ -29,6 +32,12 @@ const urls = dash !== -1 ? args.slice(dash + 1) : [
   `${base}/view`,
   `${base}/r/ply`,
   `${base}/view/${PUBLIC}/ply.git?path=src/fetchpack.ts`,
+  // The namespace index and every failure page (#29): missing repo, ref and path in public-v0, missing GitHub repo.
+  `${base}/r`,
+  `${base}/r/no-such-repo`,
+  `${base}/r/ply?ref=no-such-ref`,
+  `${base}/r/ply?path=no-such-file.txt`,
+  `${base}/view/github.com/ivarvong/no-such-repo-x`,
 ];
 const CHROME = process.env.CHROME ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const stale = process.env.STALE_CSS ? readFileSync(process.env.STALE_CSS).toString('base64') : null;
@@ -90,6 +99,11 @@ const PROBE = `(() => {
     sheets: [...document.styleSheets].map(s => { try { return { href: s.href, rules: s.cssRules.length }; } catch { return { href: s.href, rules: -1 }; } }),
     tree: !!document.querySelector('ul.files'),
     rows: document.querySelectorAll('li[data-oid]').length,
+    // the footer build line: each token (ply=…, ply-web=…) must sit on one line
+    buildTokensBroken: [...document.querySelectorAll('.site-footer .build > span')].filter(s => s.getClientRects().length > 1).map(s => s.textContent),
+    headline: document.querySelector('h1.display')?.textContent ?? null,
+    kicker: document.querySelector('.error-kicker')?.textContent ?? null,
+    upLinks: [...document.querySelectorAll('.error-card .lede a')].map(a => [a.textContent, a.getAttribute('href')]),
   };
 })()`;
 
@@ -106,11 +120,16 @@ for (const url of urls) for (const [w, h, mobile] of [[375, 812, true], [1280, 8
   if (r.iconPx && r.iconPx !== '16px') problems.push(`icon ${r.iconPx}`);
   if (!r.sheets.some(s => /\/view\.[0-9a-f]{12}\.css$/.test(s.href ?? ''))) problems.push(`stylesheet not content-hashed: ${r.sheets.map(s => s.href).join(' ')}`);
   if (r.tree && r.rows === 0) problems.push('tree page has no li[data-oid] rows');
+  if (r.buildTokensBroken.length) problems.push(`footer build token wraps inside itself: ${r.buildTokensBroken.join(', ')}`);
+  if (r.kicker && r.headline && /^\p{Ll}/u.test(r.headline)) problems.push(`headline not sentence case: ${r.headline}`);
+  // an error page never links "Repository root" back to the repository it just failed to find
+  const rootLink = r.upLinks.find(([text]) => text === 'Repository root');
+  if (rootLink && /HTTP 404 · repo/.test(r.kicker ?? '')) problems.push(`missing-repo page links Repository root → ${rootLink[1]}`);
   const name = `${url.replace(/^https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_').slice(0, 60)}-${w}-${scheme}${stale ? '-stale' : ''}.png`;
   const shot = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
   writeFileSync(join(outdir, name), Buffer.from(shot.data, 'base64'));
   if (problems.length) failed = true;
-  console.log(JSON.stringify({ ok: !problems.length, url, w, scheme, problems, shot: join(outdir, name), maxSvgPx: r.maxSvgPx, iconPx: r.iconPx, overflowPx: r.overflowPx, rows: r.rows, sheets: r.sheets }));
+  console.log(JSON.stringify({ ok: !problems.length, url, w, scheme, problems, shot: join(outdir, name), maxSvgPx: r.maxSvgPx, iconPx: r.iconPx, overflowPx: r.overflowPx, rows: r.rows, headline: r.headline, upLinks: r.upLinks, sheets: r.sheets }));
 }
 if (wrongVersion.length) failed = true;
 console.log(JSON.stringify({ cssRequested: [...cssRequested], staleCss: stale ? { url: staleUrl, servedFor: [...staleServed] } : null, version: VERSION || null, requestIds, wrongVersion, failed }));

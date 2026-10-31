@@ -492,9 +492,24 @@ function FailureBanner(props: Extract<ViewerDocument, { kind: 'error' }>) {
   if (props.code === 'auth') return <Banner tone="info"><span>{PRIVATE_HINT}</span></Banner>
   if (props.part === 'ref') return <Banner tone="info"><span><RefHint host={props.host} repoPath={props.repoPath} hint={props.hint} /></span></Banner>
   if (props.part === 'path') return <Banner tone="info"><span><PathHint host={props.host} repoPath={props.repoPath} ref={props.ref} hint={props.hint} /></span></Banner>
-  if (props.part === 'repo' && /no repository |not a repository/.test(props.message)) return <Banner tone="info"><span>That name is not in this namespace. Open the <a href="/r">repository index</a>.</span></Banner>
+  if (notInNamespace(props)) return <Banner tone="info"><span>That name is not in this namespace. Open the <a href="/r">repository index</a>.</span></Banner>
   if (props.part === 'repo') return <Banner tone="info"><span>This repository could not be opened.</span></Banner>
   return <Banner tone={tone}><span>{errorHint(props.code, props.status, props.message)}</span></Banner>
+}
+
+/** A /r/<name> that the public namespace does not have. */
+function notInNamespace(props: { part: string; message: string }): boolean {
+  return props.part === 'repo' && /no repository |not a repository/.test(props.message)
+}
+
+/**
+ * The way back up from an error. A missing repository has no root to go back to: a public-namespace name links to the
+ * namespace index, any other missing repo gets only "Back to the viewer".
+ */
+function UpLink(props: Extract<ViewerDocument, { kind: 'error' }>) {
+  if (notInNamespace(props)) return <><a href="/r">Repository index</a> · </>
+  if (props.part === 'repo' || props.host.length === 0 || props.repoPath.length === 0) return null
+  return <><a href={viewerHref(props.host, props.repoPath, {})}>Repository root</a> · </>
 }
 
 function errorTone(code: string, status: number): 'alert' | 'info' {
@@ -528,7 +543,7 @@ function ErrorPage(props: Extract<ViewerDocument, { kind: 'error' }>) {
         <h1 class="display">{headline}</h1>
         <FailureBanner {...props} />
         {hosts.length ? <ul class="host-list" aria-label="Supported hosts">{hosts.map(host => <li>{host}</li>)}</ul> : null}
-        <p class="lede">{knownRepo ? <><a href={viewerHref(props.host, props.repoPath, {})}>Repository root</a> · </> : null}<a href="/view">Back to the viewer</a></p>
+        <p class="lede"><UpLink {...props} /><a href="/view">Back to the viewer</a></p>
         <details class="reason">
           <summary>Why this was refused</summary>
           <p>{props.message}</p>

@@ -390,6 +390,7 @@ ${wide} {
 }
 .site-footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: ${S.sm}; padding: ${S.md} 2px 0; font-size: var(--text-xs); color: var(--text-color-kumo-subtle); }
 .site-footer a { color: inherit; font-weight: 500; }
+.site-footer .build > span { white-space: nowrap; }
 
 /* home */
 .hero { padding: ${S.lg} 0 0; }

@@ -1,6 +1,9 @@
 import type { Child } from 'hono/jsx'
 import type { BranchInfo, RepoHeader, TagInfo, TraceBar, TraceModel } from './model.ts'
-import { plyBuildValue } from '../version.ts'
+import { PLY_SHA, PLY_WEB_SHA, plyBuildValue } from '../version.ts'
+
+/** Hex digits of each commit shown in the footer. */
+const BUILD_SHA_CHARS = 12
 import { viewerHref } from './url.ts'
 import {
   bannerClass, buttonClass, KUMO_BADGE_DANGER, KUMO_BADGE_INFO, KUMO_BADGE_NEUTRAL, KUMO_BADGE_OUTLINE, KUMO_BADGE_SUCCESS,
@@ -347,7 +350,11 @@ export function Diagnostics(props: { trace: TraceModel; header?: RepoHeader; hos
       </details>
       <footer class="site-footer">
         <span>ply · read-only, no credentials</span>
-        <span class="mono" title="ply commit and ply-web commit this deploy was built from">{plyBuildValue()}</span>
+        {/* Abbreviated commits, one unbreakable token each, so a narrow footer wraps between them (never at "ply-web").
+            The full value is the title and the x-ply-build header. */}
+        <span class="mono build" title={`${plyBuildValue()} (ply commit and ply-web commit this deploy was built from)`}>
+          <span>ply={PLY_SHA.slice(0, BUILD_SHA_CHARS)}</span> <span>ply-web={PLY_WEB_SHA.slice(0, BUILD_SHA_CHARS)}</span>
+        </span>
         <a href="/view#limits">Limits</a>
       </footer>
     </section>

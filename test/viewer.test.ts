@@ -184,6 +184,8 @@ test('abbreviated oids, failure copy, tag order, cache headers, and version text
   const badPath = describeFailure({ code: 'not_found', status: 404, message: 'path component missing not found', host: 'github.com', repoPath: 'o/r', ref: 'main', path: 'src/missing' });
   assert.equal(badPath.part, 'path');
   assert.match(badPath.summary, /No path src\/missing in o\/r/);
+  // A /r/<name> the public namespace lacks: sentence case like every other headline.
+  assert.equal(describeFailure({ code: 'not_found', status: 404, message: 'no repository nope in the public namespace', host: 'h.example', repoPath: 'git/public-v0/nope.git', ref: null, path: '' }).summary, 'No repository nope in the public namespace');
   assert.ok(compareTagNames('refs/tags/v2.0.0', 'refs/tags/v1.9.0') < 0);
   assert.deepEqual(tagsFromRefs(refs, 10).tags.map(tag => tag.name), ['refs/tags/v1']);
   assert.match(plyBuildValue('a'.repeat(40), 'b'.repeat(40)), /^ply=[0-9a-f]{40} ply-web=[0-9a-f]{40}$/);
@@ -297,6 +299,18 @@ test('ssr markup uses Kumo classes, prose commits, and a strict CSP', () => {
   assert.match(error, /That URL is not supported/)
   assert.match(error, /Supported hosts: github.com, gitlab.com, codeberg.org, bitbucket.org, git.sr.ht/)
   assert.equal(error.includes('<script'), false)
+  // The way back up: a missing repo never links to its own (missing) root; a public-namespace name links to /r.
+  const notInNs = String(renderError(404, 'not_found', 'no repository nope in the public namespace', trace, 'h.example', 'git/public-v0/nope.git'))
+  assert.match(notInNs, /<h1 class="display">No repository nope in the public namespace<\/h1>/)
+  assert.match(notInNs, /<a href="\/r">Repository index<\/a>/)
+  assert.equal(notInNs.includes('Repository root'), false)
+  const ghMissing = String(renderError(401, 'auth', 'authentication failed', trace, 'github.com', 'o/missing'))
+  assert.equal(ghMissing.includes('Repository root'), false)
+  assert.match(ghMissing, /<a href="\/view">Back to the viewer<\/a>/)
+  assert.match(String(renderError(404, 'not_found', 'ref nope not found', trace, 'github.com', 'o/r', 'nope')), /<a href="\/view\/github\.com\/o\/r">Repository root<\/a>/)
+  // The footer's build line is two unbreakable tokens (a 375 px footer wraps between them, never inside "ply-web=").
+  assert.match(String(error), /<span class="mono build" title="ply=\S+ ply-web=\S+ [^"]*"><span>ply=[0-9a-z]{1,12}<\/span> <span>ply-web=[0-9a-z]{1,12}<\/span><\/span>/)
+  assert.match(VIEWER_CSS, /\.site-footer \.build > span \{ white-space: nowrap; \}/)
   const limited = renderError(429, 'rate_limited', 'Too many viewer requests. Retry after 1s.', trace)
   assert.match(limited, /Too many requests/)
   assert.match(VIEWER_CSS, /--color-kumo-canvas/)
