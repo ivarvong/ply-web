@@ -2,7 +2,6 @@
 // that is the root commit on an empty repository, and a new branch when `base` names another ref or a commit.
 // One find/replace on an existing file still goes through ply's editFile, which streams the blob.
 import { fail, editFile, encodeCommit, fetchObject, hashObject, isLfsPointerPrefix, lsRefs, operation, parseCommit, parseTree, push, resolveCommit, TYPE, validatePath, KIND, type Span } from 'ply'
-import { arrayBufferBytes } from './bytes.ts'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
 import { MODE_TREE, BLOB_MODES } from './constants.ts'
 import { refExists } from './errors.ts'
@@ -176,7 +175,7 @@ async function streamEdit(remote: string, req: EditRequest, target: Target, edit
     author: plyPerson(req.author),
     message: req.message,
     time: req.author.time,
-  }, { ...opts, ...head } as unknown as Parameters<typeof editFile>[2]) as { noop: boolean; newCommit: string; oldCommit: string; newTree: string; pushBytes: number }
+  }, { ...opts, ...head })
   const oid = edited.newCommit
   const oldOid = edited.noop || !creating ? edited.oldCommit : null
   return writeResult(edited.noop ? 'noop' : 'commit', target.ref, oid, oldOid, {
@@ -248,9 +247,9 @@ export async function commitEdit(remote: string, req: EditRequest, opts: CallOpt
     const seen = new Set<string>()
     const used = new Set<string>()
     referencedBlobs(mem, used)
-    const objects: { type: number; data: Uint8Array<ArrayBuffer> }[] = [{ type: TYPE.COMMIT, data: arrayBufferBytes(data) }]
-    for (const tree of built.trees) if (!seen.has(tree.oid)) { seen.add(tree.oid); objects.push({ type: TYPE.TREE, data: arrayBufferBytes(tree.data) }) }
-    for (const [blob, bytes] of blobs.created) if (used.has(blob) && !seen.has(blob)) { seen.add(blob); objects.push({ type: TYPE.BLOB, data: arrayBufferBytes(bytes) }) }
+    const objects: { type: number; data: Uint8Array }[] = [{ type: TYPE.COMMIT, data }]
+    for (const tree of built.trees) if (!seen.has(tree.oid)) { seen.add(tree.oid); objects.push({ type: TYPE.TREE, data: tree.data }) }
+    for (const [blob, bytes] of blobs.created) if (used.has(blob) && !seen.has(blob)) { seen.add(blob); objects.push({ type: TYPE.BLOB, data: bytes }) }
     root.set({ 'git.commit.tree': built.oid, 'git.commit.oid': oid, 'git.commit.parent': parent.oid ?? '', 'git.commit.objects': objects.length })
     const oldOid = creating ? ZERO_OID : target.oid
     try {

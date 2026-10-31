@@ -1,6 +1,6 @@
 # ply Worker — `https://ply.ivar.workers.dev`
 
-A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#c2ccba2c554e8a18ac438cfbc53725d4b593811b` (an exact commit of ply `main`; `bump-ply.yml` moves the pin). The `/v1` API has no
+A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#9ca64714709141cf25aabbe189454139caebff03` (an exact commit of ply `main`; an operator moves the pin with `npm run cd -- bump`). The `/v1` API has no
 storage. `GET /view` is a public repository viewer, rate-limited by client through a SQLite Durable Object. One Artifacts
 namespace, `public-v0`, is served read-only with no token (`/r/<repo>`, see [Public namespace](#public-namespace-public-v0));
 its binding is the Worker's only other binding. `GET /` prints the usage text.
@@ -73,7 +73,7 @@ its binding is the Worker's only other binding. `GET /` prints the usage text.
   400 and nothing is fetched. On an existing branch, omit `base` to commit on the tip.
 - Every `/v1` response is `cache-control: no-store` (a credentialed API: nothing it answers is stored, not even a
   `tree`/`read`/`commit` at a full oid). Every response carries `x-ply-version` (the Workers version id, which
-  `scripts/deploy.sh` checks) and `x-ply-build` (`ply=<commit> ply-web=<commit>`, injected at build time). `x-ply-trace`
+  the canary checks) and `x-ply-build` (`ply=<commit> ply-web=<commit>`, injected at build time). `x-ply-trace`
   is omitted when it would be empty.
 - `head` on edit is a **precondition**: if the branch is not at `head`, the response is 409 `cas_conflict` and nothing
   is pushed. `head` of zeros means the ref must not exist yet. `hint` is ply's soft head hint for a one-file edit.
@@ -387,29 +387,26 @@ npm test                                 # /v1 + public-namespace workerd suites
 npm run dev                              # cf dev: Vite + the Cloudflare plugin on local workerd
 npm run typecheck                        # tsc for the app, then cf workers types + tsc for cloudflare.config.ts
 npm run worker:deploy:dry-run            # cf deploy --dry-run: build and validate, no credentials, no upload
-scripts/deploy.sh "<message>"            # prod: gate, upload, 0% canary smoked pinned + telemetry gate, promote, smoke (below)
-npm run worker:deploy                    # cf deploy straight to 100% (no canary; emergencies only)
-node src/smoke.mjs https://ply.ivar.workers.dev gate                     # public + auth + allowlist checks, no Artifacts
-env -u CLOUDFLARE_API_TOKEN node src/smoke.mjs https://ply.ivar.workers.dev read|write --out smoke.json
+npm run cd                               # operator deploy: bump, 0% canary, smoke, telemetry, ramp (docs/continuous-deployment.md)
+npm run cd -- smoke --version <id>       # pinned lifecycle smoke against that Workers version
+npm run worker:deploy                    # refuses unless PLY_FORCE_FULL_DEPLOY=1; then cf deploy to 100%
 ```
 
-The operator runbook for a gradual ramp (bump, 0% canary, pinned smoke, telemetry, then 1% → 100% with a rollback at any bad step) is [docs/continuous-deployment.md](docs/continuous-deployment.md). `scripts/deploy.sh` still goes to 100% in one shot. Do not run it while a ramp is in progress.
+The operator runbook for a gradual ramp (bump, 0% canary, pinned smoke, telemetry, then 1% → 100% with a rollback at any bad step) is [docs/continuous-deployment.md](docs/continuous-deployment.md). `npm run worker:deploy` refuses unless `PLY_FORCE_FULL_DEPLOY=1`. With that set it still goes to 100% in one shot. Do not run it while a ramp is in progress.
 
-`scripts/deploy.sh` (OAuth: it runs cf with `CLOUDFLARE_API_TOKEN` unset) deploys the checked-out commit: gate, `cf workers versions create --prebuilt`, a deployment with the new version at 0% beside the current one at 100%, then `smoke.mjs gate|read|write --version <id>` and `visual-smoke.mjs` with `PLY_VERSION=<id>` (every request carries `Cloudflare-Workers-Version-Overrides: ply="<id>"`), then `scripts/canary-o11y.mjs`, which requires every smoke `x-ply-request-id` in a `ply.request` log line of the new version and 0 non-ok invocations, 0 5xx, 0 error logs. A failure routes 100% back to the previous version. Then it promotes, smokes unpinned and re-runs the telemetry gate; a failure there also routes back.
+`npm run cd` is that runbook. It uses `cf` only. A canary is a new version at 0% beside the current one at 100%. Pinned smoke sends `Cloudflare-Workers-Version-Overrides: ply="<id>"` and requires `x-ply-version` to match. Telemetry reuses the loss allowance in `scripts/canary-verdict.mjs`. The ramp compares the new version with the old one at each percentage and puts the old version back at 100% on a breach.
 
-`read` and `write` each create a scratch Artifacts repo in namespace `default` (`src/smoke-seed.mjs`), seed it with a fixed history (fixed identities and dates, so the seeded oids are the same every run), mint a 15-minute read or write token for it, compare the Worker's answers with that seeded local clone, then revoke every token and delete the repo, also on failure or Ctrl-C. A run killed harder than that leaves `ply-web-smoke-*`; the next run deletes ones older than an hour. Tokens go to git only through `GIT_CONFIG_*` and never reach argv, stdout or the JSON report. Runs are repeatable back to back. They need a cf login with Artifacts access.
+The smoke creates an empty repo in the Artifacts namespace `ply-loadgen`, mints a short-lived write token from `PLY_TOKEN_FILE` (mode `0600`, the same value as the Worker secret `PLY_TOKEN`), and drives the git lifecycle through `/v1`. It does not seed the repo with stock git. The token is revoked when the run ends. A pass deletes the repo. A fail leaves the repo name in the verdict. Tokens stay out of argv and the run log.
 
 The Worker is built and deployed with the Cloudflare CLI, [`cf`](https://developers.cloudflare.com/cf/), pinned as a dev dependency. `cloudflare.config.ts` is the Worker config (name, compatibility date, bindings, Durable Object exports, observability, limits). `vite.config.ts` holds build settings only: `cf build` delegates bundling to Vite and the Cloudflare Vite plugin and writes Build Output to `.cloudflare/output`. The workerd suites in `npm test` run that same bundle (`test/cf-bundle.js`). Nothing here needs Docker: the Vite plugin runs `docker image ls` after every build even with no containers (execFileSync, no timeout, so a hung daemon hung the build), and `vite.config.ts` sets `WRANGLER_DOCKER_BIN=false` so that call fails at once and is skipped.
 
-`npm run worker:deploy` runs `cf deploy`. When `CLOUDFLARE_API_TOKEN` is set, cf uses it. When it is unset, cf uses the OAuth session from `cf auth login`. The command uploads the Worker named `ply`: text bindings `WRITES` and `PACK_CACHE`, the `ViewerRateLimit` Durable Object, observability, `limits.cpuMs`, and `workersDev`. Worker secrets survive a deploy (the upload sends `keep_bindings: ["secret_text", "secret_key"]`). `PLY_TOKEN` stays a secret. Set or rotate it with `cf workers secrets update PLY_TOKEN --worker ply --type secret_text`. cf prompts for the value, so it never lands in shell history.
+`npm run worker:deploy` runs `cf deploy` only when `PLY_FORCE_FULL_DEPLOY=1`. Otherwise it exits and uploads nothing. When `CLOUDFLARE_API_TOKEN` is set, cf uses it. When it is unset, cf uses the OAuth session from `cf auth login`. The command uploads the Worker named `ply`: text bindings `WRITES` and `PACK_CACHE`, the `ViewerRateLimit` Durable Object, observability, `limits.cpuMs`, and `workersDev`. Worker secrets survive a deploy (the upload sends `keep_bindings: ["secret_text", "secret_key"]`). `PLY_TOKEN` stays a secret. Set or rotate it with `cf workers secrets update PLY_TOKEN --worker ply --type secret_text`. cf prompts for the value, so it never lands in shell history.
 
 cf has no live log stream yet (no equivalent of `tail`). Use the dashboard's live logs, or Workers Logs, which this Worker sends through `observability.logs`.
 
 ### GitHub Actions
 
-`bump-ply.yml` moves the `ply` git pin to the current `main` of [ivarvong/ply](https://github.com/ivarvong/ply). It runs on `repository_dispatch` (`ply-main-updated`), `workflow_dispatch`, and a daily cron (`0 16 * * *` UTC) for a dispatch that never arrived. It resolves `refs/heads/main` over the public git protocol, writes that 40-hex SHA into `package.json` and `package-lock.json`, then runs `npm test`, Oxlint, `npm run typecheck`, and `cf deploy --dry-run`. The dry run builds the Worker and validates it without credentials or API calls. When the pin is already that commit, the job stops. When the checks pass, it commits the pin straight to `main` and stops. It does not upload the Worker. This repository's `main` is not a protected branch (`protected: false`, no rulesets), so a direct push is the whole publish step. A pull request would wait on a review that `GITHUB_TOKEN` cannot approve. When the checks fail, the workflow opens an issue titled `ply bump failed for <sha>` (or comments, when that issue is already open) and leaves `main` unchanged.
-
-GitHub holds the code and the pull request. It does not deploy. An operator ships from the runbook above.
+GitHub does not bump the ply pin and does not deploy. An operator moves the pin with `npm run cd -- bump` and ships from the runbook above.
 
 ### Cloudflare token
 

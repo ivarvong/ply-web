@@ -6,7 +6,6 @@
 // and ignored the extra paths. `allowEmpty` still writes the empty commit (same tree, new commit). That is git's
 // `--keep-redundant-commits`, which ply does not take yet (#117), so the commit is built here.
 import { cherryPick, encodeCommit, fail, fetchObject, hashObject, lsRefs, operation, parseCommit, push, revertCommit, TYPE } from 'ply'
-import { arrayBufferBytes } from './bytes.ts'
 import { type CallOpts, type GitOutcome, type GitTransport } from './call.ts'
 import { type Stamp } from './identity.ts'
 import { writeResult } from './result.ts'
@@ -81,7 +80,7 @@ async function writeEmpty(remote: string, opts: CallOpts, ref: string, commit: s
       message: messageBody(message ?? fallback),
     })
     const oid = hashObject('commit', data)
-    const pushed = await push(t, { ref, oldOid: tip, newOid: oid, objects: [{ type: TYPE.COMMIT, data: arrayBufferBytes(data) }] })
+    const pushed = await push(t, { ref, oldOid: tip, newOid: oid, objects: [{ type: TYPE.COMMIT, data }] })
     return outcome(op, writeResult(revert ? 'revert' : 'cherry_pick', ref, oid, tip, { tree: target.tree, pushBytes: pushed.packBytes }))
   }) as Promise<Record<string, unknown>>
 }
