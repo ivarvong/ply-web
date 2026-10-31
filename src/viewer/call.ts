@@ -16,6 +16,8 @@ export type HandleOpts = {
   fetchImpl?: FetchLike
   now?: number
   note?: (extra: Record<string, string | number>) => void
+  /** Pinned's internal fill (src/pinned.ts): the front door already rate-limited this request. */
+  skipRate?: boolean
   /** Tests: the GitCache loopback to use (null: none). Default: ctx.exports.GitCache unless PACK_CACHE=off. */
   loopback?: (() => LoopbackBinding | null | undefined) | null
 }

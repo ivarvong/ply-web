@@ -29,6 +29,8 @@ const durableObjects = {
 const entrypoints = {
 	default: exports.worker({ cache: { enabled: false } }),
 	GitCache: exports.worker({ cache: { enabled: true } }),
+	// Whole responses pinned to a commit oid (src/pinned.ts): /v1 tree/read/commit and viewer raw files.
+	Pinned: exports.worker({ cache: { enabled: true } }),
 } as const;
 
 // A binding can only name a class declared live above. src/index.js re-exports it from src/viewer/rate.ts.

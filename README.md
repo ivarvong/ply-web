@@ -287,6 +287,13 @@ eyeball ─▶ default entrypoint (cache OFF: always runs → rate limit, ply.re
 - **Observability:** the tier (`cf-cache-status`: HIT, MISS, EXPIRED, …) reaches ply as `x-ply-pack-cache`, so every
   span carries `git.response.cache`, the viewer waterfall shows it, and `ply.request` logs count `cache_hits`. A HIT
   never runs GitCache, so it leaves no GitCache invocation.
+- **Whole responses pinned to a commit** (`src/pinned.ts`, cache-enabled `Pinned` entrypoint): `/v1/tree`, `/v1/read`,
+  `/v1/commit` with `ref=<40-hex>` on a public-v0 remote, no Authorization, no `trace=1`; and viewer raw files
+  (`?raw=1&ref|at=<40-hex>&path=`) on public-v0 or a built-in forge. The front door rate-limits and logs, then fetches the
+  canonical key `/v<CACHE_VERSION>/pinned<path>?<allowed params, sorted>` from Pinned. Pinned rebuilds the request from
+  the key alone (it reads no header, so no credential can reach it), runs the same handler, and answers `immutable` on a
+  200, `no-store` otherwise. Responses carry `x-ply-pinned-cache` (the tier). HTML pages are not cached whole: they render
+  times relative to the request and carry that request's waterfall, cf-ray and id. Their git parts are cached.
 - `PACK_CACHE=off` sends everything direct.
 
 ## Develop / deploy
