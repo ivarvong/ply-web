@@ -1,7 +1,6 @@
 // Lightweight tags point the ref at a commit. Annotated tags add a tag object and point the ref at that.
 // Delete uses the same compare-and-swap as a branch delete.
-import { fail, fetchObject, hashObject, ident, lsRefs, operation, push, resolveCommit, TYPE, ZERO_OID } from 'ply'
-import { arrayBufferBytes } from './bytes.ts'
+import { encodeTag, fail, fetchObject, hashObject, ident, lsRefs, operation, push, resolveCommit, TYPE, ZERO_OID } from 'ply'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
 import { refExists } from './errors.ts'
 import { nowSeconds, stamp, type Stamp } from './identity.ts'
@@ -16,20 +15,6 @@ type Outcome = GitOutcome
 
 function messageBody(message: string): string {
   return message.endsWith('\n') ? message : `${message}\n`
-}
-
-/**
- * Annotated tag object. ply's encodeTag (src/objects.js) is not exported, and the bytes are the four
- * headers git writes (`object`, `type`, `tag`, `tagger`) plus a blank line and the message.
- * A well-formed string encodes as UTF-8, which is what ply's encodeBytes does for one.
- */
-export function encodeTagObject(spec: { object: string; type: string; tag: string; tagger: string; message: string }): Uint8Array {
-  for (const [what, value] of [['object', spec.object], ['type', spec.type], ['tag', spec.tag], ['tagger', spec.tagger]] as const) {
-    if (/[\0\n]/.test(value)) throw fail('bad_request', `${what} must not contain NUL or newline`)
-  }
-  if (spec.message.includes('\0')) throw fail('bad_request', 'message must not contain NUL')
-  const text = `object ${spec.object}\ntype ${spec.type}\ntag ${spec.tag}\ntagger ${spec.tagger}\n\n${spec.message}`
-  return new TextEncoder().encode(text)
 }
 
 async function commitOf(t: Transport, target: string): Promise<string> {
@@ -66,7 +51,7 @@ export async function createTag(remote: string, body: unknown, opts: CallOpts): 
     let newOid = commit
     const objects: { type: number; data: Uint8Array<ArrayBuffer> }[] = []
     if (annotated && tagger) {
-      const data = encodeTagObject({
+      const data = encodeTag({
         object: commit,
         type: 'commit',
         tag: short,
@@ -74,7 +59,7 @@ export async function createTag(remote: string, body: unknown, opts: CallOpts): 
         message: messageBody(message ?? short),
       })
       newOid = hashObject('tag', data) as string
-      objects.push({ type: TYPE.TAG, data: arrayBufferBytes(data) })
+      objects.push({ type: TYPE.TAG, data })
     }
     root.set({ 'git.tag.commit': commit, 'git.tag.oid': newOid })
     try {

@@ -109,10 +109,12 @@ Artifacts after deploy (`Git-Token` is the Artifacts bearer). Pass oids from res
 
 ## Errors
 
-Every failure is JSON `{code, message, retry}`. `code` comes from ply's error table (`src/errors.js`), and `retry` is
+Every failure is JSON `{code, message, retry}`. `code` comes from ply's error table (`src/errors.ts`), and `retry` is
 that table's policy: `yes`, `fresh` (re-read, then retry), `no`, or `read` (the push may have landed; read the ref
 back first). Merge conflicts add `conflicts` and `reasons`. `match_count` adds `matches`. `auth` adds
-`upstreamStatus`.
+`upstreamStatus`. `cas_conflict` adds `expected` and `actual` when known (`null` means the ref was to be, or is,
+absent). `push_partial` adds `landed` and `rejected`. The table below covers every ply code (`src/status.ts` is
+type-checked exhaustive against ply's `CODES`).
 
 | code | HTTP | why this status |
 |---|---|---|
@@ -128,9 +130,10 @@ back first). Merge conflicts add `conflicts` and `reasons`. `match_count` adds `
 | `rate_limited` | 429 | |
 | `upstream_5xx`, `network`, `protocol`, `pack_corrupt`, `not_git`, `remote_error`, `http`, `ambiguous` | 502 | the upstream misbehaved. Check `retry` before retrying: `ambiguous` is `read` |
 | `timeout` | 504 | |
+| `aborted` | 499 | the caller went away |
 | `unsupported` | 501 | including writes when they are disabled |
 | `read_only` | 403 | a write whose remote is in the public namespace, with or without a bearer or git credential |
-| `internal` | 500 | |
+| `internal` | 500 | a bug; an error without a known code is reported as this |
 
 ## Tracing
 
