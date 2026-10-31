@@ -73,6 +73,9 @@ export default defineConfig({
 			// The public namespace, served read-only with no token (src/public.ts). The binding is scoped to this one
 			// namespace; the Worker calls only get(<repo>).createToken("read", 3600) and list(). No stored secret.
 			PUBLIC_REPOS: bindings.artifacts({ namespace: PUBLIC_NAMESPACE }),
+			// The running version's id, sent as x-ply-version on every front-door response so a deploy can prove which
+			// version answered a request pinned with Cloudflare-Workers-Version-Overrides (scripts/deploy.sh).
+			VERSION: bindings.versionMetadata(),
 		},
 		exports: { ...durableObjects, ...entrypoints },
 	},

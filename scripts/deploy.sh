@@ -7,8 +7,9 @@
 #   2. upload: cf build --mode production, then `cf workers versions create --prebuilt` (a version in no deployment;
 #      nothing reaches it).
 #   3. canary: one deployment with the new version at 0% and the current version (must be alone at 100%) at 100%.
-#   4. pinned smoke: src/smoke.mjs gate/read/write --version <new> and scripts/visual-smoke.mjs with PLY_VERSION=<new>; every
-#      request carries Cloudflare-Workers-Version-Overrides: ply="<new>".
+#   4. pinned smoke: wait until pinned requests are answered by <new> (x-ply-version; a fresh deployment takes seconds to
+#      propagate), then src/smoke.mjs gate/read/write --version <new> and scripts/visual-smoke.mjs with PLY_VERSION=<new>;
+#      every request carries Cloudflare-Workers-Version-Overrides: ply="<new>" and fails if x-ply-version is not <new>.
 #   5. telemetry gate: scripts/canary-o11y.mjs proves every pinned smoke request id was logged by <new> (a request id is
 #      minted per request, so this shows which version answered) and that <new> has 0 non-ok invocations, 0 5xx, 0 error logs.
 #   Any failure in 3-5: route 100% back to the previous version alone (removes the canary), exit 1.
@@ -68,6 +69,17 @@ log "uploaded $NEW"
 abort() { log "CANARY FAILED ($1): routing 100% to $PREV"; route "$PREV:100"; echo "active now: $(active)"; exit 1; }
 T_CANARY=$(now_ms)
 route "$NEW:0" "$PREV:100" || abort "create 0% deployment"
+# A new deployment takes a few seconds to reach every colo; until then a pinned request is answered by the old version
+# (seen 2026-10-31: the first 3 s of pinned smoke ran on the previous version). Wait until pinned requests come back with
+# x-ply-version = NEW five times in a row.
+ok=0
+for _ in $(seq 1 60); do
+  got=$(curl -s -o /dev/null -D - -H "Cloudflare-Workers-Version-Overrides: $W=\"$NEW\"" "$BASE/" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ply-version"{print $2}')
+  if [ "$got" = "$NEW" ]; then ok=$((ok+1)); [ $ok -ge 5 ] && break; else ok=0; fi
+  sleep 1
+done
+[ $ok -ge 5 ] || abort "pinned requests never answered by $NEW"
+log "pinned requests answered by $NEW"
 log "canary: $NEW 0%, $PREV 100%; pinned smoke"
 smokes canary "$NEW" || abort "pinned smoke"
 log "telemetry gate (pinned requests)"
@@ -77,7 +89,13 @@ log "promote $NEW to 100%"
 T_LIVE=$(now_ms)
 route "$NEW:100"
 [ "$(active)" = "$NEW" ] || { route "$PREV:100"; echo "promotion did not take; routed back to $PREV" >&2; exit 1; }
-sleep 5
+ok=0
+for _ in $(seq 1 90); do
+  got=$(curl -s -o /dev/null -D - "$BASE/" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ply-version"{print $2}')
+  if [ "$got" = "$NEW" ]; then ok=$((ok+1)); [ $ok -ge 5 ] && break; else ok=0; fi
+  sleep 1
+done
+[ $ok -ge 5 ] || { log "unpinned requests not answered by $NEW after promotion: routing 100% back to $PREV"; route "$PREV:100"; exit 1; }
 if ! smokes live; then log "LIVE SMOKE FAILED: routing 100% back to $PREV"; route "$PREV:100"; echo "active now: $(active)"; exit 1; fi
 env -u CLOUDFLARE_API_TOKEN node scripts/canary-o11y.mjs "$NEW" "$T_LIVE" "$OUT/live.ids" | tee "$OUT/live-o11y.json" || { log "LIVE TELEMETRY FAILED: routing 100% back to $PREV"; route "$PREV:100"; exit 1; }
 echo "DEPLOYED $NEW (previous $PREV) git $SHA; artifacts $OUT"
