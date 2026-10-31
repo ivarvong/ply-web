@@ -225,3 +225,14 @@ test('pack verification against real git: a genuine pack is immutable; a corrupt
     cleanup();
   }
 });
+
+test('serveGitCache: a token mint that fails maps to the status ply turns back into the same code (no such repo → 404)', async () => {
+  const mint = (code: string): TokenSource => ({ readToken: async () => { throw Object.assign(new Error(code), { code }); }, secrets: () => [] });
+  const up = async () => new Response('never');
+  const missing = await serveGitCache(await gcRequest('refs', `${PUB}/git-upload-pack`, LSREFS), mint('not_found'), {}, up);
+  assert.equal(missing.status, 404);
+  assert.equal(missing.headers.get('cache-control'), NO_STORE);
+  const down = await serveGitCache(await gcRequest('refs', `${PUB}/git-upload-pack`, LSREFS), mint('upstream_5xx'), {}, up);
+  assert.equal(down.status, 502);
+  assert.equal(down.headers.get('cache-control'), NO_STORE);
+});
