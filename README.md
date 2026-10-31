@@ -36,25 +36,68 @@ its binding is the Worker's only other binding. `GET /` prints the usage text.
 
 | Method | Path | Input | Output |
 |---|---|---|---|
-| GET | `/v1/refs` | `remote`, `prefix?` | `{refs: {name: oid}, head, peeled: {tag: commit}}` |
+| GET | `/v1/refs` | `remote`, `prefix?` | `{refs: {name: oid}, head, peeled: {tag: commit}}`. An empty repository adds `{empty:true, unborn:"refs/heads/main"}` and leaves `head` null |
 | GET | `/v1/discover` | `remote` | protocol v2 capabilities (`agent`, `fetch`, `filter`, `caps`, …) |
 | GET | `/v1/read` | `remote`, `ref?`, `path` | the blob, streamed. Headers: `content-length`, `x-ply-ref`, `x-ply-commit`, `x-ply-blob`, `x-ply-mode`, `x-ply-size` |
 | GET | `/v1/tree` | `remote`, `ref?`, `path?` | `{ref, commit, tree, entries: [{name, mode, oid, type}]}` (modes as `git ls-tree` prints them) |
-| GET | `/v1/commit` | `remote`, `ref?` | `{ref, oid, tree, parents: [oid], author, committer, message, signed}`. `author`/`committer` are `{name, email, time, epoch, tz}`: `time` ISO-8601 UTC, `epoch` the raw seconds, `tz` the offset as written (`+0530`). `message` is the raw body (UTF-8, trailing newline kept). `signed` means a `gpgsig`/`gpgsig-sha256` header is present (not verified). Other headers (`encoding`, `mergetag`, …) are not returned. Fetches the commit object only (`tree:0`, deepen 1; `blob:none` on servers that refuse that) |
-| POST | `/v1/edit` | `{remote, ref?, base?, path, find, replace, author, message, head?, hint?}` | `{ref, newCommit, oldCommit, pushBytes, noop, …}` |
-| POST | `/v1/branch` | `{remote, ref, from?}` | 201 `{ref, oid}`. The CAS is a zero old-oid, so an existing branch gets 409 |
-| DELETE | `/v1/branch` | `{remote, ref, oid?}` | `{ref, deleted}`. CAS on `oid` (default: the oid ls-refs shows now) |
-| POST | `/v1/merge` | `{remote, ref?, from, author, message?, fastForwardOnly?, noFastForward?}` | ply's `mergeBranch` result |
-| POST | `/v1/rebase` | `{remote, ref, onto?, committer, squash?, message?}` | ply's `rebaseBranch` result |
-| POST | `/v1/cherry-pick`, `/v1/revert` | `{remote, ref?, commit, committer, message?}` | ply's result |
+| GET | `/v1/commit` | `remote`, `ref?` | born: `{ref, oid, tree, parents, author, committer, message, signed}`. `author`/`committer` are `{name, email, time, epoch, tz}` (`time` ISO-8601 UTC, `epoch` the raw seconds, `tz` as written, e.g. `+0530`). `message` is the raw body. `signed` means a `gpgsig` header is present (not verified). Fetches the commit only (`tree:0`, deepen 1; `blob:none` when the server refuses that). Empty repository (unborn HEAD, or that same branch by name): `{empty:true, ref:"refs/heads/main", oid:null, tree:null, parents:[], author:null, committer:null, message:null, signed:false}`. A different missing ref stays 404. A born response does not grow an `empty` field |
+| POST | `/v1/edit` | `{remote, ref?, base?, author, committer?, message, head?, changes?}` or the one-file form `{path, find?, replace?, content?, delete?, to?, mode?}` | `{outcome, ref, oid, oldOid, noop, tree, newCommit, oldCommit}`. `newCommit`/`oldCommit` alias `oid`/`oldOid`. A root commit and any newly created ref have `oldOid: null` |
+| POST | `/v1/branch` | `{remote, ref, from?}` | 201 `{outcome:"created", ref, oid, oldOid:null}`. `from` is a branch or a 40-hex commit. Omit `from` only when HEAD is born |
+| DELETE | `/v1/branch` | `{remote, ref, oid?}` | `{outcome:"deleted", ref, deleted}`. CAS on `oid` (default: the oid ls-refs shows now) |
+| POST | `/v1/tag` | `{remote, name, target, annotated?, message?, tagger?}` | 201 `{outcome:"tag", ref, oid, commit, annotated}`. Lightweight unless `annotated`, `message`, or `tagger` is set. `target` is a branch or a commit id |
+| DELETE | `/v1/tag` | `{remote, name, oid?}` | same compare-and-swap as `DELETE /v1/branch` |
+| POST | `/v1/merge` | `{remote, ref?, from, author?, message?, fastForwardOnly?, noFastForward?}` | `{outcome, ref, oid, oldOid, noop, …}` where outcome is `merge`, `fast_forward`, or `up_to_date`. `from` is a branch name. A `committer` must equal `author` |
+| POST | `/v1/rebase` | `{remote, ref, onto?, committer, author?, squash?, message?}` | `{outcome, ref, oid, oldOid, …}` where outcome is `rebase`, `squash`, `fast_forward`, or `up_to_date`. `onto` is a branch name. `author.time` must equal `committer.time` |
+| POST | `/v1/cherry-pick`, `/v1/revert` | `{remote, ref?, commit, committer, message?, allowEmpty?}` | `{outcome, ref, oid, oldOid, noop, tree?}`. A patch already present is `{outcome:"empty", noop:true, oid:<tip>}`. `allowEmpty:true` writes that empty commit |
 
-- `ref` defaults to the remote's HEAD branch. If HEAD is unborn (Artifacts can leave it pointing at a deleted branch),
-  the response is 404 asking for an explicit `ref`.
+- `ref` defaults to the remote's HEAD branch. On an empty repository HEAD is an unborn symref (`refs/heads/main` on
+  Artifacts and on `git init -b main`). `GET /v1/commit` reports that as `empty: true` and names the symref.
+  `POST /v1/edit` with no `ref` creates the root commit on that branch. Merge, rebase, cherry-pick, revert, and
+  branch-from cannot use an unborn HEAD: the response is 400 naming the missing field (`ref`, `onto`, or `from`).
+  Naming that unborn ref explicitly is 404 `ref refs/heads/main is unborn; create a commit before …`.
 - On reads, short names resolve the way `git rev-parse` does: tags win over branches, and a 40-hex commit oid is also
-  accepted. On writes, short names mean `refs/heads/<name>`.
+  accepted. On writes, short names mean `refs/heads/<name>`. A 40-hex string is a commit id, never a branch of that
+  name. The zero oid is 400; omit the field to mean "no parent" or "HEAD".
+- `author` and `committer` are `{name, email, tz?, time?}`. `tz` is `+HHMM` or `-HHMM` in the civil range −12:00
+  through +14:00. `time` is unix seconds. Omitted `tz` is `+0000`. Omitted `time` is now.
+- One edit is `{path, find, replace}`. An empty or omitted `find` creates the file (`content`, or `replace`, or
+  empty). `delete: true` deletes it. `to` renames it. `mode` is `100644` (default), `100755`, or `120000`.
+  Several changes go in `changes: [{op, path, content?, find?, replace?, to?, mode?}]` with `op` of `create`,
+  `write`, `edit`, `delete`, or `rename`, applied in order. Pass `changes` or a single `path`, not both.
+  A distinct `committer` is written on the commit. One find/replace of an existing file still streams through ply.
+- `base` omitted on a missing ref is a root commit (no parent), pushed with compare-and-swap old oid all zeros.
+  `base` as another branch, or as a 40-hex commit, starts a new ref whose parent is that commit. `base` of zeros is
+  400 and nothing is fetched. On an existing branch, omit `base` to commit on the tip.
 - `head` on edit is a **precondition**: if the branch is not at `head`, the response is 409 `cas_conflict` and nothing
-  is pushed. `hint` is ply's soft head hint, which saves a round trip when it is right and is corrected when it is
-  stale.
+  is pushed. `head` of zeros means the ref must not exist yet. `hint` is ply's soft head hint for a one-file edit.
+- Every write shares `{outcome, ref, oid, oldOid, noop}`. `newCommit` and `oldCommit` are deprecated aliases of
+  `oid` and `oldOid`. `onto` is a deprecated alias of the commit the write was based on. `noop` is true for
+  `noop`, `empty`, and `up_to_date`.
+
+### Empty repository, in order
+
+This is the whole lifecycle against a brand-new repository. Nothing is seeded with stock git. Replay it against
+Artifacts after deploy (`Git-Token` is the Artifacts bearer). Pass oids from responses into later requests.
+
+1. `GET /v1/commit?remote=` → 200 `{empty:true, ref:"refs/heads/main", oid:null, tree:null, parents:[], author:null, committer:null, message:null, signed:false}`.
+   `GET /v1/commit?remote=&ref=main` is the same body. `GET /v1/commit?remote=&ref=nope` is 404.
+2. `POST /v1/edit` `{remote, message, author:{name, email, tz, time}, changes:[{op:"create", path, content, mode?}, …]}`
+   → 200 `{outcome:"commit", ref:"refs/heads/main", oid, oldOid:null, newCommit, oldCommit:null, noop:false, tree}`.
+   The ref is created with compare-and-swap old oid `000…0` and the commit has no parent. A 40-hex `base` is that
+   parent commit. `000…0` is 400.
+3. `POST /v1/edit` `{remote, message, author, committer:{name, email, tz, time}, changes:[{op:"edit", path, find, replace}, {op:"create", …}, {op:"delete", path}, {op:"rename", path, to}]}`.
+4. `POST /v1/branch` `{remote, ref, from}` → 201 `{outcome:"created", ref, oid}`. `from` is a branch or a 40-hex
+   commit. Omit `from` only when HEAD is born. `000…0` is 400 and nothing is pushed. An existing ref is 409
+   `{code:"ref_exists", retry:"no", oid}`.
+5. `DELETE /v1/branch` `{remote, ref, oid}` — a stale oid is 409 `{code:"stale_expected", retry:"fresh", expected, actual, oid:actual}`.
+6. `POST /v1/tag` `{remote, name, target, annotated?, message?, tagger?}` and `DELETE /v1/tag` `{remote, name, oid?}`.
+7. `POST /v1/merge` `{remote, ref?, from, author, message?}`.
+8. `POST /v1/rebase` `{remote, ref, onto?, committer, squash?, message?}`.
+9. `POST /v1/cherry-pick` `{remote, ref?, commit, committer, message?, allowEmpty?}` — a patch already in history is
+   200 `{outcome:"empty", noop:true, oid:<tip>}`. `allowEmpty:true` writes an empty commit (same tree, new commit).
+10. `POST /v1/revert` `{remote, ref?, commit, committer, message?, allowEmpty?}`.
+
+`GET /` prints the same sequence.
 - JSON request bodies are capped at 1 MiB (413 above that). `WRITES` (a text binding in `cloudflare.config.ts`) must be `on` for the
   POST/DELETE endpoints; otherwise they return 501 `unsupported`.
 
@@ -71,6 +114,8 @@ back first). Merge conflicts add `conflicts` and `reasons`. `match_count` adds `
 | `auth` | 401 or 403, the upstream's own status | the caller needs to know whether its credential was missing or not good enough |
 | `not_found` | 404 | ref, path or repo |
 | `cas_conflict` | 409 | the branch moved, so re-read and retry (`retry: fresh`). git 2.50 and later say `incorrect old value provided`; ply classifies that string as `cas_conflict` |
+| `ref_exists` | 409 | creating a branch or tag that already exists (`retry: no`). The body includes `oid`, the current target. Checked before the push, so a lost race that Artifacts reports as `stale ref` is mapped here too |
+| `stale_expected` | 409 | deleting a ref whose `oid` is not the current target (`retry: fresh`). The body includes `expected`, `actual`, and `oid` (the actual) |
 | `merge_conflict`, `not_fast_forward`, `push_rejected`, `push_partial` | 409 | conflict with the repository's current state |
 | `match_count`, `lfs_pointer`, `not_linear`, `unrelated_histories` | 422 | the request is well-formed but cannot apply to this content. Retrying it unchanged cannot work, even against a fresh state. That is the difference from 409 |
 | `limit_exceeded` | 413 | |

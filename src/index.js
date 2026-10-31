@@ -10,19 +10,15 @@
 //                                       oauth2, Artifacts and others → Bearer)
 // Neither git credential appears in logs, spans, error messages or responses (scrubbed at the edge as defense in depth;
 // ply itself never records them).
-import { readFile, listTree, readCommit, resolveCommit } from 'ply';
-import { editFile } from 'ply';
-import { mergeBranch } from 'ply';
-import { rebaseBranch, cherryPick, revertCommit } from 'ply';
+import { readFile, listTree } from 'ply';
 import { lsRefs } from 'ply';
 import { discover } from 'ply';
-import { push, ZERO_OID } from 'ply';
-import { operation } from 'ply';
 import { createTransport } from 'ply';
 import { Tracer, arrayExporter, flattenLine } from 'ply';
 import { RETRY, isPlyCode, fail } from 'ply';
 import { withLimits } from 'ply';
-import { validateRef, validateIdent } from 'ply';
+import { isWorkerCode, WORKER_RETRY } from './write/errors.ts';
+import { handleEdit, handleBranchCreate, handleBranchDelete, handleMerge, handleRebase, handleCherryPick, handleRevert, handleTagCreate, handleTagDelete, readCommitOrEmpty, unbornFields } from './write/handle.ts';
 import { handleViewer } from './viewer/handle.ts';
 import { checkRemote, createGuardedFetch } from './remote.ts';
 import { applySecurityHeaders } from './security-headers.ts';
@@ -78,6 +74,7 @@ export const STATUS = Object.freeze({
   rate_limited: 429, upstream_5xx: 502, not_git: 502, ssh: 502, host_key_mismatch: 502, protocol: 502, pack_corrupt: 502,
   remote_error: 502, limit_exceeded: 413, match_count: 422, lfs_pointer: 422, cas_conflict: 409, push_rejected: 409, push_partial: 409,
   merge_conflict: 409, not_fast_forward: 409, not_linear: 422, unrelated_histories: 422, ambiguous: 502, internal: 500,
+  ref_exists: 409, stale_expected: 409,
 });
 
 const USAGE = `ply — a git client for anywhere, as an HTTP API (https://ply.ivar.workers.dev)
@@ -85,25 +82,78 @@ const USAGE = `ply — a git client for anywhere, as an HTTP API (https://ply.iv
 Every endpoint except GET / needs  Authorization: Bearer <PLY_TOKEN>.
 Git credential (optional, forwarded upstream):  Git-Authorization: <Authorization value>  or  Git-Token: <token>.
 remote= is an https git URL (no userinfo, no IP literals, no private hosts, default port only).
-ref= defaults to the remote's HEAD. Short names resolve like git rev-parse (tags before branches).
+ref= defaults to the remote's HEAD. On reads, short names resolve like git rev-parse (tags before branches).
+On writes, a short name is refs/heads/<name>. A 40-hex string is a commit id, never a branch of that name.
+author and committer are {name, email, tz?, time?}. tz is +HHMM or -HHMM (−12:00..+14:00). time is unix seconds.
+Omitted tz is +0000. Omitted time is now. The zero oid (40 zeros) is rejected: omit the field instead.
+
+Every write returns {outcome, ref, oid, oldOid, noop}. outcome is the discriminant:
+  commit, noop, empty, created, deleted, merge, fast_forward, up_to_date, rebase, squash, cherry_pick, revert, tag.
+noop is true for noop, empty, and up_to_date. newCommit and oldCommit are deprecated aliases of oid and oldOid.
+onto is a deprecated alias of the commit the write was based on. A created ref has oldOid null (the compare-and-swap
+old value is the zero oid; that zero is not returned as oldCommit).
 
   GET    /v1/refs?remote=&prefix=              {refs:{name:oid}, head, peeled}
+                                               empty repo adds {empty:true, unborn:"refs/heads/main"} (head stays null)
   GET    /v1/discover?remote=                  server capabilities (protocol v2)
   GET    /v1/read?remote=&ref=&path=           file bytes, streamed; x-ply-commit, x-ply-blob, x-ply-mode, content-length
-  GET    /v1/tree?remote=&ref=&path=           [{name, mode, oid, type}]
-  GET    /v1/commit?remote=&ref=               {ref, oid, tree, parents, author, committer, message, signed}
+  GET    /v1/tree?remote=&ref=&path=           {ref, commit, tree, entries:[{name, mode, oid, type}]}
+  GET    /v1/commit?remote=&ref=               born: {ref, oid, tree, parents, author, committer, message, signed}
+                                               empty: {empty:true, ref:"refs/heads/main", oid:null, tree:null, parents:[], author:null, committer:null, message:null, signed:false}
                          author/committer: {name, email, time (ISO-8601 UTC), epoch, tz (as written, e.g. +0530)}
-  POST   /v1/edit        {remote, ref?, base?, path, find, replace, author:{name,email}, message, head?, hint?}
-                         head: expected parent (moved → 409 cas_conflict, nothing pushed); hint: a guess only
-  POST   /v1/branch      {remote, ref, from?}           create (fails 409 if it exists)
-  DELETE /v1/branch      {remote, ref, oid?}            delete (compare-and-swap on oid)
-  POST   /v1/merge       {remote, ref?, from, author, message?, fastForwardOnly?, noFastForward?}
-  POST   /v1/rebase      {remote, ref, onto?, committer, squash?, message?}
-  POST   /v1/cherry-pick {remote, ref?, commit, committer, message?}
-  POST   /v1/revert      {remote, ref?, commit, committer, message?}
+  POST   /v1/edit        one file, or changes:[{op, path, content?, find?, replace?, to?, mode?}]
+                         op is create, write, edit, delete, or rename. An empty or omitted find creates the file.
+                         mode is 100644 (default), 100755, or 120000. committer? may differ from author.
+                         base omitted + missing ref = root commit (no parent). base as another branch, or a 40-hex
+                         commit, starts a new ref at that parent. base 000…0 is 400. head is a compare-and-swap
+                         precondition (40 zeros means the ref must not exist). hint is a guess, only for a one-file edit.
+  POST   /v1/branch      {remote, ref, from?}            201 {outcome:"created", ref, oid, oldOid:null}
+                         from is a branch or a 40-hex commit. Omit from only when HEAD is born.
+                         from 000…0 is 400 and nothing is pushed. An existing ref is 409 {code:"ref_exists", retry:"no", oid}.
+  DELETE /v1/branch      {remote, ref, oid?}             {outcome:"deleted", ref, deleted}
+                         a stale oid is 409 {code:"stale_expected", retry:"fresh", expected, actual, oid:actual}
+  POST   /v1/tag         {remote, name, target, annotated?, message?, tagger?}
+                         lightweight unless annotated, message, or tagger is set. target is a branch or a commit id.
+  DELETE /v1/tag         {remote, name, oid?}            same compare-and-swap as DELETE /v1/branch
+  POST   /v1/merge       {remote, ref?, from, author?, message?, fastForwardOnly?, noFastForward?}
+                         from is a branch name. committer, when sent, must equal author.
+  POST   /v1/rebase      {remote, ref, onto?, committer, author?, squash?, message?}
+                         onto is a branch name. author.time must equal committer.time.
+  POST   /v1/cherry-pick {remote, ref?, commit, committer, message?, allowEmpty?}
+  POST   /v1/revert      {remote, ref?, commit, committer, message?, allowEmpty?}
+                         a patch already in the target history is 200 {outcome:"empty", noop:true, oid:<tip>}.
+                         allowEmpty:true writes that empty commit (same tree, new commit) instead.
 
-Errors: {code, message, retry} with retry in yes|fresh|no|read. ?trace=1 adds ply's spans to JSON responses
-(and an x-ply-trace timing summary header on /v1/read).
+Empty repository, replayed in order (Git-Token on Artifacts; no git seeding). HEAD is an unborn symref to refs/heads/main.
+
+  1. GET /v1/commit?remote=
+     200 {empty:true, ref:"refs/heads/main", oid:null, tree:null, parents:[], author:null, committer:null, message:null, signed:false}
+     GET /v1/commit?remote=&ref=main is the same body. GET /v1/commit?remote=&ref=nope is 404.
+  2. POST /v1/edit
+     {remote, message, author:{name, email, tz, time}, changes:[{op:"create", path, content, mode?}, ...]}
+     200 {outcome:"commit", ref:"refs/heads/main", oid, oldOid:null, newCommit, oldCommit:null, noop:false, tree}
+     The ref is created with compare-and-swap old oid 000…0 and the commit has no parent.
+     A 40-hex base is that parent commit. 000…0 is 400.
+  3. POST /v1/edit
+     {remote, message, author, committer:{name, email, tz, time}, changes:[{op:"edit", path, find, replace}, {op:"create", ...}, {op:"delete", path}, {op:"rename", path, to}]}
+  4. POST /v1/branch {remote, ref, from}  →  201 {outcome:"created", ref, oid}
+     Omit from only when HEAD is born. 000…0 is 400 (no push). An existing ref is 409 {code:"ref_exists", retry:"no", oid}.
+  5. DELETE /v1/branch {remote, ref, oid}
+     a stale oid is 409 {code:"stale_expected", retry:"fresh", expected, actual, oid:actual}.
+  6. POST /v1/tag {remote, name, target, annotated?, message?, tagger?}   and   DELETE /v1/tag {remote, name, oid?}
+  7. POST /v1/merge {remote, ref?, from, author, message?}
+  8. POST /v1/rebase {remote, ref, onto?, committer, squash?, message?}
+  9. POST /v1/cherry-pick {remote, ref?, commit, committer, message?, allowEmpty?}
+     a patch already in history is 200 {outcome:"empty", noop:true, oid:<tip>}. allowEmpty:true writes an empty commit.
+  10. POST /v1/revert {remote, ref?, commit, committer, message?, allowEmpty?}
+
+Pass oids returned by these responses into later requests. When HEAD is unborn, merge, rebase, cherry-pick, revert,
+and branch-from require the missing field (ref, onto, or from) by name. An explicit unborn ref is 404
+"ref refs/heads/main is unborn; create a commit before …".
+
+Errors: {code, message, retry} with retry in yes|fresh|no|read. ref_exists is retry "no". stale_expected is retry
+"fresh" and includes the actual oid. ?trace=1 adds ply's spans to JSON responses (and an x-ply-trace timing summary
+header on /v1/read).
 
 Public read-only viewer (no token, no git credential):  GET /view   and   GET /view/<host>/<owner>/<repo>?ref=&path=
 
@@ -166,9 +216,6 @@ async function scrubResponse(res, scrub) {
   return new Response(scrub(await res.text()), { status: res.status, statusText: res.statusText, headers });
 }
 
-const fullRef = r => (typeof r === 'string' && !r.startsWith('refs/') ? `refs/heads/${r}` : r);
-const need = (body, k) => { if (body[k] === undefined || body[k] === null || body[k] === '') throw fail('bad_request', `${k} is required`); return body[k]; };
-
 // ---- effects ----
 
 async function timingSafeTokenEqual(a, b) {
@@ -188,23 +235,19 @@ async function readJson(req) {
   try { const v = JSON.parse(text); if (!v || typeof v !== 'object' || Array.isArray(v)) throw 0; return v; } catch { throw fail('bad_request', 'body must be a JSON object'); }
 }
 
-// The default branch: the remote's HEAD symref (some hosts let it go unborn — then the caller must name the ref).
-async function headBranch(remote, opts) {
-  const t = createTransport(remote, { ...opts, parent: null });
-  const { head } = await lsRefs(t, ['HEAD']);
-  if (!head) throw fail('not_found', 'remote HEAD is unborn or not a symref; pass ref explicitly');
-  return head;
-}
-
 const json = (status, obj, scrub, extra = {}) => new Response(scrub(JSON.stringify(obj)), { status, headers: { 'content-type': 'application/json; charset=utf-8', ...extra } });
 
 function errorBody(e) {
-  const code = isPlyCode(e?.code) ? e.code : 'internal';
-  const body = { code, message: String(e?.message ?? e).slice(0, 1000), retry: RETRY[code] ?? 'no' };
+  const worker = isWorkerCode(e?.code);
+  const code = worker ? e.code : isPlyCode(e?.code) ? e.code : 'internal';
+  const body = { code, message: String(e?.message ?? e).slice(0, 1000), retry: worker ? WORKER_RETRY[code] : (RETRY[code] ?? 'no') };
   if (Array.isArray(e?.conflicts)) body.conflicts = e.conflicts.slice(0, 200);
   if (e?.reasons && typeof e.reasons === 'object') body.reasons = e.reasons;
   if (Array.isArray(e?.bases)) body.bases = e.bases;
   if (typeof e?.matches === 'number') body.matches = e.matches;
+  if (typeof e?.expected === 'string') body.expected = e.expected;
+  if (typeof e?.actual === 'string') body.actual = e.actual;
+  if (typeof e?.oid === 'string') body.oid = e.oid;
   if (code === 'auth' && e?.status) body.upstreamStatus = e.status;
   return body;
 }
@@ -222,7 +265,8 @@ const READS = {
     const { refs, head } = await lsRefs(t, prefix ? [prefix, 'HEAD'] : []);
     const out = {}, peeled = {};
     for (const [name, r] of refs) { if (name === 'HEAD') continue; if (prefix && !name.startsWith(prefix)) continue; out[name] = r.oid; if (r.peeled) peeled[name] = r.peeled; }
-    return { body: { refs: out, head, peeled } };
+    const extra = head ? {} : await unbornFields(remote, opts, head);
+    return { body: { refs: out, head, peeled, ...extra } };
   },
   'GET /v1/discover': async ({ remote, opts }) => {
     const info = await discover(createTransport(remote, opts));
@@ -232,7 +276,7 @@ const READS = {
     const r = await listTree(remote, { ref: q.get('ref') || null, path: q.get('path') ?? '' }, opts);
     return { body: { ref: r.ref, commit: r.commit, tree: r.tree, entries: r.entries } };
   },
-  'GET /v1/commit': async ({ remote, q, opts }) => ({ body: await readCommit(remote, { ref: q.get('ref') || null }, opts) }),
+  'GET /v1/commit': async ({ remote, q, opts }) => ({ body: await readCommitOrEmpty(remote, q.get('ref') || null, opts) }),
   'GET /v1/read': async ({ remote, q, opts, spans, ctx, log }) => {
     const r = await readFile(remote, { ref: q.get('ref') || null, path: q.get('path') }, opts);
     const fixed = new FixedLengthStream(r.size);
@@ -245,64 +289,16 @@ const READS = {
   },
 };
 
-const unixSeconds = () => Math.floor(Date.now() / MS_PER_SECOND);
-
-// validateIdent requires a non-negative unix time and a civil zone, then brands the result.
-// The HTTP body is still {name, email, tz?}. This stamp exists only so a bad name, email, or
-// zone is bad_request before any fetch; ply stamps the commit with its own time.
-function checkedIdent(raw) {
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw fail('bad_request', 'identity must be {name, email}');
-  validateIdent({ name: raw.name, email: raw.email, time: unixSeconds(), tz: raw.tz });
-  if (raw.tz === undefined) return { name: raw.name, email: raw.email };
-  return { name: raw.name, email: raw.email, tz: raw.tz };
-}
-
-const ident = (body, k) => checkedIdent(need(body, k));
-
 const WRITES = {
-  'POST /v1/edit': async ({ remote, body, opts }) => {
-    const ref = body.ref ? fullRef(body.ref) : await headBranch(remote, opts);
-    const r = await editFile(remote, { ref, base: body.base ? fullRef(body.base) : ref, path: need(body, 'path'), find: need(body, 'find'), replace: body.replace ?? '', author: ident(body, 'author'), message: need(body, 'message') }, { ...opts, ...(body.head ? { head: body.head, strictHead: true } : body.hint ? { head: body.hint } : {}) });
-    return { body: { ref, newCommit: r.newCommit, oldCommit: r.oldCommit, pushBytes: r.pushBytes, noop: r.noop, newBlob: r.newBlob, newTree: r.newTree, hint: r.hint, attempt: r.attempt } };
-  },
-  'POST /v1/branch': async ({ remote, body, opts }) => {
-    const ref = validateRef(fullRef(need(body, 'ref')));
-    return { status: 201, body: await operation('branch_create', remote, { ...opts, attrs: { 'git.branch_create.ref': ref } }, async ({ t, root, outcome }) => {
-      const { commit } = await resolveCommit(t, body.from ?? null);
-      root.set({ 'git.branch_create.oid': commit });
-      const r = await push(t, { ref, oldOid: ZERO_OID, newOid: commit, objects: [] });
-      return outcome('created', { ref, oid: commit, pushBytes: r.packBytes });
-    }) };
-  },
-  'DELETE /v1/branch': async ({ remote, body, opts }) => {
-    const ref = validateRef(fullRef(need(body, 'ref')));
-    if (body.oid !== undefined && !/^[0-9a-f]{40}$/.test(body.oid)) throw fail('bad_request', 'oid must be a 40-hex oid');
-    return { body: await operation('branch_delete', remote, { ...opts, attrs: { 'git.branch_delete.ref': ref } }, async ({ t, root, outcome }) => {
-      let oid = body.oid;
-      if (!oid) { oid = (await lsRefs(t, [ref])).refs.get(ref)?.oid; if (!oid) throw fail('not_found', `ref ${ref} not found`); }
-      root.set({ 'git.branch_delete.oid': oid, 'git.branch_delete.cas_from_caller': !!body.oid });
-      await push(t, { ref, oldOid: oid, newOid: ZERO_OID, objects: [] });
-      return outcome('deleted', { ref, deleted: oid });
-    }) };
-  },
-  'POST /v1/merge': async ({ remote, body, opts }) => {
-    const ref = body.ref ? fullRef(body.ref) : await headBranch(remote, opts);
-    const r = await mergeBranch(remote, { ref, from: fullRef(need(body, 'from')), author: body.author ? checkedIdent(body.author) : undefined, message: body.message, fastForwardOnly: !!body.fastForwardOnly, noFastForward: !!body.noFastForward }, opts);
-    return { body: r };
-  },
-  'POST /v1/rebase': async ({ remote, body, opts }) => {
-    const onto = body.onto ? fullRef(body.onto) : await headBranch(remote, opts);
-    const r = await rebaseBranch(remote, { ref: fullRef(need(body, 'ref')), onto, committer: ident(body, 'committer'), author: body.author ? checkedIdent(body.author) : undefined, squash: !!body.squash, message: body.message ?? null }, opts);
-    return { body: r };
-  },
-  'POST /v1/cherry-pick': async ({ remote, body, opts }) => {
-    const ref = body.ref ? fullRef(body.ref) : await headBranch(remote, opts);
-    return { body: await cherryPick(remote, { ref, commit: need(body, 'commit'), committer: ident(body, 'committer'), message: body.message ?? null }, opts) };
-  },
-  'POST /v1/revert': async ({ remote, body, opts }) => {
-    const ref = body.ref ? fullRef(body.ref) : await headBranch(remote, opts);
-    return { body: await revertCommit(remote, { ref, commit: need(body, 'commit'), committer: ident(body, 'committer'), message: body.message ?? null }, opts) };
-  },
+  'POST /v1/edit': ({ remote, body, opts }) => handleEdit(remote, body, opts),
+  'POST /v1/branch': ({ remote, body, opts }) => handleBranchCreate(remote, body, opts),
+  'DELETE /v1/branch': ({ remote, body, opts }) => handleBranchDelete(remote, body, opts),
+  'POST /v1/tag': ({ remote, body, opts }) => handleTagCreate(remote, body, opts),
+  'DELETE /v1/tag': ({ remote, body, opts }) => handleTagDelete(remote, body, opts),
+  'POST /v1/merge': ({ remote, body, opts }) => handleMerge(remote, body, opts),
+  'POST /v1/rebase': ({ remote, body, opts }) => handleRebase(remote, body, opts),
+  'POST /v1/cherry-pick': ({ remote, body, opts }) => handleCherryPick(remote, body, opts),
+  'POST /v1/revert': ({ remote, body, opts }) => handleRevert(remote, body, opts),
 };
 
 // A viewer URL whose repo is public by construction: public-v0 or a built-in forge (never a VIEWER_EXTRA_HOSTS host).
