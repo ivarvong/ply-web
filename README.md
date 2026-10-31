@@ -1,6 +1,6 @@
 # ply Worker — `https://ply.ivar.workers.dev`
 
-A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#c2ccba2c554e8a18ac438cfbc53725d4b593811b` (an exact commit of ply `main`; `bump-ply.yml` moves the pin). The `/v1` API has no
+A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#9ca64714709141cf25aabbe189454139caebff03` (an exact commit of ply `main`; an operator moves the pin with `npm run cd -- bump`). The `/v1` API has no
 storage. `GET /view` is a public repository viewer, rate-limited by client through a SQLite Durable Object. One Artifacts
 namespace, `public-v0`, is served read-only with no token (`/r/<repo>`, see [Public namespace](#public-namespace-public-v0));
 its binding is the Worker's only other binding. `GET /` prints the usage text.
@@ -389,10 +389,10 @@ npm run typecheck                        # tsc for the app, then cf workers type
 npm run worker:deploy:dry-run            # cf deploy --dry-run: build and validate, no credentials, no upload
 npm run cd                               # operator deploy: bump, 0% canary, smoke, telemetry, ramp (docs/continuous-deployment.md)
 npm run cd -- smoke --version <id>       # pinned lifecycle smoke against that Workers version
-npm run worker:deploy                    # cf deploy straight to 100% (no canary; emergencies only)
+npm run worker:deploy                    # refuses unless PLY_FORCE_FULL_DEPLOY=1; then cf deploy to 100%
 ```
 
-The operator runbook for a gradual ramp (bump, 0% canary, pinned smoke, telemetry, then 1% → 100% with a rollback at any bad step) is [docs/continuous-deployment.md](docs/continuous-deployment.md). `npm run worker:deploy` still goes to 100% in one shot. Do not run it while a ramp is in progress.
+The operator runbook for a gradual ramp (bump, 0% canary, pinned smoke, telemetry, then 1% → 100% with a rollback at any bad step) is [docs/continuous-deployment.md](docs/continuous-deployment.md). `npm run worker:deploy` refuses unless `PLY_FORCE_FULL_DEPLOY=1`. With that set it still goes to 100% in one shot. Do not run it while a ramp is in progress.
 
 `npm run cd` is that runbook. It uses `cf` only. A canary is a new version at 0% beside the current one at 100%. Pinned smoke sends `Cloudflare-Workers-Version-Overrides: ply="<id>"` and requires `x-ply-version` to match. Telemetry reuses the loss allowance in `scripts/canary-verdict.mjs`. The ramp compares the new version with the old one at each percentage and puts the old version back at 100% on a breach.
 
@@ -400,15 +400,13 @@ The smoke creates an empty repo in the Artifacts namespace `ply-loadgen`, mints 
 
 The Worker is built and deployed with the Cloudflare CLI, [`cf`](https://developers.cloudflare.com/cf/), pinned as a dev dependency. `cloudflare.config.ts` is the Worker config (name, compatibility date, bindings, Durable Object exports, observability, limits). `vite.config.ts` holds build settings only: `cf build` delegates bundling to Vite and the Cloudflare Vite plugin and writes Build Output to `.cloudflare/output`. The workerd suites in `npm test` run that same bundle (`test/cf-bundle.js`). Nothing here needs Docker: the Vite plugin runs `docker image ls` after every build even with no containers (execFileSync, no timeout, so a hung daemon hung the build), and `vite.config.ts` sets `WRANGLER_DOCKER_BIN=false` so that call fails at once and is skipped.
 
-`npm run worker:deploy` runs `cf deploy`. When `CLOUDFLARE_API_TOKEN` is set, cf uses it. When it is unset, cf uses the OAuth session from `cf auth login`. The command uploads the Worker named `ply`: text bindings `WRITES` and `PACK_CACHE`, the `ViewerRateLimit` Durable Object, observability, `limits.cpuMs`, and `workersDev`. Worker secrets survive a deploy (the upload sends `keep_bindings: ["secret_text", "secret_key"]`). `PLY_TOKEN` stays a secret. Set or rotate it with `cf workers secrets update PLY_TOKEN --worker ply --type secret_text`. cf prompts for the value, so it never lands in shell history.
+`npm run worker:deploy` runs `cf deploy` only when `PLY_FORCE_FULL_DEPLOY=1`. Otherwise it exits and uploads nothing. When `CLOUDFLARE_API_TOKEN` is set, cf uses it. When it is unset, cf uses the OAuth session from `cf auth login`. The command uploads the Worker named `ply`: text bindings `WRITES` and `PACK_CACHE`, the `ViewerRateLimit` Durable Object, observability, `limits.cpuMs`, and `workersDev`. Worker secrets survive a deploy (the upload sends `keep_bindings: ["secret_text", "secret_key"]`). `PLY_TOKEN` stays a secret. Set or rotate it with `cf workers secrets update PLY_TOKEN --worker ply --type secret_text`. cf prompts for the value, so it never lands in shell history.
 
 cf has no live log stream yet (no equivalent of `tail`). Use the dashboard's live logs, or Workers Logs, which this Worker sends through `observability.logs`.
 
 ### GitHub Actions
 
-`bump-ply.yml` moves the `ply` git pin to the current `main` of [ivarvong/ply](https://github.com/ivarvong/ply). It runs on `repository_dispatch` (`ply-main-updated`), `workflow_dispatch`, and a daily cron (`0 16 * * *` UTC) for a dispatch that never arrived. It resolves `refs/heads/main` over the public git protocol, writes that 40-hex SHA into `package.json` and `package-lock.json`, then runs `npm test`, Oxlint, `npm run typecheck`, and `cf deploy --dry-run`. The dry run builds the Worker and validates it without credentials or API calls. When the pin is already that commit, the job stops. When the checks pass, it commits the pin straight to `main` and stops. It does not upload the Worker. This repository's `main` is not a protected branch (`protected: false`, no rulesets), so a direct push is the whole publish step. A pull request would wait on a review that `GITHUB_TOKEN` cannot approve. When the checks fail, the workflow opens an issue titled `ply bump failed for <sha>` (or comments, when that issue is already open) and leaves `main` unchanged.
-
-GitHub holds the code and the pull request. It does not deploy. An operator ships from the runbook above.
+GitHub does not bump the ply pin and does not deploy. An operator moves the pin with `npm run cd -- bump` and ships from the runbook above.
 
 ### Cloudflare token
 

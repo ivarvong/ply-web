@@ -1,5 +1,5 @@
 import { MESSAGE_MAX } from './baseline.ts'
-import { asRecord, extractJson } from './json.ts'
+import { asRecord } from './json.ts'
 
 export const VERSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -98,36 +98,57 @@ function uuidIn(value: unknown): string | null {
   return value
 }
 
-function versionFromJson(value: unknown): string | null {
-  const rec = asRecord(value)
-  if (!rec) return null
-  const direct = uuidIn(rec.version_id) ?? uuidIn(rec.id)
-  if (direct) return direct
-  const version = asRecord(rec.version)
-  if (version) {
-    const nested = uuidIn(version.id) ?? uuidIn(version.version_id)
-    if (nested) return nested
-  }
-  for (const item of Object.values(rec)) {
-    const found = versionFromJson(item)
-    if (found) return found
-  }
-  return null
+export type ListedVersion = {
+  readonly id: string
+  readonly tag: string
 }
 
-/** `cf workers versions create` prints a banner, a "version id" line, or JSON. */
-export function parseVersionId(text: string): string | null {
-  try {
-    const fromJson = versionFromJson(extractJson(text))
-    if (fromJson) return fromJson
-  } catch {
-    // text output, not JSON
+export type VersionLookup =
+  | { readonly ok: true; readonly versionId: string }
+  | { readonly ok: false; readonly kind: 'version-not-found'; readonly tag: string }
+
+function tagOf(rec: Record<string, unknown>): string | null {
+  if (typeof rec.tag === 'string' && rec.tag !== '') return rec.tag
+  const annotations = asRecord(rec.annotations)
+  const tagged = annotations?.['workers/tag']
+  return typeof tagged === 'string' && tagged !== '' ? tagged : null
+}
+
+/** Versions in a `cf workers versions list` JSON payload. A string is TTY text and yields nothing. */
+export function versionsFromList(payload: unknown): ListedVersion[] {
+  if (typeof payload === 'string') return []
+  const out: ListedVersion[] = []
+  const visit = (node: unknown) => {
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item)
+      return
+    }
+    const rec = asRecord(node)
+    if (!rec) return
+    const id = uuidIn(rec.id) ?? uuidIn(rec.version_id)
+    const tag = tagOf(rec)
+    if (id && tag && !out.some(version => version.id === id && version.tag === tag)) out.push({ id, tag })
+    for (const item of Object.values(rec)) visit(item)
   }
-  const labeled = text.split('\n').filter(line => /version id/i.test(line)).join('\n')
-  const labeledId = labeled.match(VERSION_ID)
-  if (labeledId) return labeledId[0]
-  const all = text.match(new RegExp(VERSION_ID.source, 'gi'))
-  return all?.[all.length - 1] ?? null
+  visit(payload)
+  return out
+}
+
+/** The version whose tag is `tag`. Missing is a typed error. TTY banners are not read. */
+export function versionByTag(payload: unknown, tag: string): VersionLookup {
+  const found = versionsFromList(payload).find(version => version.tag === tag)
+  if (!found) return { ok: false, kind: 'version-not-found', tag }
+  return { ok: true, versionId: found.id }
+}
+
+/** True when the two deployments name the same ids at the same percentages. */
+export function sameSplit(actual: readonly VersionShare[], expected: readonly VersionShare[]): boolean {
+  if (actual.length !== expected.length) return false
+  for (const want of expected) {
+    const got = actual.find(version => version.versionId === want.versionId)
+    if (!got || got.percentage !== want.percentage) return false
+  }
+  return true
 }
 
 function shareFrom(value: unknown): VersionShare | null {

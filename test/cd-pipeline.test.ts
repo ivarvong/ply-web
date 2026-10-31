@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { parseArgs } from '../scripts/cd/main.ts'
-import { nextPhase, pipelineStart, type PipelineState } from '../scripts/cd/pipeline-plan.ts'
+import { nextPhase, pipelineStart, type PhaseOutcome, type PipelineState } from '../scripts/cd/pipeline-plan.ts'
 
-function run(state: PipelineState, outcome: 'pass' | 'fail' | 'rolled-back') {
+function run(state: PipelineState, outcome: PhaseOutcome) {
   return nextPhase(state, outcome).phase
 }
 
@@ -32,6 +32,13 @@ test('a ramp rollback does not roll back again, and a live failure does', () => 
   assert.equal(run({ phase: 'telemetry-live', smoke: 'pass' }, 'pass'), 'done')
   assert.equal(run({ phase: 'rollback', smoke: 'pass' }, 'pass'), 'halt')
   assert.equal(run({ phase: 'rollback', smoke: 'pass' }, 'fail'), 'halt')
+})
+
+test('a harness fault or a state conflict holds the split', () => {
+  assert.equal(run({ phase: 'smoke-live', smoke: 'pass' }, 'harness-stop'), 'halt')
+  assert.equal(run({ phase: 'smoke-canary', smoke: null }, 'harness-stop'), 'halt')
+  assert.equal(run({ phase: 'ramp', smoke: 'pass' }, 'state-conflict'), 'halt')
+  assert.equal(run({ phase: 'telemetry-live', smoke: 'pass' }, 'state-conflict'), 'halt')
 })
 
 test('usage and a bad version exit as argument errors', () => {

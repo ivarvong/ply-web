@@ -1,5 +1,6 @@
 import { join } from 'node:path'
 import type { CdConfig } from './config.ts'
+import { fullSplit, isTrafficSplit } from './deploy-plan.ts'
 import { isoOffset, type RunLog } from './log.ts'
 import { nextPhase, pipelineStart, type PhaseOutcome } from './pipeline-plan.ts'
 import { fail, type Fail, type StageResult } from './result.ts'
@@ -18,6 +19,8 @@ export type PipelineExit = {
 
 function outcomeOf(result: StageResult<unknown>): PhaseOutcome {
   if (result.kind === 'pass') return 'pass'
+  if (result.fault === 'harness_fault') return 'harness-stop'
+  if (result.fault === 'state_conflict') return 'state-conflict'
   return result.rolledBack ? 'rolled-back' : 'fail'
 }
 
@@ -135,7 +138,9 @@ export async function runPipeline(
       continue
     }
     if (state.phase === 'rollback') {
-      const result = await span(runLog, 'rollback', () => stageRollback(config, previous))
+      const expected = fullSplit(version)
+      const prior = isTrafficSplit(expected) ? expected.versions : []
+      const result = await span(runLog, 'rollback', () => stageRollback(config, previous, prior))
       await writeJson(runDir, 'rollback.json', result)
       if (result.kind === 'pass') {
         runLog.patch({ rolledBack: true, rollbackReason: failure?.reason ?? null, restoredAt: isoOffset(new Date()) })
@@ -146,7 +151,8 @@ export async function runPipeline(
       }
       if (result.kind === 'fail') {
         const reason = failure ? `${failure.reason}; ${result.reason}` : result.reason
-        failure = fail(failure?.stage ?? 'rollback', reason)
+        const fault = result.fault === 'state_conflict' ? 'state_conflict' : 'worker'
+        failure = fail(failure?.stage ?? 'rollback', reason, false, fault)
         if (!runLog.facts.failedAt) runLog.patch({ failedAt: isoOffset(new Date()) })
         await runLog.error(result.reason, { stage: 'rollback' })
         opts.log(`rollback: ${result.reason}`)
@@ -156,12 +162,18 @@ export async function runPipeline(
     }
     state = { phase: 'halt', smoke: state.smoke }
   }
+  const verdictKind = failure?.fault === 'harness_fault'
+    ? 'harness_fault' as const
+    : failure?.fault === 'state_conflict'
+      ? 'state_conflict' as const
+      : 'fail' as const
   const verdict = failure
-    ? { kind: 'fail' as const, version, previous, stage: failure.stage, reason: failure.reason, rolledBack: failure.rolledBack, failures: [failure.reason] }
+    ? { kind: verdictKind, version, previous, stage: failure.stage, reason: failure.reason, rolledBack: failure.rolledBack, fault: failure.fault, failures: [failure.reason] }
     : { kind: 'pass' as const, version, previous, failures: [] as string[] }
   await writeJson(runDir, 'verdict.json', verdict, [opts.token])
   if (failure) {
-    opts.log(`cd: FAIL ${failure.stage}: ${failure.reason}`)
+    const label = failure.fault === 'worker' ? 'FAIL' : failure.fault
+    opts.log(`cd: ${label} ${failure.stage}: ${failure.reason}`)
     return { code: 1, reason: `${failure.stage}: ${failure.reason}` }
   }
   opts.log(`cd: PASS ${version}`)

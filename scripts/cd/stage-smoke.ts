@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { REPO_PREFIX, SMOKE_HTTP_MS, STALE_REPO_MS, TOKEN_TTL_SECONDS } from './baseline.ts'
 import { cfOk, runCf } from './cf.ts'
+import { classifyCall, type FailureClass } from './classify.ts'
 import { csvDocument, type CsvRow } from './csv.ts'
 import { asRecord, extractJson } from './json.ts'
 import { judgeCall, type Saved } from './judge.ts'
@@ -130,7 +131,7 @@ async function oneCall(
   gitToken: string,
   version: string | null,
   pin: boolean,
-): Promise<{ row: CsvRow; judgementDetail: string; ok: boolean; save: Saved; request: SmokeRequest | null; refs: ApiRefs | null }> {
+): Promise<{ row: CsvRow; judgementDetail: string; ok: boolean; save: Saved; request: SmokeRequest | null; refs: ApiRefs | null; fault: FailureClass | null }> {
   const started = Date.now()
   const params = new URLSearchParams({ remote, ...(step.query ?? {}) })
   const url = `${config.baseUrl}${step.path}?${params.toString()}`
@@ -164,6 +165,7 @@ async function oneCall(
       save: {},
       request: null,
       refs: null,
+      fault: classifyCall({ status: 0, body: detail, timedOut: true, mintedToken: step.git !== false }),
     }
   }
   const bodyText = await response.text()
@@ -232,6 +234,12 @@ async function oneCall(
     save: judgement.kind === 'ok' ? judgement.save : {},
     request: requestId ? { id: requestId, version: seen, step: step.name, status: response.status, expected: [expectedStatus(step)] } : null,
     refs,
+    fault: judgement.kind === 'ok' ? null : classifyCall({
+      status: response.status,
+      body: bodyText,
+      timedOut: response.status === 0,
+      mintedToken: step.git !== false,
+    }),
   }
 }
 
@@ -288,6 +296,7 @@ export async function stageSmoke(
   let detail = 'ok'
   let refs: ApiRefs | null = null
   let passed = false
+  let harness = false
   try {
     const created = await cfJson([
       'artifacts', 'namespaces', 'repos', 'create', config.namespace,
@@ -316,6 +325,7 @@ export async function stageSmoke(
       if (result.request) requests.push(result.request)
       if (!result.ok) {
         detail = `${step.name}: ${result.judgementDetail}`
+        harness = result.fault === 'harness_fault'
         break
       }
       saved = { ...saved, ...result.save }
@@ -370,10 +380,10 @@ export async function stageSmoke(
     await runLog.decision({
       inputs: [ref],
       rules: [{ name: 'correctness.target', value: CORRECTNESS.target }],
-      outcome: passed ? 'advance' : 'stop',
+      outcome: passed ? 'advance' : harness ? 'harness_fault' : 'stop',
       reason: detail,
     })
   }
-  if (!passed) return fail('smoke', `${detail}; repo ${deleted ? 'deleted' : name}`)
+  if (!passed) return fail('smoke', `${detail}; repo ${deleted ? 'deleted' : name}`, false, harness ? 'harness_fault' : 'worker')
   return pass('smoke', report)
 }

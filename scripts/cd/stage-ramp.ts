@@ -1,8 +1,9 @@
 import { readFile, appendFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { publicRemote } from '../../src/public.ts'
+import { SMOKE_HTTP_MS } from './baseline.ts'
 import type { CdConfig } from './config.ts'
-import { isTrafficSplit, trafficSplit } from './deploy-plan.ts'
+import { isTrafficSplit, trafficSplit, type VersionShare } from './deploy-plan.ts'
 import { queryCaptured } from './o11y.ts'
 import { errorMessage } from './proc.ts'
 import { activeLog } from './log.ts'
@@ -59,60 +60,91 @@ async function observe(config: CdConfig, version: string, previous: string, from
   }
 }
 
-async function probeOnce(config: CdConfig, version: string, token: string): Promise<number> {
+async function probeCall(
+  config: CdConfig,
+  version: string,
+  pin: string,
+  method: string,
+  url: string,
+  headers: Record<string, string>,
+): Promise<{ readonly failures: number; readonly harness: number }> {
   const log = activeLog()
-  let failures = 0
-  const calls: { method: string; url: string; headers: Record<string, string> }[] = [
-    { method: 'GET', url: `${config.baseUrl}/`, headers: {} },
-  ]
-  if (token) {
-    const remote = publicRemote('ply')
-    calls.push({
-      method: 'GET',
-      url: `${config.baseUrl}/v1/discover?remote=${encodeURIComponent(remote)}`,
-      headers: { authorization: `Bearer ${token}` },
+  const started = Date.now()
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: { ...headers, 'Cloudflare-Workers-Version-Overrides': `${config.worker}="${pin}"` },
+      signal: AbortSignal.timeout(SMOKE_HTTP_MS),
     })
+    const seen = response.headers.get('x-ply-version')
+    const status = response.status
+    await log?.request({
+      method,
+      url,
+      status,
+      version: seen,
+      latencyMs: Date.now() - started,
+      cfRay: response.headers.get('cf-ray'),
+      requestId: response.headers.get('x-ply-request-id'),
+      artifactsRay: response.headers.get('x-artifacts-ray'),
+    })
+    if (status === 0) return { failures: 0, harness: 1 }
+    if (seen === version && (status < 200 || status >= 300)) return { failures: 1, harness: 0 }
+    return { failures: 0, harness: 0 }
+  } catch (error) {
+    await log?.error(errorMessage(error), { stage: 'ramp', url })
+    return { failures: 0, harness: 1 }
   }
-  for (const call of calls) {
-    const started = Date.now()
-    try {
-      const response = await fetch(call.url, { method: call.method, headers: call.headers })
-      const seen = response.headers.get('x-ply-version')
-      const status = response.status
-      await log?.request({
-        method: call.method,
-        url: call.url,
-        status,
-        version: seen,
-        latencyMs: Date.now() - started,
-        cfRay: response.headers.get('cf-ray'),
-        requestId: response.headers.get('x-ply-request-id'),
-        artifactsRay: response.headers.get('x-artifacts-ray'),
-      })
-      if (seen === version && (status < 200 || status >= 300)) failures += 1
-    } catch (error) {
-      failures += 1
-      await log?.error(errorMessage(error), { stage: 'ramp', url: call.url })
-    }
-  }
-  return failures
 }
 
-async function dwell(config: CdConfig, version: string, token: string, ms: number, rps: number): Promise<{ probeFailures: number }> {
+/** Each arm is pinned, so the new version is sampled at the probe rate instead of the split. */
+async function probeOnce(
+  config: CdConfig,
+  version: string,
+  previous: string,
+  token: string,
+): Promise<{ readonly failures: number; readonly harness: number }> {
+  const remote = publicRemote('ply')
+  const discover = `${config.baseUrl}/v1/discover?remote=${encodeURIComponent(remote)}`
+  let failures = 0
+  let harness = 0
+  await Promise.all([version, previous].map(async pin => {
+    const root = await probeCall(config, version, pin, 'GET', `${config.baseUrl}/`, {})
+    failures += root.failures
+    harness += root.harness
+    if (!token) return
+    const read = await probeCall(config, version, pin, 'GET', discover, { authorization: `Bearer ${token}` })
+    failures += read.failures
+    harness += read.harness
+  }))
+  return { failures, harness }
+}
+
+async function dwell(
+  config: CdConfig,
+  version: string,
+  previous: string,
+  token: string,
+  ms: number,
+  rps: number,
+): Promise<{ probeFailures: number; harnessFaults: number }> {
   if (rps <= 0) {
     await new Promise(resolve => setTimeout(resolve, ms))
-    return { probeFailures: 0 }
+    return { probeFailures: 0, harnessFaults: 0 }
   }
   const deadline = Date.now() + ms
   const period = 1000 / rps
   let probeFailures = 0
+  let harnessFaults = 0
   while (Date.now() < deadline) {
     const tick = Date.now()
-    probeFailures += await probeOnce(config, version, token)
+    const probed = await probeOnce(config, version, previous, token)
+    probeFailures += probed.failures
+    harnessFaults += probed.harness
     const remain = Math.min(period - (Date.now() - tick), deadline - Date.now())
     if (remain > 0) await new Promise(resolve => setTimeout(resolve, remain))
   }
-  return { probeFailures }
+  return { probeFailures, harnessFaults }
 }
 
 export async function stageRamp(
@@ -136,6 +168,7 @@ export async function stageRamp(
   const verdict = readPassVerdict(verdictText, opts.version)
   if (!verdict.ok) return fail('ramp', `${verdict.reason}; traffic was not changed`)
   let previous = opts.previous
+  let expected: VersionShare[]
   try {
     const shares = await readShares(config.worker)
     const live = shares.find(share => share.percentage === 100)
@@ -148,6 +181,7 @@ export async function stageRamp(
     if (!dark || dark.percentage !== 0 || shares.length !== 2) {
       return fail('ramp', `expected ${opts.version} at 0% beside ${previous}; traffic was not changed`)
     }
+    expected = shares.map(share => ({ versionId: share.versionId, percentage: share.percentage }))
   } catch (error) {
     return fail('ramp', `${errorMessage(error)}; traffic was not changed`)
   }
@@ -156,12 +190,16 @@ export async function stageRamp(
   const result = await runRamp(config.schedule, {
     now: () => Date.now(),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
-    dwell: ms => dwell(config, opts.version, opts.token, ms, config.schedule.probeRps),
+    dwell: ms => dwell(config, opts.version, target, opts.token, ms, config.schedule.probeRps),
     applySplit: async percent => {
       const want = trafficSplit(percent, opts.version, target)
       if (!isTrafficSplit(want)) return want.reason
       try {
-        return await applySplit(config.worker, `ramp ${opts.version} ${percent}%`, want)
+        const applied = await applySplit(config.worker, `ramp ${opts.version} ${percent}%`, want, expected)
+        if (applied.ok) expected = want.versions.map(share => ({ versionId: share.versionId, percentage: share.percentage }))
+        if (!applied.ok && applied.kind === 'state_conflict') return { kind: 'state_conflict', reason: applied.reason }
+        if (!applied.ok) return applied.reason
+        return null
       } catch (error) {
         return errorMessage(error)
       }
@@ -178,7 +216,12 @@ export async function stageRamp(
         reason: decision.reason,
       })
     },
-    rollback: () => rollbackTo(config.worker, target),
+    rollback: async () => {
+      const applied = await rollbackTo(config.worker, target, expected)
+      if (applied.ok) return null
+      if (applied.kind === 'state_conflict') return { kind: 'state_conflict', reason: applied.reason }
+      return applied.reason
+    },
   })
   for (const line of result.lines) {
     opts.log(line)
@@ -193,6 +236,7 @@ export async function stageRamp(
     previous: target,
   })
   if (result.state.kind === 'complete') return pass('ramp', { version: opts.version, previous: target, lines: result.lines })
+  if (result.state.kind === 'stopped') return fail('ramp', result.state.reason, false, result.state.fault)
   const reason = result.state.kind === 'rolled-back' ? result.state.reason : 'ramp stopped'
   if (result.rollbackError) return fail('ramp', `${reason}; rollback to ${target} failed: ${result.rollbackError}`)
   return fail('ramp', reason, true)

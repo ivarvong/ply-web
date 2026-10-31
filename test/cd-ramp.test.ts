@@ -103,6 +103,48 @@ test('at 100% the old side is the last wall sample that met the quantile floor',
   assert.match(result.lines[1] ?? '', /samples=8\/8/)
 })
 
+test('a harness fault during the dwell stops and does not roll back', async () => {
+  let rolled = 0
+  const result = await runRamp({ percents: [1, 5], dwellMs: 1, probeRps: 1 }, {
+    now: () => 0,
+    sleep: async () => {},
+    dwell: async () => ({ probeFailures: 0, harnessFaults: 1 }),
+    applySplit: async () => null,
+    observe: async () => sample(),
+    rollback: async () => {
+      rolled += 1
+      return null
+    },
+  })
+  assert.equal(result.state.kind, 'stopped')
+  if (result.state.kind === 'stopped') {
+    assert.equal(result.state.fault, 'harness_fault')
+    assert.equal(result.state.reason, 'harness fault during probes')
+  }
+  assert.equal(rolled, 0)
+  assert.equal(result.lines.length, 0)
+})
+
+test('a state conflict stops and does not roll back', async () => {
+  let rolled = 0
+  const result = await runRamp(schedule, {
+    now: () => 0,
+    sleep: async () => {},
+    applySplit: async () => ({ kind: 'state_conflict', reason: 'deployment does not match the expected prior state' }),
+    observe: async () => sample(),
+    rollback: async () => {
+      rolled += 1
+      return null
+    },
+  })
+  assert.deepEqual(result.state, {
+    kind: 'stopped',
+    reason: 'deployment does not match the expected prior state',
+    fault: 'state_conflict',
+  })
+  assert.equal(rolled, 0)
+})
+
 test('a decision callback without an observation ref throws', async () => {
   await assert.rejects(runRamp(
     { percents: [100], dwellMs: 1, probeRps: 0 },

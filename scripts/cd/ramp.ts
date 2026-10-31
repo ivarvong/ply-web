@@ -12,9 +12,12 @@ export type Observation =
 
 export type RampDecision = StepVerdict
 
+export type HeldWrite = { readonly kind: 'state_conflict'; readonly reason: string }
+
 export type RampState =
   | { readonly kind: 'ramping'; readonly step: number }
   | { readonly kind: 'rolled-back'; readonly reason: string }
+  | { readonly kind: 'stopped'; readonly reason: string; readonly fault: 'harness_fault' | 'state_conflict' }
   | { readonly kind: 'complete' }
 
 export function rampStart(): RampState {
@@ -40,7 +43,7 @@ function emptyStats(): VersionStats {
 
 /** Advance on a clean step, including insufficient_data. A terminal state stays terminal. */
 export function applyRamp(state: RampState, decision: RampDecision, stepCount: number): RampState {
-  if (state.kind === 'complete' || state.kind === 'rolled-back') return state
+  if (state.kind !== 'ramping') return state
   if (decision.outcome === 'rollback') return { kind: 'rolled-back', reason: decision.reason }
   const next = state.step + 1
   if (next >= stepCount) return { kind: 'complete' }
@@ -98,12 +101,12 @@ export type RampIo = {
   now(): number
   sleep(ms: number): Promise<void>
   /** Probe during the dwell. When omitted, `sleep` is the whole dwell and probes are zero. */
-  dwell?(ms: number): Promise<{ readonly probeFailures: number }>
-  applySplit(percent: number): Promise<string | null>
+  dwell?(ms: number): Promise<{ readonly probeFailures: number; readonly harnessFaults?: number }>
+  applySplit(percent: number): Promise<null | string | HeldWrite>
   observe(from: number, to: number, percent: number): Promise<Observation>
   /** Called with the observation ref. A missing ref is a bug: a decision without an observation. */
   onDecision?(ref: ObservationRef, decision: RampDecision, percent: number): Promise<void>
-  rollback(): Promise<string | null>
+  rollback(): Promise<null | string | HeldWrite>
 }
 
 export type RampStepRecord = {
@@ -123,6 +126,11 @@ export type RampLoopResult = {
  * Step the schedule. At 100% the previous version is no longer allocated, so the old side of
  * the latency compare is the last step whose old version had enough wall samples.
  */
+function asConflict(value: null | string | HeldWrite): HeldWrite | null {
+  if (value && typeof value === 'object') return value
+  return null
+}
+
 export async function runRamp(schedule: RampSchedule, io: RampIo): Promise<RampLoopResult> {
   const lines: string[] = []
   const steps: RampStepRecord[] = []
@@ -138,13 +146,28 @@ export async function runRamp(schedule: RampSchedule, io: RampIo): Promise<RampL
       break
     }
     const splitError = await io.applySplit(percent)
-    if (splitError) {
-      rollbackError = await io.rollback()
+    const splitConflict = asConflict(splitError)
+    if (splitConflict) {
+      state = { kind: 'stopped', reason: splitConflict.reason, fault: 'state_conflict' }
+      break
+    }
+    if (typeof splitError === 'string') {
+      const rolled = await io.rollback()
+      const rolledConflict = asConflict(rolled)
+      if (rolledConflict) {
+        state = { kind: 'stopped', reason: rolledConflict.reason, fault: 'state_conflict' }
+        break
+      }
+      rollbackError = typeof rolled === 'string' ? rolled : null
       state = { kind: 'rolled-back', reason: splitError }
       break
     }
     const from = io.now()
     const probed = io.dwell ? await io.dwell(schedule.dwellMs) : (await io.sleep(schedule.dwellMs), { probeFailures: 0 })
+    if ((probed.harnessFaults ?? 0) > 0) {
+      state = { kind: 'stopped', reason: 'harness fault during probes', fault: 'harness_fault' }
+      break
+    }
     const to = io.now()
     const observed = await io.observe(from, to, percent)
     if (observed.kind === 'sample' && observed.previous.wallMs.length >= QUANTILE_FLOOR) carried = observed.previous
@@ -178,13 +201,25 @@ export async function runRamp(schedule: RampSchedule, io: RampIo): Promise<RampL
     }
     state = applyRamp(state, decision, schedule.percents.length)
     if (state.kind === 'rolled-back') {
-      rollbackError = await io.rollback()
+      const rolled = await io.rollback()
+      const rolledConflict = asConflict(rolled)
+      if (rolledConflict) {
+        state = { kind: 'stopped', reason: rolledConflict.reason, fault: 'state_conflict' }
+        break
+      }
+      rollbackError = typeof rolled === 'string' ? rolled : null
       break
     }
   }
   if (state.kind === 'ramping') {
-    rollbackError = await io.rollback()
-    state = { kind: 'rolled-back', reason: 'ramp did not finish' }
+    const rolled = await io.rollback()
+    const rolledConflict = asConflict(rolled)
+    if (rolledConflict) {
+      state = { kind: 'stopped', reason: rolledConflict.reason, fault: 'state_conflict' }
+    } else {
+      rollbackError = typeof rolled === 'string' ? rolled : null
+      state = { kind: 'rolled-back', reason: 'ramp did not finish' }
+    }
   }
   return { state, lines, rollbackError, steps }
 }

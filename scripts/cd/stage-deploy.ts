@@ -1,6 +1,7 @@
 import { PIN_ATTEMPTS, PIN_CONFIRMATIONS, PIN_INTERVAL_MS } from './baseline.ts'
 import { cfOk, ROOT } from './cf.ts'
-import { isTrafficSplit, parseVersionId, planCanary, trafficSplit } from './deploy-plan.ts'
+import { isTrafficSplit, planCanary, trafficSplit, versionByTag } from './deploy-plan.ts'
+import { extractJson } from './json.ts'
 import { errorMessage, run } from './proc.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import type { CdConfig } from './config.ts'
@@ -37,20 +38,32 @@ export async function stageDeploy(config: CdConfig): Promise<StageResult<DeployV
   const tag = sha.stdout.trim()
   try {
     await cfOk(['build', '--mode', 'production'])
-    const uploaded = await cfOk([
+    await cfOk([
       'workers', 'versions', 'create', '--prebuilt', '--mode', 'production',
       '--worker', config.worker, '--tag', tag, '--message', `cd canary ${tag}`.slice(0, 100),
     ])
-    const version = parseVersionId(uploaded)
-    if (!version) return fail('deploy-canary', 'upload did not print a version id')
-    const plan = planCanary(await readShares(config.worker), version)
+    const listed = await cfOk(['workers', 'versions', 'list', '--worker-id', config.worker, '--page', '1', '--per-page', '100'])
+    let payload: unknown = listed
+    try {
+      payload = extractJson(listed)
+    } catch {
+      payload = listed
+    }
+    const found = versionByTag(payload, tag)
+    if (!found.ok) return fail('deploy-canary', `${found.kind}: no version tagged ${found.tag}`)
+    const version = found.versionId
+    const shares = await readShares(config.worker)
+    const plan = planCanary(shares, version)
     if (plan.kind === 'refuse') return fail('deploy-canary', plan.reason)
     const want = trafficSplit(0, version, plan.live)
     if (!isTrafficSplit(want)) return fail('deploy-canary', `${want.reason}; traffic was not changed`)
-    const mismatch = await applySplit(config.worker, `canary ${tag}`, want)
-    if (mismatch) {
-      const rollbackError = await rollbackTo(config.worker, plan.live)
-      return fail('deploy-canary', rollbackError ? `${mismatch}; ${rollbackError}` : mismatch, rollbackError === null)
+    const applied = await applySplit(config.worker, `canary ${tag}`, want, shares)
+    if (!applied.ok && applied.kind === 'state_conflict') return fail('deploy-canary', applied.reason, false, 'state_conflict')
+    if (!applied.ok) {
+      const seen = await readShares(config.worker)
+      const rolled = await rollbackTo(config.worker, plan.live, seen)
+      const rollbackError = rolled.ok ? null : rolled.reason
+      return fail('deploy-canary', rollbackError ? `${applied.reason}; ${rollbackError}` : applied.reason, rollbackError === null)
     }
     const pinned = await pinReady(config, version)
     if (!pinned) return fail('deploy-canary', `pinned requests were not answered by ${version}; left the 0% canary in place`)

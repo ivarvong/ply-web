@@ -5,6 +5,7 @@ import {
   isFullRollback,
   isTrafficSplit,
   parseDeployment,
+  sameSplit,
   type TrafficSplit,
   type VersionShare,
 } from './deploy-plan.ts'
@@ -32,17 +33,48 @@ export async function putSplit(worker: string, message: string, split: TrafficSp
   await cfOk(['workers', 'deployments', 'create', '--worker', worker, '--body', JSON.stringify(body)], secrets)
 }
 
+export type ApplyResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly kind: 'state_conflict'; readonly reason: string }
+  | { readonly ok: false; readonly kind: 'rejected'; readonly reason: string }
+
 /**
- * Read the deployment, apply `split`, read it back, and record the change.
- * Returns null when the live deployment matches. Does not call cf when `split` is a refusal;
- * callers must pass a TrafficSplit, which an empty or unbalanced body cannot be.
+ * Compare-and-swap. Read the deployment and put `split` only when it is still `expected`.
+ * A mismatch emits `state_conflict` and does not call cf. The caller stops; it does not roll back.
  */
-export async function applySplit(worker: string, message: string, split: TrafficSplit, secrets: readonly string[] = []): Promise<string | null> {
+export async function applySplit(
+  worker: string,
+  message: string,
+  split: TrafficSplit,
+  expected: readonly VersionShare[],
+  secrets: readonly string[] = [],
+): Promise<ApplyResult> {
   const before = await readDeployment(worker, secrets)
+  if (!sameSplit(before.versions, expected)) {
+    const reason = 'deployment does not match the expected prior state'
+    const ref = await activeLog()?.observation({
+      measurement: { source: 'state_conflict', expected: [...expected], actual: [...before.versions] },
+      query: { source: 'cf workers deployments list', worker },
+      from: Date.now(),
+      to: Date.now(),
+      raw: JSON.stringify({ expected, actual: before.versions }),
+    })
+    if (ref) {
+      await activeLog()?.decision({
+        inputs: [ref],
+        rules: [{ name: 'deployment_cas', value: 'expected_prior' }],
+        outcome: 'state_conflict',
+        reason,
+      })
+    }
+    return { ok: false, kind: 'state_conflict', reason }
+  }
   await putSplit(worker, message, split, secrets)
   const after = await readDeployment(worker, secrets)
   await activeLog()?.stateChange({ before: before.versions, after: after.versions, deploymentId: after.id })
-  return assertSplit(after.versions, split)
+  const mismatch = assertSplit(after.versions, split)
+  if (mismatch) return { ok: false, kind: 'rejected', reason: mismatch }
+  return { ok: true }
 }
 
 /** Null when the deployment matches. Otherwise why it does not. */
@@ -55,16 +87,21 @@ export async function confirmSplit(worker: string, split: TrafficSplit, secrets:
  * Move the previous version to 100% alone and read the deployment back.
  * Returns null when that is what is live. The error names the version that should be at 100%.
  */
-export async function rollbackTo(worker: string, previous: string, secrets: readonly string[] = []): Promise<string | null> {
+export async function rollbackTo(
+  worker: string,
+  previous: string,
+  expected: readonly VersionShare[],
+  secrets: readonly string[] = [],
+): Promise<ApplyResult> {
   const split = fullSplit(previous)
-  if (!isTrafficSplit(split)) return `rollback refused: ${split.reason}`
+  if (!isTrafficSplit(split)) return { ok: false, kind: 'rejected', reason: `rollback refused: ${split.reason}` }
   try {
-    const mismatch = await applySplit(worker, `rollback ${previous}`, split, secrets)
-    if (mismatch) return mismatch
+    const applied = await applySplit(worker, `rollback ${previous}`, split, expected, secrets)
+    if (!applied.ok) return applied
     const versions = await readShares(worker, secrets)
-    if (isFullRollback(versions, previous)) return null
-    return `rollback did not land on ${previous} at 100%`
+    if (isFullRollback(versions, previous)) return { ok: true }
+    return { ok: false, kind: 'rejected', reason: `rollback did not land on ${previous} at 100%` }
   } catch (error) {
-    return `rollback to ${previous} failed: ${errorMessage(error)}`
+    return { ok: false, kind: 'rejected', reason: `rollback to ${previous} failed: ${errorMessage(error)}` }
   }
 }

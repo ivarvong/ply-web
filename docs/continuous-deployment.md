@@ -23,7 +23,7 @@ touch "$HOME/.ply-token" && chmod 0600 "$HOME/.ply-token"
 export PLY_TOKEN_FILE="$HOME/.ply-token"
 ```
 
-Do not run `npm run worker:deploy` while this is in progress. It still sends the Worker to 100% in one shot and will replace the split you are ramping. GitHub does not deploy.
+Do not run `npm run worker:deploy` while this is in progress. It refuses unless `PLY_FORCE_FULL_DEPLOY=1`. With that set it sends the Worker to 100% in one shot and will replace the split you are ramping. GitHub does not bump the pin and does not deploy.
 
 Optional overrides (anything you do not set keeps the default in the table further down):
 
@@ -37,7 +37,7 @@ Optional overrides (anything you do not set keeps the default in the table furth
 | `PLY_SHA` | ply `main` | 40-hex pin, instead of resolving ply `main` |
 | `PLY_RAMP_PERCENTS` | `1,5,10,25,50,75,100` | Strictly increasing integers, each 1–100, last one 100 |
 | `PLY_RAMP_DWELL_MS` | `40000` | How long each percentage stays up before it is judged |
-| `PLY_RAMP_PROBE_RPS` | `2` | During the dwell, probes per second. Each probe is `GET /` plus one authenticated `GET /v1/discover`. `0` dwells without probing. |
+| `PLY_RAMP_PROBE_RPS` | `2` | During the dwell, probes per second on each version. Each probe is `GET /` plus one authenticated `GET /v1/discover`, pinned with `Cloudflare-Workers-Version-Overrides`. `0` dwells without probing. |
 | `PLY_CD_LEDGER` | `~/.local/state/ply-cd/ledger.jsonl` | Append-only event ledger across runs |
 
 `PLY_RAMP_MAX_HOLDS` and `PLY_RAMP_MIN_REQUESTS` are rejected if set. The ramp no longer holds. SLO targets, the fast-burn multiple, and the sample floor live in `scripts/cd/slo.ts` and are copied into `run_started`.
@@ -73,6 +73,8 @@ cd: PASS 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 | --- | --- | --- |
 | `cd: PASS <version id>` | 0 | The new version is at 100%, and the live smoke and telemetry passed. |
 | `cd: FAIL <stage>: <reason>` | 1 | That stage stopped the run. If the line is from ramp or from the live checks, traffic is already back on `previous` unless the line says the rollback itself failed. |
+| `cd: harness_fault <stage>: <reason>` | 1 | A request got no response, or a 403 named the token this stage minted. The split is unchanged. |
+| `cd: state_conflict <stage>: <reason>` | 1 | The deployment was not the expected prior split, so the write was skipped. The split is unchanged. |
 | a usage line, no `cd: PASS` / `cd: FAIL` | 2 | The arguments were wrong. Traffic was not touched. |
 
 A failing run still writes the directory. Relay the last line and the ramp lines from that directory.
@@ -115,7 +117,7 @@ You push `bump-ply` yourself if you want a pull request for the pin. The rest of
 npm run cd -- deploy-canary
 ```
 
-Builds, uploads a version with `cf workers versions create`, and routes that version to **0%** beside the single version that is at 100%. It will not upload into a 50/50 split, a deployment with more than two versions, or a version that is already the live one. If a different version is already sitting at 0%, that slot is replaced. The new version is never given traffic here.
+Builds and uploads a version with `cf workers versions create`. The version id is the row in `cf workers versions list` whose tag is the 12-character HEAD sha. The create command's own text is not parsed. A missing tag stops before traffic changes. It then routes that version to **0%** beside the single version that is at 100%, and only when the deployment is still the split it just read. A mismatch stops with `state_conflict` and leaves the split alone. It will not upload into a 50/50 split, a deployment with more than two versions, or a version that is already the live one. If a different version is already sitting at 0%, that slot is replaced. The new version is never given traffic here.
 
 Pass:
 
@@ -153,7 +155,7 @@ Live (after the ramp, or any time you want to see who is actually serving). No o
 npm run cd -- smoke --expect-version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 ```
 
-The smoke creates an **empty** repo in `ply-loadgen` (prefix `ply-web-cd-`), mints a write token, and replays the git lifecycle over `/v1`. It does not seed the repo with stock git. The token is revoked when the run ends. On a pass the repo is deleted. On a fail the repo name is in the verdict and the token is still revoked.
+The smoke creates an **empty** repo in `ply-loadgen` (prefix `ply-web-cd-`), mints a write token immediately before the requests, and replays the git lifecycle over `/v1`. It does not seed the repo with stock git. The token is revoked after those requests finish. On a pass the repo is deleted. On a fail the repo name is in the verdict and the token is still revoked. A request that gets no response, or a 403 naming that token as invalid or expired, stops the run as `harness_fault`. The split stays where it is. The operator decides what to do next. There is no retry and no rollback for that fault.
 
 A 409 is a pass when that step expects it. The ones that matter after the current write API:
 
@@ -236,7 +238,7 @@ npm run cd -- ramp --version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e \
 
 Without `--verdict`, or with a verdict that is not a pass for that version, the command exits and does not change traffic.
 
-The schedule is `1, 5, 10, 25, 50, 75, 100`. Each step waits `40000` ms. During that wait the ramp probes at `PLY_RAMP_PROBE_RPS` (default 2): `GET /` (the usage text, 200, no bearer) and `GET /v1/discover?remote=…` for the public `ply` mirror with the bearer from `PLY_TOKEN_FILE`. There is no `/health` route. A non-2xx answer from the **new** version fails the step. A probe that lands on the old version is ordinary split traffic.
+The schedule is `1, 5, 10, 25, 50, 75, 100`. Each step waits `40000` ms. During that wait the ramp probes at `PLY_RAMP_PROBE_RPS` (default 2) **on each version**: `GET /` (the usage text, 200, no bearer) and `GET /v1/discover?remote=…` for the public `ply` mirror with the bearer from `PLY_TOKEN_FILE`. Each call sends `Cloudflare-Workers-Version-Overrides` for the new version and, separately, for the previous one, so both arms are sampled at the probe rate rather than at the traffic split. There is no `/health` route. A non-2xx answer from the **new** version fails the step. A probe that gets no response stops the ramp as `harness_fault` and leaves the current split in place. Before each percentage change the ramp reads the deployment and writes only when it is still the previous step's split. Otherwise it stops with `state_conflict` and does not roll back.
 
 Then it reads `cf o11y` for **both** versions over that step's window. Span events have no `$workers.scriptVersion.id`, so traces are queried by service only and joined to a version by `$metadata.requestId`.
 
@@ -253,7 +255,7 @@ The step decision is the new version's SLO burn, not a hand-tuned rate delta. Bu
 | Sample too small for that compare | `decision=insufficient_data`. This is not a pass of the latency SLO. The percentage still advances when the hard checks above are clean |
 | Query failed | Rollback. A missing query is not zero errors |
 
-There is no hold. A quiet 1% step with zero errors is `insufficient_data` and the ramp moves to 5%. `ply.ivar.workers.dev` often will not collect 20 new-version samples at 1% in 40 seconds. Raise `PLY_RAMP_DWELL_MS` or `PLY_RAMP_PROBE_RPS` when you want the burn and Mann-Whitney checks to actually run. Do not treat `insufficient_data` as a failure.
+There is no hold. A quiet 1% step with zero errors is `insufficient_data` and the ramp moves to 5%. The pinned probes are what put samples on the new version at 1%. Raise `PLY_RAMP_DWELL_MS` or `PLY_RAMP_PROBE_RPS` when you want the burn and Mann-Whitney checks to see more than that. Do not treat `insufficient_data` as a failure.
 
 At 100% the old version is dropped, so its wall times are the last step whose old version had at least 5 samples. That line includes `previous_sample=carried`. If no earlier step had them, 100% is `insufficient_data` when the new version is clean, and the ramp completes.
 
@@ -353,7 +355,7 @@ cd: FAIL rollback: rollback to 1aa0bb11-… failed: …
 
 | File | What you open it for |
 | --- | --- |
-| `verdict.json` | `{ "kind": "pass", "version": "…", "failures": [] }` or `kind: "fail"` with `stage`, `reason`, and `rolledBack` |
+| `verdict.json` | `{ "kind": "pass", "version": "…", "failures": [] }`, `kind: "fail"` with `stage`, `reason`, and `rolledBack`, or `kind: "harness_fault"` / `kind: "state_conflict"` with the split left as it was |
 | `smoke.csv` / `live-smoke.csv` | One row per HTTP call. `pass` is the step. `detail` is why a row failed. |
 | `smoke.json` / `live-smoke.json` | The ids telemetry asks for, plus the scratch repo name if it was kept |
 | `telemetry.md` / `live-telemetry.md` | The verdict line and the percentiles |
@@ -376,6 +378,8 @@ cd: FAIL rollback: rollback to 1aa0bb11-… failed: …
 | A ramp line with `decision=rollback`, then `cd: FAIL ramp:` | Previous at 100% | Relay the line. The new version is off traffic. |
 | `cd: FAIL ramp:` and the text says rollback failed | **Not** safe | Run `npm run cd -- rollback --to <previous>` and read the deployment list. The id to restore is the one in that sentence. |
 | `cd: FAIL smoke:` or `cd: FAIL telemetry:` after ramp lines that reached `percent=100` | Previous at 100% if rollback landed | Same as a ramp rollback. The live check is what rejected it. |
+| `cd: harness_fault` | The split where the run stopped | The version was not blamed. No retry and no rollback. Decide from the request that got no response, or the 403 on the token this stage minted. |
+| `cd: state_conflict` | The split that was already there | Something else changed the deployment. Do not apply the step again until you have read `cf workers deployments list`. |
 
 ## Metrics
 

@@ -10,7 +10,7 @@ export type Phase =
   | 'halt'
   | 'done'
 
-export type PhaseOutcome = 'pass' | 'fail' | 'rolled-back'
+export type PhaseOutcome = 'pass' | 'fail' | 'rolled-back' | 'harness-stop' | 'state-conflict'
 
 export type PipelineState = {
   readonly phase: Phase
@@ -24,9 +24,11 @@ export function pipelineStart(): PipelineState {
 /**
  * The operator pipeline. A pinned smoke failure halts: the canary stays at 0% and
  * telemetry does not run. A ramp rollback is already done, so the pipeline halts
- * instead of rolling back again. A live failure enters rollback, and that stage then halts.
+ * instead of rolling back again. A live worker failure enters rollback. A harness fault
+ * or a state conflict stops with the split held.
  */
 export function nextPhase(state: PipelineState, outcome: PhaseOutcome): PipelineState {
+  if (outcome === 'harness-stop' || outcome === 'state-conflict') return { phase: 'halt', smoke: state.smoke }
   switch (state.phase) {
     case 'bump':
       return outcome === 'pass' ? { phase: 'deploy-canary', smoke: null } : { phase: 'halt', smoke: null }
