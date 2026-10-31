@@ -631,10 +631,14 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
     git(work, ['push', '-q', bare, 'HEAD:refs/heads/main']);
     const seen: { authorization: string | null; cookie: string | null; gitToken: string | null; ua: string | null }[] = [];
     const dial = rewriteAllowlisted(srv.url);
+    let rayN = 0;
     const fetchImpl: typeof fetch = async (input, init) => {
       const h = new Headers(init?.headers);
       seen.push({ authorization: h.get('authorization'), cookie: h.get('cookie'), gitToken: h.get('git-token'), ua: h.get('user-agent') });
-      return dial(input, init);
+      const res = await dial(input, init);
+      const headers = new Headers(res.headers);
+      headers.set('cf-ray', `${(++rayN).toString(16).padStart(16, '0')}-IAD`);
+      return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
     };
     const env = viewerEnv();
     const repoPath = `/view/github.com/${name}.git`;
@@ -656,6 +660,11 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
     assert.match(page.headers.get('content-security-policy') ?? '', /style-src 'self'/);
     assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
     assert.equal(page.headers.get('cache-control'), 'no-store');
+    const rayHeader = page.headers.get('x-artifacts-ray') ?? '';
+    assert.match(rayHeader, /ls-refs=[0-9a-f]{16}-IAD;dur=\d+/);
+    assert.match(page.headers.get('server-timing') ?? '', /ls-refs;dur=\d+/);
+    assert.match(page.headers.get('server-timing') ?? '', /total;dur=\d+/);
+    for (const secret of ['127.0.0.1', 'viewer-should-ignore', 'git-secret', 'github.com', 'session=secret']) assert.equal(rayHeader.includes(secret), false, secret);
     assert.equal(html.includes('viewer-should-ignore'), false);
     assert.equal(html.includes('git-secret'), false);
     assert.ok(seen.length > 0);

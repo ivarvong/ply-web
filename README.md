@@ -143,6 +143,25 @@ back first). Merge conflicts add `conflicts` and `reasons`. `match_count` adds `
   the path or the credential), status, ms, round trips, how many fetches used the blob:none fallback, and pack-cache
   hits. Workers Observability logs and traces are enabled, and `redact_query_string` keeps `remote=` out of the
   platform's request records. Each response carries `x-ply-request-id`.
+- Every `/v1` response that talked to the remote, including 4xx and 5xx, carries `x-artifacts-ray` and `Server-Timing`.
+  The ray header is the upstream `cf-ray` of each git HTTP exchange, in start order:
+
+  ```
+  ray-header = entry *( ", " entry ) [ ", " overflow ]
+  entry      = phase "=" ray ";dur=" duration
+  overflow   = "overflow=" 1*DIGIT
+  phase      = "ls-refs" / "fetch" / "receive-pack"
+  ray        = cf-ray / "-" / "no-response"
+  cf-ray     = 16HEX "-" 3ALPHA
+  duration   = 1*DIGIT
+  ```
+
+  `ls-refs` is info/refs and v2 ls-refs. `fetch` is each upload-pack fetch, including a blob:none retry. `receive-pack`
+  is the advertisement and the push. `-` is a response with no ray id (the raw header is not echoed). `no-response` is
+  a call that failed before headers. Past 32 entries the rest are `overflow=<count>`. `Server-Timing` repeats the same
+  phases and durations, then `total` for the Worker. The matching spans gain `git.upstream.cf_ray`,
+  `git.upstream.phase`, and `git.upstream.dur_ms`. The viewer sends the same header. It contains no URL, credential, or
+  repository name.
 
 ## Servers that refuse `filter tree:0`
 

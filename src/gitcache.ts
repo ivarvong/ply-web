@@ -22,6 +22,7 @@
 // owns it) and fetches again.
 import { CACHE_VERSION } from './cache-version.ts';
 import { extractRequestPath, rawPathHasUnsafeSegment } from './pathguard.ts';
+import { parseCfRay } from './rays.ts';
 import { publicUploadPackRepo, scrubSecrets, type TokenSource, withPublicReadCredential, type FetchLike } from './public.ts';
 import { ALLOWED_HOSTS } from './viewer/url.ts';
 import { withLimits } from 'ply';
@@ -189,6 +190,12 @@ function plain(status: number, text: string): Response {
   return new Response(text, { status, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': NO_STORE } });
 }
 
+/** A rebuilt response keeps the upstream ray only when it is a ray id. Anything else (a URL, a token) is dropped. */
+function copyCfRay(from: Headers, to: Headers): void {
+  const ray = parseCfRay(from.get('cf-ray'));
+  if (ray.kind === 'id') to.set('cf-ray', ray.id);
+}
+
 /**
  * GitCache's fetch: verify the key binds the carried request, re-check that it is public, fetch upstream (the public
  * namespace's read token is attached here, by withPublicReadCredential), and label the answer.
@@ -229,6 +236,7 @@ export async function serveGitCache(req: Request, tokens: TokenSource | null, ct
   }
   const ct = res.headers.get('content-type') ?? '';
   const out = new Headers({ 'content-type': ct || 'application/octet-stream', 'x-ply-gc-kind': kind, 'cache-tag': `ply-gc-v${CACHE_VERSION},ply-gc-${kind}` });
+  copyCfRay(res.headers, out);
   const location = res.headers.get('location');
   if (location) out.set('location', location);
   const ok = res.status === 200 && /^application\/x-git-upload-pack-(result|advertisement)/.test(ct) && res.body;
