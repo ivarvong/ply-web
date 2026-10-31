@@ -10,6 +10,7 @@ import {
 import { exactTime, formatBytes, formatDuration, percentClass } from './format.ts'
 import { repoIdentity } from './identity.ts'
 import { LAYOUT } from './layout.ts'
+import { VIEWER_CSS_PATH } from './styles.ts'
 
 export function Button(props: { variant: ButtonVariant; size: ButtonSize; type?: 'submit' | 'button'; children: Child }) {
   const tone = props.variant === 'primary' ? 'is-primary' : 'is-secondary'
@@ -44,14 +45,14 @@ const ICONS: Record<string, string> = {
 
 export function Sprite() {
   return (
-    <svg class="sprite" aria-hidden="true" focusable="false">
+    <svg class="sprite" width="0" height="0" aria-hidden="true" focusable="false">
       {Object.entries(ICONS).map(([id, d]) => <symbol id={`i-${id}`} viewBox="0 0 16 16"><path d={d} /></symbol>)}
     </svg>
   )
 }
 
 export function Icon(props: { name: keyof typeof ICONS; class?: string }) {
-  return <svg class={`i i-${props.name}${props.class ? ` ${props.class}` : ''}`} aria-hidden="true" focusable="false"><use href={`#i-${props.name}`} /></svg>
+  return <svg class={`i i-${props.name}${props.class ? ` ${props.class}` : ''}`} width="16" height="16" aria-hidden="true" focusable="false"><use href={`#i-${props.name}`} /></svg>
 }
 
 export function IconFolder() { return <Icon name="dir" /> }
@@ -67,7 +68,7 @@ export function Document(props: { title: string; children: Child }) {
         <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
         <meta name="color-scheme" content="light dark" />
         <title>{props.title}</title>
-        <link rel="stylesheet" href="/view.css" />
+        <link rel="stylesheet" href={VIEWER_CSS_PATH} />
       </head>
       <body>
         <Sprite />

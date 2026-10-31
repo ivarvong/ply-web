@@ -342,7 +342,7 @@ const worker = {
     // Friendly name for a public-namespace repo: /r/<repo> → the viewer's canonical URL. No fetch, so no rate limit.
     if (url.pathname === '/r' || url.pathname.startsWith('/r/')) return done(publicRedirect(req, url));
     // Public viewer. Before the token gate, and it never reads Authorization / Git-Token / Cookie.
-    if (url.pathname === '/view.css' || url.pathname === '/view' || url.pathname.startsWith('/view/')) {
+    if (url.pathname === '/view.css' || /^\/view\.[0-9a-f]{12}\.css$/.test(url.pathname) || url.pathname === '/view' || url.pathname.startsWith('/view/')) {
       if (url.pathname.includes('@') || url.pathname.toLowerCase().includes('%40')) record.path = '/view/redacted';
       // A raw file at a pinned commit is cached whole (src/pinned.ts): rate-limit here, then ask Pinned.
       const pinKey = isInternal(req) ? null : pinnedViewKey(url, req.method, isPublicViewLoc(env));

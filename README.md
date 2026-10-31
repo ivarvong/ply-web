@@ -124,7 +124,7 @@ README and `.md` files render GitHub-flavoured markdown (tables, task lists, fen
 lists, quotes, reference and auto links) through `src/viewer/markdown.ts`: source text is only ever escaped, tags and
 class names come from fixed sets in `safehtml.ts`, hrefs pass the scheme allowlist, and repository-relative links
 resolve to viewer URLs. Images render as links (the CSP is `img-src 'none'`; a README must not make visitors fetch
-third-party pixels). `/view.css` is Kumo's theme and base plus only the Kumo utilities `kumo-classes.ts` emits
+third-party pixels). The stylesheet is served at a content-hashed URL, `/view.<sha1-prefix-12>.css` (`VIEWER_CSS_PATH`), with `cache-control: public, max-age=31536000, immutable`; HTML is `no-store`, so a page always links the sheet it was rendered with. `/view.css` and a previous deploy's hash still answer with the current sheet, `no-cache` plus an ETag. Icons carry `width`/`height` 16 so an unstyled page never draws them large. After every deploy run `node scripts/visual-smoke.mjs` (headless Chrome over CDP: 375 and 1280 px, light and dark; exits 1 on an SVG wider than 64 px, overflow, an unapplied or unhashed stylesheet, or a tree page without `li[data-oid]` rows; `STALE_CSS=<file>` emulates a browser holding an old `/view.css`). That sheet is Kumo's theme and base plus only the Kumo utilities `kumo-classes.ts` emits
 (`kumoSubset`, 167.9 KB → 67 KB).
 
 **Machine-readable markup (stable interface).** Styling and layout may change; these attributes do not, and
