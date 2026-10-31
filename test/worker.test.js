@@ -327,14 +327,36 @@ test('a server that refuses tree:0 (Artifacts mode): reads and an edit still mat
 test('empty repo lifecycle: first commit through history, with no git seeding', { skip }, async () => {
   const name = `e${n++}`;
   const bare = makeBareRepo(root, name);
-  const remote = `${srv.url}/${name}.git`;
+  // srv's origin was already discovered by the missing-repo commit read above. raySrv is a different origin
+  // (it proxies the same http-backend) and this isolate has not asked it for ls-refs=unborn yet.
+  const remote = `${raySrv.url}/${name}.git`;
   const post = (p, body, method = 'POST') => W(p + (p.includes('?') ? '' : ''), { method, body: { remote, ...body } }).then(async res => ({ status: res.status, body: await res.json() }));
   const ZERO = '0'.repeat(40);
   assert.equal(git(bare, ['symbolic-ref', 'HEAD']).trim(), 'refs/heads/main');
   assert.throws(() => git(bare, ['rev-parse', '--verify', 'HEAD']));
-  const empty = await (await W(`/v1/commit?${qs({ remote })}`)).json();
+  const emptyRes = await W(`/v1/commit?${qs({ remote, trace: '1' })}`);
+  const emptyBody = await emptyRes.json();
+  const { trace: coldTrace, ...empty } = emptyBody;
   assert.deepEqual(empty, { empty: true, ref: 'refs/heads/main', oid: null, tree: null, parents: [], author: null, committer: null, message: null, signed: false });
-  assert.deepEqual(await (await W(`/v1/commit?${qs({ remote, ref: 'main' })}`)).json(), empty);
+  // Cold HEAD read: ply discovers `ls-refs=unborn` (one GET) before the unborn ls-refs. The readCommit miss is another ls-refs.
+  assert.equal(coldTrace.filter(s => s.name === 'git.upload-pack discover').length, 1, JSON.stringify(coldTrace.map(s => s.name)));
+  assert.equal(coldTrace.find(s => s.name === 'git.head')?.attrs['git.head.discover'], 'discover');
+  const coldLs = (emptyRes.headers.get('x-artifacts-ray') ?? '').split(', ').filter(part => part.startsWith('ls-refs=')).length;
+  assert.match(emptyRes.headers.get('x-ply-request-id') ?? '', /\S/);
+  assert.match(emptyRes.headers.get('x-ply-build') ?? '', /^ply=[0-9a-f]{40} ply-web=[0-9a-f]{40}$/);
+  assert.match(emptyRes.headers.get('server-timing') ?? '', /ls-refs;dur=\d+/);
+  assert.match(emptyRes.headers.get('server-timing') ?? '', /total;dur=\d+/);
+  const warmRes = await W(`/v1/commit?${qs({ remote, ref: 'main', trace: '1' })}`);
+  const warmBody = await warmRes.json();
+  const { trace: warmTrace, ...warm } = warmBody;
+  assert.deepEqual(warm, empty);
+  // The advertisement is remembered for the origin. This HEAD read is ls-refs only.
+  assert.equal(warmTrace.filter(s => s.name === 'git.upload-pack discover').length, 0, JSON.stringify(warmTrace.map(s => s.name)));
+  assert.equal(warmTrace.find(s => s.name === 'git.head')?.attrs['git.head.discover'], 'cached');
+  const warmLs = (warmRes.headers.get('x-artifacts-ray') ?? '').split(', ').filter(part => part.startsWith('ls-refs=')).length;
+  assert.equal(coldLs, warmLs + 1, `cold ${emptyRes.headers.get('x-artifacts-ray')} warm ${warmRes.headers.get('x-artifacts-ray')}`);
+  assert.notEqual(warmRes.headers.get('x-ply-request-id'), emptyRes.headers.get('x-ply-request-id'));
+  assert.match(warmRes.headers.get('server-timing') ?? '', /total;dur=\d+/);
   assert.equal((await W(`/v1/commit?${qs({ remote, ref: 'nope' })}`)).status, 404);
   const refs = await (await W(`/v1/refs?${qs({ remote })}`)).json();
   assert.equal(refs.head, null); assert.equal(refs.empty, true); assert.equal(refs.unborn, 'refs/heads/main');
@@ -362,6 +384,7 @@ test('empty repo lifecycle: first commit through history, with no git seeding', 
   assert.equal(x.body.newCommit, c0);
   assert.equal(git(bare, ['rev-parse', 'main']).trim(), c0);
   assert.ok(x.body.trace.some(s => s.name === 'git.commit' || s.name === 'git.head'), JSON.stringify(x.body.trace?.map(s => s.name)));
+  assert.equal(x.body.trace.filter(s => s.name === 'git.upload-pack discover').length, 0, 'HEAD capability was cached by the commit reads');
   const raw0 = gitBuf(bare, ['cat-file', 'commit', c0]).toString();
   assert.equal(raw0.split('\n').some(l => l.startsWith('parent ')), false);
   assert.match(raw0, /author w <w@x> 1700000000 \+0530\n/);
@@ -412,6 +435,27 @@ test('empty repo lifecycle: first commit through history, with no git seeding', 
   assert.equal(git(bare, ['rev-parse', 'other']).trim(), emptyPick);
   assert.equal(git(bare, ['rev-parse', 'other^{tree}']).trim(), git(bare, ['rev-parse', `${otherTip}^{tree}`]).trim());
   assert.equal(git(bare, ['rev-parse', 'other^']).trim(), otherTip);
+  // The same patch, plus an add that exists only on the target. ply keeps the rename guard, so this is 409, not empty.
+  x = await post('/v1/branch', { ref: 'wider', from: c0 });
+  assert.equal(x.status, 201, JSON.stringify(x.body));
+  x = await post('/v1/edit', { ref: 'wider', message: 'wider', author: A, changes: [
+    { op: 'edit', path: 'src/a.txt', find: 'v1', replace: 'v2' },
+    { op: 'delete', path: 'src/keep.txt' },
+    { op: 'create', path: 'ADDED.txt', content: 'added\n' },
+    { op: 'rename', path: 'old.txt', to: 'new.txt' },
+    { op: 'create', path: 'extra.txt', content: 'only here\n' },
+  ] });
+  assert.equal(x.status, 200, JSON.stringify(x.body));
+  const widerTip = x.body.oid;
+  x = await post('/v1/cherry-pick', { ref: 'wider', commit: c1, committer: A });
+  assert.equal(x.status, 409, JSON.stringify(x.body));
+  assert.equal(x.body.code, 'merge_conflict');
+  assert.equal(x.body.retry, 'no');
+  assert.equal(git(bare, ['rev-parse', 'wider']).trim(), widerTip);
+  x = await post('/v1/cherry-pick', { ref: 'wider', commit: c1, committer: A, allowEmpty: true });
+  assert.equal(x.status, 409, JSON.stringify(x.body));
+  assert.equal(x.body.code, 'merge_conflict');
+  assert.equal(git(bare, ['rev-parse', 'wider']).trim(), widerTip);
   x = await post('/v1/branch', { ref: 'feat', from: c1 });
   assert.equal(x.status, 201); assert.equal(x.body.oid, c1);
   x = await post('/v1/edit', { ref: 'feat', message: 'feat file', author: A, changes: [{ op: 'create', path: 'feat.txt', content: 'feat\n' }] });
@@ -435,28 +479,54 @@ test('empty repo lifecycle: first commit through history, with no git seeding', 
   const mainMoved = x.body.oid;
   assert.equal(git(bare, ['rev-parse', 'side']).trim(), side);
   assert.equal(git(bare, ['rev-parse', 'main']).trim(), mainMoved);
-  x = await post('/v1/merge', { from: 'side', author: { ...A, tz: '+0530', time: 1700000200 }, message: 'merge side' });
+  x = await post('/v1/merge', { from: side, author: { ...A, tz: '+0530', time: 1700000200 }, committer: { name: 'c', email: 'c@x', tz: '-0800', time: 1700000300 }, message: 'merge side' });
   assert.equal(x.status, 200, JSON.stringify(x.body)); assert.equal(x.body.outcome, 'merge');
   assert.equal(git(bare, ['rev-parse', 'main']).trim(), x.body.oid);
   assert.equal(gitBuf(bare, ['show', 'main:README.md']).toString(), 'hello side\n');
   assert.equal(gitBuf(bare, ['show', 'main:ADDED.txt']).toString(), 'added main\n');
-  x = await post('/v1/merge', { from: 'side', author: A, committer: { name: 'c', email: 'c@x' } });
-  assert.equal(x.status, 400, JSON.stringify(x.body)); assert.match(x.body.message, /one identity/);
+  const merged = gitBuf(bare, ['cat-file', 'commit', x.body.oid]).toString();
+  assert.match(merged, /author w <w@x> 1700000200 \+0530\n/);
+  assert.match(merged, /committer c <c@x> 1700000300 -0800\n/);
   x = await post('/v1/branch', { ref: 'reb', from: c0 });
   assert.equal(x.status, 201);
   x = await post('/v1/edit', { ref: 'reb', message: 'reb file', author: A, changes: [{ op: 'create', path: 'reb.txt', content: 'reb\n' }] });
   assert.equal(x.status, 200, JSON.stringify(x.body));
-  x = await post('/v1/rebase', { ref: 'reb', onto: 'main', committer: A });
+  const rebBefore = git(bare, ['rev-parse', 'reb']).trim();
+  x = await post('/v1/rebase', { ref: 'reb', onto: ZERO, committer: A });
+  assert.equal(x.status, 400, JSON.stringify(x.body)); assert.match(x.body.message, /zero oid/);
+  assert.equal(git(bare, ['rev-parse', 'reb']).trim(), rebBefore);
+  x = await post('/v1/rebase', { ref: 'reb', onto: 'main', committer: { name: 'c', email: 'c@x', tz: '-0800', time: 1700000400 }, author: { ...A, tz: '+0530', time: 1700000500 } });
   assert.equal(x.status, 200, JSON.stringify(x.body)); assert.equal(x.body.outcome, 'rebase');
   assert.equal(gitBuf(bare, ['show', 'reb:reb.txt']).toString(), 'reb\n');
   assert.equal(git(bare, ['merge-base', 'reb', 'main']).trim(), git(bare, ['rev-parse', 'main']).trim());
+  assert.match(gitBuf(bare, ['cat-file', 'commit', x.body.oid]).toString(), /committer c <c@x> 1700000400 -0800\n/);
   x = await post('/v1/edit', { ref: 'from-oid', base: c0, message: 'from oid', author: A, changes: [{ op: 'create', path: 'from-oid.txt', content: 'p\n' }] });
   assert.equal(x.status, 200, JSON.stringify(x.body));
   const fromOid = x.body.oid;
   assert.equal(x.body.oldOid, null);
   assert.match(gitBuf(bare, ['cat-file', 'commit', fromOid]).toString(), new RegExp(`parent ${c0}\\n`));
+  const mainAt = git(bare, ['rev-parse', 'main']).trim();
   x = await post('/v1/merge', { from: c0, author: A });
-  assert.equal(x.status, 400, JSON.stringify(x.body)); assert.match(x.body.message, /branch name, not a commit id/);
+  assert.equal(x.status, 200, JSON.stringify(x.body)); assert.equal(x.body.outcome, 'up_to_date');
+  assert.equal(git(bare, ['rev-parse', 'main']).trim(), mainAt);
+  x = await post('/v1/branch', { ref: 'sq', from: c0 });
+  assert.equal(x.status, 201, JSON.stringify(x.body));
+  x = await post('/v1/edit', { ref: 'sq', message: 'sq one', author: A, changes: [{ op: 'create', path: 'sq.txt', content: 'one\n' }] });
+  assert.equal(x.status, 200, JSON.stringify(x.body));
+  x = await post('/v1/edit', { ref: 'sq', message: 'sq two', author: A, changes: [{ op: 'edit', path: 'sq.txt', find: 'one', replace: 'two' }] });
+  assert.equal(x.status, 200, JSON.stringify(x.body));
+  x = await post('/v1/rebase', {
+    ref: 'sq', onto: mainAt, squash: true, message: 'squashed\n',
+    committer: { name: 'c', email: 'c@x', tz: '-0800', time: 1700000600 },
+    author: { name: 'a', email: 'a@x', tz: '+0530', time: 1700000700 },
+  });
+  assert.equal(x.status, 200, JSON.stringify(x.body)); assert.equal(x.body.outcome, 'squash');
+  assert.equal(git(bare, ['rev-parse', 'sq^']).trim(), mainAt);
+  assert.equal(gitBuf(bare, ['show', 'sq:sq.txt']).toString(), 'two\n');
+  const squashed = gitBuf(bare, ['cat-file', 'commit', x.body.oid]).toString();
+  assert.match(squashed, /author a <a@x> 1700000700 \+0530\n/);
+  assert.match(squashed, /committer c <c@x> 1700000600 -0800\n/);
+  assert.match(squashed, /\nsquashed\n$/);
   x = await post('/v1/cherry-pick', { commit: ZERO, committer: A });
   assert.equal(x.status, 400, JSON.stringify(x.body));
   x = await post('/v1/tag', { name: 'v1', target: c0 });
@@ -620,7 +690,6 @@ const RAY_ENTRY = /^([a-z-]+)=([0-9a-f]{16}-[A-Z]{3}|-|no-response);dur=(\d+)$/;
 const RAY_SPAN = {
   'git.upload-pack ls-refs': 'ls-refs',
   'git.upload-pack discover': 'ls-refs',
-  'git.head': 'ls-refs',
   'git.upload-pack fetch': 'fetch',
   'git.receive-pack': 'receive-pack',
   'git.receive-pack advertise': 'receive-pack',

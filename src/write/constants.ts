@@ -17,26 +17,8 @@ export const MODE_TREE = '40000';
 
 export const BLOB_MODES = Object.freeze([MODE_BLOB, MODE_EXEC, MODE_LINK]);
 
-/**
- * Digits after the sign of an ident timezone (`+0530`). git ident: a sign and four digits.
- * ply's validateIdent holds callers to civil offsets, −12:00 through +14:00.
- */
-export const IDENT_TZ_DIGITS = 4;
-export const IDENT_TZ_HOUR_MIN = -12;
-export const IDENT_TZ_HOUR_MAX = 14;
-export const IDENT_TZ_MINUTE_MAX = 59;
-
 /** Sentinel shared with String.prototype.indexOf and ply's indexOfBytes: the needle is absent. */
 export const NOT_FOUND = -1;
-
-/**
- * gitprotocol-v2 ls-refs. The command line is argument 0; `pkts({ delimAfter })` inserts the delim
- * packet after that line, and the arguments (including `unborn`) follow it.
- */
-export const LS_REFS_COMMAND = 'command=ls-refs\n';
-export const LS_REFS_DELIM_AFTER = 0;
-export const LS_REFS_UNBORN = 'unborn';
-export const LS_REFS_SYMREF_TARGET = 'symref-target:';
 
 /** Change operations one commit can apply, in order. */
 export const OP_CREATE = 'create';

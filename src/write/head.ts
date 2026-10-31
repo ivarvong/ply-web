@@ -1,10 +1,13 @@
-// HEAD, including an unborn symref. ply's lsRefs does not send the `unborn` argument and drops `unborn` lines
-// (src/lsrefs.js: an unborn line parses as null), so an empty repository's HEAD — which git reports as
-// `unborn HEAD symref-target:refs/heads/main` — is invisible through it. This speaks that one ls-refs itself.
-import { fail, pkts, type Span } from 'ply';
-import { KIND } from 'ply';
+// HEAD, including an unborn symref, as ply's lsRefs reports it.
+//
+// Asking for `unborn` costs one advertisement GET the first time an origin is seen in this isolate: ply sends the
+// argument only when discover() shows `ls-refs=unborn`, which is git's own rule (connect.c server_supports_feature).
+// The bit is a fact about the server. It is remembered here and passed back as `info`, the option ply provides so a
+// discover result already in hand does not fetch the advertisement again. A later HEAD read on that origin is one
+// ls-refs. The first is discover + ls-refs. Sending `unborn` without that check would be this module speaking the
+// protocol, which is the code this adapter replaced.
+import { discover, KIND, lsRefs, type Span } from 'ply';
 import { type GitTransport } from './call.ts';
-import { LS_REFS_COMMAND, LS_REFS_DELIM_AFTER, LS_REFS_SYMREF_TARGET, LS_REFS_UNBORN } from './constants.ts';
 import { asOid, type Oid } from './oid.ts';
 
 export type HeadState =
@@ -13,77 +16,69 @@ export type HeadState =
   | { readonly kind: 'unborn'; readonly ref: string }
   | { readonly kind: 'absent' };
 
-/** The transport `operation` hands the callback. An unborn HEAD is read through its `frames`. */
-export type HeadTransport = GitTransport;
+/** What `lsRefs` returns that decides HEAD. Structural so a listing can be built in a test. */
+export type HeadListing = {
+  readonly refs: ReadonlyMap<string, { readonly oid: string }>;
+  readonly head: string | null;
+  readonly unborn: { readonly target: string } | null;
+};
 
-const HEAD = 'HEAD';
-const ERR = 'ERR ';
-const textDecoder = new TextDecoder();
+const HEAD_NAME = 'HEAD';
+const DISCOVER_FETCHED = 'discover';
+const DISCOVER_CACHED = 'cached';
 
-export function unbornLsRefsBody(): Uint8Array<ArrayBuffer> {
-  return pkts([
-    LS_REFS_COMMAND,
-    'peel\n',
-    'symrefs\n',
-    `${LS_REFS_UNBORN}\n`,
-    `ref-prefix ${HEAD}\n`,
-  ], { delimAfter: LS_REFS_DELIM_AFTER });
+/** Origins whose `ls-refs=unborn` advertisement this isolate has already read. Same bound as the quirks map. */
+const MAX_UNBORN_ORIGINS = 256;
+const unbornAdvertised = new Map<string, boolean>();
+const unbornInflight = new Map<string, Promise<boolean>>();
+
+type DiscoverSource = typeof DISCOVER_FETCHED | typeof DISCOVER_CACHED;
+
+function rememberUnborn(origin: string, advertised: boolean): boolean {
+  if (!unbornAdvertised.has(origin) && unbornAdvertised.size >= MAX_UNBORN_ORIGINS) unbornAdvertised.clear();
+  unbornAdvertised.set(origin, advertised);
+  return advertised;
 }
 
-function lineOf(payload: Uint8Array): string {
-  const text = textDecoder.decode(payload);
-  return text.endsWith('\n') ? text.slice(0, -1) : text;
-}
-
-type Listed =
-  | { readonly kind: 'unborn'; readonly name: string; readonly target: string | null }
-  | { readonly kind: 'ref'; readonly oid: Oid; readonly name: string; readonly target: string | null };
-
-export function parseHeadLine(line: string): Listed {
-  if (line.startsWith(ERR)) throw fail('remote_error', `remote: ${line.slice(ERR.length)}`);
-  const sp = line.indexOf(' ');
-  if (sp < 0) throw fail('protocol', `ls-refs: malformed line ${JSON.stringify(line.slice(0, 60))}`);
-  const first = line.slice(0, sp);
-  const rest = line.slice(sp + 1);
-  const cut = rest.indexOf(' ');
-  const name = cut < 0 ? rest : rest.slice(0, cut);
-  const attrs = cut < 0 ? '' : rest.slice(cut + 1);
-  const targetAttr = attrs.split(' ').find(a => a.startsWith(LS_REFS_SYMREF_TARGET));
-  const target = targetAttr ? targetAttr.slice(LS_REFS_SYMREF_TARGET.length) : null;
-  if (first === LS_REFS_UNBORN) return { kind: 'unborn', name, target };
-  return { kind: 'ref', oid: asOid(first.toLowerCase()), name, target };
-}
-
-export function headFromLines(lines: readonly Listed[]): HeadState {
-  const head = lines.find(l => l.name === HEAD);
-  if (!head) return { kind: 'absent' };
-  if (head.kind === 'unborn') {
-    if (!head.target) throw fail('protocol', 'unborn HEAD without a symref-target');
-    return { kind: 'unborn', ref: head.target };
+/** ply's `lsRefsUnborn` for this origin: one discover per isolate, then the cached bit. */
+async function lsRefsUnbornOf(t: GitTransport): Promise<{ readonly advertised: boolean; readonly source: DiscoverSource }> {
+  const origin = new URL(t.url).origin;
+  const known = unbornAdvertised.get(origin);
+  if (known !== undefined) return { advertised: known, source: DISCOVER_CACHED };
+  let flight = unbornInflight.get(origin);
+  if (!flight) {
+    flight = discover(t).then(info => rememberUnborn(origin, info.lsRefsUnborn)).finally(() => { unbornInflight.delete(origin); });
+    unbornInflight.set(origin, flight);
   }
-  if (head.target) return { kind: 'born', ref: head.target, oid: head.oid };
-  return { kind: 'detached', oid: head.oid };
+  return { advertised: await flight, source: DISCOVER_FETCHED };
 }
 
-export async function readHead(t: HeadTransport): Promise<HeadState> {
+/**
+ * unborn wins (an empty repository). A listed HEAD with a symref target is born. A listed HEAD with no target is
+ * detached. Anything else is absent, including a server that does not advertise `ls-refs=unborn`.
+ */
+export function headFromListing(listed: HeadListing): HeadState {
+  if (listed.unborn) return { kind: 'unborn', ref: listed.unborn.target };
+  const rec = listed.refs.get(HEAD_NAME);
+  if (rec && listed.head !== null) return { kind: 'born', ref: listed.head, oid: asOid(rec.oid) };
+  if (rec) return { kind: 'detached', oid: asOid(rec.oid) };
+  return { kind: 'absent' };
+}
+
+export async function readHead(t: GitTransport): Promise<HeadState> {
   return t.tracer.span('git.head', {
     parent: t.parent,
     kind: KIND.CLIENT,
-    attrs: { 'git.command': 'ls-refs', 'git.ls_refs.unborn': true, 'git.ls_refs.prefixes': [HEAD] },
+    attrs: { 'git.command': 'ls-refs', 'git.ls_refs.unborn': true, 'git.ls_refs.prefixes': [HEAD_NAME] },
   }, async (span: Span) => {
-    const lines: Listed[] = [];
-    let ended = false;
-    for await (const frame of t.frames('git-upload-pack', unbornLsRefsBody(), span)) {
-      if (ended) throw fail('protocol', `ls-refs: ${frame.kind} after the terminating flush-pkt`);
-      if (frame.kind === 'flush') { ended = true; continue; }
-      if (frame.kind !== 'data' || !frame.payload) throw fail('protocol', `ls-refs: unexpected ${frame.kind} in ref listing`);
-      lines.push(parseHeadLine(lineOf(frame.payload)));
-    }
-    if (!ended) throw fail('protocol', 'ls-refs: response ended without the terminating flush-pkt');
-    const head = headFromLines(lines);
+    const cap = await lsRefsUnbornOf(t);
+    const listed = await lsRefs(t, [HEAD_NAME], { unborn: true, info: { lsRefsUnborn: cap.advertised } });
+    const head = headFromListing(listed);
     span.set({
       'git.head.kind': head.kind,
       'git.head.ref': head.kind === 'born' || head.kind === 'unborn' ? head.ref : '',
+      'git.head.discover': cap.source,
+      'git.head.unborn_advertised': cap.advertised,
       'git.head.oid': head.kind === 'born' || head.kind === 'detached' ? head.oid : '',
     });
     return head;
