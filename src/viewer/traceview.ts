@@ -1,7 +1,29 @@
 import { fromAny } from 'ply';
+import type { AnyValue } from 'ply/otel';
 import type { FilterName, TraceBar, TraceModel } from './model.ts';
 
 type Kv = { key: string; value: unknown };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+// fromAny reads one OTLP AnyValue, in this field order. A span attribute that is not one is omitted.
+function isAnyValue(value: unknown): value is AnyValue {
+  if (!isRecord(value)) return false;
+  if ('stringValue' in value) return typeof value.stringValue === 'string';
+  if ('intValue' in value) return typeof value.intValue === 'string';
+  if ('doubleValue' in value) return typeof value.doubleValue === 'number';
+  if ('boolValue' in value) return typeof value.boolValue === 'boolean';
+  if ('arrayValue' in value) return isAnyArray(value.arrayValue);
+  if ('bytesValue' in value) return typeof value.bytesValue === 'string';
+  return false;
+}
+
+function isAnyArray(value: unknown): value is { readonly values: readonly AnyValue[] } {
+  if (!isRecord(value) || !Array.isArray(value.values)) return false;
+  return value.values.every(isAnyValue);
+}
 
 type RawSpan = {
   name: string;
@@ -27,7 +49,7 @@ const SHOW = [
 
 function flattenAttrs(list: Kv[] | undefined): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  for (const entry of list ?? []) out[entry.key] = fromAny(entry.value);
+  for (const entry of list ?? []) if (isAnyValue(entry.value)) out[entry.key] = fromAny(entry.value);
   return out;
 }
 
