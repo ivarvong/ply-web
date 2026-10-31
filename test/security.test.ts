@@ -14,7 +14,18 @@ type Node = DefaultTreeAdapterMap['node'];
 type Element = DefaultTreeAdapterMap['element'];
 
 const URL_ATTRS = new Set(['href', 'src', 'action', 'formaction', 'poster', 'data', 'xlink:href', 'srcset']);
-const MARKDOWN_TAGS = new Set(['p', 'a', 'code', 'strong', 'ul', 'li', 'pre', 'h3', 'h4', 'h5']);
+const MARKDOWN_TAGS = new Set(['p', 'a', 'code', 'strong', 'em', 'del', 'ul', 'ol', 'li', 'pre', 'blockquote', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'div', 'span', 'br', 'hr', 'h2', 'h3', 'h4', 'h5', 'h6']);
+// Markdown output may carry only these attributes, with these values: the renderer never copies source text into one,
+// except href (allowlisted, checked below), an integer `start`, and a heading id slug.
+const MARKDOWN_CLASSES = new Set(['md-code', 'md-code-lang', 'md-table', 'task', 'task done', 'task-item', 'al-l', 'al-c', 'al-r', 'md-img', 'md-frontmatter']);
+function markdownAttrOk(name: string, value: string): boolean {
+  if (name === 'href') return true;
+  if (name === 'rel') return value === 'noopener noreferrer nofollow';
+  if (name === 'class') return MARKDOWN_CLASSES.has(value);
+  if (name === 'start') return /^\d{1,9}$/.test(value);
+  if (name === 'id') return /^[a-z0-9][a-z0-9-]{0,79}$/.test(value);
+  return false;
+}
 
 function isElement(node: Node): node is Element {
   return node.nodeName !== '#text' && node.nodeName !== '#comment' && node.nodeName !== '#document-fragment' && node.nodeName !== '#document' && 'attrs' in node;
@@ -44,6 +55,7 @@ function assertHtmlSafe(html: string, where: string, markdown = false): void {
     if (markdown) assert.equal(MARKDOWN_TAGS.has(tag), true, `${where} unexpected ${tag}`);
   }
   for (const attr of attrs) {
+    if (markdown) assert.equal(markdownAttrOk(attr.name, attr.value), true, `${where} markdown attribute ${attr.name}=${attr.value}`);
     assert.equal(attr.name.startsWith('on'), false, `${where} handler ${attr.name}=${attr.value}`);
     assert.equal(/^[-a-z0-9:]+$/.test(attr.name), true, `${where} attribute name ${attr.name}`);
     if (!URL_ATTRS.has(attr.name)) continue;
@@ -128,8 +140,18 @@ test('hostile markdown, filenames, commits, refs, and authors do not break out o
       `# ${text}\n\n[${label}](${href})\n\n- ${text}\n- [${label}](${href})\n\n\`\`\`\n${text}\n\`\`\`\n\n**${text}** \`${label}\``,
       `paragraph ${text} [${label}](${href}) tail`,
       `## ${label}\n\n${text}`,
+      // GFM: tables (with alignment), task lists, images, reference and auto links, quotes, fences with a hostile info string.
+      `| ${label} | b |\n|:--|--:|\n| [${label}](${href}) | ${text} |\n| \`${text}\` | ![${label}](${href}) |`,
+      `- [ ] ${text}\n- [x] [${label}](${href})\n  1. nested ${text}\n\n7. ${label}\n8. ${text}`,
+      `[${label}][r] and [r] and <${href}> and ${href}\n\n[r]: ${href}`,
+      `> ${text}\n> [${label}](${href})\n\n\`\`\`${label}\n${text}\n\`\`\``,
+      `${text}\n===\n\n${label}\n---\n\n***\n\n~~${text}~~ _${label}_`,
     ];
-    for (const src of shapes) assertHtmlSafe(String(renderMarkdown(src)), `sample ${n}`, true);
+    for (const src of shapes) {
+      assertHtmlSafe(String(renderMarkdown(src)), `sample ${n}`, true);
+      // A repository-relative resolver must not widen what reaches href either.
+      assertHtmlSafe(String(renderMarkdown(src, { base: 'docs', resolve: (path, kind) => `/view/github.com/o/r?path=${encodeURIComponent(path)}${kind === 'image' ? '&raw=1' : ''}` })), `resolved ${n}`, true);
+    }
   }
   const trace: TraceModel = { bars: [], totalMs: 0, cfRay: 'ray', requestId: 'id' };
   for (let n = 0; n < 20; n++) {

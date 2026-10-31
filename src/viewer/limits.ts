@@ -23,7 +23,7 @@ export const VIEWER_CAPS = Object.freeze({
   // commit against this cap, not only the one shown (curl's tests/data has 2,135 entries, so every curl page was a 413).
   maxTreeEntries: 10_000,
   maxTreeShown: 500,
-  maxLogCommits: 5,
+  maxLogCommits: 10,
   maxPreviewChars: 2_000,
   maxUrlLength: 2_048,
   maxLineRows: 4_000,

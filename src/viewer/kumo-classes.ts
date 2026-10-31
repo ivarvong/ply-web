@@ -52,3 +52,35 @@ export function buttonClass(variant: ButtonVariant, size: ButtonSize): string {
   const variantClass = variant === 'primary' ? KUMO_BUTTON_PRIMARY : KUMO_BUTTON_SECONDARY
   return `${sizeClass} ${variantClass} ${KUMO_BUTTON_FOCUS}`
 }
+
+// LayerCard (kumo 2.16.0, layer-card.tsx): an elevated frame, a Secondary header strip, and a raised Primary panel.
+// Primary drops its p-4 pr-3 here (rows and code bring their own padding); everything else is verbatim.
+export const KUMO_LAYER_CARD = 'flex w-full flex-col overflow-hidden rounded-lg bg-kumo-elevated text-base ring ring-kumo-hairline'
+export const KUMO_LAYER_CARD_SECONDARY = 'flex items-center gap-2 bg-kumo-elevated text-base font-medium text-kumo-subtle'
+export const KUMO_LAYER_CARD_PRIMARY = 'relative flex flex-col overflow-hidden rounded-lg bg-kumo-base text-inherit no-underline ring ring-kumo-fill'
+
+// Breadcrumbs size "sm" and its parts (breadcrumbs.tsx).
+export const KUMO_BREADCRUMBS = 'flex min-w-0 grow items-center overflow-hidden whitespace-nowrap text-sm gap-0.5'
+export const KUMO_BREADCRUMB_LINK = 'flex shrink-0 items-center gap-1 whitespace-nowrap text-kumo-subtle no-underline'
+export const KUMO_BREADCRUMB_CURRENT = 'flex max-w-full min-w-0 items-center gap-1 font-medium'
+export const KUMO_BREADCRUMB_SEPARATOR = 'flex shrink-0 items-center text-kumo-inactive'
+
+// Badge base + variants (badge.tsx).
+const KUMO_BADGE_BASE = 'inline-flex w-fit flex-none shrink-0 items-center justify-self-start gap-1 rounded-full px-2 py-0.5 text-xs font-medium whitespace-nowrap'
+export const KUMO_BADGE_NEUTRAL = `${KUMO_BADGE_BASE} bg-kumo-fill text-kumo-badge-neutral-subtle`
+export const KUMO_BADGE_OUTLINE = `${KUMO_BADGE_BASE} border border-kumo-fill bg-kumo-base text-kumo-default`
+export const KUMO_BADGE_INFO = `${KUMO_BADGE_BASE} bg-kumo-info-tint text-kumo-info`
+export const KUMO_BADGE_WARNING = `${KUMO_BADGE_BASE} bg-kumo-warning-tint text-kumo-warning`
+export const KUMO_BADGE_DANGER = `${KUMO_BADGE_BASE} bg-kumo-danger-tint text-kumo-danger`
+
+// Button variant "ghost" (button.tsx), for quiet actions such as Raw and the ref switcher.
+export const KUMO_BUTTON_GHOST = 'bg-transparent text-kumo-default hover:bg-kumo-tint shadow-none border-0'
+
+// Text variants (text.tsx).
+export const KUMO_TEXT_HEADING2 = 'text-2xl font-semibold'
+export const KUMO_TEXT_HEADING3 = 'text-lg font-semibold'
+export const KUMO_TEXT_SECONDARY = 'text-kumo-subtle'
+export const KUMO_TEXT_MONO_SECONDARY = 'font-mono text-kumo-subtle'
+
+// Code block (code.tsx).
+export const KUMO_CODE_BLOCK = 'min-w-0 rounded-md border border-kumo-fill bg-kumo-base'
