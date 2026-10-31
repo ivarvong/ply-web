@@ -28,6 +28,7 @@ import { checkRemote, createGuardedFetch } from './remote.ts';
 import { applySecurityHeaders } from './security-headers.ts';
 import { quirksFor } from './quirks.ts';
 import { createLoopbackFetch } from './gitcache.ts';
+import { syncAll } from './mirror.ts';
 import { viewerErrorDocument } from './viewer/safehtml.ts';
 import { admitClient } from './viewer/app.tsx';
 import { viewerHref } from './viewer/url.ts';
@@ -301,6 +302,15 @@ const WRITES = {
 };
 
 export default {
+  // Cron (cloudflare.config.ts): keep the public-v0 mirrors on their GitHub branch (src/mirror.ts). One log line per mirror.
+  async scheduled(controller, env, ctx) {
+    if (env.MIRROR_SYNC !== 'on' || !env.PUBLIC_REPOS) return;
+    const tokens = tokenSourceFor(env.PUBLIC_REPOS);
+    const scrub = text => scrubSecrets(tokens?.secrets() ?? [])(text);
+    const results = await syncAll({ binding: env.PUBLIC_REPOS, tokens });
+    for (const r of results) console.log(scrub(JSON.stringify({ msg: 'ply.mirror', cron: controller?.cron ?? '', scheduledTime: controller?.scheduledTime ?? 0, ...r })));
+    void ctx;
+  },
   async fetch(req, env, ctx) {
     const t0 = Date.now();
     const url = new URL(req.url);

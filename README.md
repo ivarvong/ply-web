@@ -214,6 +214,16 @@ URLs under it, so moving to `public-v1` is a one-line change (plus creating the 
   `cf artifacts namespaces tokens revoke <id> --namespace public-v0 --force`); the Worker mints new ones on the next
   request. To take the namespace offline, remove the binding and deploy.
 
+### Mirrors that follow GitHub
+
+`public-v0/ply` and `public-v0/ply-web` follow their GitHub `main` (`src/mirror.ts` `MIRRORS`). A Worker cron
+(`* * * * *`) compares the two refs; when they differ it fetches only the new objects from GitHub (`want <github tip>`,
+`have <mirror tip>`, anonymous) and pushes them to the mirror as a CAS update from the mirror's tip (a rewritten
+upstream is followed). The write token is minted through the namespace-scoped binding for that one repo with the
+minimum TTL (60 s) and revoked as soon as the push returns. No token lives in CI or in the repo. One log line per mirror
+per minute: `{"msg":"ply.mirror", repo, outcome: in-sync|updated|error, from, to, objects, pushBytes, ms}`.
+`MIRROR_SYNC="off"` stops it. An update over 32 MiB is refused (logged); publish that with the script below.
+
 ### Publish a repo
 
 ```sh
