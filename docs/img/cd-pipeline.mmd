@@ -1,0 +1,28 @@
+%% Operator pipeline. One color per stage kind.
+%% The happy path is the left column. Each failure stays on its own row, to the right.
+%% docs/img/cd-pipeline.svg is this graph on that grid (mermaid-cli's auto-layout crossed the spine).
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '18px', 'fontFamily': 'ui-sans-serif, system-ui, sans-serif', 'lineColor': '#334155'}}}%%
+flowchart TB
+  bump["Gate · bump"]:::gate ==> deploy["Deploy · version at 0%"]:::deploy
+  deploy ==> smoke["Smoke · pinned to the new version"]:::smoke
+  smoke ==> tel["Telemetry · canary window"]:::telemetry
+  tel ==> ramp["Ramp · 1% to 100%"]:::ramp
+  ramp ==> liveSmoke["Smoke · live, no pin"]:::smoke
+  liveSmoke ==> liveTel["Telemetry · live window"]:::telemetry
+  liveTel ==> done["Done · 100% on the new version"]:::done
+
+  bump --> stopBump["Stop · tree unchanged"]:::halt
+  deploy --> stopDeploy["Stop · still at 0%"]:::halt
+  tel --> stopTel["Stop · stay at 0%"]:::halt
+  ramp --> rollRamp["Rollback · 100% old"]:::rollback
+  liveSmoke --> rollSmoke["Rollback · 100% old"]:::rollback
+  liveTel --> rollTel["Rollback · 100% old"]:::rollback
+
+  classDef gate fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px,color:#0f172a
+  classDef deploy fill:#ede9fe,stroke:#6d28d9,stroke-width:2px,color:#0f172a
+  classDef smoke fill:#dcfce7,stroke:#15803d,stroke-width:2px,color:#0f172a
+  classDef telemetry fill:#ccfbf1,stroke:#0f766e,stroke-width:2px,color:#0f172a
+  classDef ramp fill:#ffedd5,stroke:#c2410c,stroke-width:2px,color:#0f172a
+  classDef rollback fill:#fee2e2,stroke:#b91c1c,stroke-width:2px,color:#0f172a
+  classDef halt fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#0f172a
+  classDef done fill:#f8fafc,stroke:#0f172a,stroke-width:2px,color:#0f172a

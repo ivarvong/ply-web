@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="1088" viewBox="0 0 860 1088" role="img" aria-labelledby="title desc">
+  <title id="title">ply-web operator deploy</title>
+  <desc id="desc">Happy path down the left column: gate, deploy at 0%, pinned smoke, telemetry, ramp, live smoke, live telemetry, done. Each failure is a short arrow to the right on that same row. Nothing crosses.</desc>
+  <rect width="860" height="1088" fill="#ffffff"/>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
+    .kind { font-size: 16px; font-weight: 700; }
+    .detail { font-size: 14px; font-weight: 500; }
+    .legend { font-size: 13px; font-weight: 600; }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 1.2 L 9 5 L 0 8.8 z" fill="#334155"/>
+    </marker>
+  </defs>
+
+  <text x="40" y="36" class="kind" font-size="18">ply-web operator deploy</text>
+  <text x="40" y="58" class="detail" fill="#475569">Left column moves forward. A failure leaves to the right and stops.</text>
+
+  <!-- row 1 gate -->
+  <rect x="40" y="84" width="340" height="72" rx="10" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+  <text x="210" y="112" text-anchor="middle" class="kind">Gate</text>
+  <text x="210" y="134" text-anchor="middle" class="detail">bump the ply pin, then the local gate</text>
+  <line x1="380" y1="120" x2="468" y2="120" stroke="#334155" stroke-width="1.75" marker-end="url(#arrow)"/>
+  <rect x="476" y="84" width="344" height="72" rx="10" fill="#f1f5f9" stroke="#475569" stroke-width="2"/>
+  <text x="648" y="112" text-anchor="middle" class="kind">Stop</text>
+  <text x="648" y="134" text-anchor="middle" class="detail">tree unchanged, nothing uploaded</text>
+  <line x1="210" y1="156" x2="210" y2="188" stroke="#334155" stroke-width="2.25" marker-end="url(#arrow)"/>
+
+  <!-- row 2 deploy -->
+  <rect x="40" y="196" width="340" height="72" rx="10" fill="#ede9fe" stroke="#6d28d9" stroke-width="2"/>
+  <text x="210" y="224" text-anchor="middle" class="kind">Deploy</text>
+  <text x="210" y="246" text-anchor="middle" class="detail">new version at 0%, old stays at 100%</text>
+  <line x1="380" y1="232" x2="468" y2="232" stroke="#334155" stroke-width="1.75" marker-end="url(#arrow)"/>
+  <rect x="476" y="196" width="344" height="72" rx="10" fill="#f1f5f9" stroke="#475569" stroke-width="2"/>
+  <text x="648" y="224" text-anchor="middle" class="kind">Stop</text>
+  <text x="648" y="246" text-anchor="middle" class="detail">canary left at 0%</text>
+  <line x1="210" y1="268" x2="210" y2="300" stroke="#334155" stroke-width="2.25" marker-end="url(#arrow)"/>
+
+  <!-- row 3 smoke pinned -->
+  <rect x="40" y="308" width="340" height="72" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+  <text x="210" y="336" text-anchor="middle" class="kind">Smoke</text>
+  <text x="210" y="358" text-anchor="middle" class="detail">pinned empty-repo lifecycle</text>
+  <line x1="210" y1="380" x2="210" y2="412" stroke="#334155" stroke-width="2.25" marker-end="url(#arrow)"/>
+
+  <!-- row 4 telemetry -->
+  <rect x="40" y="420" width="340" height="72" rx="10" fill="#ccfbf1" stroke="#0f766e" stroke-width="2"/>
+  <text x="210" y="448" text-anchor="middle" class="kind">Telemetry</text>
+  <text x="210" y="470" text-anchor="middle" class="detail">canary window, both checks must pass</text>
+  <line x1="380" y1="456" x2="468" y2="456" stroke="#334155" stroke-width="1.75" marker-end="url(#arrow)"/>
+  <rect x="476" y="420" width="344" height="72" rx="10" fill="#f1f5f9" stroke="#475569" stroke-width="2"/>
+  <text x="648" y="448" text-anchor="middle" class="kind">Stop</text>
+  <text x="648" y="470" text-anchor="middle" class="detail">stay at 0%, do not ramp</text>
+  <line x1="210" y1="492" x2="210" y2="524" stroke="#334155" stroke-width="2.25" marker-end="url(#arrow)"/>
+
+  <!-- row 5 ramp -->
+  <rect x="40" y="532" width="340" height="72" rx="10" fill="#ffedd5" stroke="#c2410c" stroke-width="2"/>
+  <text x="210" y="560" text-anchor="middle" class="kind">Ramp</text>
+  <text x="210" y="582" text-anchor="middle" class="detail">1, 5, 10, 25, 50, 75, 100</text>
+  <line x1="380" y1="568" x2="468" y2="568" stroke="#334155" stroke-width="1.75" marker-end="url(#arrow)"/>
+  <rect x="476" y="532" width="344" height="72" rx="10" fill="#fee2e2" stroke="#b91c1c" stroke-width="2"/>
+  <text x="648" y="560" text-anchor="middle" class="kind">Rollback</text>
+  <text x="648" y="582" text-anchor="middle" class="detail">100% back on the old version</text>
+  <line x1="210" y1="604" x2="210" y2="636" stroke="#334155" stroke-width="2.25" marker-end="url(#arrow)"/>
+
+  <!-- row 6 live smoke -->
+  <rect x="40" y="644" width="340" height="72" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+  <text x="210" y="672" text-anchor="middle" class="kind">Smoke</text>
+  <text x="210" y="694" text-anchor="middle" class="detail">live, unpinned, must be the new version</text>
+  <line x1="380" y1="680" x2="468" y2="680" stroke="#334155" stroke-width="1.75" marker-end="url(#arrow)"/>
+  <rect x="476" y="644" width="344" height="72" rx="10" fill="#fee2e2" stroke="#b91c1c" stroke-width="2"/>
+  <text x="648" y="672" text-anchor="middle" class="kind">Rollback</text>
+  <text x="648" y="694" text-anchor="middle" class="detail">100% back on the old version</text>
+  <line x1="210" y1="716" x2="210" y2="748" stroke="#334155" stroke-width="2.25" marker-end="url(#arrow)"/>
+
+  <!-- row 7 live telemetry -->
+  <rect x="40" y="756" width="340" height="72" rx="10" fill="#ccfbf1" stroke="#0f766e" stroke-width="2"/>
+  <text x="210" y="784" text-anchor="middle" class="kind">Telemetry</text>
+  <text x="210" y="806" text-anchor="middle" class="detail">live window</text>
+  <line x1="380" y1="792" x2="468" y2="792" stroke="#334155" stroke-width="1.75" marker-end="url(#arrow)"/>
+  <rect x="476" y="756" width="344" height="72" rx="10" fill="#fee2e2" stroke="#b91c1c" stroke-width="2"/>
+  <text x="648" y="784" text-anchor="middle" class="kind">Rollback</text>
+  <text x="648" y="806" text-anchor="middle" class="detail">100% back on the old version</text>
+  <line x1="210" y1="828" x2="210" y2="860" stroke="#334155" stroke-width="2.25" marker-end="url(#arrow)"/>
+
+  <!-- row 8 done -->
+  <rect x="40" y="868" width="340" height="72" rx="10" fill="#f8fafc" stroke="#0f172a" stroke-width="2"/>
+  <text x="210" y="896" text-anchor="middle" class="kind">Done</text>
+  <text x="210" y="918" text-anchor="middle" class="detail">100% on the new version</text>
+
+  <!-- legend -->
+  <text x="40" y="978" class="detail" fill="#475569">Stage kind</text>
+  <rect x="40" y="992" width="118" height="32" rx="6" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+  <text x="99" y="1013" text-anchor="middle" class="legend">Gate</text>
+  <rect x="170" y="992" width="118" height="32" rx="6" fill="#ede9fe" stroke="#6d28d9" stroke-width="2"/>
+  <text x="229" y="1013" text-anchor="middle" class="legend">Deploy</text>
+  <rect x="300" y="992" width="118" height="32" rx="6" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+  <text x="359" y="1013" text-anchor="middle" class="legend">Smoke</text>
+  <rect x="430" y="992" width="130" height="32" rx="6" fill="#ccfbf1" stroke="#0f766e" stroke-width="2"/>
+  <text x="495" y="1013" text-anchor="middle" class="legend">Telemetry</text>
+  <rect x="572" y="992" width="118" height="32" rx="6" fill="#ffedd5" stroke="#c2410c" stroke-width="2"/>
+  <text x="631" y="1013" text-anchor="middle" class="legend">Ramp</text>
+  <rect x="702" y="992" width="118" height="32" rx="6" fill="#fee2e2" stroke="#b91c1c" stroke-width="2"/>
+  <text x="761" y="1013" text-anchor="middle" class="legend">Rollback</text>
+  <text x="40" y="1056" class="detail" fill="#475569">Gray boxes are a stop with traffic left as it is. Red boxes move the old version back to 100% and exit.</text>
+</svg>
