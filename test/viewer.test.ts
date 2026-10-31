@@ -848,3 +848,34 @@ test('history in one call: on a tree:0 server the page fetches the head and its 
     cleanup();
   }
 });
+
+test('scraping contract: li[data-oid] rows equal git ls-tree, and the commit card carries data-commit', async () => {
+  // External monitors (ply issue #44) count these rows and compare the oids to the forge's tree API.
+  // A redesign may restyle anything, but must keep: li[data-oid][data-mode][data-type][data-name], ul.files[data-entries],
+  // and [data-commit] on the latest-commit card. See README "Machine-readable markup".
+  const { root, cleanup } = tmpRoot();
+  const srv = await startGitServer(root);
+  try {
+    const bare = makeBareRepo(root, 'scrape');
+    const work = join(root, 'w-scrape');
+    mkdirSync(work);
+    git(work, ['init', '-q', '-b', 'main']);
+    const files = { 'README.md': 'x\n', 'src/a.js': 'a\n', 'src/b.ts': 'b\n', 'src/run.sh': { data: '#!/bin/sh\n', mode: '100755' }, 'src/lib/c.js': 'c\n', 'src/lib/d/e.js': 'e\n' };
+    const head = commitFiles(work, bare, files, 'seed');
+    const dial = rewriteAllowlisted(srv.url);
+    const page = await handleViewer(new Request('https://ply.ivar.workers.dev/view/github.com/scrape.git?path=src'), viewerEnv(), {}, { fetchImpl: dial });
+    assert.equal(page.status, 200);
+    const html = await page.text();
+    const rows = [...html.matchAll(/<li data-oid="([0-9a-f]{40})" data-mode="([0-7]{6})" data-type="(blob|tree|commit)" data-name="([^"]*)">/g)]
+      .map(m => `${m[2]} ${m[3]} ${m[1]}\t${m[4]}`).sort();
+    const expected = git(bare, ['ls-tree', `${head}:src`]).trim().split('\n').sort();
+    assert.deepEqual(rows, expected);
+    assert.match(html, new RegExp(`<ul class="files"[^>]* data-path="src" data-entries="${expected.length}" data-shown="${expected.length}">`));
+    assert.match(html, new RegExp(`data-commit="${head}"`));
+    // The parent-directory row is not an entry.
+    assert.equal([...html.matchAll(/<li data-oid=/g)].length, expected.length);
+  } finally {
+    await srv.close();
+    cleanup();
+  }
+});
