@@ -15,9 +15,9 @@
 // env:   CHROME (default: macOS Google Chrome), STALE_CSS, STALE_CSS_URL,
 //        PLY_VERSION=<version id>: every request carries Cloudflare-Workers-Version-Overrides: ply="<id>" (a 0% canary).
 // The last line lists every x-ply-request-id the Worker answered with (requestIds) and, per request, the x-ply-version that
-// answered it (requests: [{ id, version, url }], read by scripts/deploy.sh for the telemetry gate); with PLY_VERSION, a
+// answered it (requests: [{ id, version, url }], read by the telemetry gate); with PLY_VERSION, a
 // response from another version (x-ply-version) fails the run.
-// Run after every deploy, next to `node src/smoke.mjs <base> gate`.
+// Run after a deploy, next to `npm run cd -- smoke --version <id>`.
 import { spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
