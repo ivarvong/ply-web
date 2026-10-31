@@ -5,11 +5,12 @@ import type { FilterName } from './model.ts';
 import { interpretRemote } from './paste.ts';
 import { extractRequestPath, rawPathHasUnsafeSegment, rawQueryPathUnsafe } from '../pathguard.ts';
 import { allowlistFromEnv, validatePublicRepoUrl, viewerPathFor, withHost, type AllowedHost, type RepoLocation } from './url.ts';
-import { PUBLIC_GIT_HOST, PUBLIC_GIT_ORIGIN, PUBLIC_NAMESPACE, publicRepoOfRemote } from '../public.ts';
+import { PUBLIC_GIT_HOST, PUBLIC_GIT_ORIGIN, PUBLIC_NAMESPACE, isPublicRepoName, publicRemote, publicRepoOfRemote, publicRepoShortName } from '../public.ts';
 
 export type ViewerRoute =
   | { kind: 'css'; hash: string | null }
   | { kind: 'home' }
+  | { kind: 'namespace' }
   | { kind: 'redirect'; location: string }
   | {
       kind: 'repo';
@@ -38,9 +39,29 @@ export function routeOptsFromEnv(env: { VIEWER_EXTRA_HOSTS?: string }): RouteOpt
 function chosenRef(url: URL, fallback: string | null = null): string | null {
   const at = url.searchParams.get('at')
   if (at !== null && at !== '') return parseRef(at)
+  const commit = url.searchParams.get('commit')
+  if (commit !== null && commit !== '') return parseRef(commit)
   const ref = url.searchParams.get('ref')
   if (ref !== null && ref !== '') return parseRef(ref)
   return fallback
+}
+
+/** `at` and `commit` are aliases of `ref`. A public-namespace page on the long host path canonicalises to `/r/<name>`. */
+function canonicalLocation(url: URL, loc: RepoLocation, ref: string | null, path: string, raw: boolean, pack: Extract<ViewerRoute, { kind: 'repo' }>['pack']): string | null {
+  const alias = url.searchParams.has('at') || url.searchParams.has('commit')
+  const short = publicRepoShortName(loc.host, loc.repoPath)
+  const onShort = short !== null && url.pathname === `/r/${encodeURIComponent(short)}`
+  if (!alias && (short === null || onShort)) return null
+  const query: Record<string, string | undefined> = {
+    ref: ref ?? undefined,
+    path: path || undefined,
+    raw: raw ? '1' : undefined,
+    trace: url.searchParams.get('trace') === '1' ? '1' : undefined,
+    want: pack?.want,
+    filter: pack ? pack.filter : undefined,
+    offset: pack?.offset !== null && pack?.offset !== undefined ? String(pack.offset) : undefined,
+  }
+  return viewerPathFor(loc, query)
 }
 
 function parseRef(raw: string | null): string | null {
@@ -118,18 +139,28 @@ export function parseViewerRoute(url: URL, opts: RouteOpts): ViewerRoute {
     const ref = chosenRef(url, pasted.ref ?? null);
     return { kind: 'redirect', location: viewerPathFor(loc, { ref: ref ?? undefined, path: pasted.path || undefined }) };
   }
-  if (!url.pathname.startsWith('/view/')) bad('not a viewer route');
-  let decoded: string;
-  try { decoded = decodeURIComponent(url.pathname.slice('/view/'.length)); } catch { bad('remote path is not allowed'); }
-  if (decoded.includes('%') || decoded.includes('\\') || decoded.includes('\0') || decoded.includes('..')) bad('remote path is not allowed');
-  for (const segment of decoded.split('/')) {
-    if (segment === '.' || segment === '..') bad('remote path is not allowed');
+  if (url.pathname === '/r' || url.pathname === '/r/') return { kind: 'namespace' };
+  let loc: RepoLocation;
+  if (url.pathname.startsWith('/r/')) {
+    const rest = url.pathname.slice('/r/'.length);
+    let name: string;
+    try { name = decodeURIComponent(rest); } catch { throw fail('not_found', `not a repository in ${PUBLIC_NAMESPACE}`); }
+    if (name.includes('/') || !isPublicRepoName(name)) throw fail('not_found', `not a repository in ${PUBLIC_NAMESPACE}`);
+    loc = validateLocation(publicRemote(name), opts);
+  } else {
+    if (!url.pathname.startsWith('/view/')) bad('not a viewer route');
+    let decoded: string;
+    try { decoded = decodeURIComponent(url.pathname.slice('/view/'.length)); } catch { bad('remote path is not allowed'); }
+    if (decoded.includes('%') || decoded.includes('\\') || decoded.includes('\0') || decoded.includes('..')) bad('remote path is not allowed');
+    for (const segment of decoded.split('/')) {
+      if (segment === '.' || segment === '..') bad('remote path is not allowed');
+    }
+    const parts = decoded.split('/').filter(part => part.length > 0);
+    if (parts.length < 2) bad('remote path is not allowed');
+    const host = parts[0] ?? '';
+    const repoPath = parts.slice(1).join('/');
+    loc = locate(host, repoPath, opts);
   }
-  const parts = decoded.split('/').filter(part => part.length > 0);
-  if (parts.length < 2) bad('remote path is not allowed');
-  const host = parts[0] ?? '';
-  const repoPath = parts.slice(1).join('/');
-  const loc = locate(host, repoPath, opts);
   const wantRaw = url.searchParams.get('want');
   const filter = parseFilter(url.searchParams.get('filter'), wantRaw !== null);
   let pack: { want: string; filter: FilterName; offset: number | null } | null = null;
@@ -146,5 +177,9 @@ export function parseViewerRoute(url: URL, opts: RouteOpts): ViewerRoute {
   } else if (url.searchParams.get('filter') || url.searchParams.get('offset')) bad('filter and offset need a want');
   const raw = url.searchParams.get('raw') === '1';
   if (raw && pack) bad('raw is a file view');
-  return { kind: 'repo', loc, ref: chosenRef(url), path: parsePath(url.searchParams.get('path')), raw, pack };
+  const ref = chosenRef(url);
+  const path = parsePath(url.searchParams.get('path'));
+  const location = canonicalLocation(url, loc, ref, path, raw, pack);
+  if (location) return { kind: 'redirect', location };
+  return { kind: 'repo', loc, ref, path, raw, pack };
 }

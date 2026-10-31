@@ -32,7 +32,7 @@ export function repoIdentity(host: string, repoPath: string): RepoIdentity {
     const scope = parts[1] ?? ''
     return {
       scope,
-      scopeHref: host === PUBLIC_GIT_HOST && scope === PUBLIC_NAMESPACE ? '/view#public' : null,
+      scopeHref: host === PUBLIC_GIT_HOST && scope === PUBLIC_NAMESPACE ? '/r' : null,
       name: parts[2] ?? '',
       hostLabel: 'Artifacts',
       remote,

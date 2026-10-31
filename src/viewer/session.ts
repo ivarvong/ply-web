@@ -17,6 +17,9 @@ import type { RepoLocation, ValidatedPublicRepoUrl } from './url.ts';
 import { viewerHref } from './url.ts';
 
 import { quirksFor, type Quirks } from '../quirks.ts';
+import { isAbbreviatedOid, matchAbbreviatedOid } from '../abbrev.ts';
+import { nearbyRefs, type ViewerHint } from './hint.ts';
+import { tagsFromRefs } from './tags.ts';
 
 type NoCredential = { auth?: never };
 
@@ -71,25 +74,53 @@ function headerFor(loc: RepoLocation, ref: string, commit: string, server: Serve
   return { host: loc.host, repoPath: loc.repoPath, ref, commit, treeHref: viewerHref(loc.host, loc.repoPath, { ref }), server };
 }
 
-function refPrefixes(ref: string | null): string[] {
-  const prefixes = new Set<string>(['HEAD', 'refs/heads/']);
+/** A viewer failure carrying the error page's hint (src/viewer/hint.ts reads it back); ply's Extra has no such field. */
+function withHint<E extends object>(err: E, viewerHint: ViewerHint): E & { viewerHint: ViewerHint } {
+  return Object.assign(err, { viewerHint });
+}
+
+function refPrefixes(ref: string | null, allTags = true): string[] {
+  const prefixes = new Set<string>(allTags ? ['HEAD', 'refs/heads/', 'refs/tags/'] : ['HEAD', 'refs/heads/']);
   for (const cand of candidates(ref)) {
     if (cand === 'HEAD') continue;
-    if (cand.startsWith('refs/tags/')) prefixes.add('refs/tags/');
-    else prefixes.add(cand);
+    prefixes.add(cand);
   }
   return [...prefixes];
 }
 
-function resolveRef(refs: Map<string, RefRec>, head: string | null, ref: string | null): { name: string; commit: string } {
+function refMiss(listedRefs: { refs: Map<string, RefRec>; head: string | null }, wanted: string, code: 'not_found' | 'bad_request', message: string): never {
+  const catalog = refCatalog(listedRefs);
+  throw withHint(fail(code, message), { nearby: nearbyRefs(wanted, catalog.branches, catalog.tags), path: null });
+}
+
+function resolveRef(listedRefs: { refs: Map<string, RefRec>; head: string | null }, ref: string | null): { name: string; commit: string } {
+  const refs = listedRefs.refs;
   const cands = candidates(ref);
   if (!cands.length) return { name: ref ?? '', commit: ref ?? '' };
   for (const cand of cands) {
     const rec = refs.get(cand);
     if (!rec) continue;
-    return { name: cand === 'HEAD' ? (head ?? 'HEAD') : cand, commit: rec.peeled ?? rec.oid };
+    return { name: cand === 'HEAD' ? (listedRefs.head ?? 'HEAD') : cand, commit: rec.peeled ?? rec.oid };
   }
-  throw fail('not_found', cands[0] === 'HEAD' ? 'remote HEAD is unborn or absent; pass ref explicitly' : `ref ${ref} not found`);
+  if (ref && isAbbreviatedOid(ref)) {
+    const match = matchAbbreviatedOid(ref, refs);
+    if (match.kind === 'unique') return { name: match.oid, commit: match.oid };
+    refMiss(listedRefs, ref, 'bad_request', match.message);
+  }
+  const message = cands[0] === 'HEAD' ? 'remote HEAD is unborn or absent; pass ref explicitly' : `ref ${ref} not found`;
+  refMiss(listedRefs, ref ?? '', 'not_found', message);
+}
+
+function refCatalog(listedRefs: { refs: Map<string, RefRec>; head: string | null }) {
+  const heads = [];
+  for (const [name, rec] of listedRefs.refs) {
+    if (!name.startsWith('refs/heads/')) continue;
+    heads.push({ name, oid: rec.oid, head: name === listedRefs.head });
+  }
+  heads.sort((a, b) => Number(b.head) - Number(a.head) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const branches = heads.slice(0, VIEWER_CAPS.maxBranchesShown);
+  const tagView = tagsFromRefs(listedRefs.refs, VIEWER_CAPS.maxTagsShown);
+  return { branches, branchesTruncated: heads.length - branches.length, tags: tagView.tags, tagsTruncated: tagView.truncated };
 }
 
 async function loadTreeBytes(transport: GitTransport, oid: string, cache: Map<string, Uint8Array>): Promise<Uint8Array> {
@@ -223,9 +254,24 @@ function historyOf(first: CommitInfo, held: Map<string, Held> | null): { log: Co
   return { log, logStopped: false };
 }
 
+/**
+ * Branches and every tag (for the picker). A repository whose tags alone pass maxRefs (or the ls-refs byte cap) still
+ * opens: one more ls-refs lists branches and the asked-for name only, and the picker shows no tags.
+ */
+export async function listPageRefs(transport: GitTransport, ref: string | null): Promise<{ refs: Map<string, RefRec>; head: string | null }> {
+  try {
+    return await listRefs(transport, refPrefixes(ref));
+  } catch (err) {
+    const e = err as { code?: string; what?: string; message?: string };
+    if (e?.code !== 'limit_exceeded' || !/^ls-refs /.test(String(e.what ?? e.message ?? ''))) throw err;
+    return await listRefs(transport, refPrefixes(ref, false));
+  }
+}
+
 async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { kind: 'repo' }>, server: ServerInfo, quirks: Quirks, budget: Budget, tracer: ViewerTracer): Promise<Loaded> {
-  const listedRefs = await listRefs(transport, refPrefixes(route.ref));
-  const resolved = resolveRef(listedRefs.refs, listedRefs.head, route.ref);
+  const listedRefs = await listPageRefs(transport, route.ref);
+  const resolved = resolveRef(listedRefs, route.ref);
+  const catalog = refCatalog(listedRefs);
   // Raw bytes need no history: read the commit alone. Every page reads the window (it replaces the commit read).
   const held = route.raw ? null : await loadWindow(transport, resolved.commit, quirks);
   const headObj = held?.get(resolved.commit);
@@ -245,10 +291,11 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
     const entries = parseTree(data, VIEWER_GIT_LIMITS);
     if (entries.length > VIEWER_GIT_LIMITS.maxTreeEntries) throw limitError('tree entries', entries.length, VIEWER_GIT_LIMITS.maxTreeEntries);
     const entry = entries.find((item: { name: string }) => item.name === name);
-    if (!entry) throw fail('not_found', `path component ${name} not found`);
+    const existingPath = comps.slice(0, depth).join('/');
+    if (!entry) throw withHint(fail('not_found', `path component ${name} not found`), { nearby: [], path: { missing: name, existingPath, notDirectory: false } });
     const last = depth === comps.length - 1;
     if (!last) {
-      if (entry.mode !== '40000') throw fail('not_found', `${name} is not a directory`);
+      if (entry.mode !== '40000') throw withHint(fail('not_found', `${name} is not a directory`), { nearby: [], path: { missing: name, existingPath, notDirectory: true } });
       treeOid = entry.oid;
       continue;
     }
@@ -259,16 +306,16 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
     const mode = treeMode(file.mode);
     if (file.mode === '160000') {
       if (route.raw) throw fail('not_found', 'submodule has no blob in this repository');
-      return { kind: 'file', header, path: route.path, mode, blob: file.oid, size: 0, note: 'submodule', text: null };
+      return { kind: 'file', header, path: route.path, ...catalog, mode, blob: file.oid, size: 0, note: 'submodule', text: null };
     }
     const blob = await readBlob(transport, tracer, file.oid);
     if (blob.tooBig || !blob.bytes) {
       if (route.raw) throw limitError('file bytes', blob.size, VIEWER_CAPS.maxFileDisplayBytes);
-      return { kind: 'file', header, path: route.path, mode, blob: file.oid, size: blob.size, note: 'too-big', text: null };
+      return { kind: 'file', header, path: route.path, ...catalog, mode, blob: file.oid, size: blob.size, note: 'too-big', text: null };
     }
     if (route.raw) return { kind: 'raw', filename: safeFilename(route.path), bytes: blob.bytes, size: blob.size };
     const text = asText(blob.bytes);
-    return { kind: 'file', header, path: route.path, mode, blob: file.oid, size: blob.size, note: text === null ? 'binary' : 'text', text };
+    return { kind: 'file', header, path: route.path, ...catalog, mode, blob: file.oid, size: blob.size, note: text === null ? 'binary' : 'text', text };
   }
   if (route.raw) throw fail('bad_request', 'raw is a file view');
   const data = await loadTreeBytes(transport, treeOid, cache);
@@ -292,17 +339,9 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
       }
     }
   }
-  const heads = [];
-  for (const [name, rec] of listedRefs.refs) {
-    if (!name.startsWith('refs/heads/')) continue;
-    heads.push({ name, oid: rec.oid, head: name === listedRefs.head });
-  }
-  heads.sort((a, b) => Number(b.head) - Number(a.head) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  const branches = heads.slice(0, VIEWER_CAPS.maxBranchesShown);
   const { log, logStopped } = historyOf(commit, held);
   return {
-    kind: 'tree', header, path: route.path, commit, log, logStopped, branches,
-    branchesTruncated: heads.length - branches.length,
+    kind: 'tree', header, path: route.path, commit, log, logStopped, ...catalog,
     entries: entries.shown,
     entriesTruncated: entries.truncated,
     readme,

@@ -11,7 +11,7 @@
 // /v<CACHE_VERSION>/pinned<path>?<allowed params, sorted>. Pinned rebuilds the public request from that key alone (it
 // reads no header, so no credential can reach it), marks it internal, and runs the same handler. A non-200 is no-store.
 import { CACHE_VERSION } from './cache-version.ts';
-import { publicRepoOfRemote } from './public.ts';
+import { isPublicRepoName, publicRepoOfRemote } from './public.ts';
 
 const OID = /^[0-9a-f]{40}$/;
 export const PINNED_V1 = new Set(['/v1/tree', '/v1/read', '/v1/commit']);
@@ -44,14 +44,25 @@ export function pinnedV1Key(url: URL, method: string): string | null {
   return q === null ? null : `/v${CACHE_VERSION}/pinned${url.pathname}?${q}`;
 }
 
+function shortPublicName(pathname: string): string | null {
+  const match = /^\/r\/([^/]+)$/.exec(pathname);
+  if (!match?.[1]) return null;
+  let name: string;
+  try { name = decodeURIComponent(match[1]); } catch { return null; }
+  return isPublicRepoName(name) ? name : null;
+}
+
 /** The cache key for a viewer raw file at a pinned commit, or null. `isPublicLoc` is the viewer's own route check. */
 export function pinnedViewKey(url: URL, method: string, isPublicLoc: (url: URL) => boolean): string | null {
-  if ((method !== 'GET' && method !== 'HEAD') || !url.pathname.startsWith('/view/')) return null;
+  if (method !== 'GET' && method !== 'HEAD') return null;
+  const short = shortPublicName(url.pathname);
+  const long = url.pathname.startsWith('/view/');
+  if (!short && !long) return null;
   if (url.searchParams.get('raw') !== '1' || !url.searchParams.get('path')) return null;
   const at = url.searchParams.get('at') || url.searchParams.get('ref') || '';
   if (!OID.test(at)) return null;
   if (url.searchParams.get('at') && url.searchParams.get('ref') && url.searchParams.get('at') !== url.searchParams.get('ref')) return null;
-  if (!isPublicLoc(url)) return null;
+  if (long && !isPublicLoc(url)) return null;
   const q = sorted(url, VIEW_PARAMS);
   return q === null ? null : `/v${CACHE_VERSION}/pinned${url.pathname}?${q}`;
 }
@@ -71,7 +82,7 @@ export function requestForKey(path: string, isPublicLoc: (url: URL) => boolean):
 /** Pinned's answer: the handler's response, immutable when it is a 200, never carrying the fill's per-request headers. */
 export function asPinned(res: Response): Response {
   const headers = new Headers(res.headers);
-  for (const h of ['x-ply-request-id', 'x-ply-trace', 'server-timing', 'set-cookie']) headers.delete(h);
+  for (const h of ['x-ply-request-id', 'x-ply-trace', 'server-timing', 'set-cookie', 'vary']) headers.delete(h);
   headers.set('cache-control', res.status === 200 ? IMMUTABLE : 'no-store');
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }

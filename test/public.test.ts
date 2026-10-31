@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   PUBLIC_GIT_HOST, PUBLIC_GIT_ORIGIN, PUBLIC_NAMESPACE, READ_TOKEN_REFRESH_S, READ_TOKEN_TTL_S,
-  createTokenSource, isPublicNamespaceRemote, isPublicRepoName, publicRemote, publicRepoOfRemote, publicUploadPackRepo,
+  createTokenSource, EMPTY_PUBLIC_REPOS, isPublicNamespaceRemote, isPublicRepoName, listPublicRepos, publicRemote, publicRepoOfRemote, publicUploadPackRepo,
   scrubSecrets, withPublicReadCredential, type ArtifactsNamespace,
 } from '../src/public.ts';
 import { PUBLIC_NAMESPACE as CONFIG_NAMESPACE } from '../src/public-namespace.ts';
@@ -13,6 +13,20 @@ import { PUBLIC_NAMESPACE as CONFIG_NAMESPACE } from '../src/public-namespace.ts
 const O = PUBLIC_GIT_ORIGIN;
 const NS = PUBLIC_NAMESPACE;
 const TOKEN = `art_v1_${'ab12'.repeat(10)}?expires=4102444800`;
+
+test('listPublicRepos is the list /view and /r/ share; unavailable only when list() throws', async () => {
+  const get = async () => { throw new Error('unused'); };
+  assert.deepEqual(await listPublicRepos(null, 0), EMPTY_PUBLIC_REPOS);
+  assert.deepEqual(await listPublicRepos({ get }, 0), EMPTY_PUBLIC_REPOS);
+  const down = { get, list: async () => { throw new Error('upstream'); } };
+  assert.deepEqual(await listPublicRepos(down, 0), { names: [], unavailable: true });
+  const names = ['ply', 'curl', 'ply-web', 'deepfile'];
+  const up = { get, list: async () => ({ repos: names.map(name => ({ name, status: 'ready' as const })) }) };
+  const page = await listPublicRepos(up, 0);
+  assert.deepEqual(page, { names: ['curl', 'deepfile', 'ply', 'ply-web'], unavailable: false });
+  assert.deepEqual(await listPublicRepos(down, 1_000), page);
+  assert.deepEqual(await listPublicRepos({ get, list: async () => ({ repos: [{ name: 'only' }] }) }, 120_000), { names: ['only'], unavailable: false });
+});
 
 test('the namespace is one constant, shared by the binding config and the URL rules', () => {
   assert.equal(NS, 'public-v0');

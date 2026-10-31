@@ -28,6 +28,8 @@ export type TreeEntry = { name: string; mode: string; oid: string; type: string 
 
 export type BranchInfo = { name: string; oid: string; head: boolean };
 
+export type TagInfo = { name: string; oid: string };
+
 export type TraceBar = {
   name: string;
   startMs: number;
@@ -69,6 +71,8 @@ export type Loaded =
       logStopped: boolean;
       branches: BranchInfo[];
       branchesTruncated: number;
+      tags: TagInfo[];
+      tagsTruncated: number;
       entries: TreeEntry[];
       entriesTruncated: number;
       readme: { name: string; text: string } | { name: string; tooBig: true } | null;
@@ -77,6 +81,10 @@ export type Loaded =
       kind: 'file';
       header: RepoHeader;
       path: string;
+      branches: BranchInfo[];
+      branchesTruncated: number;
+      tags: TagInfo[];
+      tagsTruncated: number;
       mode: string;
       blob: string;
       size: number;

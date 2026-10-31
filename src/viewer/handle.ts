@@ -1,5 +1,6 @@
 // Public viewer entry. No PLY_TOKEN, no git credential, no /v1 handler. Rate limit runs before any git fetch.
 // This module does not import rate.ts: node tests must not load cloudflare:workers. The Worker re-exports the class.
+import { plyBuildValue, BUILD_HEADER } from '../version.ts'
 import { viewerApp } from './app.tsx'
 import { viewerCalls, type HandleOpts, type ViewerCall, type ViewerCtx } from './call.ts'
 import { htmlResponse } from './http.ts'
@@ -41,5 +42,6 @@ export async function handleViewer(req: Request, env: ViewerEnv, ctx: ViewerCtx 
     for (const [key, value] of Object.entries(call.fields)) span?.setAttribute?.(key, value)
     span?.end?.()
   } catch { /* tracing is optional */ }
+  res.headers.set(BUILD_HEADER, plyBuildValue())
   return res
 }

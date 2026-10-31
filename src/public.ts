@@ -30,6 +30,36 @@ export function isPublicRepoName(name: string): boolean {
   return typeof name === 'string' && REPO_NAME.test(name) && !name.includes('..') && !/\.git$/i.test(name);
 }
 
+const GIT_SUFFIX = '.git';
+
+/**
+ * The public-namespace repo name when `host` + `repoPath` is exactly one repo under PUBLIC_NAMESPACE.
+ * That name is the short viewer URL `/r/<name>`.
+ */
+export function publicRepoShortName(host: string, repoPath: string): string | null {
+  if (host !== PUBLIC_GIT_HOST) return null;
+  const prefix = `git/${PUBLIC_NAMESPACE}/`;
+  if (!repoPath.startsWith(prefix) || !repoPath.endsWith(GIT_SUFFIX)) return null;
+  const name = repoPath.slice(prefix.length, -GIT_SUFFIX.length);
+  return isPublicRepoName(name) ? name : null;
+}
+
+export type RepoPresence = true | false | 'unknown';
+
+/** True when the namespace binding has the repo. `unknown` when the binding is missing or errors for another reason. */
+export async function publicRepoExists(binding: ArtifactsNamespace | undefined | null, name: string): Promise<RepoPresence> {
+  if (!isPublicRepoName(name)) return false;
+  if (!binding || typeof binding.get !== 'function') return 'unknown';
+  try {
+    const handle = await binding.get(name);
+    try { handle[Symbol.dispose]?.(); } catch { /* releasing the RPC stub is best effort */ }
+    return true;
+  } catch (e) {
+    if (/not.?found|does not exist|no such/i.test(String((e as { message?: string })?.message ?? e))) return false;
+    return 'unknown';
+  }
+}
+
 /** The canonical remote for a repo in the public namespace. */
 export function publicRemote(name: string, origin: string = PUBLIC_GIT_ORIGIN): string {
   if (!isPublicRepoName(name)) throw fail('bad_request', 'not a public repository name');
@@ -192,17 +222,31 @@ const LIST_TTL_MS = 60_000;
 const LIST_LIMIT = 100;
 let listed: { at: number; names: string[] } | null = null;
 
-/** Repo names in the public namespace for the home page, cached for a minute per isolate. Empty when unavailable. */
-export async function listPublicRepos(binding: ArtifactsNamespace | undefined | null, now: number = Date.now()): Promise<string[]> {
-  if (!binding || typeof binding.list !== 'function') return [];
-  if (listed && now - listed.at < LIST_TTL_MS) return listed.names;
+/** Names from `binding.list()`. `/view` and `/r/` both render this value. */
+export type PublicRepoList = {
+  names: readonly string[];
+  /** True only when `list()` threw and this isolate has no cached page to show. */
+  unavailable: boolean;
+};
+
+export const EMPTY_PUBLIC_REPOS: PublicRepoList = { names: [], unavailable: false };
+
+/**
+ * Repo names in the public namespace, cached for a minute per isolate.
+ * A missing binding or an empty namespace is an empty list, not a failure.
+ * `unavailable` is set only when the upstream `list()` call throws and nothing is cached.
+ */
+export async function listPublicRepos(binding: ArtifactsNamespace | undefined | null, now: number = Date.now()): Promise<PublicRepoList> {
+  if (!binding || typeof binding.list !== 'function') return EMPTY_PUBLIC_REPOS;
+  if (listed && now - listed.at < LIST_TTL_MS) return { names: listed.names, unavailable: false };
   try {
     const page = await binding.list({ limit: LIST_LIMIT });
     const names = (page?.repos ?? []).filter(r => !r.status || r.status === 'ready').map(r => String(r.name)).filter(isPublicRepoName).sort();
     listed = { at: now, names };
-    return names;
+    return { names, unavailable: false };
   } catch {
-    return listed?.names ?? [];
+    if (listed) return { names: listed.names, unavailable: false };
+    return { names: [], unavailable: true };
   }
 }
 

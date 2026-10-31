@@ -3,18 +3,20 @@ import { createBudget } from './budget.ts'
 import { viewerCalls, type ViewerCall } from './call.ts'
 import { safeFilename } from './escape.ts'
 import { createViewerFetch, type FetchLike } from './fetchguard.ts'
+import { describeFailure } from './failure.ts'
+import { hintFromError } from './hint.ts'
 import { htmlResponse, SECURITY, statusOf, textResponse } from './http.ts'
 import { VIEWER_CAPS, rateLimitFor, type RateBucket } from './limits.ts'
 import type { RateDecision, TraceModel, ViewerEnv } from './model.ts'
 import { makeTracer, plyCode, spanCollector } from './ply.ts'
 import { createLoopbackFetch } from '../gitcache.ts'
 import { parseViewerRequest, routeOptsFromEnv, type ViewerRoute } from './route.ts'
-import { renderError, renderHome, renderLoaded } from './render.tsx'
+import { renderError, renderHome, renderLoaded, renderNamespace } from './render.tsx'
 import { VIEWER_CSS, VIEWER_CSS_HASH } from './styles.ts'
 import { loadRepo } from './session.ts'
 import { buildTrace, traceHeader } from './traceview.ts'
 import { LAYOUT } from './layout.ts'
-import { listPublicRepos, tokenSourceFor, withPublicReadCredential } from '../public.ts'
+import { PUBLIC_NAMESPACE, listPublicRepos, publicRepoExists, publicRepoShortName, tokenSourceFor, withPublicReadCredential } from '../public.ts'
 
 function callOf(req: Request): ViewerCall {
   const call = viewerCalls.get(req)
@@ -68,7 +70,7 @@ function routeError(call: ViewerCall, err: unknown): Response {
   return htmlResponse(status, renderError(status, code, message, trace), trace, call.requestId)
 }
 
-async function rateGate(req: Request, env: ViewerEnv, call: ViewerCall, route: Extract<ViewerRoute, { kind: 'repo' }> | { kind: 'home' } | { kind: 'redirect' }): Promise<Response | null> {
+async function rateGate(req: Request, env: ViewerEnv, call: ViewerCall, route: Extract<ViewerRoute, { kind: 'repo' }> | { kind: 'home' } | { kind: 'redirect' } | { kind: 'namespace' }): Promise<Response | null> {
   if (call.opts.skipRate) return null
   const bucket: RateBucket = route.kind === 'repo' && route.pack ? 'pack' : 'page'
   const decision = await admitClient(req, env, bucket, call.now)
@@ -125,6 +127,11 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
   const loopback = call.opts.loopback !== undefined ? call.opts.loopback : env.PACK_CACHE === 'off' ? null : () => call.ctx.exports?.GitCache
   const fetchImpl: FetchLike = createViewerFetch(createLoopbackFetch(direct, loopback), route.loc.url, route.loc.allowedHosts, budget, pageSignal)
   try {
+    const short = publicRepoShortName(route.loc.host, route.loc.repoPath)
+    if (short) {
+      const exists = await publicRepoExists(env.PUBLIC_REPOS, short)
+      if (exists === false) throw Object.assign(new Error(`no repository ${short} in ${PUBLIC_NAMESPACE}`), { code: 'not_found' })
+    }
     const loaded = await loadRepo(route, { tracer, fetchImpl, signal: pageSignal, budget })
     const trace = { ...buildTrace(collected.lines, call.cfRay, call.requestId), expanded: new URL(req.url).searchParams.get('trace') === '1' }
     call.opts.note?.({ host: route.loc.host, rtt: trace.bars.length, bytes: budget.bytes, code: 'ok' })
@@ -137,8 +144,9 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
         'cache-control': 'no-store',
         'x-content-type-options': 'nosniff',
         'x-ply-request-id': call.requestId,
-        'x-ply-trace': traceHeader(trace),
       })
+      const summary = traceHeader(trace)
+      if (summary) headers.set('x-ply-trace', summary)
       const copy = new ArrayBuffer(loaded.bytes.byteLength)
       new Uint8Array(copy).set(loaded.bytes)
       call.fields['http.status_code'] = 200
@@ -154,14 +162,15 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
     return headless(req, htmlResponse(200, renderLoaded(loaded, trace, call.now), trace, call.requestId))
   } catch (err) {
     const code = plyCode((err as { code?: string })?.code) ? (err as { code: string }).code : 'internal'
-    const status = code === 'internal' ? 500 : statusOf(err as { code?: string; status?: number })
+    const upstream = code === 'internal' ? 500 : statusOf(err as { code?: string; status?: number })
     const message = code === 'internal' ? 'The viewer hit an internal error.' : String((err as { message?: string })?.message ?? err).slice(0, 500)
+    const view = describeFailure({ code, status: upstream, message, host: route.loc.host, repoPath: route.loc.repoPath, ref: route.ref, path: route.path })
     const trace = { ...buildTrace(collected.lines, call.cfRay, call.requestId), expanded: new URL(req.url).searchParams.get('trace') === '1' }
-    call.opts.note?.({ host: route.loc.host, code, status, rtt: trace.bars.length })
-    call.fields['http.status_code'] = status
+    call.opts.note?.({ host: route.loc.host, code, status: view.status, rtt: trace.bars.length })
+    call.fields['http.status_code'] = view.status
     call.fields['error.type'] = code
     call.fields['server.address'] = route.loc.host
-    return headless(req, htmlResponse(status, renderError(status, code, message, trace, route.loc.host, route.loc.repoPath, route.ref, call.now), trace, call.requestId))
+    return headless(req, htmlResponse(view.status, renderError(upstream, code, message, trace, route.loc.host, route.loc.repoPath, route.ref, call.now, route.path, hintFromError(err)), trace, call.requestId))
   }
 }
 
@@ -193,12 +202,38 @@ viewerApp.on(['GET', 'HEAD'], '/:sheet{view\\.[0-9a-f]{12}\\.css}', c => serveCs
 viewerApp.on(['GET', 'HEAD'], '/view', c => serveEntry(c.req.raw, c.env))
 viewerApp.on(['GET', 'HEAD'], '/view/', c => serveEntry(c.req.raw, c.env))
 
-viewerApp.on(['GET', 'HEAD'], '/view/*', c => {
+viewerApp.on(['GET', 'HEAD'], '/view/*', c => dispatchViewer(c))
+viewerApp.on(['GET', 'HEAD'], '/r', c => dispatchViewer(c))
+viewerApp.on(['GET', 'HEAD'], '/r/', c => dispatchViewer(c))
+viewerApp.on(['GET', 'HEAD'], '/r/*', c => dispatchViewer(c))
+
+function dispatchViewer(c: { req: { raw: Request }; env: ViewerEnv }): Promise<Response> | Response {
   const call = callOf(c.req.raw)
   const route = call.route
-  if (!route || route.kind !== 'repo') return headless(c.req.raw, routeError(call, { code: 'bad_request', message: 'not a viewer route' }))
+  if (!route) return headless(c.req.raw, routeError(call, { code: 'bad_request', message: 'not a viewer route' }))
+  if (route.kind === 'namespace') return serveNamespace(c.req.raw, c.env)
+  if (route.kind === 'redirect') return serveRedirect(c.req.raw, c.env, call, route)
+  if (route.kind !== 'repo') return headless(c.req.raw, routeError(call, { code: 'bad_request', message: 'not a viewer route' }))
   return serveRepo(c.req.raw, c.env, call, route)
-})
+}
+
+async function serveRedirect(req: Request, env: ViewerEnv, call: ViewerCall, route: Extract<ViewerRoute, { kind: 'redirect' }>): Promise<Response> {
+  const limited = await rateGate(req, env, call, route)
+  if (limited) return headless(req, limited)
+  call.fields['http.status_code'] = 302
+  return new Response(null, { status: 302, headers: { location: route.location, 'cache-control': 'no-store', ...SECURITY, 'x-ply-request-id': call.requestId } })
+}
+
+async function serveNamespace(req: Request, env: ViewerEnv): Promise<Response> {
+  const call = callOf(req)
+  const limited = await rateGate(req, env, call, { kind: 'namespace' })
+  if (limited) return headless(req, limited)
+  const trace = traceOf(call)
+  call.fields['http.status_code'] = 200
+  call.fields['ply.viewer.route'] = 'namespace'
+  const publicRepos = await listPublicRepos(env.PUBLIC_REPOS, call.now)
+  return headless(req, htmlResponse(200, renderNamespace(publicRepos, call.now), trace, call.requestId))
+}
 
 viewerApp.notFound(c => {
   const call = viewerCalls.get(c.req.raw)
