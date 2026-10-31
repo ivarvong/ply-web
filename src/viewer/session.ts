@@ -25,45 +25,7 @@ export type SessionDeps = {
   fetchImpl: FetchLike;
   signal: AbortSignal;
   budget: Budget;
-  /** Cache-API store for verified blobs (BlobStore below). Absent in tests that don't pass one, and when PACK_CACHE=off. */
-  blobs?: BlobStore | null;
 };
-
-type CacheLike = { match: (key: string) => Promise<Response | undefined>; put: (key: string, res: Response) => Promise<void> };
-
-/**
- * Verified blob bytes, at most the display cap, keyed by repo URL and blob oid. ply's pack cache does not cache a blob
- * fetch (no filter line: that is its size guard), so before this every file page, README and raw view paid one
- * upload-pack round trip. Only bytes whose git hash was just checked are stored, and a hit is hashed again before use,
- * so a bad upstream answer is never pinned and a bad entry is never served.
- */
-export type BlobStore = { get(repo: string, oid: string): Promise<Uint8Array | null>; put(repo: string, oid: string, bytes: Uint8Array): void };
-
-export function blobStore(cache: CacheLike | null | undefined, waitUntil: (p: Promise<unknown>) => void): BlobStore | null {
-  if (!cache) return null;
-  const key = async (repo: string, oid: string) => {
-    const d = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`ply-viewer-blob/1\n${repo}\n${oid}`)));
-    let hex = '';
-    for (const b of d) hex += b.toString(16).padStart(2, '0');
-    return `https://ply.blob/${hex}`;
-  };
-  return {
-    async get(repo, oid) {
-      try {
-        const hit = await cache.match(await key(repo, oid));
-        if (!hit) return null;
-        const bytes = new Uint8Array(await hit.arrayBuffer());
-        return bytes.byteLength <= VIEWER_CAPS.maxFileDisplayBytes && hashObject('blob', bytes) === oid ? bytes : null;
-      } catch { return null; }
-    },
-    put(repo, oid, bytes) {
-      if (bytes.byteLength > VIEWER_CAPS.maxFileDisplayBytes) return;
-      const copy = new Uint8Array(bytes);
-      try { waitUntil(key(repo, oid).then(k => cache.put(k, new Response(copy, { headers: { 'content-type': 'application/octet-stream', 'cache-control': 'public, max-age=31536000, immutable' } }))).catch(() => {})); }
-      catch { /* best effort */ }
-    },
-  };
-}
 
 type RefRec = { oid: string; peeled?: string };
 
@@ -153,15 +115,8 @@ function refuseOversizedChunk(cursor: PackCursor, chunk: Uint8Array): void {
   if (next > VIEWER_CAPS.maxPackBytes) throw limitError('pack bytes', next, VIEWER_CAPS.maxPackBytes);
 }
 
-async function readBlob(transport: GitTransport, tracer: ViewerTracer, oid: string, store: { blobs: BlobStore | null; repo: string } = { blobs: null, repo: '' }): Promise<{ size: number; bytes: Uint8Array | null; tooBig: boolean }> {
+async function readBlob(transport: GitTransport, tracer: ViewerTracer, oid: string): Promise<{ size: number; bytes: Uint8Array | null; tooBig: boolean }> {
   const span = tracer.start('git.viewer.blob', { attrs: { 'git.read.blob.oid': oid } });
-  const held = store.blobs ? await store.blobs.get(store.repo, oid) : null;
-  if (held) {
-    span.set({ 'git.viewer.blob.cache': 'HIT', 'git.viewer.blob.size': held.byteLength });
-    span.end();
-    return { size: held.byteLength, bytes: held, tooBig: false };
-  }
-  if (store.blobs) span.set({ 'git.viewer.blob.cache': 'MISS' });
   const fetchSpan = tracer.start('git.upload-pack fetch', { parent: span, kind: 3 });
   const it = streamPack(transport, { wants: [oid], ofsDelta: true, thinPack: false }, fetchSpan)[Symbol.asyncIterator]();
   let sp = cursorInit();
@@ -199,7 +154,6 @@ async function readBlob(transport: GitTransport, tracer: ViewerTracer, oid: stri
     const { out } = inflateObject(concat(zlibParts), 0, { expectedSize: sp.size, maxOutput: VIEWER_CAPS.maxFileDisplayBytes });
     const got = hashObject('blob', out);
     if (got !== oid) throw fail('pack_corrupt', `blob content hashes to ${got}, not ${oid}`);
-    store.blobs?.put(store.repo, oid, out);
     fetchSpan.end();
     span.set({ 'git.viewer.blob.size': sp.size });
     span.end();
@@ -237,7 +191,7 @@ async function loadParents(transport: GitTransport, budget: Budget, first: Commi
   return { log, logStopped: false };
 }
 
-async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { kind: 'repo' }>, server: ServerInfo, quirks: Quirks, budget: Budget, tracer: ViewerTracer, blobs: BlobStore | null): Promise<Loaded> {
+async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { kind: 'repo' }>, server: ServerInfo, quirks: Quirks, budget: Budget, tracer: ViewerTracer): Promise<Loaded> {
   const listedRefs = await listRefs(transport, refPrefixes(route.ref));
   const resolved = resolveRef(listedRefs.refs, listedRefs.head, route.ref);
   const commitObj = await readObject(transport, { oid: resolved.commit, filter: 'tree:0', deepen: 1, expectType: TYPE.COMMIT });
@@ -269,7 +223,7 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
       if (route.raw) throw fail('not_found', 'submodule has no blob in this repository');
       return { kind: 'file', header, path: route.path, mode, blob: file.oid, size: 0, note: 'submodule', text: null };
     }
-    const blob = await readBlob(transport, tracer, file.oid, { blobs, repo: route.loc.url });
+    const blob = await readBlob(transport, tracer, file.oid);
     if (blob.tooBig || !blob.bytes) {
       if (route.raw) throw limitError('file bytes', blob.size, VIEWER_CAPS.maxFileDisplayBytes);
       return { kind: 'file', header, path: route.path, mode, blob: file.oid, size: blob.size, note: 'too-big', text: null };
@@ -287,7 +241,7 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
     const hit = parsed.find((entry: { name: string; mode: string; oid: string }) => (entry.name === 'README.md' || entry.name === 'README') && entry.mode !== '40000' && entry.mode !== '160000');
     if (hit) {
       try {
-        const blob = await readBlob(transport, tracer, hit.oid, { blobs, repo: route.loc.url });
+        const blob = await readBlob(transport, tracer, hit.oid);
         if (blob.tooBig || !blob.bytes) readme = { name: hit.name, tooBig: true };
         else {
           const text = asText(blob.bytes);
@@ -360,5 +314,5 @@ export async function loadRepo(route: Extract<ViewerRoute, { kind: 'repo' }>, de
   const info = await discoverRepo(transport);
   const server = serverOf(info);
   if (route.pack) return loadPack(transport, route, server, quirks);
-  return loadTree(transport, route, server, quirks, deps.budget, deps.tracer, deps.blobs ?? null);
+  return loadTree(transport, route, server, quirks, deps.budget, deps.tracer);
 }

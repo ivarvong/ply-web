@@ -7,7 +7,6 @@ import { fetchPack as fetchPackJs } from 'ply';
 import { createTransport as createTransportJs } from 'ply';
 import { inflate as inflateJs } from 'ply';
 import { lsRefs as lsRefsJs } from 'ply';
-import { cachingFetch as cachingFetchJs } from 'ply';
 import { Tracer as TracerJs, arrayExporter as arrayExporterJs } from 'ply';
 import { commitView as commitViewJs, entryType as entryTypeJs, lsMode as lsModeJs, refCandidates as refCandidatesJs } from 'ply';
 import type { FetchLike } from './fetchguard.ts';
@@ -83,8 +82,4 @@ export function spanCollector(): { lines: unknown[]; exporter: (line: unknown) =
 
 export function makeTracer(exporter: (line: unknown) => void, opts: { maxEvents: number; resource: Record<string, string> }): ViewerTracer {
   return new (TracerJs as unknown as new (options: object) => ViewerTracer)({ exporter, maxEvents: opts.maxEvents, resource: opts.resource });
-}
-
-export function cachedFetch(inner: FetchLike, cache: object, waitUntil: (promise: Promise<unknown>) => void): FetchLike {
-  return loose<(fetchImpl: FetchLike, cache: object, opts: { waitUntil: (promise: Promise<unknown>) => void }) => FetchLike>(cachingFetchJs)(inner, cache, { waitUntil });
 }
