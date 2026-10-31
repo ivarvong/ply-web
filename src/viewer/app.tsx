@@ -10,7 +10,7 @@ import { makeTracer, plyCode, spanCollector } from './ply.ts'
 import { createLoopbackFetch } from '../gitcache.ts'
 import { parseViewerRequest, routeOptsFromEnv, type ViewerRoute } from './route.ts'
 import { renderError, renderHome, renderLoaded } from './render.tsx'
-import { VIEWER_CSS } from './styles.ts'
+import { VIEWER_CSS, VIEWER_CSS_HASH } from './styles.ts'
 import { loadRepo } from './session.ts'
 import { buildTrace, traceHeader } from './traceview.ts'
 import { LAYOUT } from './layout.ts'
@@ -89,18 +89,26 @@ async function rateGate(req: Request, env: ViewerEnv, call: ViewerCall, route: E
   return null
 }
 
-function cssResponse(call: ViewerCall, method: string): Response {
+// The hashed URL that matches these bytes is immutable. /view.css (HTML from before hashed hrefs) and a stale hash (HTML
+// rendered by the previous deploy) get the current sheet with an ETag and must revalidate, so they heal on the next load.
+function cssResponse(call: ViewerCall, req: Request): Response {
   call.fields['http.status_code'] = 200
   call.fields['ply.viewer.route'] = 'css'
-  return new Response(method === 'HEAD' ? null : VIEWER_CSS, {
-    status: 200,
-    headers: {
-      'content-type': 'text/css; charset=utf-8',
-      'cache-control': `public, max-age=${LAYOUT.cssCacheSeconds}`,
-      ...SECURITY,
-      'x-ply-request-id': call.requestId,
-    },
-  })
+  const route = call.route
+  const exact = route?.kind === 'css' && route.hash === VIEWER_CSS_HASH
+  const etag = `"${VIEWER_CSS_HASH}"`
+  const headers = {
+    'content-type': 'text/css; charset=utf-8',
+    'cache-control': exact ? 'public, max-age=31536000, immutable' : 'no-cache',
+    etag,
+    ...SECURITY,
+    'x-ply-request-id': call.requestId,
+  }
+  if (req.headers.get('if-none-match') === etag) {
+    call.fields['http.status_code'] = 304
+    return new Response(null, { status: 304, headers })
+  }
+  return new Response(req.method === 'HEAD' ? null : VIEWER_CSS, { status: 200, headers })
 }
 
 async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: Extract<ViewerRoute, { kind: 'repo' }>): Promise<Response> {
@@ -173,11 +181,14 @@ viewerApp.use('*', async (c, next) => {
   await next()
 })
 
-viewerApp.on(['GET', 'HEAD'], '/view.css', c => {
+function serveCss(c: { req: { raw: Request } }): Response {
   const call = callOf(c.req.raw)
   if (call.route?.kind !== 'css') return headless(c.req.raw, routeError(call, { code: 'bad_request', message: 'not a viewer route' }))
-  return cssResponse(call, c.req.method)
-})
+  return cssResponse(call, c.req.raw)
+}
+
+viewerApp.on(['GET', 'HEAD'], '/view.css', c => serveCss(c))
+viewerApp.on(['GET', 'HEAD'], '/:sheet{view\\.[0-9a-f]{12}\\.css}', c => serveCss(c))
 
 viewerApp.on(['GET', 'HEAD'], '/view', c => serveEntry(c.req.raw, c.env))
 viewerApp.on(['GET', 'HEAD'], '/view/', c => serveEntry(c.req.raw, c.env))

@@ -8,7 +8,7 @@ import { allowlistFromEnv, validatePublicRepoUrl, viewerPathFor, withHost, type 
 import { PUBLIC_GIT_HOST, PUBLIC_GIT_ORIGIN, PUBLIC_NAMESPACE, publicRepoOfRemote } from '../public.ts';
 
 export type ViewerRoute =
-  | { kind: 'css' }
+  | { kind: 'css'; hash: string | null }
   | { kind: 'home' }
   | { kind: 'redirect'; location: string }
   | {
@@ -107,7 +107,9 @@ export function parseViewerRoute(url: URL, opts: RouteOpts): ViewerRoute {
   if (url.pathname.length > VIEWER_CAPS.maxUrlLength || url.href.length > VIEWER_CAPS.maxUrlLength * 2) bad('URL is too long');
   if (url.href.includes('\\') || rawPathHasUnsafeSegment(url.pathname) || rawQueryPathUnsafe(url.href)) bad('remote path is not allowed');
   for (const key of url.searchParams.keys()) if (SECRET_QUERY.test(key)) bad('query must not carry credentials');
-  if (url.pathname === '/view.css') return { kind: 'css' };
+  if (url.pathname === '/view.css') return { kind: 'css', hash: null };
+  const hashed = /^\/view\.([0-9a-f]{12})\.css$/.exec(url.pathname);
+  if (hashed?.[1]) return { kind: 'css', hash: hashed[1] };
   if (url.pathname === '/view' || url.pathname === '/view/') {
     const remote = url.searchParams.get('remote');
     if (!remote) return { kind: 'home' };

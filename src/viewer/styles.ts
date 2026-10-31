@@ -10,6 +10,7 @@
 import * as KUMO from './kumo-classes.ts'
 import { KUMO_STANDALONE_CSS } from './kumo-standalone.ts'
 import { LAYOUT, RADIUS, SPACE } from './layout.ts'
+import { Sha1, toHex } from 'ply'
 
 const DARK_MARKER = ':root[data-mode=dark]'
 const MIN_DARK_TOKENS = 10
@@ -446,3 +447,11 @@ ${percentRules()}
 const KUMO_SHEET = kumoSubset(KUMO_STANDALONE_CSS, KUMO_USED)
 
 export const VIEWER_CSS = `${KUMO_SHEET}\n${colorSchemeBridge(KUMO_STANDALONE_CSS)}\n${layoutCss()}`
+
+/**
+ * The stylesheet's URL carries a hash of its bytes, so a browser can never pair new markup with a stale sheet: a deploy
+ * that changes the CSS changes the href (2026-10-31: an iPhone kept the old 167 KB /view.css for its max-age=3600 and
+ * rendered the redesigned HTML unstyled). The hashed URL is immutable; /view.css stays for HTML cached before this.
+ */
+export const VIEWER_CSS_HASH: string = toHex(new Sha1().update(new TextEncoder().encode(VIEWER_CSS)).digest()).slice(0, 12)
+export const VIEWER_CSS_PATH = `/view.${VIEWER_CSS_HASH}.css`

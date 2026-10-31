@@ -147,7 +147,7 @@ test('paste parsing stays inside the allowlist', () => {
 test('ssr markup uses Kumo classes, prose commits, and a strict CSP', () => {
   const home = renderHome(null, 1_700_000_000_000)
   assert.match(home, /name="remote"/)
-  assert.match(home, /href="\/view\.css"/)
+  assert.match(home, /href="\/view\.[0-9a-f]{12}\.css"/)
   assert.match(home, /bg-kumo-contrast/)
   assert.equal(home.includes('<script'), false)
   assert.equal(home.includes('style='), false)
@@ -878,4 +878,32 @@ test('scraping contract: li[data-oid] rows equal git ls-tree, and the commit car
     await srv.close();
     cleanup();
   }
+});
+
+test('stylesheet URL is content-hashed and immutable; HTML is no-store and links the sheet it was rendered with', async () => {
+  // 2026-10-31: an iPhone kept the old /view.css (max-age=3600) and rendered the redesigned markup unstyled.
+  const env = viewerEnv();
+  const home = await handleViewer(new Request('https://ply.ivar.workers.dev/view'), env, {});
+  assert.equal(home.headers.get('cache-control'), 'no-store');
+  const href = /<link rel="stylesheet" href="(\/view\.([0-9a-f]{12})\.css)"\/>/.exec(await home.text());
+  assert.ok(href?.[1] && href[2], 'hashed stylesheet href');
+  const sheet = await handleViewer(new Request(`https://ply.ivar.workers.dev${href[1]}`), env, {});
+  assert.equal(sheet.status, 200);
+  assert.equal(sheet.headers.get('cache-control'), 'public, max-age=31536000, immutable');
+  const body = await sheet.text();
+  // The href names the bytes actually served.
+  assert.equal(new Sha1().update(new TextEncoder().encode(body)).digest().reduce((s: string, b: number) => s + b.toString(16).padStart(2, '0'), '').slice(0, 12), href[2]);
+  assert.equal(body, VIEWER_CSS);
+  // Old HTML (/view.css) and a previous deploy's hash get the current sheet, but must revalidate.
+  for (const old of ['/view.css', '/view.000000000000.css']) {
+    const res = await handleViewer(new Request(`https://ply.ivar.workers.dev${old}`), env, {});
+    assert.equal(res.status, 200, old);
+    assert.equal(res.headers.get('cache-control'), 'no-cache', old);
+    assert.equal(await res.text(), VIEWER_CSS, old);
+  }
+  const revalidated = await handleViewer(new Request('https://ply.ivar.workers.dev/view.css', { headers: { 'if-none-match': `"${href[2]}"` } }), env, {});
+  assert.equal(revalidated.status, 304);
+  // Icons carry intrinsic sizes, so even an unstyled page never draws a giant SVG.
+  const html = String(renderLoaded(treeFixture({}), { bars: [], totalMs: 0, cfRay: 'r', requestId: 'q' }));
+  for (const m of html.matchAll(/<svg class="i [^"]*"([^>]*)>/g)) assert.match(m[1] ?? '', /width="16" height="16"/);
 });
