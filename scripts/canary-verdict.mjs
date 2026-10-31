@@ -53,7 +53,7 @@ export function verdict({ version, requests, loggedBy, health }) {
 }
 
 /**
- * Smoke requests from an ids file (scripts/deploy.sh): one JSON object { id, version, step } per line. A bare id line
+ * Smoke requests from an ids file (`npm run cd` smoke JSON): one JSON object { id, version, step } per line. A bare id line
  * (the pre-2026-10-31 format) has no recorded version, so a loss of it is never tolerated.
  */
 export function parseRequests(text) {

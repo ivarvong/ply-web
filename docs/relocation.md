@@ -300,7 +300,7 @@ isFilterRefusal(status: number, text: string): boolean
 logOn(t, { commit, limit }): Promise<Result<{ commits: readonly Commit[]; truncated: boolean; cut: string | null }, PlyError>>
 ```
 
-`src/quirks.ts` stays. ply keeps no module state; the isolate-wide map is ply-web's.
+`src/quirks.ts` stays. ply keeps no module state; the isolate-wide map is ply-web's. Artifacts returns 400 for a partial-clone filter other than `blob:none`, and ply-web falls back to that filter (ply #118).
 
 ### 13. openBlob on the caller's transport — ply #119
 
@@ -432,6 +432,8 @@ commitTrailers(message: string): {
 ```
 
 **The `lsRefsUnborn` origin cache** (`head.ts` `lsRefsUnbornOf`). No issue. It is isolate policy and disappears with step 6. Hardcoding the bit would skip the discover GET and would disagree with git on `allow` / `ignore` servers.
+
+**A rejected CAS lists the ref twice.** `commitEdit` lists the target in `resolveTarget` (`src/write/commit.ts`), then lists it again on `cas_conflict` — both the streamed one-file path and the pack push — before throwing `refExists`. `createBranch` lists before the push and again when the CAS loses (`src/write/branch.ts`). `deleteRef` does the same pair, then throws `staleExpected`. The second listing is a ply follow-up. Do not file an issue.
 
 ## Not git logic (stays)
 

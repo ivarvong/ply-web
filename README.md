@@ -73,7 +73,7 @@ its binding is the Worker's only other binding. `GET /` prints the usage text.
   400 and nothing is fetched. On an existing branch, omit `base` to commit on the tip.
 - Every `/v1` response is `cache-control: no-store` (a credentialed API: nothing it answers is stored, not even a
   `tree`/`read`/`commit` at a full oid). Every response carries `x-ply-version` (the Workers version id, which
-  `scripts/deploy.sh` checks) and `x-ply-build` (`ply=<commit> ply-web=<commit>`, injected at build time). `x-ply-trace`
+  the canary checks) and `x-ply-build` (`ply=<commit> ply-web=<commit>`, injected at build time). `x-ply-trace`
   is omitted when it would be empty.
 - `head` on edit is a **precondition**: if the branch is not at `head`, the response is 409 `cas_conflict` and nothing
   is pushed. `head` of zeros means the ref must not exist yet. `hint` is ply's soft head hint for a one-file edit.
@@ -387,17 +387,16 @@ npm test                                 # /v1 + public-namespace workerd suites
 npm run dev                              # cf dev: Vite + the Cloudflare plugin on local workerd
 npm run typecheck                        # tsc for the app, then cf workers types + tsc for cloudflare.config.ts
 npm run worker:deploy:dry-run            # cf deploy --dry-run: build and validate, no credentials, no upload
-scripts/deploy.sh "<message>"            # prod: gate, upload, 0% canary smoked pinned + telemetry gate, promote, smoke (below)
+npm run cd                               # operator deploy: bump, 0% canary, smoke, telemetry, ramp (docs/continuous-deployment.md)
+npm run cd -- smoke --version <id>       # pinned lifecycle smoke against that Workers version
 npm run worker:deploy                    # cf deploy straight to 100% (no canary; emergencies only)
-node src/smoke.mjs https://ply.ivar.workers.dev gate                     # public + auth + allowlist checks, no Artifacts
-env -u CLOUDFLARE_API_TOKEN node src/smoke.mjs https://ply.ivar.workers.dev read|write --out smoke.json
 ```
 
-The operator runbook for a gradual ramp (bump, 0% canary, pinned smoke, telemetry, then 1% → 100% with a rollback at any bad step) is [docs/continuous-deployment.md](docs/continuous-deployment.md). `scripts/deploy.sh` still goes to 100% in one shot. Do not run it while a ramp is in progress.
+The operator runbook for a gradual ramp (bump, 0% canary, pinned smoke, telemetry, then 1% → 100% with a rollback at any bad step) is [docs/continuous-deployment.md](docs/continuous-deployment.md). `npm run worker:deploy` still goes to 100% in one shot. Do not run it while a ramp is in progress.
 
-`scripts/deploy.sh` (OAuth: it runs cf with `CLOUDFLARE_API_TOKEN` unset) deploys the checked-out commit: gate, `cf workers versions create --prebuilt`, a deployment with the new version at 0% beside the current one at 100%, then `smoke.mjs gate|read|write --version <id>` and `visual-smoke.mjs` with `PLY_VERSION=<id>` (every request carries `Cloudflare-Workers-Version-Overrides: ply="<id>"`), then `scripts/canary-o11y.mjs`, which requires every smoke `x-ply-request-id` in a `ply.request` log line of the new version and 0 non-ok invocations, 0 5xx, 0 error logs. A failure routes 100% back to the previous version. Then it promotes, smokes unpinned and re-runs the telemetry gate; a failure there also routes back.
+`npm run cd` is that runbook. It uses `cf` only. A canary is a new version at 0% beside the current one at 100%. Pinned smoke sends `Cloudflare-Workers-Version-Overrides: ply="<id>"` and requires `x-ply-version` to match. Telemetry reuses the loss allowance in `scripts/canary-verdict.mjs`. The ramp compares the new version with the old one at each percentage and puts the old version back at 100% on a breach.
 
-`read` and `write` each create a scratch Artifacts repo in namespace `default` (`src/smoke-seed.mjs`), seed it with a fixed history (fixed identities and dates, so the seeded oids are the same every run), mint a 15-minute read or write token for it, compare the Worker's answers with that seeded local clone, then revoke every token and delete the repo, also on failure or Ctrl-C. A run killed harder than that leaves `ply-web-smoke-*`; the next run deletes ones older than an hour. Tokens go to git only through `GIT_CONFIG_*` and never reach argv, stdout or the JSON report. Runs are repeatable back to back. They need a cf login with Artifacts access.
+The smoke creates an empty repo in the Artifacts namespace `ply-loadgen`, mints a short-lived write token from `PLY_TOKEN_FILE` (mode `0600`, the same value as the Worker secret `PLY_TOKEN`), and drives the git lifecycle through `/v1`. It does not seed the repo with stock git. The token is revoked when the run ends. A pass deletes the repo. A fail leaves the repo name in the verdict. Tokens stay out of argv and the run log.
 
 The Worker is built and deployed with the Cloudflare CLI, [`cf`](https://developers.cloudflare.com/cf/), pinned as a dev dependency. `cloudflare.config.ts` is the Worker config (name, compatibility date, bindings, Durable Object exports, observability, limits). `vite.config.ts` holds build settings only: `cf build` delegates bundling to Vite and the Cloudflare Vite plugin and writes Build Output to `.cloudflare/output`. The workerd suites in `npm test` run that same bundle (`test/cf-bundle.js`). Nothing here needs Docker: the Vite plugin runs `docker image ls` after every build even with no containers (execFileSync, no timeout, so a hung daemon hung the build), and `vite.config.ts` sets `WRANGLER_DOCKER_BIN=false` so that call fails at once and is skipped.
 

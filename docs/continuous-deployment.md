@@ -1,7 +1,5 @@
 # Continuous deployment
 
-**Commands land in the follow-up PR.** Every `npm run cd` on this page is that entrypoint. It is not in this repository yet. This page is the procedure that entrypoint has to match.
-
 You ship ply-web from a Linux box where `cf` is already logged in. One command uploads the commit you have checked out, smokes it at 0%, then walks traffic from 0% to 100% over about five minutes. If a step goes bad, traffic goes back to the previous version and the command exits. GitHub holds the code and the pull request. It does not deploy.
 
 ![Operator pipeline. The left column is gate, deploy, smoke, telemetry, ramp, live smoke, live telemetry, done. Failures leave to the right.](img/cd-pipeline.png)
@@ -13,7 +11,7 @@ The left column is the only path that raises traffic. An arrow to the right is t
 On the box:
 
 - `cf auth login` already done. The login needs Workers Scripts Edit (versions and deployments; an account token calls this Workers Scripts Write), Workers Observability Read, and Artifacts Edit on the namespace below. It does not need routes, KV, R2, or tail.
-- `npm ci` in this repo. Node matches `package.json` `engines`.
+- `npm ci` in this repo. Node matches `package.json` `engines`. `npm run cd` also refuses Node older than 22.18, which is what `cloudflare.config.ts` needs when `cf` loads it.
 - `git config user.name` and `user.email` set. The bump stage commits with them and does not push.
 - A clean work tree. Deploy refuses a dirty one.
 - `PLY_TOKEN_FILE` pointing at the same bearer the Worker secret `PLY_TOKEN` uses, mode `0600` (no group or other bits). The file is read, never printed.
@@ -25,7 +23,7 @@ touch "$HOME/.ply-token" && chmod 0600 "$HOME/.ply-token"
 export PLY_TOKEN_FILE="$HOME/.ply-token"
 ```
 
-Do not run `scripts/deploy.sh` or `npm run worker:deploy` while this is in progress. Both still send the Worker to 100% in one shot and will replace the split you are ramping. GitHub does not deploy.
+Do not run `npm run worker:deploy` while this is in progress. It still sends the Worker to 100% in one shot and will replace the split you are ramping. GitHub does not deploy.
 
 Optional overrides (anything you do not set keeps the default in the table further down):
 
@@ -39,20 +37,20 @@ Optional overrides (anything you do not set keeps the default in the table furth
 | `PLY_SHA` | ply `main` | 40-hex pin, instead of resolving ply `main` |
 | `PLY_RAMP_PERCENTS` | `1,5,10,25,50,75,100` | Strictly increasing integers, each 1–100, last one 100 |
 | `PLY_RAMP_DWELL_MS` | `40000` | How long each percentage stays up before it is judged |
-| `PLY_RAMP_MAX_HOLDS` | `1` | Short or missing samples tolerated at the current percentage |
-| `PLY_RAMP_MIN_REQUESTS` | `5` | Requests required on **each** version in a step window |
+| `PLY_RAMP_PROBE_RPS` | `2` | During the dwell, probes per second. Each probe is `GET /` plus one authenticated `GET /v1/discover`. `0` dwells without probing. |
+| `PLY_CD_LEDGER` | `~/.local/state/ply-cd/ledger.jsonl` | Append-only event ledger across runs |
 
-Latency ceilings and the rate ratios are not environment variables. They are the numbers in the ramp section below.
+`PLY_RAMP_MAX_HOLDS` and `PLY_RAMP_MIN_REQUESTS` are rejected if set. The ramp no longer holds. SLO targets, the fast-burn multiple, and the sample floor live in `scripts/cd/slo.ts` and are copied into `run_started`.
 
 ## The whole run
 
-From a clean checkout of the commit you want to ship. Commands land in the follow-up PR:
+From a clean checkout of the commit you want to ship:
 
 ```sh
 npm run cd
 ```
 
-You can pin ply to a sha you already know. Commands land in the follow-up PR:
+You can pin ply to a sha you already know:
 
 ```sh
 npm run cd -- --sha 1274f2dd05b83d70f8d421cdcc79628692d848df
@@ -79,11 +77,9 @@ cd: PASS 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 
 A failing run still writes the directory. Relay the last line and the ramp lines from that directory.
 
-Stages, alone, use the same last-line shape. `npm run cd -- help` lists them. Commands land in the follow-up PR.
+Stages, alone, use the same last-line shape. `npm run cd -- help` lists them.
 
 ## 1. Bump
-
-Commands land in the follow-up PR:
 
 ```sh
 npm run cd -- bump
@@ -111,11 +107,9 @@ cd: FAIL bump: tracked files are modified; bump wants a clean tree
 cd: FAIL bump: npm test failed: …
 ```
 
-You push `bump-ply` yourself if you want a pull request for the pin. The rest of `npm run cd` (commands land in the follow-up PR) deploys the checkout you are on, which is this new commit only after you check it out.
+You push `bump-ply` yourself if you want a pull request for the pin. The rest of `npm run cd` deploys the checkout you are on, which is this new commit only after you check it out.
 
 ## 2. Deploy the canary
-
-Commands land in the follow-up PR:
 
 ```sh
 npm run cd -- deploy-canary
@@ -149,15 +143,11 @@ cd: FAIL deploy-canary: 8c1af0e2-… is at 10%, wanted 0%
 
 Pinned (the canary). Every request sends the version override, and every response must carry that same id in `x-ply-version`:
 
-Commands land in the follow-up PR:
-
 ```sh
 npm run cd -- smoke --version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 ```
 
 Live (after the ramp, or any time you want to see who is actually serving). No override. `x-ply-version` must still be that id, which is how you know traffic moved:
-
-Commands land in the follow-up PR:
 
 ```sh
 npm run cd -- smoke --expect-version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
@@ -186,11 +176,9 @@ cd: FAIL smoke: cherry-wider: status 200, wanted 409; repo ply-web-cd-2026103121
 
 `smoke.csv` in the run directory is one row per request. `pass` is the step verdict, not the HTTP status. A row with status 409 and `pass` is an expected conflict. Columns: `step`, `method`, `path`, `status`, `ms`, `pass`, `cf_ray`, `x_ply_request_id`, `x_artifacts_ray`, `x_ply_version`, `x_ply_build`, `server_timing`, `detail`. The token is not in the file.
 
-On a full `npm run cd` (commands land in the follow-up PR), a smoke failure leaves the canary at 0%. The ramp does not start. Nothing is rolled back: the previous version is already at 100%. The smoke CSV is still written. Telemetry for that canary does not run.
+On a full `npm run cd`, a smoke failure leaves the canary at 0%. The ramp does not start. Nothing is rolled back: the previous version is already at 100%. The smoke CSV is still written. Telemetry for that canary does not run.
 
 ## 4. Telemetry
-
-Commands land in the follow-up PR:
 
 ```sh
 npm run cd -- telemetry --version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e \
@@ -238,9 +226,7 @@ If `cf o11y` cannot be queried, the stage fails. It does not treat a missing que
 
 ## 5. Ramp
 
-Only after the pinned smoke and the telemetry file are both a pass for this version, and the deployment is still new-at-0% / previous-at-100%:
-
-Commands land in the follow-up PR:
+Only after the pinned smoke and the telemetry file are both a pass for this version, and the deployment is still new-at-0% / previous-at-100%. An empty split, a percent that is not an integer 0–100, or two copies of one version id is refused before `cf` is called:
 
 ```sh
 npm run cd -- ramp --version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e \
@@ -250,31 +236,26 @@ npm run cd -- ramp --version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e \
 
 Without `--verdict`, or with a verdict that is not a pass for that version, the command exits and does not change traffic.
 
-The schedule is `1, 5, 10, 25, 50, 75, 100`. Each step waits `40000` ms, then reads `cf o11y` for **both** versions over that step's window:
+The schedule is `1, 5, 10, 25, 50, 75, 100`. Each step waits `40000` ms. During that wait the ramp probes at `PLY_RAMP_PROBE_RPS` (default 2): `GET /` (the usage text, 200, no bearer) and `GET /v1/discover?remote=…` for the public `ply` mirror with the bearer from `PLY_TOKEN_FILE`. There is no `/health` route. A non-2xx answer from the **new** version fails the step. A probe that lands on the old version is ordinary split traffic.
 
-- request count
-- error rate (non-ok outcomes / requests) and exception count
-- 5xx rate
-- wall and CPU, p50 and p99
-- Artifacts upstream latency, from trace spans named `fetch`, p50 and p99
+Then it reads `cf o11y` for **both** versions over that step's window. Span events have no `$workers.scriptVersion.id`, so traces are queried by service only and joined to a version by `$metadata.requestId`.
 
-Compare new against old:
+The step decision is the new version's SLO burn, not a hand-tuned rate delta. Burn rate is `(bad / total) / (1 − target)`. Definitions are in [Metrics](#metrics).
 
 | Check | Rolls back when |
 | --- | --- |
-| Exceptions on the new version | More than 0, even if the sample is shorter than the minimum |
-| 5xx rate | New rate is more than 0.01 above the old rate |
-| Error rate | Same, once both sides have enough requests |
-| Wall, CPU, fetch p50 and p99 | New / old is greater than 2. Equal to 2 still advances. Old 0 and new 0 is fine. Old 0 and new above 0 is a breach. |
-| Sample size | Either side has fewer than 5 requests. This is a **hold**, not a pass. |
-| Fetch spans | Both sides have none: skip the fetch comparison. One side is short of 3 spans: hold. |
-| Query failed | Hold. Not a pass. |
+| Exception on the new version | Any, even one request |
+| 5xx on the new version | Any. A 5xx on the old version does not roll the canary back onto it |
+| Non-ok Worker outcome on the new version | Any |
+| Probe | A response from the new version that is not 2xx |
+| SLO burn | `bad/total` divided by the error budget is above **14.4**, and that SLO saw at least 20 requests in the window |
+| Latency vs the old version | Both sides have at least 20 wall samples and Mann-Whitney says the new version is slower (one-sided, alpha 0.01). With 5–19 samples on both sides, wall p99 new/old above 2. Equal to 2 still advances |
+| Sample too small for that compare | `decision=insufficient_data`. This is not a pass of the latency SLO. The percentage still advances when the hard checks above are clean |
+| Query failed | Rollback. A missing query is not zero errors |
 
-One hold waits another `20000` ms at the same percentage and reads again. A second short sample rolls back. A breach does not wait for that hold. It rolls back immediately.
+There is no hold. A quiet 1% step with zero errors is `insufficient_data` and the ramp moves to 5%. `ply.ivar.workers.dev` often will not collect 20 new-version samples at 1% in 40 seconds. Raise `PLY_RAMP_DWELL_MS` or `PLY_RAMP_PROBE_RPS` when you want the burn and Mann-Whitney checks to actually run. Do not treat `insufficient_data` as a failure.
 
-At 100% the old version is no longer in the deployment, so its side of the comparison is the last step where it had at least 5 requests. That line includes `previous_sample=carried`. If no earlier step had enough old traffic, 100% is a hold and then a rollback, not a pass.
-
-`ply.ivar.workers.dev` is often too quiet for 5 requests at 1% inside 40 seconds. The default then holds and rolls back. That is the safe outcome. Set `PLY_RAMP_MIN_REQUESTS` to a number you can actually collect. Do not set it to 0 to force the ramp through.
+At 100% the old version is dropped, so its wall times are the last step whose old version had at least 5 samples. That line includes `previous_sample=carried`. If no earlier step had them, 100% is `insufficient_data` when the new version is clean, and the ramp completes.
 
 Each step prints one line to stdout and appends the same line to `ramp.jsonl` in the run directory. Relay those lines as they appear.
 
@@ -300,19 +281,20 @@ How to read a line:
 | `samples=14/132` | Requests in this step's window, new / old. |
 | `error_rate=0.0000/0.0085` | Non-ok rate, new / old, four decimal places. |
 | `p99_wall_ms=90/76` | Wall-time p99 in milliseconds, new / old. `-` means that side had no sample. |
-| `decision=advance` | Move to the next percentage. `hold` stays. `rollback` is already being undone. |
-| `reason="…"` | Present on hold and rollback. This is the sentence to relay with the line. |
-| `previous_sample=carried` | The old-version numbers are from the last step that had enough of them, not from a version that is no longer allocated. |
+| `decision=advance` | The burn and the latency compare both passed. Move to the next percentage. |
+| `decision=insufficient_data` | Not enough wall samples to compare. The next line is the next percentage when nothing else failed. |
+| `decision=rollback` | Traffic is being put back on the previous version. |
+| `reason="…"` | Present unless the decision is `advance`. Relay it with the line. |
+| `previous_sample=carried` | The old-version numbers are from the last step that had at least 5 wall samples, not from a version that is no longer allocated. |
 
-A quiet first step, then rollback. Traffic returns to 100% on the old version:
+A quiet first step advances. It does not roll back:
 
 ```text
-ramp step=1/7 percent=1 previous=99 samples=2/40 error_rate=0.0000/0.0000 p99_wall_ms=88/74 decision=hold reason="insufficient sample 2/40, minimum 5 each"
-ramp step=1/7 percent=1 previous=99 samples=1/12 error_rate=0.0000/0.0000 p99_wall_ms=80/70 decision=rollback reason="insufficient sample 1/12, minimum 5 each; after 1 hold(s)"
-cd: FAIL ramp: insufficient sample 1/12, minimum 5 each; after 1 hold(s)
+ramp step=1/7 percent=1 previous=99 samples=3/40 error_rate=0.0000/0.0000 p99_wall_ms=88/74 decision=insufficient_data reason="wall samples 3/4; need 20 each for Mann-Whitney or 5 each for a quantile compare"
+ramp step=2/7 percent=5 previous=95 samples=14/132 error_rate=0.0000/0.0000 p99_wall_ms=90/76 decision=advance
 ```
 
-A breach does not hold first:
+A short sample whose p99 ratio is above 2 rolls back immediately:
 
 ```text
 ramp step=4/7 percent=25 previous=75 samples=22/88 error_rate=0.0000/0.0000 p99_wall_ms=210/80 decision=rollback reason="wall p99 ratio 2.625 > 2"
@@ -322,23 +304,22 @@ cd: FAIL ramp: wall p99 ratio 2.625 > 2
 An exception on the new version, even with one request:
 
 ```text
-ramp step=2/7 percent=5 previous=95 samples=1/40 error_rate=1.0000/0.0000 p99_wall_ms=40/70 decision=rollback reason="1 exceptions on the new version"
-cd: FAIL ramp: 1 exceptions on the new version
+ramp step=2/7 percent=5 previous=95 samples=1/40 error_rate=1.0000/0.0000 p99_wall_ms=40/70 decision=rollback reason="1 exception on the new version"
+cd: FAIL ramp: 1 exception on the new version
 ```
 
-`cf o11y` down:
+`cf o11y` down rolls back on that step. It does not wait:
 
 ```text
-ramp step=3/7 percent=10 previous=90 samples=-/- error_rate=-/- p99_wall_ms=-/- decision=hold reason="telemetry unavailable: …"
+ramp step=3/7 percent=10 previous=90 samples=-/- error_rate=-/- p99_wall_ms=-/- decision=rollback reason="telemetry unavailable: …"
+cd: FAIL ramp: telemetry unavailable: …
 ```
-
-The same line a second time, after the hold, is `decision=rollback` and the exit is `cd: FAIL ramp: …`.
 
 If the rollback request itself does not stick, the last line says so and names the version that should be at 100%. Do not treat that run as rolled back. Put it back yourself with the command in the next section.
 
 ## 6. After 100%
 
-`npm run cd` (commands land in the follow-up PR) does not stop at the last ramp line. It smokes again with **no** version override (`--expect-version`), then runs telemetry on that live window. Both have to pass.
+`npm run cd` does not stop at the last ramp line. It smokes again with **no** version override (`--expect-version`), then runs telemetry on that live window. Both have to pass.
 
 Pass is the same `cd: PASS <version id>` as the whole run.
 
@@ -354,8 +335,6 @@ Organic 5xx on the new version during the live window fails this telemetry check
 ## Rollback
 
 Any time, including when a ramp or a live check did not put the old version back:
-
-Commands land in the follow-up PR:
 
 ```sh
 npm run cd -- rollback --to 1aa0bb11-2222-4333-8444-555566667777
@@ -380,18 +359,110 @@ cd: FAIL rollback: rollback to 1aa0bb11-… failed: …
 | `telemetry.md` / `live-telemetry.md` | The verdict line and the percentiles |
 | `telemetry.json` | The pass/fail the ramp reads. A ramp with a fail here does not change traffic. |
 | `ramp.jsonl` | The same progress lines that went to stdout, one JSON object per step: `{ "line": "ramp step=…" }` |
+| `events.jsonl` | Append-only log. One typed event per line. This is the record a debrief reads |
+| `manifest.json` | sha256 of every other file, written after `run_finished`. The directory is not modified after this |
+| `captures/` | stdout and stderr of each command, redacted |
+| `raw/` | The response body behind each observation |
 
 ## When it fails
 
 | You see | Traffic now | What you do |
 | --- | --- | --- |
 | `cd: FAIL bump:` | Unchanged | Fix the tree or the gate. Nothing was uploaded. |
-| `cd: FAIL deploy-canary:` and the line says the canary was left at 0% | Old at 100%, new at 0% | Read the pin failure. Rollback only if you want the 0% slot cleared: `npm run cd -- rollback --to <previous>` (commands land in the follow-up PR). |
+| `cd: FAIL deploy-canary:` and the line says the canary was left at 0% | Old at 100%, new at 0% | Read the pin failure. Rollback only if you want the 0% slot cleared: `npm run cd -- rollback --to <previous>`. |
 | `cd: FAIL deploy-canary:` after a bad split | Previous at 100% if the rollback landed | Confirm with `cf workers deployments list --worker ply`. |
 | `cd: FAIL smoke:` or `cd: FAIL telemetry:` before any ramp line | Still 0% / 100% | The ramp did not start. The scratch repo name is in the smoke failure. |
+| A ramp line with `decision=insufficient_data`, then the next `step=` | The next percentage | Relay the line. Nothing was rolled back. |
 | A ramp line with `decision=rollback`, then `cd: FAIL ramp:` | Previous at 100% | Relay the line. The new version is off traffic. |
-| `cd: FAIL ramp:` and the text says rollback failed | **Not** safe | Run `npm run cd -- rollback --to <previous>` (commands land in the follow-up PR) and read the deployment list. The id to restore is the one in that sentence. |
+| `cd: FAIL ramp:` and the text says rollback failed | **Not** safe | Run `npm run cd -- rollback --to <previous>` and read the deployment list. The id to restore is the one in that sentence. |
 | `cd: FAIL smoke:` or `cd: FAIL telemetry:` after ramp lines that reached `percent=100` | Previous at 100% if rollback landed | Same as a ramp rollback. The live check is what rejected it. |
+
+## Metrics
+
+SLOs are data in `scripts/cd/slo.ts`. A ramp step does not inline the numbers.
+
+| SLO | Good event | Target | Window |
+| --- | --- | --- | --- |
+| Availability | Not a 5xx and no exception, over `/v1` requests, excluding expected 4xx | 99.9% | 28 days |
+| Read latency | `GET /v1/*` wall time under 1000 ms | 99% | 28 days |
+| Write latency | `POST /v1/*` wall time under 2500 ms | 99% | 28 days |
+| Correctness | Lifecycle smoke: every step the expected status, `git fsck` clean, refs equal | 99.5% | 28 days |
+
+The latency ceilings are initial. Tighten them from a real baseline; the 99% target stays.
+
+Error budget and burn rate:
+
+```text
+budget = 1 − target
+burn   = (bad / total) / budget
+```
+
+A burn of 1 spends the budget at the planned rate. The ramp fails a step when burn is above **14.4** and that SLO has at least 20 samples in the step window. 14.4 is the SRE workbook fast-burn multiple: on a 30-day budget, 14.4× for one hour spends about 2%. Our SLO window is 28 days. The step still uses 14.4, not a recomputed multiple.
+
+Availability on a ramp step treats every 4xx as expected, so client errors leave the denominator. The probe contract and the correctness smoke still fail an unexpected status. One 5xx or one exception fails the step even when the sample is shorter than 20, so the availability burn is the rate view for a window that is already large.
+
+Correctness is one lifecycle smoke, not a ramp step. Any failed step fails the smoke stage (`decision=stop`, canary left at 0%). The burn from the pass/fail counts is stored on the run. It is what a later alert would page on. It is not a second gate inside the ramp.
+
+Latency against the old version, when both sides have at least 20 wall samples, is a one-sided Mann-Whitney U test (average ranks on ties). It fails when the new sample is stochastically slower and the upper tail is under 0.01. Between 5 and 19 samples on both sides the compare is wall p99, and a ratio above 2 fails. Fewer than that is `insufficient_data`.
+
+Alerting policy for later, not applied on a ramp step. These are the workbook's 30-day windows:
+
+| Severity | Burn | Long window | Short window | Budget spent if both fire |
+| --- | --- | --- | --- | --- |
+| page | 14.4× | 1h | 5m | about 2% |
+| ticket | 6× | 6h | 30m | about 5% |
+| ticket | 1× | 3d | 6h | about 10% |
+
+### Delivery
+
+Every event is appended to the run's `events.jsonl` and to the ledger (`PLY_CD_LEDGER`, default `~/.local/state/ply-cd/ledger.jsonl`). `run_finished` carries the fields a delivery report needs: ply sha, ply merge time, ply-web sha, version id, stage timestamps and durations, verdict, rollback flag and reason, smoke pass/fail counts, and per-SLO burn per step.
+
+```sh
+npm run cd -- report
+```
+
+| Metric | Formula |
+| --- | --- |
+| Deployment frequency | deploys / days. A deploy is a `run_finished` with a version id. Days are the span from the first such timestamp to the last. One timestamp has no rate. |
+| Lead time | `liveAt − plyMergedAt` on a passing deploy. `liveAt` is when the ramp reached 100%. `plyMergedAt` is the ply commit's committer time from the GitHub API, or null if that fetch fails (the deploy still finishes). Report p50 and p90. |
+| Change failure rate | rollbacks / deploys |
+| Time to restore | `restoredAt − failedAt` for a rolled-back deploy. p50 and p90. |
+| Stage duration | p50 and p90 of each stage's `durationMs`, across runs. Percentile is `sorted[floor((n − 1) · p)]`. |
+
+## Debrief
+
+The event log is the record of the run. Every line is one JSON object:
+
+| Field | What |
+| --- | --- |
+| `seq` | 1, 2, 3, … inside that run |
+| `ts` | ISO-8601 with a numeric offset |
+| `run_id` | The run directory name |
+| `stage` | `run`, `bump`, `deploy-canary`, `smoke`, `telemetry`, `ramp`, `rollback`, or the live variants |
+| `kind` | One of the variants below |
+| `payload` | The variant's fields |
+
+| Kind | Payload |
+| --- | --- |
+| `lifecycle` | `run_started` (config, node/cf/git versions, ply and ply-web shas, host) or `run_finished` (verdict, rollback, smoke counts, stage timings, per-step burns, live/fail/restore times) |
+| `command` | argv with secrets already replaced by `<redacted>`, cwd, exit code, duration, sha256 of stdout and stderr, and the paths of those captures |
+| `observation` | The measurement, the exact `cf o11y` query (or the smoke source) and its window, and `responsePath` of the raw body under `raw/` |
+| `decision` | `inputs` (one or more earlier observation seqs), `rules` (`name` and `value` from `slo.ts`, or the smoke rule), `outcome` (`advance`, `hold`, `insufficient_data`, `rollback`, `stop`), and `reason` |
+| `state_change` | Traffic split before and after, and the deployment id when cf returned one |
+| `request` | One smoke or probe call: method, url, status, version, latency, `cf-ray`, `x-ply-request-id`, `x-artifacts-ray` |
+| `error` | An unexpected failure and a JSON context |
+
+A decision cannot be written unless `inputs` cites an earlier `observation`. A `Secret` cannot be serialized: `JSON.stringify` throws, and command argv stores `<redacted>` instead of the value. Token text that still shows up in a captured stdout is replaced with `[redacted]` before the line is appended.
+
+The ramp does not emit `hold`. The outcome stays in the schema so a recorded decision can say it waited. `stop` is a gate that leaves traffic where it is (the pinned smoke failure). `rollback` is traffic returned to the previous version.
+
+After `run_finished` the run writes `manifest.json` with the sha256 of every other file and then refuses further appends. Do not edit the run directory. A debrief writes beside it:
+
+```sh
+npm run cd -- debrief cd-runs/2026-10-31T21-05-00-123Z
+```
+
+That prints `debrief: cd-runs/2026-10-31T21-05-00-123Z.debrief/debrief.md`. The markdown stands alone: a timeline, every decision with the rule and the observations it used, every traffic change, three charts (`split.png` configured percent against the share of requests the new version received, `latency.png` wall p99 by version, `burn.png` burn per SLO with a line at 14.4), and links back to `events.jsonl`, `raw/`, and `captures/`.
 
 ## Later
 

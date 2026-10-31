@@ -291,7 +291,7 @@ test('GET /v1/commit equals git log / cat-file (HEAD, short, full, tag, oid, mer
   assert.match(usageText, /GET \/view/);
   assert.match(usageText, /GET \/r\/<name>/);
   assert.match(usage.headers.get('x-ply-build') ?? '', /^ply=[0-9a-f]{40} ply-web=[0-9a-f]{40}$/);
-  assert.doesNotMatch(usage.headers.get('x-ply-version') ?? '', /ply=/, 'x-ply-version stays the Workers version id (scripts/deploy.sh)');
+  assert.doesNotMatch(usage.headers.get('x-ply-version') ?? '', /ply=/, 'x-ply-version stays the Workers version id');
   const s = await (await W(`/v1/commit?${qs({ remote: r.remote, ref: 'side' })}`)).json();
   assert.deepEqual(s.author, { name: 'Zoë Ångström', email: 'z@ë.x', time: '2023-11-14T22:13:20Z', epoch: 1700000000, tz: '+0530' }); assert.equal(s.message, 'side: Zoë\n\nline two\nline three\n');
   for (const [ref, status, code] of [['nope', 404, 'not_found'], ['f'.repeat(40), 404, 'not_found'], [git(r.bare, ['rev-parse', 'main:f.txt']).trim(), 404, 'not_found'], ['a..b', 400, 'bad_request']]) {

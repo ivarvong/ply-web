@@ -5,7 +5,7 @@
 declare const __PLY_SHA__: string;
 declare const __PLY_WEB_SHA__: string;
 
-// x-ply-version is the Workers version id (src/index.js, env.VERSION); scripts/deploy.sh and the smokes compare it
+// x-ply-version is the Workers version id (src/index.js, env.VERSION); the canary smoke compares it
 // exactly. The build identity is a separate header so the canary check keeps working.
 export const BUILD_HEADER = 'x-ply-build';
 
