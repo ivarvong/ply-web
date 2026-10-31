@@ -15,3 +15,8 @@ export function quirksFor(origin: string): Quirks {
   }
   return q;
 }
+
+/** Tests only: forget what this process has learned (the node suites fake many servers under one origin). */
+export function resetQuirks(): void {
+  QUIRKS.clear();
+}

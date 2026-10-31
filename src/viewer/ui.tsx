@@ -164,7 +164,9 @@ export function Trace(props: { trace: TraceModel; host: string; repoPath: string
   const span = Math.max(trace.totalMs, 1)
   const wide = trace.bars.filter(bar => bar.lines.some(line => line.startsWith('git.fetch.filter.fallback=')))
   // learned=true: this page saw the 400 and retried. learned=false: the isolate already knew, so it asked for blob:none.
-  const fallbacks = wide.filter(bar => bar.lines.includes('git.fetch.filter.learned=true')).length
+  // A refusal on this page (any call: the history fetch is often the first to ask for tree:0) counts as a retry here.
+  const refusedHere = trace.bars.some(bar => bar.lines.includes('http.response.status_code=400') && bar.lines.some(line => line.startsWith('git.fetch.filter=') && line !== 'git.fetch.filter=blob:none'))
+  const fallbacks = wide.filter(bar => bar.lines.includes('git.fetch.filter.learned=true')).length || (refusedHere ? wide.length : 0)
   const known = wide.length - fallbacks
   const retry = fallbacks === 0 ? '' : fallbacks === 1 ? ' · 1 retry' : ` · ${fallbacks} retries`
   const pill = `${trace.bars.length} upstream ${trace.bars.length === 1 ? 'call' : 'calls'} · ${formatDuration(trace.totalMs)}${retry}`

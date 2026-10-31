@@ -172,10 +172,42 @@ function asText(bytes: Uint8Array): string | null {
   catch { return null; }
 }
 
-async function loadParents(transport: GitTransport, budget: Budget, first: CommitInfo, quirks: Quirks): Promise<{ log: CommitInfo[]; logStopped: boolean }> {
+type History = Map<string, { type: number; data: Uint8Array }>;
+
+/**
+ * The head commit and its first-parent history (up to maxLogCommits) in one upload-pack call: `filter tree:0` with
+ * `deepen N` returns commits only. Before, the page made one call per commit (the head, then each parent: 5 calls on
+ * GitHub; the watcher's 9-call baseline for github.com/ivarvong/ply). null when the server refuses tree:0 (the quirk is
+ * learned) or the answer is unusable; the caller then falls back to one commit at a time.
+ */
+async function loadHistory(transport: GitTransport, commit: string, quirks: Quirks): Promise<History | null> {
+  if (quirks.treeFilter === 'blob:none') return null;
+  try {
+    const r = await readPack(transport, { wants: [commit], filter: 'tree:0', deepen: VIEWER_CAPS.maxLogCommits, ofsDelta: true, thinPack: false }, { resolve: true, attrs: { 'git.viewer.history.depth': VIEWER_CAPS.maxLogCommits } });
+    const objects = r.objects;
+    if (!objects || objects.get(commit)?.type !== TYPE.COMMIT) return null;
+    for (const o of objects.values()) if (o.type !== TYPE.COMMIT) return null;
+    return objects;
+  } catch (err) {
+    if (filterRejected(err)) { quirks.treeFilter = 'blob:none'; return null; }
+    const code = (err as { code?: string }).code;
+    if (code === 'limit_exceeded' || code === 'timeout' || code === 'aborted') throw err;
+    return null;
+  }
+}
+
+async function loadParents(transport: GitTransport, budget: Budget, first: CommitInfo, quirks: Quirks, history: History | null = null): Promise<{ log: CommitInfo[]; logStopped: boolean }> {
   const log = [first];
   let parent = first.parents[0];
   while (parent && log.length < VIEWER_CAPS.maxLogCommits) {
+    const held = history?.get(parent);
+    if (held && held.type === TYPE.COMMIT) {
+      const commit = toCommit(parent, held.data);
+      log.push(commit);
+      parent = commit.parents[0];
+      continue;
+    }
+    if (history) return { log, logStopped: false };
     if (quirks.treeFilter === 'blob:none' || !budget.canSpend()) return { log, logStopped: true };
     try {
       const obj = await readObject(transport, { oid: parent, filter: 'tree:0', deepen: 1, expectType: TYPE.COMMIT });
@@ -194,8 +226,9 @@ async function loadParents(transport: GitTransport, budget: Budget, first: Commi
 async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { kind: 'repo' }>, server: ServerInfo, quirks: Quirks, budget: Budget, tracer: ViewerTracer): Promise<Loaded> {
   const listedRefs = await listRefs(transport, refPrefixes(route.ref));
   const resolved = resolveRef(listedRefs.refs, listedRefs.head, route.ref);
-  const commitObj = await readObject(transport, { oid: resolved.commit, filter: 'tree:0', deepen: 1, expectType: TYPE.COMMIT });
-  const commit = toCommit(resolved.commit, commitObj.data);
+  const history = await loadHistory(transport, resolved.commit, quirks);
+  const commitData = history?.get(resolved.commit)?.data ?? (await readObject(transport, { oid: resolved.commit, filter: 'tree:0', deepen: 1, expectType: TYPE.COMMIT })).data;
+  const commit = toCommit(resolved.commit, commitData);
   const header = headerFor(route.loc, resolved.name, resolved.commit, server);
   const cache = new Map<string, Uint8Array>();
   const comps = route.path ? route.path.split('/') : [];
@@ -261,7 +294,7 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
   }
   heads.sort((a, b) => Number(b.head) - Number(a.head) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   const branches = heads.slice(0, VIEWER_CAPS.maxBranchesShown);
-  const { log, logStopped } = await loadParents(transport, budget, commit, quirks);
+  const { log, logStopped } = await loadParents(transport, budget, commit, quirks, history);
   return {
     kind: 'tree', header, path: route.path, commit, log, logStopped, branches,
     branchesTruncated: heads.length - branches.length,
