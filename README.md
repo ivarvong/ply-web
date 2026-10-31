@@ -1,6 +1,6 @@
 # ply Worker — `https://ply.ivar.workers.dev`
 
-A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#9ca64714709141cf25aabbe189454139caebff03` (an exact commit of ply `main`; an operator moves the pin with `npm run cd -- bump`). The `/v1` API has no
+A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#af5cac0372df6caf774d108cbf9229b04af45eb6` (an exact commit of ply `main`; an operator moves the pin with `npm run cd -- bump`). The `/v1` API has no
 storage. `GET /view` is a public repository viewer, rate-limited by client through a SQLite Durable Object. One Artifacts
 namespace, `public-v0`, is served read-only with no token (`/r/<repo>`, see [Public namespace](#public-namespace-public-v0));
 its binding is the Worker's only other binding. `GET /` prints the usage text.

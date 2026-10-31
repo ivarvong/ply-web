@@ -1,11 +1,10 @@
 // Create or delete a ref. `from: 000…0` is rejected before any transport is opened, so nothing is pushed.
 // An existing ref is ref_exists (retry no). A delete whose expected oid is stale is stale_expected and carries
 // the oid the ref actually points at.
-import { fail, fetchObject, lsRefs, operation, push, resolveCommit, TYPE, ZERO_OID } from 'ply'
+import { fail, fetchCommit, lsRefs, operation, parseOid, push, resolveCommit, ZERO_OID } from 'ply'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
 import { refExists, staleExpected } from './errors.ts'
 import { readHead } from './head.ts'
-import { isOid, isZeroOid } from './oid.ts'
 import { branchRef } from './request.ts'
 import { writeResult } from './result.ts'
 
@@ -14,13 +13,22 @@ type Root = GitSpan
 type Outcome = GitOutcome
 
 async function tipOf(t: Transport, from: string): Promise<string> {
-  if (isOid(from)) {
-    try {
-      await fetchObject(t, { oid: from, filter: 'tree:0', deepen: 1, expectType: TYPE.COMMIT })
-    } catch (e) {
-      const code = (e as { code?: string })?.code
-      if (code === 'pack_corrupt' || code === 'remote_error' || code === 'not_found') throw fail('not_found', `commit ${from} not found`)
-      throw e
+  if (parseOid(from).ok) {
+    const fetched = await fetchCommit(t, from)
+    if (!fetched.ok) {
+      const error = fetched.error
+      if (error.code === 'not_found' && error.miss) {
+        switch (error.miss.kind) {
+          case 'absent':
+          case 'not_commit':
+            throw error
+          default: {
+            const unreachable: never = error.miss
+            throw unreachable
+          }
+        }
+      }
+      throw error
     }
     return from
   }
@@ -38,7 +46,7 @@ async function bornTip(t: Transport): Promise<string> {
 export async function createBranch(remote: string, refName: unknown, from: unknown, opts: CallOpts): Promise<Record<string, unknown>> {
   const ref = branchRef(refName, 'ref')
   // Zero is refused here, before operation() opens a transport, so receive-pack is never called.
-  if (isZeroOid(from)) throw fail('bad_request', 'from must not be the zero oid')
+  if (from === ZERO_OID) throw fail('bad_request', 'from must not be the zero oid')
   if (from !== undefined && from !== null && from !== '' && typeof from !== 'string') throw fail('bad_request', 'from must be a branch name or a commit id')
   const specified = typeof from === 'string' && from !== '' ? from : null
   return operation('branch_create', remote, { ...opts, attrs: { 'git.branch_create.ref': ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
