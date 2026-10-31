@@ -3,6 +3,8 @@
 //
 //   node src/smoke.mjs <base-url> gate  [--out file.json]
 //   env -u CLOUDFLARE_API_TOKEN node src/smoke.mjs <base-url> read|write [--out file.json] [--outdir dir]
+//   --version <id>: every request to the Worker carries Cloudflare-Workers-Version-Overrides: ply="<id>", so a version routed
+//   at 0% answers it (scripts/deploy.sh). Each step records the x-ply-request-id it got back.
 //
 // PLY token: ~/.config/ply/worker-token. `read` and `write` each run against a scratch Artifacts repo that
 // src/smoke-seed.mjs creates, seeds with a fixed history, and deletes (tokens revoked) when the run ends, so runs are
@@ -22,9 +24,12 @@ const short = s => (s.length > 160 ? s.slice(0, 160) + '…' : s);
 const secrets = [PLY];
 const clean = s => secrets.reduce((t, x) => (x ? t.split(x).join('[redacted]') : t), String(s));
 
+const VERSION = arg('version');
+const pin = VERSION ? { 'cloudflare-workers-version-overrides': `ply="${VERSION}"` } : {};
+
 async function call(name, method, path, { body, headers = {}, ply = true, expect, check } = {}) {
   const t0 = performance.now();
-  const res = await fetch(base + path, { method, headers: { ...(ply ? { authorization: `Bearer ${PLY}` } : {}), ...(body ? { 'content-type': 'application/json' } : {}), ...headers }, body: body ? JSON.stringify(body) : undefined });
+  const res = await fetch(base + path, { method, headers: { ...pin, ...(ply ? { authorization: `Bearer ${PLY}` } : {}), ...(body ? { 'content-type': 'application/json' } : {}), ...headers }, body: body ? JSON.stringify(body) : undefined });
   const buf = Buffer.from(await res.arrayBuffer());
   const ms = Math.round(performance.now() - t0);
   let json = null; try { json = JSON.parse(buf.toString('utf8')); } catch { /* bytes */ }
@@ -151,7 +156,7 @@ if (phase === 'write') {
 }
 
 const out = arg('out');
-if (out) writeFileSync(out, JSON.stringify({ base, phase, at: new Date().toISOString(), steps }, null, 2));
+if (out) writeFileSync(out, JSON.stringify({ base, phase, version: VERSION, at: new Date().toISOString(), steps }, null, 2));
 const failed = steps.filter(s => !s.pass);
 console.log(`\n${steps.length - failed.length}/${steps.length} passed`);
 process.exit(failed.length ? 1 : 0);

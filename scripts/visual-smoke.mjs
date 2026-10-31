@@ -9,7 +9,9 @@
 // browser that cached an old unversioned sheet does. A hashed href never hits it, so the run must still pass.
 //
 // usage: node scripts/visual-smoke.mjs [base=https://ply.ivar.workers.dev] [outdir=<tmp>] [-- url ...]
-// env:   CHROME (default: macOS Google Chrome), STALE_CSS, STALE_CSS_URL
+// env:   CHROME (default: macOS Google Chrome), STALE_CSS, STALE_CSS_URL,
+//        PLY_VERSION=<version id>: every request carries Cloudflare-Workers-Version-Overrides: ply="<id>" (a 0% canary).
+// The last line lists every x-ply-request-id the Worker answered with, so Observability can prove which version served them.
 // Run after every deploy, next to `node src/smoke.mjs <base> gate`.
 import { spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
@@ -55,6 +57,14 @@ const once = name => new Promise(r => { const h = m => { if (m.method === name) 
 
 await send('Page.enable'); await send('Runtime.enable'); await send('Network.enable');
 await send('Network.setCacheDisabled', { cacheDisabled: true });
+const VERSION = process.env.PLY_VERSION ?? '';
+if (VERSION) await send('Network.setExtraHTTPHeaders', { headers: { 'Cloudflare-Workers-Version-Overrides': `ply="${VERSION}"` } });
+const requestIds = [];
+handlers.push(m => {
+  if (m.method !== 'Network.responseReceived') return;
+  const h = Object.fromEntries(Object.entries(m.params.response.headers ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
+  if (h['x-ply-request-id']) requestIds.push(h['x-ply-request-id']);
+});
 const cssRequested = new Set(); const staleServed = new Set();
 await send('Fetch.enable', { patterns: [{ urlPattern: '*.css*', requestStage: 'Request' }] });
 handlers.push(m => {
@@ -100,6 +110,6 @@ for (const url of urls) for (const [w, h, mobile] of [[375, 812, true], [1280, 8
   if (problems.length) failed = true;
   console.log(JSON.stringify({ ok: !problems.length, url, w, scheme, problems, shot: join(outdir, name), maxSvgPx: r.maxSvgPx, iconPx: r.iconPx, overflowPx: r.overflowPx, rows: r.rows, sheets: r.sheets }));
 }
-console.log(JSON.stringify({ cssRequested: [...cssRequested], staleCss: stale ? { url: staleUrl, servedFor: [...staleServed] } : null, failed }));
+console.log(JSON.stringify({ cssRequested: [...cssRequested], staleCss: stale ? { url: staleUrl, servedFor: [...staleServed] } : null, version: VERSION || null, requestIds, failed }));
 ws.close(); chrome.kill();
 process.exit(failed ? 1 : 0);
