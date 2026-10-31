@@ -13,6 +13,7 @@ import { VIEWER_CSS } from './styles.ts'
 import { loadRepo } from './session.ts'
 import { buildTrace, traceHeader } from './traceview.ts'
 import { LAYOUT } from './layout.ts'
+import { listPublicRepos, tokenSourceFor, withPublicReadCredential } from '../public.ts'
 
 function callOf(req: Request): ViewerCall {
   const call = viewerCalls.get(req)
@@ -28,7 +29,8 @@ async function clientKey(req: Request): Promise<string> {
   return hex
 }
 
-async function admit(req: Request, env: ViewerEnv, bucket: RateBucket, now: number): Promise<RateDecision | 'unconfigured' | 'unavailable'> {
+/** The viewer's per-client rate limit. /v1 public-namespace reads use it too (index.js). */
+export async function admitClient(req: Request, env: ViewerEnv, bucket: RateBucket, now: number): Promise<RateDecision | 'unconfigured' | 'unavailable'> {
   const ns = env.VIEWER_RATE
   if (!ns) return 'unconfigured'
   try {
@@ -72,7 +74,7 @@ function routeError(call: ViewerCall, err: unknown): Response {
 
 async function rateGate(req: Request, env: ViewerEnv, call: ViewerCall, route: Extract<ViewerRoute, { kind: 'repo' }> | { kind: 'home' } | { kind: 'redirect' }): Promise<Response | null> {
   const bucket: RateBucket = route.kind === 'repo' && route.pack ? 'pack' : 'page'
-  const decision = await admit(req, env, bucket, call.now)
+  const decision = await admitClient(req, env, bucket, call.now)
   if (decision === 'unconfigured' || decision === 'unavailable') {
     const trace = traceOf(call)
     const message = decision === 'unconfigured' ? 'The viewer rate limiter is not configured.' : 'The viewer rate limiter is unavailable.'
@@ -111,7 +113,10 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
   const tracer = makeTracer(collected.exporter, { maxEvents: 48, resource: { 'service.name': 'ply-viewer' } })
   const budget = createBudget()
   const pageSignal = AbortSignal.timeout(VIEWER_CAPS.pageTimeoutMs)
-  const guard = createViewerFetch(call.opts.fetchImpl ?? globalThis.fetch, route.loc.url, route.loc.allowedHosts, budget, pageSignal)
+  // The public namespace's read token is attached below the guard: every hop is validated by createViewerFetch first,
+  // then checked again by withPublicReadCredential, and the pack cache above never sees it in its key.
+  const inner = withPublicReadCredential(call.opts.fetchImpl ?? globalThis.fetch, tokenSourceFor(env.PUBLIC_REPOS))
+  const guard = createViewerFetch(inner, route.loc.url, route.loc.allowedHosts, budget, pageSignal)
   const cache = call.opts.cache === undefined ? (env.PACK_CACHE === 'off' ? null : defaultCache()) : call.opts.cache
   const fetchImpl: FetchLike = cache ? cachedFetch(guard, cache, promise => { try { call.ctx.waitUntil?.(promise) } catch { /* already settled */ } }) : guard
   try {
@@ -210,5 +215,6 @@ async function serveEntry(req: Request, env: ViewerEnv): Promise<Response> {
   const trace = traceOf(call)
   call.fields['http.status_code'] = 200
   call.fields['ply.viewer.route'] = 'home'
-  return headless(req, htmlResponse(200, renderHome(null, call.now), trace, call.requestId))
+  const publicRepos = await listPublicRepos(env.PUBLIC_REPOS, call.now)
+  return headless(req, htmlResponse(200, renderHome(null, call.now, publicRepos), trace, call.requestId))
 }

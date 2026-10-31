@@ -7,8 +7,8 @@ export function renderDocument(doc: ViewerDocument): SafeHtml {
   return trustRendered(`<!doctype html>${String(<ViewerPage doc={doc} />)}`)
 }
 
-export function renderHome(error: string | null, now = Date.now()): SafeHtml {
-  return renderDocument({ kind: 'home', error, now })
+export function renderHome(error: string | null, now = Date.now(), publicRepos: readonly string[] = []): SafeHtml {
+  return renderDocument({ kind: 'home', error, now, publicRepos })
 }
 
 export function renderError(status: number, code: string, message: string, trace: TraceModel, host = '', repoPath = '', ref: string | null = null, now = Date.now()): SafeHtml {

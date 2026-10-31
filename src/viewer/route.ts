@@ -4,7 +4,8 @@ import { VIEWER_CAPS, VIEWER_GIT_LIMITS } from './limits.ts';
 import type { FilterName } from './model.ts';
 import { interpretRemote } from './paste.ts';
 import { extractRequestPath, rawPathHasUnsafeSegment, rawQueryPathUnsafe } from '../pathguard.ts';
-import { allowlistFromEnv, validatePublicRepoUrl, viewerPathFor, type AllowedHost, type RepoLocation } from './url.ts';
+import { allowlistFromEnv, validatePublicRepoUrl, viewerPathFor, withHost, type AllowedHost, type RepoLocation } from './url.ts';
+import { PUBLIC_GIT_HOST, PUBLIC_GIT_ORIGIN, PUBLIC_NAMESPACE, publicRepoOfRemote } from '../public.ts';
 
 export type ViewerRoute =
   | { kind: 'css' }
@@ -73,10 +74,22 @@ function parseFilter(raw: string | null, wantPresent: boolean): FilterName {
   bad('filter must be tree:0 or blob:none');
 }
 
+/**
+ * The Artifacts host of the public namespace is served without VIEWER_EXTRA_HOSTS, but only for one repo directly under
+ * /git/<PUBLIC_NAMESPACE>/. Any other path on that host (another namespace, a nested path) is refused before a fetch.
+ */
+function validateLocation(raw: string, opts: RouteOpts): RepoLocation {
+  if (raw.startsWith(`${PUBLIC_GIT_ORIGIN}/`)) {
+    if (publicRepoOfRemote(raw) === null) bad(`only /git/${PUBLIC_NAMESPACE}/<repo> is served from ${PUBLIC_GIT_HOST}`);
+    return validatePublicRepoUrl(raw, { allowedHosts: withHost(opts.allowedHosts, PUBLIC_GIT_HOST), maxLength: VIEWER_CAPS.maxUrlLength });
+  }
+  return validatePublicRepoUrl(raw, { allowedHosts: opts.allowedHosts, maxLength: VIEWER_CAPS.maxUrlLength });
+}
+
 function locate(host: string, repoPath: string, opts: RouteOpts): RepoLocation {
   // oxlint-disable-next-line no-control-regex -- hostnames cannot contain controls or whitespace
   if (!host || host.length > 253 || /[\u0000-\u001f\u007f\s/@\\]/.test(host)) bad(`remote host is not allowed. Supported hosts: ${opts.allowedHosts.join(', ')}.`);
-  return validatePublicRepoUrl(`https://${host}/${repoPath}`, { allowedHosts: opts.allowedHosts, maxLength: VIEWER_CAPS.maxUrlLength });
+  return validateLocation(`https://${host.toLowerCase()}/${repoPath}`, opts);
 }
 
 /** Parse a viewer URL from the raw request target, before `new URL` collapses dot segments. */
@@ -99,7 +112,7 @@ export function parseViewerRoute(url: URL, opts: RouteOpts): ViewerRoute {
     const remote = url.searchParams.get('remote');
     if (!remote) return { kind: 'home' };
     const pasted = interpretRemote(remote);
-    const loc = validatePublicRepoUrl(pasted.remote, { allowedHosts: opts.allowedHosts, maxLength: VIEWER_CAPS.maxUrlLength });
+    const loc = validateLocation(pasted.remote, opts);
     const ref = chosenRef(url, pasted.ref ?? null);
     return { kind: 'redirect', location: viewerPathFor(loc, { ref: ref ?? undefined, path: pasted.path || undefined }) };
   }

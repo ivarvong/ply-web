@@ -1,3 +1,4 @@
+import type { ArtifactsNamespace } from '../public.ts';
 import type { PackMap } from './packmap.ts';
 
 export type FilterName = 'tree:0' | 'blob:none';
@@ -102,6 +103,8 @@ export type RateNamespace = {
 
 export type ViewerEnv = {
   VIEWER_RATE?: RateNamespace;
+  /** Artifacts binding for the public namespace (cloudflare.config.ts). Mints read tokens; nothing else is called. */
+  PUBLIC_REPOS?: ArtifactsNamespace;
   /** Comma-separated exact hostnames appended to the built-in allowlist. Wildcards are ignored. */
   VIEWER_EXTRA_HOSTS?: string;
   VIEWER_RATE_PER_MIN?: string;
