@@ -21,21 +21,47 @@ export function formatDuration(ms: number): string {
   return `${Math.round(ms)} ms`
 }
 
-export type CommitProse = { subject: string; paragraphs: readonly string[] }
+export type Trailer = { key: string; value: string }
+export type CommitProse = { subject: string; paragraphs: readonly string[]; trailers: readonly Trailer[] }
 
-/** Git paragraphs stay separate. Hard wraps inside a paragraph reflow. */
-export function commitProse(message: string): CommitProse {
-  const clamped = clampText(message, LAYOUT.commitMessageChars).replace(/\r\n/g, '\n')
-  const trimmed = clamped.replace(/\n+$/, '')
-  const subject = (trimmed.split('\n')[0] ?? '').trim()
-  const rest = trimmed.slice(subject.length).replace(/^\n+/, '')
-  if (!rest.trim()) return { subject, paragraphs: [] }
-  const paragraphs = rest.split(/\n{2,}/).map(reflow).filter(paragraph => paragraph.length > 0)
-  return { subject, paragraphs }
+// git interpret-trailers: `Token: value` lines in the final paragraph. GitHub's closing keywords count too.
+const TRAILER = /^([A-Za-z][A-Za-z0-9-]{0,63}):[ \t]+(\S.*)$/
+const CLOSING = /^((?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)) +((?:[\w.-]+\/[\w.-]+)?#\d+.*)$/i
+
+const KNOWN_TRAILER = /^(?:[A-Za-z-]+-by|change-id|closes?|closed|fix(?:es|ed)?|resolve[sd]?|refs?|see-also|cc|bug|issue|ticket|[A-Za-z]+-session)$/i
+
+function trailerOf(line: string): Trailer | null {
+  const t = TRAILER.exec(line)
+  if (t?.[1] && t[2]) return { key: t[1], value: t[2].trim() }
+  const c = CLOSING.exec(line)
+  if (c?.[1] && c[2]) return { key: c[1].charAt(0).toUpperCase() + c[1].slice(1).toLowerCase(), value: c[2].trim() }
+  return null
 }
 
-function reflow(block: string): string {
-  return block.split('\n').map(line => line.trim()).filter(line => line.length > 0).join(' ')
+/**
+ * Subject, body paragraphs, trailers. Paragraphs keep their line breaks (git messages are often lists or hard-wrapped
+ * prose; the page shows them with white-space: pre-wrap). Trailing trailer lines (Co-Authored-By, Signed-off-by,
+ * Closes #n) are split out so the page can show them quietly.
+ */
+export function commitProse(message: string): CommitProse {
+  const clamped = clampText(message, LAYOUT.commitMessageChars).replace(/\r\n?/g, '\n')
+  const trimmed = clamped.replace(/\s+$/, '')
+  const subject = (trimmed.split('\n')[0] ?? '').trim()
+  const rest = trimmed.slice(trimmed.indexOf('\n') === -1 ? trimmed.length : trimmed.indexOf('\n')).replace(/^\n+/, '')
+  if (!rest.trim()) return { subject, paragraphs: [], trailers: [] }
+  const blocks = rest.split(/\n[ \t]*\n/).map(block => block.replace(/^\n+|\s+$/g, '')).filter(block => block.trim().length > 0)
+  const trailers: Trailer[] = []
+  // Trailers live in the final paragraphs; a run of closing keywords may sit in its own paragraph just above them.
+  while (blocks.length) {
+    const lines = (blocks[blocks.length - 1] ?? '').split('\n').map(line => line.trim()).filter(line => line.length > 0)
+    const parsed = lines.map(trailerOf)
+    if (!parsed.length || parsed.some(t => t === null)) break
+    // "Before: 12 ms / After: 5 ms" is prose, not trailers: ask for one key git or GitHub would recognise.
+    if (!parsed.some(t => t && KNOWN_TRAILER.test(t.key))) break
+    trailers.unshift(...(parsed as Trailer[]))
+    blocks.pop()
+  }
+  return { subject, paragraphs: blocks, trailers }
 }
 
 export type ExactTime = { iso: string; label: string; relative: string }

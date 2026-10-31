@@ -117,7 +117,7 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
   const fetchImpl: FetchLike = createViewerFetch(createLoopbackFetch(direct, loopback), route.loc.url, route.loc.allowedHosts, budget, pageSignal)
   try {
     const loaded = await loadRepo(route, { tracer, fetchImpl, signal: pageSignal, budget })
-    const trace = buildTrace(collected.lines, call.cfRay, call.requestId)
+    const trace = { ...buildTrace(collected.lines, call.cfRay, call.requestId), expanded: new URL(req.url).searchParams.get('trace') === '1' }
     call.opts.note?.({ host: route.loc.host, rtt: trace.bars.length, bytes: budget.bytes, code: 'ok' })
     if (loaded.kind === 'raw') {
       const text = isText(loaded.bytes)
@@ -147,7 +147,7 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
     const code = plyCode((err as { code?: string })?.code) ? (err as { code: string }).code : 'internal'
     const status = code === 'internal' ? 500 : statusOf(err as { code?: string; status?: number })
     const message = code === 'internal' ? 'The viewer hit an internal error.' : String((err as { message?: string })?.message ?? err).slice(0, 500)
-    const trace = buildTrace(collected.lines, call.cfRay, call.requestId)
+    const trace = { ...buildTrace(collected.lines, call.cfRay, call.requestId), expanded: new URL(req.url).searchParams.get('trace') === '1' }
     call.opts.note?.({ host: route.loc.host, code, status, rtt: trace.bars.length })
     call.fields['http.status_code'] = status
     call.fields['error.type'] = code

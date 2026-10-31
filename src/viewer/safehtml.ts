@@ -24,8 +24,30 @@ export function concatHtml(parts: readonly SafeHtml[]): SafeHtml {
   return mark(parts.join(''));
 }
 
-export function tag(name: 'p' | 'ul' | 'li' | 'pre' | 'code' | 'strong' | 'h3' | 'h4' | 'h5', content: SafeHtml): SafeHtml {
-  return concatHtml([mark(`<${name}>`), content, mark(`</${name}>`)]);
+export type MdTag = 'p' | 'ul' | 'ol' | 'li' | 'pre' | 'code' | 'strong' | 'em' | 'del' | 'blockquote' | 'table' | 'thead' | 'tbody' | 'tr' | 'th' | 'td' | 'div' | 'span';
+
+/** Fixed class names the markdown renderer may attach. Never derived from the source text. */
+export type MdClass = 'md-code' | 'md-code-lang' | 'md-table' | 'task' | 'task done' | 'task-item' | 'al-l' | 'al-c' | 'al-r' | 'md-img' | 'md-frontmatter';
+
+export function tag(name: MdTag, content: SafeHtml, cls?: MdClass): SafeHtml {
+  const open = cls ? `<${name} class="${cls}">` : `<${name}>`;
+  return concatHtml([mark(open), content, mark(`</${name}>`)]);
+}
+
+export function voidTag(name: 'br' | 'hr'): SafeHtml {
+  return mark(`<${name}>`);
+}
+
+/** h2–h6. The id is a slug of [a-z0-9-] only, so a README's `[x](#usage)` lands on its heading. */
+export function heading(level: 2 | 3 | 4 | 5 | 6, slug: string, content: SafeHtml): SafeHtml {
+  const id = /^[a-z0-9][a-z0-9-]{0,79}$/.test(slug) ? ` id="${slug}"` : '';
+  return concatHtml([mark(`<h${level}${id}>`), content, mark(`</h${level}>`)]);
+}
+
+/** An ordered list that starts at an integer other than 1. */
+export function orderedList(start: number, content: SafeHtml): SafeHtml {
+  const n = Number.isSafeInteger(start) && start >= 0 && start !== 1 ? ` start="${start}"` : '';
+  return concatHtml([mark(`<ol${n}>`), content, mark('</ol>')]);
 }
 
 /** href has already passed the scheme allowlist and contains no quote, space, or control. */

@@ -46,6 +46,8 @@ export type TraceModel = {
   totalMs: number;
   cfRay: string;
   requestId: string;
+  /** ?trace=1: render the Diagnostics section open. */
+  expanded?: boolean;
 };
 
 export type RepoHeader = {

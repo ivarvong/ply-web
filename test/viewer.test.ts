@@ -22,7 +22,10 @@ import { escapeHtml } from '../src/viewer/escape.ts';
 import { credentialFreeHeaders, createViewerFetch } from '../src/viewer/fetchguard.ts';
 import { handleViewer } from '../src/viewer/handle.ts';
 import { renderError, renderHome, renderLoaded } from '../src/viewer/html.ts';
-import { VIEWER_CSS } from '../src/viewer/styles.ts';
+import { KUMO_USED, VIEWER_CSS, cssNodes, selectorClasses } from '../src/viewer/styles.ts';
+import { commitProse } from '../src/viewer/format.ts';
+import { repoIdentity } from '../src/viewer/identity.ts';
+import { PUBLIC_GIT_HOST } from '../src/public.ts';
 import { VIEWER_CAPS, VIEWER_GIT_LIMITS, VIEWER_UA, rateLimitFor } from '../src/viewer/limits.ts';
 import type { Loaded, RateNamespace, TraceModel } from '../src/viewer/model.ts';
 import { renderMarkdown } from '../src/viewer/markdown.ts';
@@ -37,6 +40,24 @@ import { ALLOWED_HOSTS, allowlistFromEnv, assertUpstreamUrl, validatePublicRepoU
 beforeEach(() => resetQuirks());
 const FIXTURE = fileURLToPath(new URL('./fixtures/viewer/small.pack', import.meta.url));
 const FIXTURE_SHA = 'a86b269e52e69445e10d4c1dd7c5a89b323c0988f1d73b1f0b0c7c1d112f846a';
+
+function treeFixture(over: { message?: string; host?: string; repoPath?: string }): Extract<Loaded, { kind: "tree" }> {
+  const host = over.host ?? 'github.com'
+  const repoPath = over.repoPath ?? 'o/r'
+  return {
+    kind: 'tree',
+    header: {
+      host, repoPath, ref: 'refs/heads/main', commit: 'a'.repeat(40), treeHref: `/view/${host}/${repoPath}`,
+      server: { agent: 'git/2', protocol: 2, objectFormat: 'sha1', caps: ['agent'], fetchFeatures: ['filter'], filterAdvertised: true },
+    },
+    path: '',
+    commit: { oid: 'a'.repeat(40), tree: 'b'.repeat(40), parents: [], authorName: 'Ada', authorEmail: 'a@b', authorTime: '2020-01-02T03:04:05Z', authorTz: '+0000', message: over.message ?? 'subject', signed: false },
+    log: [], logStopped: false,
+    branches: [{ name: 'refs/heads/main', oid: 'a'.repeat(40), head: true }], branchesTruncated: 0,
+    entries: [{ name: 'a.txt', mode: '100644', oid: 'c'.repeat(40), type: 'blob' }], entriesTruncated: 0,
+    readme: null,
+  }
+}
 
 function loc(raw: string, allowed: readonly AllowedHost[] = ALLOWED_HOSTS): RepoLocation {
   return validatePublicRepoUrl(raw, { allowedHosts: allowed });
@@ -152,8 +173,8 @@ test('ssr markup uses Kumo classes, prose commits, and a strict CSP', () => {
     readme: null,
   }
   const html = renderLoaded(loaded, trace, when + 5 * 86_400_000)
-  assert.match(html, /This is a wrapped paragraph that should flow\./)
-  assert.match(html, /Second paragraph/)
+  // Commit bodies keep their line structure (pre-wrap), paragraph by paragraph.
+  assert.match(html, /<p class="msg-p">This is a wrapped\nparagraph that should flow\.<\/p><p class="msg-p">Second paragraph\.<\/p>/)
   assert.match(html, /5 days ago/)
   assert.match(html, /title="02 Jan 2020, 03:04:05 UTC \(-0700\)"/)
   assert.equal(html.includes('<pre class="msg"'), false)
@@ -170,8 +191,70 @@ test('ssr markup uses Kumo classes, prose commits, and a strict CSP', () => {
   assert.match(VIEWER_CSS, /color-scheme: light dark/)
   assert.match(VIEWER_CSP, /script-src 'none'/)
   assert.equal(VIEWER_CSP.includes('unsafe-inline'), false)
+  // /view.css carries Kumo's theme and base whole, plus only the utilities kumo-classes.ts can emit.
   const shipped = readFileSync(fileURLToPath(new URL('../node_modules/@cloudflare/kumo/dist/styles/kumo-standalone.css', import.meta.url)), 'utf8')
-  assert.equal(VIEWER_CSS.startsWith(shipped), true)
+  const layers = cssNodes(shipped)
+  const theme = layers.find(node => node.prelude === '@layer theme')
+  assert.ok(theme?.body && VIEWER_CSS.includes(theme.body))
+  const shippedUtilities = new Set<string>()
+  const collect = (body: string) => { for (const node of cssNodes(body)) { if (node.body === null) continue; if (node.prelude.startsWith('@')) collect(node.body); else for (const name of selectorClasses(node.prelude)) shippedUtilities.add(name) } }
+  collect(layers.find(node => node.prelude === '@layer utilities')?.body ?? '')
+  for (const name of KUMO_USED) if (name !== 'kumo-input-placeholder') assert.equal(shippedUtilities.has(name), true, `Kumo has no utility ${name}`)
+  const keptUtilities = new Set<string>()
+  const keptCollect = (body: string) => { for (const node of cssNodes(body)) { if (node.body === null) continue; if (node.prelude.startsWith('@')) keptCollect(node.body); else for (const name of selectorClasses(node.prelude)) keptUtilities.add(name) } }
+  keptCollect(cssNodes(VIEWER_CSS).find(node => node.prelude === '@layer utilities')?.body ?? '')
+  for (const name of KUMO_USED) if (name !== 'kumo-input-placeholder') assert.equal(keptUtilities.has(name), true, `subset dropped ${name}`)
+  assert.equal(keptUtilities.has('bg-kumo-badge-teal'), false)
+  assert.ok(VIEWER_CSS.length < 80_000, `view.css is ${VIEWER_CSS.length} bytes`)
+})
+
+test('README markdown: GFM table, task list, fenced code label, headings, relative links', () => {
+  const md = String(renderMarkdown([
+    '# ply', '', 'Intro with `code` and **bold**.', '',
+    '## Wire sequence', '', '| # | Request | Why |', '|---|:---:|--:|', '| 1 | v2 `ls-refs` with `ref-prefix` | head oid |', '| 2 | pipe \\| inside | x |', '',
+    '- [ ] todo', '- [x] done', '', '```js', "const a = '<b>'", '```', '', 'See [docs](docs/a.md#usage) and ![logo](img/l.png).',
+  ].join('\n'), { base: '', resolve: (path, kind) => `/view/github.com/o/r?path=${encodeURIComponent(path)}${kind === 'image' ? '&raw=1' : ''}` }))
+  assert.match(md, /<h2 id="ply">ply<\/h2>/)
+  assert.match(md, /<h3 id="wire-sequence">Wire sequence<\/h3>/)
+  assert.equal(md.includes('| # |'), false)
+  assert.match(md, /<div class="md-table"><table><thead><tr><th>#<\/th><th class="al-c">Request<\/th><th class="al-r">Why<\/th><\/tr><\/thead><tbody><tr><td>1<\/td><td class="al-c">v2 <code>ls-refs<\/code> with <code>ref-prefix<\/code><\/td><td class="al-r">head oid<\/td><\/tr><tr><td>2<\/td><td class="al-c">pipe \| inside<\/td><td class="al-r">x<\/td><\/tr><\/tbody><\/table><\/div>/)
+  assert.match(md, /<li class="task-item"><span class="task"><\/span>todo<\/li><li class="task-item"><span class="task done">✓<\/span>done<\/li>/)
+  assert.match(md, /<div class="md-code"><div class="md-code-lang">js<\/div><pre><code>const a = &#39;&lt;b&gt;&#39;<\/code><\/pre><\/div>/)
+  assert.match(md, /href="\/view\/github\.com\/o\/r\?path=docs%2Fa\.md#usage"/)
+  assert.match(md, /href="\/view\/github\.com\/o\/r\?path=img%2Fl\.png&amp;raw=1" rel="noopener noreferrer nofollow"><span class="md-img">logo<\/span>/)
+  assert.equal(md.includes('<img'), false)
+})
+
+test('commit bodies keep their lines; trailers are split out and shown quietly', () => {
+  const prose = commitProse('subject\n\nline one\nline two\n\n- bullet a\n- bullet b\n\nCloses #33\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_x\n')
+  assert.deepEqual(prose.paragraphs, ['line one\nline two', '- bullet a\n- bullet b'])
+  assert.deepEqual(prose.trailers, [
+    { key: 'Closes', value: '#33' },
+    { key: 'Co-Authored-By', value: 'Claude <noreply@anthropic.com>' },
+    { key: 'Claude-Session', value: 'https://claude.ai/code/session_x' },
+  ])
+  // "Key: value" prose with no recognised trailer stays prose.
+  assert.deepEqual(commitProse('s\n\nBefore: 12 ms\nAfter: 5 ms').trailers, [])
+  const trace: TraceModel = { bars: [], totalMs: 0, cfRay: 'r', requestId: 'q' }
+  const html = String(renderLoaded(treeFixture({ message: 'subject\n\nline one\nline two\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n' }), trace))
+  assert.match(html, /<p class="msg-p">line one\nline two<\/p><dl class="trailers"><div><dt>Co-Authored-By<\/dt><dd><span title="Claude &lt;noreply@anthropic.com&gt;">Claude<\/span><\/dd><\/div><\/dl>/)
+})
+
+test('header identity: public-v0 leads with namespace / repo; GitHub with owner / repo; hosts live in Diagnostics', () => {
+  const pub = repoIdentity(PUBLIC_GIT_HOST, 'git/public-v0/ply.git')
+  assert.deepEqual({ scope: pub.scope, name: pub.name, hostLabel: pub.hostLabel, scopeHref: pub.scopeHref }, { scope: 'public-v0', name: 'ply', hostLabel: 'Artifacts', scopeHref: '/view#public' })
+  const gh = repoIdentity('github.com', 'octocat/Hello-World')
+  assert.deepEqual({ scope: gh.scope, name: gh.name, hostLabel: gh.hostLabel }, { scope: 'octocat', name: 'Hello-World', hostLabel: 'GitHub' })
+  const trace: TraceModel = { bars: [], totalMs: 0, cfRay: 'r', requestId: 'q' }
+  const html = String(renderLoaded(treeFixture({ host: PUBLIC_GIT_HOST, repoPath: 'git/public-v0/ply.git' }), trace))
+  assert.match(html, /<title>public-v0\/ply<\/title>/)
+  assert.match(html, /<p class="repo-scope"><span class="repo-host" title="https:\/\/[0-9a-f]{32}\.artifacts\.cloudflare\.net\/git\/public-v0\/ply\.git">Artifacts<\/span><a href="\/view#public">public-v0<\/a><span class="repo-slash" aria-hidden="true">\/<\/span><\/p><h1 class="repo-name"><a href="[^"]+">ply<\/a><\/h1>/)
+  // The raw host appears only in hrefs, the title attribute, and the collapsed Diagnostics section.
+  const visible = html.replace(/<section class="diag"[\s\S]*$/, '').replace(/<[^>]+>/g, ' ')
+  assert.equal(visible.includes(PUBLIC_GIT_HOST), false)
+  assert.equal(html.includes('git/public-v0/ply<'), false)
+  const open = String(renderLoaded(treeFixture({}), { ...trace, expanded: true }))
+  assert.match(open, /<details class="diag-box" open="">/)
 })
 
 test('rate and byte caps clamp and fail closed', () => {
@@ -525,16 +608,34 @@ test('a tree:0 rejection is visible, then the blob:none retry, and a denied rate
     mkdirSync(work);
     git(work, ['init', '-q', '-b', 'main']);
     commitFiles(work, bare, { 'README.md': 'artifacts-shaped\n' }, 'one');
+    // Twelve commits, each touching its own directory, so a blob:none window carries trees as well as commits.
+    const subjects = ['one'];
+    for (let n = 2; n <= 12; n++) { subjects.push(`commit ${n}`); commitFiles(work, bare, { [`d${n}/f.txt`]: `${n}\n` }, `commit ${n}`); }
     let fetches = 0;
+    const bodies: string[] = [];
     const dial = rewriteAllowlisted(proxy.url);
-    const fetchImpl: typeof fetch = async (input, init) => { fetches++; return dial(input, init); };
+    const fetchImpl: typeof fetch = async (input, init) => {
+      fetches++;
+      if (init?.body) bodies.push(Buffer.from(init.body as Uint8Array).toString('latin1'));
+      return dial(input, init);
+    };
     const env = viewerEnv();
     const res = await handleViewer(new Request('https://ply.ivar.workers.dev/view/github.com/art.git', { headers: { 'cf-connecting-ip': '203.0.113.10' } }), env, {}, { fetchImpl });
     assert.equal(res.status, 200, await res.clone().text());
     const html = await res.text();
     assert.match(html, /filter tree:0 was rejected/);
-    assert.match(html, /HTTP 400/);
+    assert.match(html, /<span class="num wf-status" role="cell">400<\/span>/);
     assert.match(html, /blob:none/);
+    // The log fix: on a server that refuses tree:0, Recent commits used to stop after one commit ("Log stopped").
+    // One fetch (want HEAD, deepen 10, blob:none after the 400) now carries the whole first-parent window.
+    const shown = [...html.matchAll(/<span class="log-subject">([^<]*)<\/span>/g)].map(m => m[1]);
+    assert.deepEqual(shown, subjects.slice().reverse().slice(0, VIEWER_CAPS.maxLogCommits));
+    assert.equal(html.includes('Log stopped'), false);
+    const fetchBodies = bodies.filter(body => body.includes('command=fetch'));
+    // tree:0 window (400) + blob:none window + README blob. No per-commit fetches.
+    assert.equal(fetchBodies.length, 3, fetchBodies.join('\n---\n'));
+    assert.equal(fetchBodies.filter(body => body.includes(`deepen ${VIEWER_CAPS.maxLogCommits}`)).length, 2);
+    assert.ok(fetches <= 5, `fetches ${fetches}`);
     const limited = fakeRate();
     let called = 0;
     const denyEnv = { VIEWER_RATE: limited, PACK_CACHE: 'off', VIEWER_RATE_PER_MIN: '1' };
@@ -737,7 +838,7 @@ test('history in one call: on a tree:0 server the page fetches the head and its 
     const html = await page.text();
     for (let i = 6; i >= 2; i--) assert.match(html, new RegExp(`subject-${i}\\b`), `subject-${i} in the log`);
     const fetches = calls.filter(c => c.body.includes('command=fetch'));
-    const history = fetches.filter(c => /deepen 5\n/.test(c.body) && /filter tree:0\n/.test(c.body));
+    const history = fetches.filter(c => new RegExp(`deepen ${VIEWER_CAPS.maxLogCommits}\n`).test(c.body) && /filter tree:0\n/.test(c.body));
     assert.equal(history.length, 1, 'one history fetch');
     assert.equal(fetches.filter(c => /deepen 1\n/.test(c.body)).length, 0, 'no per-commit fetches');
     // discover + ls-refs + history + root tree + README blob
