@@ -71,7 +71,7 @@ export function requestForKey(path: string, isPublicLoc: (url: URL) => boolean):
 /** Pinned's answer: the handler's response, immutable when it is a 200, never carrying the fill's per-request headers. */
 export function asPinned(res: Response): Response {
   const headers = new Headers(res.headers);
-  for (const h of ['x-ply-request-id', 'x-ply-trace', 'server-timing', 'set-cookie', 'vary']) headers.delete(h);
+  for (const h of ['x-ply-request-id', 'x-ply-trace', 'server-timing', 'x-artifacts-ray', 'set-cookie', 'vary']) headers.delete(h);
   headers.set('cache-control', res.status === 200 ? IMMUTABLE : 'no-store');
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }

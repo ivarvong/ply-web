@@ -10,6 +10,7 @@ import { VIEWER_CAPS, rateLimitFor, type RateBucket } from './limits.ts'
 import type { RateDecision, TraceModel, ViewerEnv } from './model.ts'
 import { makeTracer, plyCode, spanCollector } from './ply.ts'
 import { createLoopbackFetch } from '../gitcache.ts'
+import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from '../rays.ts'
 import { parseViewerRequest, routeOptsFromEnv, type ViewerRoute } from './route.ts'
 import { renderError, renderHome, renderLoaded, renderNamespace } from './render.tsx'
 import { VIEWER_CSS, VIEWER_CSS_HASH } from './styles.ts'
@@ -125,7 +126,18 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
   // Public, credential-free exchanges go to the cache-enabled GitCache entrypoint (Workers Caching) under the guard.
   const direct = withPublicReadCredential(call.opts.fetchImpl ?? globalThis.fetch, tokenSourceFor(env.PUBLIC_REPOS))
   const loopback = call.opts.loopback !== undefined ? call.opts.loopback : env.PACK_CACHE === 'off' ? null : () => call.ctx.exports?.GitCache
-  const fetchImpl: FetchLike = createViewerFetch(createLoopbackFetch(direct, loopback), route.loc.url, route.loc.allowedHosts, budget, pageSignal)
+  const rays = createRayLog()
+  const fetchImpl: FetchLike = createViewerFetch(observeUpstream(createLoopbackFetch(direct, loopback), rays), route.loc.url, route.loc.allowedHosts, budget, pageSignal)
+  let stamped = false
+  const traced = () => {
+    const report = rays.report()
+    if (!stamped) { stampUpstreamSpans(collected.lines, report); stamped = true }
+    return { ...buildTrace(collected.lines, call.cfRay, call.requestId), expanded: new URL(req.url).searchParams.get('trace') === '1' }
+  }
+  const attach = (res: Response): Response => {
+    applyUpstreamHeaders(res.headers, rays.report(), Date.now() - call.now)
+    return res
+  }
   try {
     const short = publicRepoShortName(route.loc.host, route.loc.repoPath)
     if (short) {
@@ -133,7 +145,7 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
       if (exists === false) throw Object.assign(new Error(`no repository ${short} in ${PUBLIC_NAMESPACE}`), { code: 'not_found' })
     }
     const loaded = await loadRepo(route, { tracer, fetchImpl, signal: pageSignal, budget })
-    const trace = { ...buildTrace(collected.lines, call.cfRay, call.requestId), expanded: new URL(req.url).searchParams.get('trace') === '1' }
+    const trace = traced()
     call.opts.note?.({ host: route.loc.host, rtt: trace.bars.length, bytes: budget.bytes, code: 'ok' })
     if (loaded.kind === 'raw') {
       const text = isText(loaded.bytes)
@@ -152,25 +164,25 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
       call.fields['http.status_code'] = 200
       call.fields['ply.viewer.route'] = 'raw'
       call.fields['server.address'] = route.loc.host
-      return new Response(req.method === 'HEAD' ? null : new Blob([copy]), { status: 200, headers })
+      return attach(new Response(req.method === 'HEAD' ? null : new Blob([copy]), { status: 200, headers }))
     }
     call.fields['http.status_code'] = 200
     call.fields['ply.viewer.route'] = loaded.kind
     call.fields['server.address'] = route.loc.host
     call.fields['ply.viewer.ref'] = loaded.header.ref
     call.fields['ply.viewer.upstream_spans'] = trace.bars.length
-    return headless(req, htmlResponse(200, renderLoaded(loaded, trace, call.now), trace, call.requestId))
+    return headless(req, attach(htmlResponse(200, renderLoaded(loaded, trace, call.now), trace, call.requestId)))
   } catch (err) {
     const code = plyCode((err as { code?: string })?.code) ? (err as { code: string }).code : 'internal'
     const upstream = code === 'internal' ? 500 : statusOf(err as { code?: string; status?: number })
     const message = code === 'internal' ? 'The viewer hit an internal error.' : String((err as { message?: string })?.message ?? err).slice(0, 500)
     const view = describeFailure({ code, status: upstream, message, host: route.loc.host, repoPath: route.loc.repoPath, ref: route.ref, path: route.path })
-    const trace = { ...buildTrace(collected.lines, call.cfRay, call.requestId), expanded: new URL(req.url).searchParams.get('trace') === '1' }
+    const trace = traced()
     call.opts.note?.({ host: route.loc.host, code, status: view.status, rtt: trace.bars.length })
     call.fields['http.status_code'] = view.status
     call.fields['error.type'] = code
     call.fields['server.address'] = route.loc.host
-    return headless(req, htmlResponse(view.status, renderError(upstream, code, message, trace, route.loc.host, route.loc.repoPath, route.ref, call.now, route.path, hintFromError(err)), trace, call.requestId))
+    return headless(req, attach(htmlResponse(view.status, renderError(upstream, code, message, trace, route.loc.host, route.loc.repoPath, route.ref, call.now, route.path, hintFromError(err)), trace, call.requestId)))
   }
 }
 

@@ -41,9 +41,9 @@ test('requestForKey: Pinned accepts only canonical keys it would issue, and mark
 });
 
 test('asPinned: a 200 is immutable without the fill\'s per-request headers; anything else is no-store', () => {
-  const ok = asPinned(new Response('x', { status: 200, headers: { 'x-ply-request-id': 'r', 'x-ply-trace': 't', 'server-timing': 's', 'content-type': 'text/plain' } }));
+  const ok = asPinned(new Response('x', { status: 200, headers: { 'x-ply-request-id': 'r', 'x-ply-trace': 't', 'server-timing': 's', 'x-artifacts-ray': 'ls-refs=-;dur=1', 'content-type': 'text/plain' } }));
   assert.equal(ok.headers.get('cache-control'), IMMUTABLE);
-  for (const h of ['x-ply-request-id', 'x-ply-trace', 'server-timing']) assert.equal(ok.headers.get(h), null);
+  for (const h of ['x-ply-request-id', 'x-ply-trace', 'server-timing', 'x-artifacts-ray']) assert.equal(ok.headers.get(h), null);
   assert.equal(ok.headers.get('content-type'), 'text/plain');
   assert.equal(asPinned(new Response('no', { status: 404 })).headers.get('cache-control'), 'no-store');
 });
