@@ -25,7 +25,7 @@ const PUBLIC = '5ad2236b39de4c8bd8f6270ea63f3ea9.artifacts.cloudflare.net/git/pu
 const urls = dash !== -1 ? args.slice(dash + 1) : [
   `${base}/view`,
   `${base}/r/ply`,
-  `${base}/view/${PUBLIC}/ply.git?path=src/fetchpack.js`,
+  `${base}/view/${PUBLIC}/ply.git?path=src/fetchpack.ts`,
 ];
 const CHROME = process.env.CHROME ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const stale = process.env.STALE_CSS ? readFileSync(process.env.STALE_CSS).toString('base64') : null;
