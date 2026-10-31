@@ -9,8 +9,7 @@ on:
     - cron: '0 16 * * *'
 
 # The job permissions replace this default. contents: write pushes the pin.
-# issues: write files a failed bump. actions: write starts deploy.yml.
-# A GITHUB_TOKEN push does not trigger on: push.
+# issues: write files a failed bump. This workflow does not deploy.
 permissions:
   contents: read
 
@@ -23,7 +22,6 @@ jobs:
     permissions:
       contents: write # push the pin commit to main
       issues: write # open or comment on the bump-failed issue
-      actions: write # start deploy.yml; a GITHUB_TOKEN push does not trigger on: push
     runs-on: ubuntu-24.04
     env:
       CF_SEND_TELEMETRY: "false"
@@ -112,7 +110,7 @@ jobs:
         run: |
           set -euo pipefail
           # cf deploy --dry-run builds the Worker and validates it without credentials or API calls.
-          # The real upload stays in deploy.yml.
+          # This workflow does not upload. An operator deploys.
           {
             npm install --no-audit --no-fund
             node --input-type=module -e '
@@ -160,7 +158,6 @@ jobs:
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "$(printf 'Pin ply to %s.\n\n%s\n' "$PLY_SHA" "$subject")"
           gh auth setup-git
           git push origin HEAD:main
-          gh workflow run deploy.yml --ref main
       - name: Open an issue when the bump fails
         if: steps.verify.outcome == 'failure'
         env:
@@ -185,7 +182,7 @@ jobs:
           const body = [
             `The ply pin update to \`${sha}\` failed the test suite, Oxlint, \`npm run typecheck\`, or \`cf deploy --dry-run\`.`,
             "",
-            "`main` was left unchanged, and deploy.yml was not started.",
+            "`main` was left unchanged. This workflow does not deploy.",
             "",
             fence,
             log,

@@ -1,22 +1,24 @@
 %% Operator pipeline. One color per stage kind.
-%% The happy path is the left column. Each failure stays on its own row, to the right.
-%% docs/img/cd-pipeline.svg is this graph on that grid (mermaid-cli's auto-layout crossed the spine).
-%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '18px', 'fontFamily': 'ui-sans-serif, system-ui, sans-serif', 'lineColor': '#334155'}}}%%
+%% The happy path is the ==> chain. Each --> is that stage's failure, drawn on the same row.
+%% mermaid-cli's layered layout drops those failures onto the next row and drifts the spine.
+%% docs/img/render-cd-pipeline.py reads this file and writes cd-pipeline.svg on a grid.
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '18px', 'fontFamily': 'ui-sans-serif, system-ui, sans-serif', 'lineColor': '#334155'}, 'flowchart': {'htmlLabels': false, 'nodeSpacing': 28, 'rankSpacing': 36, 'padding': 12, 'wrappingWidth': 280}}}%%
 flowchart TB
-  bump["Gate · bump"]:::gate ==> deploy["Deploy · version at 0%"]:::deploy
-  deploy ==> smoke["Smoke · pinned to the new version"]:::smoke
-  smoke ==> tel["Telemetry · canary window"]:::telemetry
-  tel ==> ramp["Ramp · 1% to 100%"]:::ramp
-  ramp ==> liveSmoke["Smoke · live, no pin"]:::smoke
+  bump["Gate · bump the ply pin, then the local gate"]:::gate ==> deploy["Deploy · new version at 0%, old stays at 100%"]:::deploy
+  deploy ==> smoke["Smoke · pinned empty-repo lifecycle"]:::smoke
+  smoke ==> tel["Telemetry · canary window, both checks must pass"]:::telemetry
+  tel ==> ramp["Ramp · 1, 5, 10, 25, 50, 75, 100"]:::ramp
+  ramp ==> liveSmoke["Smoke · live, unpinned, must be the new version"]:::smoke
   liveSmoke ==> liveTel["Telemetry · live window"]:::telemetry
   liveTel ==> done["Done · 100% on the new version"]:::done
 
-  bump --> stopBump["Stop · tree unchanged"]:::halt
-  deploy --> stopDeploy["Stop · still at 0%"]:::halt
-  tel --> stopTel["Stop · stay at 0%"]:::halt
-  ramp --> rollRamp["Rollback · 100% old"]:::rollback
-  liveSmoke --> rollSmoke["Rollback · 100% old"]:::rollback
-  liveTel --> rollTel["Rollback · 100% old"]:::rollback
+  bump --> stopBump["Stop · tree unchanged, nothing uploaded"]:::halt
+  deploy --> stopDeploy["Stop · canary left at 0%"]:::halt
+  smoke --> stopSmoke["Stop · stay at 0%, do not ramp"]:::halt
+  tel --> stopTel["Stop · stay at 0%, do not ramp"]:::halt
+  ramp --> rollRamp["Rollback · 100% back on the old version"]:::rollback
+  liveSmoke --> rollSmoke["Rollback · 100% back on the old version"]:::rollback
+  liveTel --> rollTel["Rollback · 100% back on the old version"]:::rollback
 
   classDef gate fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px,color:#0f172a
   classDef deploy fill:#ede9fe,stroke:#6d28d9,stroke-width:2px,color:#0f172a

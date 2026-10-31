@@ -1,10 +1,12 @@
 # Continuous deployment
 
+**Commands land in the follow-up PR.** Every `npm run cd` on this page is that entrypoint. It is not in this repository yet. This page is the procedure that entrypoint has to match.
+
 You ship ply-web from a Linux box where `cf` is already logged in. One command uploads the commit you have checked out, smokes it at 0%, then walks traffic from 0% to 100% over about five minutes. If a step goes bad, traffic goes back to the previous version and the command exits. GitHub holds the code and the pull request. It does not deploy.
 
 ![Operator pipeline. The left column is gate, deploy, smoke, telemetry, ramp, live smoke, live telemetry, done. Failures leave to the right.](img/cd-pipeline.png)
 
-The left column is the only path that raises traffic. An arrow to the right is that step stopping. A gray box leaves the split as it is. A red box puts the previous version back at 100% and the process exits. Pinned smoke has no box on the right: a smoke failure still runs telemetry, and telemetry is what stops the ramp. Source for the picture: [cd-pipeline.mmd](img/cd-pipeline.mmd). The vector file is [cd-pipeline.svg](img/cd-pipeline.svg).
+The left column is the only path that raises traffic. An arrow to the right is that step stopping. A gray box leaves the split as it is. A red box puts the previous version back at 100% and the process exits. A pinned smoke failure takes the gray stop on that row: the canary stays at 0% and the ramp does not start. Source for the picture: [cd-pipeline.mmd](img/cd-pipeline.mmd). The vector file is [cd-pipeline.svg](img/cd-pipeline.svg).
 
 ## Before you start
 
@@ -23,7 +25,7 @@ touch "$HOME/.ply-token" && chmod 0600 "$HOME/.ply-token"
 export PLY_TOKEN_FILE="$HOME/.ply-token"
 ```
 
-Do not run `scripts/deploy.sh`, `npm run worker:deploy`, or a push that starts `.github/workflows/deploy.yml` while this is in progress. Those still send the Worker to 100% in one shot and will replace the split you are ramping.
+Do not run `scripts/deploy.sh` or `npm run worker:deploy` while this is in progress. Both still send the Worker to 100% in one shot and will replace the split you are ramping. GitHub does not deploy.
 
 Optional overrides (anything you do not set keeps the default in the table further down):
 
@@ -44,13 +46,13 @@ Latency ceilings and the rate ratios are not environment variables. They are the
 
 ## The whole run
 
-From a clean checkout of the commit you want to ship:
+From a clean checkout of the commit you want to ship. Commands land in the follow-up PR:
 
 ```sh
 npm run cd
 ```
 
-You can pin ply to a sha you already know:
+You can pin ply to a sha you already know. Commands land in the follow-up PR:
 
 ```sh
 npm run cd -- --sha 1274f2dd05b83d70f8d421cdcc79628692d848df
@@ -77,9 +79,11 @@ cd: PASS 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 
 A failing run still writes the directory. Relay the last line and the ramp lines from that directory.
 
-Stages, alone, use the same last-line shape. `npm run cd -- help` lists them.
+Stages, alone, use the same last-line shape. `npm run cd -- help` lists them. Commands land in the follow-up PR.
 
 ## 1. Bump
+
+Commands land in the follow-up PR:
 
 ```sh
 npm run cd -- bump
@@ -107,9 +111,11 @@ cd: FAIL bump: tracked files are modified; bump wants a clean tree
 cd: FAIL bump: npm test failed: …
 ```
 
-You push `bump-ply` yourself if you want a pull request for the pin. The rest of `npm run cd` deploys the checkout you are on, which is this new commit only after you check it out.
+You push `bump-ply` yourself if you want a pull request for the pin. The rest of `npm run cd` (commands land in the follow-up PR) deploys the checkout you are on, which is this new commit only after you check it out.
 
 ## 2. Deploy the canary
+
+Commands land in the follow-up PR:
 
 ```sh
 npm run cd -- deploy-canary
@@ -143,11 +149,15 @@ cd: FAIL deploy-canary: 8c1af0e2-… is at 10%, wanted 0%
 
 Pinned (the canary). Every request sends the version override, and every response must carry that same id in `x-ply-version`:
 
+Commands land in the follow-up PR:
+
 ```sh
 npm run cd -- smoke --version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 ```
 
 Live (after the ramp, or any time you want to see who is actually serving). No override. `x-ply-version` must still be that id, which is how you know traffic moved:
+
+Commands land in the follow-up PR:
 
 ```sh
 npm run cd -- smoke --expect-version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
@@ -176,9 +186,11 @@ cd: FAIL smoke: cherry-wider: status 200, wanted 409; repo ply-web-cd-2026103121
 
 `smoke.csv` in the run directory is one row per request. `pass` is the step verdict, not the HTTP status. A row with status 409 and `pass` is an expected conflict. Columns: `step`, `method`, `path`, `status`, `ms`, `pass`, `cf_ray`, `x_ply_request_id`, `x_artifacts_ray`, `x_ply_version`, `x_ply_build`, `server_timing`, `detail`. The token is not in the file.
 
-On a full `npm run cd`, a smoke failure still continues into telemetry so you get the trace of what did run. The ramp does not start. The canary stays at 0%.
+On a full `npm run cd` (commands land in the follow-up PR), a smoke failure leaves the canary at 0%. The ramp does not start. Nothing is rolled back: the previous version is already at 100%. The smoke CSV is still written. Telemetry for that canary does not run.
 
 ## 4. Telemetry
+
+Commands land in the follow-up PR:
 
 ```sh
 npm run cd -- telemetry --version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e \
@@ -227,6 +239,8 @@ If `cf o11y` cannot be queried, the stage fails. It does not treat a missing que
 ## 5. Ramp
 
 Only after the pinned smoke and the telemetry file are both a pass for this version, and the deployment is still new-at-0% / previous-at-100%:
+
+Commands land in the follow-up PR:
 
 ```sh
 npm run cd -- ramp --version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e \
@@ -324,7 +338,7 @@ If the rollback request itself does not stick, the last line says so and names t
 
 ## 6. After 100%
 
-`npm run cd` does not stop at the last ramp line. It smokes again with **no** version override (`--expect-version`), then runs telemetry on that live window. Both have to pass.
+`npm run cd` (commands land in the follow-up PR) does not stop at the last ramp line. It smokes again with **no** version override (`--expect-version`), then runs telemetry on that live window. Both have to pass.
 
 Pass is the same `cd: PASS <version id>` as the whole run.
 
@@ -340,6 +354,8 @@ Organic 5xx on the new version during the live window fails this telemetry check
 ## Rollback
 
 Any time, including when a ramp or a live check did not put the old version back:
+
+Commands land in the follow-up PR:
 
 ```sh
 npm run cd -- rollback --to 1aa0bb11-2222-4333-8444-555566667777
@@ -370,11 +386,11 @@ cd: FAIL rollback: rollback to 1aa0bb11-… failed: …
 | You see | Traffic now | What you do |
 | --- | --- | --- |
 | `cd: FAIL bump:` | Unchanged | Fix the tree or the gate. Nothing was uploaded. |
-| `cd: FAIL deploy-canary:` and the line says the canary was left at 0% | Old at 100%, new at 0% | Read the pin failure. Rollback only if you want the 0% slot cleared: `npm run cd -- rollback --to <previous>`. |
+| `cd: FAIL deploy-canary:` and the line says the canary was left at 0% | Old at 100%, new at 0% | Read the pin failure. Rollback only if you want the 0% slot cleared: `npm run cd -- rollback --to <previous>` (commands land in the follow-up PR). |
 | `cd: FAIL deploy-canary:` after a bad split | Previous at 100% if the rollback landed | Confirm with `cf workers deployments list --worker ply`. |
 | `cd: FAIL smoke:` or `cd: FAIL telemetry:` before any ramp line | Still 0% / 100% | The ramp did not start. The scratch repo name is in the smoke failure. |
 | A ramp line with `decision=rollback`, then `cd: FAIL ramp:` | Previous at 100% | Relay the line. The new version is off traffic. |
-| `cd: FAIL ramp:` and the text says rollback failed | **Not** safe | Run `npm run cd -- rollback --to <previous>` and read the deployment list. The id to restore is the one in that sentence. |
+| `cd: FAIL ramp:` and the text says rollback failed | **Not** safe | Run `npm run cd -- rollback --to <previous>` (commands land in the follow-up PR) and read the deployment list. The id to restore is the one in that sentence. |
 | `cd: FAIL smoke:` or `cd: FAIL telemetry:` after ramp lines that reached `percent=100` | Previous at 100% if rollback landed | Same as a ramp rollback. The live check is what rejected it. |
 
 ## Later
