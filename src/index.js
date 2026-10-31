@@ -27,6 +27,7 @@ import { validateRef, validateIdent } from 'ply';
 import { handleViewer } from './viewer/handle.ts';
 import { checkRemote, createGuardedFetch } from './remote.ts';
 import { applySecurityHeaders } from './security-headers.ts';
+import { quirksFor } from './quirks.ts';
 import { viewerErrorDocument } from './viewer/safehtml.ts';
 import { admitClient } from './viewer/app.tsx';
 import { viewerHref } from './viewer/url.ts';
@@ -63,10 +64,7 @@ const LIMITS = withLimits({
   requestTimeoutMs: API_REQUEST_TIMEOUT_MS,
 });
 
-// Learned server properties (ply's `quirks`: e.g. "refuses tree:0, use blob:none"), per origin, for the isolate's life.
-// Not request state: a fact about a server, learned from its own answer, the same for every caller.
-const QUIRKS = new Map();
-const quirksFor = origin => { if (!QUIRKS.has(origin)) { if (QUIRKS.size >= 256) QUIRKS.clear(); QUIRKS.set(origin, {}); } return QUIRKS.get(origin); };
+// Learned server properties per origin, shared with the viewer (src/quirks.ts).
 
 // HTTP status for each ply error code (see README.md).
 export const STATUS = Object.freeze({

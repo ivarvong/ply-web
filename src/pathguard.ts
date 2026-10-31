@@ -62,7 +62,9 @@ export function rawQueryPathUnsafe(raw: string): boolean {
     const key = eq < 0 ? pair : pair.slice(0, eq);
     if (key !== 'path') continue;
     const value = eq < 0 ? '' : pair.slice(eq + 1);
-    if (value.includes('\\') || encodedSeparator(value)) return true;
+    // `%2F` is a path separator inside a git path and is what URLSearchParams writes for `/`, so it is allowed here;
+    // an encoded dot or backslash is not. The decoded value is then checked segment by segment.
+    if (value.includes('\\') || /%(?:2e|5c)/i.test(value)) return true;
     let decoded: string;
     try { decoded = decodeURIComponent(value.replace(/\+/g, '%20')); }
     catch { return true; }

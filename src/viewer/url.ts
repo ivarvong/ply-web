@@ -175,7 +175,8 @@ export function viewerHref(host: string, repoPath: string, query: Record<string,
   const path = `/view/${encodeURIComponent(host)}/${repoPath.split('/').map(part => encodeURIComponent(part)).join('/')}`;
   const qs = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) if (value) qs.set(key, value);
-  const tail = qs.toString();
+  // `/` is legal in a query value (RFC 3986 §3.4); keep paths and refs readable.
+  const tail = qs.toString().replace(/%2F/gi, '/');
   return tail ? `${path}?${tail}` : path;
 }
 
