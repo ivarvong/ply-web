@@ -7,6 +7,7 @@ import { classifyHref, renderMarkdown } from '../src/viewer/markdown.ts';
 import { handleViewer } from '../src/viewer/handle.ts';
 import { renderLoaded } from '../src/viewer/html.ts';
 import { parseViewerRequest, routeOptsFromEnv } from '../src/viewer/route.ts';
+import { viewerHref } from '../src/viewer/url.ts';
 import type { Loaded, TraceModel } from '../src/viewer/model.ts';
 
 type Node = DefaultTreeAdapterMap['node'];
@@ -286,6 +287,14 @@ test('viewer paths reject dot segments and encoded separators before normalizati
   for (const raw of hostile) {
     assert.throws(() => parseViewerRequest(raw, opts), /not allowed|not a viewer/, raw);
   }
+  for (const raw of ['https://ply.example/view/github.com/o/r?path=a%2Fb%2Fc', 'https://ply.example/view/github.com/o/r?path=a/b/c']) {
+    const nested = parseViewerRequest(raw, opts);
+    assert.equal(nested.kind === 'repo' && nested.path, 'a/b/c', raw);
+  }
+  for (const raw of ['https://ply.example/view/github.com/o/r?path=a%2F..%2Fb', 'https://ply.example/view/github.com/o/r?path=a%2F%2e%2e%2Fb', 'https://ply.example/view/github.com/o/r?path=a%2F%5Cb']) {
+    assert.throws(() => parseViewerRequest(raw, opts), /not allowed|not a valid|path/, raw);
+  }
+  assert.equal(viewerHref('github.com', 'o/r', { ref: 'refs/heads/main', path: 'a/b c/d' }), '/view/github.com/o/r?ref=refs/heads/main&path=a/b+c/d');
   const ok = parseViewerRequest('https://ply.example/view/github.com/octocat/Hello-World?path=README.md', opts);
   assert.equal(ok.kind, 'repo');
   if (ok.kind === 'repo') assert.equal(ok.path, 'README.md');

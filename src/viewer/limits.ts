@@ -19,7 +19,9 @@ export const VIEWER_CAPS = Object.freeze({
   maxRedirects: 2,
   maxRefs: 2_000,
   maxBranchesShown: 200,
-  maxTreeEntries: 2_000,
+  // 10,000, not 2,000: on a server that refuses tree:0 (Artifacts), ply's blob:none fallback checks every tree under the
+  // commit against this cap, not only the one shown (curl's tests/data has 2,135 entries, so every curl page was a 413).
+  maxTreeEntries: 10_000,
   maxTreeShown: 500,
   maxLogCommits: 5,
   maxPreviewChars: 2_000,

@@ -103,11 +103,12 @@ isolate, so only the first request on an isolate pays for the 400.
 
 `GET /view` is a server-rendered browser for a **public** smart-HTTP repository. It does not use `PLY_TOKEN` and it
 never reads `Authorization`, `Git-Token`, `Git-Authorization`, or `Cookie`. A URL with userinfo is rejected, not
-turned into a credential. `/v1` is unchanged: same gate, same credential headers, same isolate-wide `quirks` map.
-The viewer keeps a fresh `quirks` object per request, so a server that rejects `filter tree:0` shows that 400 and
-the `blob:none` retry on every page (the `/v1` path still learns it once per isolate).
+turned into a credential. `/v1` is unchanged: same gate, same credential headers. `/v1` and the viewer share one isolate-wide, per-origin `quirks`
+map (`src/quirks.ts`): a server that rejects `filter tree:0` costs that 400 and the `blob:none` retry once per isolate,
+and later pages ask for `blob:none` directly (the waterfall says which). Until 2026-10-31 the viewer re-learned it on
+every page; on Artifacts that 400 was ~110–150 ms of every page.
 
-The home form accepts an https URL, `github.com/owner/repo`, `owner/repo` (github.com), or `git@host:path` (the ssh user is dropped, then the allowlist runs). Shareable URLs: `/view/<host>/<repo path>?ref=&path=`. A path segment of `.` or `..`, a backslash, or an encoded slash, backslash, or dot is rejected on the raw URL, before the URL parser collapses it. `?raw=1` returns the file as `text/plain` or
+The home form accepts an https URL, `github.com/owner/repo`, `owner/repo` (github.com), or `git@host:path` (the ssh user is dropped, then the allowlist runs). Shareable URLs: `/view/<host>/<repo path>?ref=&path=` (`path` may use `/` or `%2F`). A path segment of `.` or `..`, a backslash, or an encoded slash, backslash, or dot in the URL path (and an encoded dot or backslash in `?path=`) is rejected on the raw URL, before the URL parser collapses it. `?raw=1` returns the file as `text/plain` or
 `application/octet-stream` (never `text/html`). `?want=<oid>&filter=tree:0|blob:none&offset=` is the pack map.
 Every HTML page includes a waterfall of the git round trips that produced it (method, filter, wants, HTTP status,
 cache HIT/MISS, server agent, pkt-line counters) plus the `cf-ray` when the platform sends one. The Workers trace
@@ -142,7 +143,7 @@ paths (plus a `.git` suffix). `createViewerFetch` follows them before ply sees t
 | per-call timeout | 12 s |
 | page timeout | 20 s |
 | refs retained | 2000 (200 branches shown) |
-| tree entries retained / shown | 2000 / 500 |
+| tree entries retained / shown | 10000 / 500 |
 | parent commits shown | 5 |
 | page rate | 60 / minute / client |
 | pack-map rate | 20 / minute / client |

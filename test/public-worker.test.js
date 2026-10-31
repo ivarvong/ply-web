@@ -24,7 +24,7 @@ const TOKEN = `art_v1_${'5eed'.repeat(10)}?expires=4102444800`;
 const TOKEN_FORMS = [TOKEN, TOKEN.split('?')[0], Buffer.from(`x-access-token:${TOKEN}`).toString('base64'), encodeURIComponent(TOKEN), '5eed'.repeat(10)];
 // A caller's own credential for another namespace.
 const OTHER = `art_v1_${'0the'.repeat(10)}`;
-const KNOWN = ['ply', 'moved', 'away', 'hop', 'echo'];
+const KNOWN = ['ply', 'moved', 'away', 'hop', 'echo', 'wide'];
 
 let root, cleanup, srv, router, proc, logs = '';
 let plyRepo, otherRepo;
@@ -49,8 +49,17 @@ function startRouter(upstream) {
     if (!need) { req.resume(); res.writeHead(404); return void res.end('not found'); }
     if (!auth) { req.resume(); res.writeHead(401, { 'www-authenticate': 'Basic realm="git"' }); return void res.end('Authentication required'); }
     if (auth !== need) { req.resume(); res.writeHead(403); return void res.end('Forbidden'); }
-    const u = http.request({ host: up.hostname, port: up.port, path: req.url, method: req.method, headers: { ...req.headers, host: up.host } }, r => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
-    req.pipe(u);
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      const body = Buffer.concat(chunks);
+      const filter = /filter ([^\n]+)\n/.exec(body.toString('latin1'))?.[1] ?? null;
+      hits.at(-1).filter = filter;
+      // Artifacts' answer to every partial-clone filter but blob:none (lab_notebook/ply-artifacts-eval-2026-10-23.md).
+      if (filter && filter !== 'blob:none') { res.writeHead(400, { 'content-type': 'text/plain' }); return void res.end('git-upload-pack: Unsupported Git fetch filter; only blob:none is supported.'); }
+      const u = http.request({ host: up.hostname, port: up.port, path: req.url, method: req.method, headers: { ...req.headers, host: up.host } }, r => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
+      u.end(body);
+    });
   });
   return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({ port: s.address().port, close: () => new Promise(r => { s.closeAllConnections?.(); s.close(r); }) })));
 }
@@ -83,6 +92,10 @@ before(async () => {
   };
   plyRepo = seed(`git/${NS}/ply`, { 'README.md': '# ply\n\npublic mirror\n', 'src/a.js': 'export const a = 1;\n' });
   otherRepo = seed('git/other/secret', { 'SECRET.md': 'other namespace\n' });
+  // curl's shape: one directory over the viewer's old 2,000-entry cap, next to a small one three levels down.
+  const wideFiles = { 'README.md': 'wide\n', 'docs/lib/opts/A.md': 'a\n', 'docs/lib/opts/B.md': 'b\n' };
+  for (let k = 0; k < 2135; k++) wideFiles[`tests/data/test${k}`] = `t${k}\n`;
+  seed(`git/${NS}/wide`, wideFiles);
   const out = join(root, 'wk'); mkdirSync(out, { recursive: true });
   copyCfBundle(join(out, 'worker.mjs'));
   writeFileSync(join(out, 'fake-artifacts.mjs'), FAKE_ARTIFACTS);
@@ -145,6 +158,23 @@ test('viewer: public-v0/ply renders (tree, file, raw) with no token; every upstr
     assert.ok((h.method === 'GET' && h.path.endsWith('/info/refs?service=git-upload-pack')) || (h.method === 'POST' && h.path.endsWith('/git-upload-pack')), `${h.method} ${h.path}`);
     assert.equal(h.auth, `Bearer ${TOKEN}`);
   }
+});
+
+test('a server that refuses tree:0: the viewer learns it once per isolate, a 2,135-entry sibling tree is no 413, and its own nested links work', { skip }, async () => {
+  const i = mark();
+  const root = await W(publicView('wide'));
+  assert.equal(root.status, 200, root.text.slice(0, 400));
+  // the viewer's own link to a directory three levels down: literal slashes, and it renders
+  const dirLink = /href="([^"]*path=docs\/lib\/opts[^"]*)"/.exec((await W(publicView('wide', '?path=docs/lib'))).text)?.[1]?.replace(/&amp;/g, '&');
+  assert.ok(dirLink, 'nested link present');
+  const dir = await W(dirLink);
+  assert.equal(dir.status, 200);
+  assert.match(dir.text, /A\.md/);
+  assert.equal((await W(publicView('wide', '?path=docs%2Flib%2Fopts'))).status, 200, 'an encoded slash in path is accepted');
+  assert.equal((await W(publicView('wide', '?path=docs%2F%2E%2E%2Fsecret'))).status, 400, 'an encoded dot is not');
+  const refused = since(i).filter(h => h.filter === 'tree:0');
+  assert.ok(refused.length <= 1, `tree:0 was refused ${refused.length} times; the isolate should learn it once`);
+  assert.match(dir.text, /learned earlier in this isolate|was rejected/);
 });
 
 test('/r/<repo> redirects to the canonical viewer URL; bad names are 404 with no fetch; the home page lists the namespace', { skip }, async () => {

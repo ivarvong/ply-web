@@ -162,13 +162,17 @@ export function Trace(props: { trace: TraceModel; host: string; repoPath: string
   const trace = props.trace
   if (!trace.bars.length) return null
   const span = Math.max(trace.totalMs, 1)
-  const fallbacks = trace.bars.filter(bar => bar.lines.some(line => line.startsWith('git.fetch.filter.fallback='))).length
+  const wide = trace.bars.filter(bar => bar.lines.some(line => line.startsWith('git.fetch.filter.fallback=')))
+  // learned=true: this page saw the 400 and retried. learned=false: the isolate already knew, so it asked for blob:none.
+  const fallbacks = wide.filter(bar => bar.lines.includes('git.fetch.filter.learned=true')).length
+  const known = wide.length - fallbacks
   const retry = fallbacks === 0 ? '' : fallbacks === 1 ? ' · 1 retry' : ` · ${fallbacks} retries`
   const pill = `${trace.bars.length} upstream ${trace.bars.length === 1 ? 'call' : 'calls'} · ${formatDuration(trace.totalMs)}${retry}`
   return (
     <details class="quiet trace">
       <summary>{pill}</summary>
       {fallbacks > 0 ? <Banner tone="alert">filter tree:0 was rejected. ply retried with blob:none. The calls are serial, which is why the waterfall is a staircase.</Banner> : null}
+      {fallbacks === 0 && known > 0 ? <Banner tone="alert">This server refuses filter tree:0 (learned earlier in this isolate), so ply asked for blob:none directly. That brings every tree under the commit, not just one.</Banner> : null}
       {trace.bars.map(bar => {
         const left = Math.max(0, Math.min(LAYOUT.percentSteps, Math.round((bar.startMs / span) * LAYOUT.percentSteps)))
         let width = Math.max(bar.durMs > 0 ? 1 : 0, Math.round((bar.durMs / span) * LAYOUT.percentSteps))

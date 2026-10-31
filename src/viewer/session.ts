@@ -1,6 +1,6 @@
 // One public page: discover, then either a pack map or a ref → commit → tree walk → optional blob.
-// Quirks stay on this request. Sharing them with the /v1 isolate map would hide the tree:0 → blob:none
-// retry the trace is here to show, and would change /v1 timing.
+// Quirks are the isolate's per-origin map (src/quirks.ts), shared with /v1: a server that refuses tree:0 costs that 400
+// once per isolate, not once per page. The trace still names the fallback on every fetch that uses it.
 import { concat } from 'ply';
 import { fail } from 'ply';
 import { limitError } from 'ply';
@@ -16,7 +16,7 @@ import type { ViewerRoute } from './route.ts';
 import type { RepoLocation, ValidatedPublicRepoUrl } from './url.ts';
 import { viewerHref } from './url.ts';
 
-type Quirks = { treeFilter?: 'blob:none' };
+import { quirksFor, type Quirks } from '../quirks.ts';
 
 type NoCredential = { auth?: never };
 
@@ -309,7 +309,7 @@ async function loadPack(transport: GitTransport, route: Extract<ViewerRoute, { k
 }
 
 export async function loadRepo(route: Extract<ViewerRoute, { kind: 'repo' }>, deps: SessionDeps): Promise<Loaded> {
-  const quirks: Quirks = {};
+  const quirks = quirksFor(route.loc.origin);
   const transport = openTransport(route.loc.url, { tracer: deps.tracer, fetchImpl: deps.fetchImpl, signal: deps.signal, quirks });
   const info = await discoverRepo(transport);
   const server = serverOf(info);
