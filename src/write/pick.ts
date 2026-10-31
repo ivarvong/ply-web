@@ -1,17 +1,55 @@
-// Cherry-pick and revert. ply reports a merge_conflict for an already-applied rename (deleted on both sides
-// while paths were added) where git says the pick is empty. When every path the commit changed already has the
-// commit's post-image in the target tree, this returns outcome `empty` instead. `allowEmpty` writes that empty
-// commit (same tree, new commit). A real conflict, where the post-image does not match, stays a merge_conflict.
-import { cherryPick, encodeCommit, fail, fetchObject, hashObject, lsRefs, operation, parseCommit, parseTree, push, revertCommit, TYPE } from 'ply'
+// Cherry-pick and revert.
+//
+// ply returns `{outcome:'empty'}` when the transplanted tree equals the target tree and the rename guard stands
+// down: both sides added and deleted exactly the same paths (#103). A target that also has its own adds or deletes
+// is `merge_conflict` (HTTP 409). ply-web used to report that wider case as empty, because it compared post-images
+// and ignored the extra paths. `allowEmpty` still writes the empty commit (same tree, new commit). That is git's
+// `--keep-redundant-commits`, which ply does not take yet (#117), so the commit is built here.
+import { cherryPick, encodeCommit, fail, fetchObject, hashObject, lsRefs, operation, parseCommit, push, revertCommit, TYPE } from 'ply'
 import { arrayBufferBytes } from './bytes.ts'
 import { type CallOpts, type GitOutcome, type GitTransport } from './call.ts'
-import { MODE_TREE } from './constants.ts'
 import { type Stamp } from './identity.ts'
 import { writeResult } from './result.ts'
 
 type Transport = GitTransport
-type Entry = { readonly mode: string; readonly oid: string }
 type Outcome = GitOutcome
+
+const OUTCOME_EMPTY = 'empty'
+const OUTCOME_OK = 'ok'
+
+export type PlyPickResult = {
+  readonly outcome: string
+  readonly ref: string
+  readonly oid: string
+  readonly tree?: string
+  readonly onto?: string
+  readonly pushBytes?: number
+}
+
+export type MappedPick =
+  | { readonly kind: 'empty'; readonly ref: string; readonly oid: string }
+  | { readonly kind: 'applied'; readonly name: 'cherry_pick' | 'revert'; readonly ref: string; readonly oid: string; readonly oldOid: string | null; readonly tree: string | null; readonly pushBytes: number }
+
+/**
+ * ply's pick result, and nothing else. `empty` and `ok` are the whole `PickOutcome` union. Any other string is an
+ * internal error (HTTP 500), not a guessed success. `merge_conflict` is not a result: ply throws it, and the status
+ * table maps that code to 409.
+ */
+export function mapPickOutcome(result: PlyPickResult, revert: boolean): MappedPick {
+  if (result.outcome === OUTCOME_EMPTY) return { kind: 'empty', ref: result.ref, oid: result.oid }
+  if (result.outcome === OUTCOME_OK) {
+    return {
+      kind: 'applied',
+      name: revert ? 'revert' : 'cherry_pick',
+      ref: result.ref,
+      oid: result.oid,
+      oldOid: result.onto ?? null,
+      tree: result.tree ?? null,
+      pushBytes: result.pushBytes ?? 0,
+    }
+  }
+  throw fail('internal', `unexpected ${revert ? 'revert' : 'cherry-pick'} outcome ${result.outcome}`)
+}
 
 function messageBody(message: string): string {
   return message.endsWith('\n') ? message : `${message}\n`
@@ -20,61 +58,6 @@ function messageBody(message: string): string {
 async function load(t: Transport, oid: string): Promise<{ tree: string; parents: string[]; author: string; message: string | null }> {
   const obj = await fetchObject(t, { oid, filter: 'tree:0', deepen: 1, expectType: TYPE.COMMIT })
   return parseCommit(obj.data, t.limits) as { tree: string; parents: string[]; author: string; message: string | null }
-}
-
-async function treeMap(t: Transport, oid: string, cache: Map<string, Map<string, Entry>>): Promise<Map<string, Entry>> {
-  const held = cache.get(oid)
-  if (held) return held
-  const obj = await fetchObject(t, { oid, filter: 'tree:0', expectType: TYPE.TREE })
-  const entries = parseTree(obj.data, t.limits) as { name: string; mode: string; oid: string }[]
-  const map = new Map<string, Entry>()
-  for (const entry of entries) map.set(entry.name, { mode: entry.mode, oid: entry.oid })
-  cache.set(oid, map)
-  return map
-}
-
-const keyOf = (entry: Entry | null) => (entry ? `${entry.mode} ${entry.oid}` : '')
-
-/** Paths that differ between `base` and `post` must already equal `post` in `target`. Unchanged paths are free. */
-async function imagesMatch(t: Transport, base: string | null, post: string | null, target: string | null, cache: Map<string, Map<string, Entry>>): Promise<boolean> {
-  if (base === post || post === target) return true
-  const [b, p, g] = await Promise.all([
-    base ? treeMap(t, base, cache) : new Map<string, Entry>(),
-    post ? treeMap(t, post, cache) : new Map<string, Entry>(),
-    target ? treeMap(t, target, cache) : new Map<string, Entry>(),
-  ])
-  const names = new Set<string>([...b.keys(), ...p.keys()])
-  for (const name of names) {
-    const before = b.get(name) ?? null
-    const after = p.get(name) ?? null
-    const got = g.get(name) ?? null
-    if (keyOf(before) === keyOf(after)) continue
-    if (before?.mode === MODE_TREE && after?.mode === MODE_TREE) {
-      const next = got?.mode === MODE_TREE ? got.oid : null
-      if (!(await imagesMatch(t, before.oid, after.oid, next, cache))) return false
-      continue
-    }
-    if (keyOf(after) !== keyOf(got)) return false
-  }
-  return true
-}
-
-export type Applied = { readonly applied: false } | { readonly applied: true; readonly oid: string }
-
-/** True when the pick would change nothing because the target tree already has the commit's post-image. */
-export async function patchApplied(t: Transport, ref: string, commit: string, revert: boolean): Promise<Applied> {
-  const tip = (await lsRefs(t, [ref])).refs.get(ref)?.oid as string | undefined
-  if (!tip) return { applied: false }
-  const target = await load(t, tip)
-  const picked = await load(t, commit)
-  if (picked.parents.length !== 1) return { applied: false }
-  const parentOid = picked.parents[0]
-  if (!parentOid) return { applied: false }
-  const parent = await load(t, parentOid)
-  const base = revert ? picked.tree : parent.tree
-  const post = revert ? parent.tree : picked.tree
-  const applied = await imagesMatch(t, base, post, target.tree, new Map())
-  return applied ? { applied: true, oid: tip } : { applied: false }
 }
 
 function emptyResult(ref: string, oid: string): Record<string, unknown> {
@@ -105,25 +88,16 @@ async function writeEmpty(remote: string, opts: CallOpts, ref: string, commit: s
 
 export async function pick(remote: string, opts: CallOpts, spec: { ref: string; commit: string; committer: Stamp; message: string | null; allowEmpty: boolean; revert: boolean }): Promise<Record<string, unknown>> {
   const run = spec.revert ? revertCommit : cherryPick
-  try {
-    const result = await run(remote, {
-      ref: spec.ref,
-      commit: spec.commit,
-      committer: { name: spec.committer.name, email: spec.committer.email, tz: spec.committer.tz },
-      time: spec.committer.time,
-      message: spec.message,
-    }, opts) as { outcome: string; ref: string; oid: string; tree?: string; onto?: string; pushBytes?: number }
-    if (result.outcome === 'empty') {
-      if (spec.allowEmpty) return writeEmpty(remote, opts, spec.ref, spec.commit, spec.committer, spec.message, spec.revert)
-      return emptyResult(result.ref, result.oid)
-    }
-    const outcome = spec.revert ? 'revert' : 'cherry_pick'
-    return writeResult(outcome, result.ref, result.oid, result.onto ?? null, { tree: result.tree ?? null, pushBytes: result.pushBytes ?? 0 })
-  } catch (e) {
-    if ((e as { code?: string })?.code !== 'merge_conflict') throw e
-    const applied = await operation(spec.revert ? 'revert' : 'cherry_pick', remote, opts, async ({ t, outcome }: { t: Transport; outcome: Outcome }) => outcome('empty', await patchApplied(t, spec.ref, spec.commit, spec.revert))) as Applied
-    if (!applied.applied) throw e
+  const result = await run(remote, {
+    ref: spec.ref,
+    commit: spec.commit,
+    committer: { name: spec.committer.name, email: spec.committer.email, tz: spec.committer.tz, time: spec.committer.time },
+    message: spec.message,
+  }, opts) as PlyPickResult
+  const mapped = mapPickOutcome(result, spec.revert)
+  if (mapped.kind === 'empty') {
     if (spec.allowEmpty) return writeEmpty(remote, opts, spec.ref, spec.commit, spec.committer, spec.message, spec.revert)
-    return emptyResult(spec.ref, applied.oid)
+    return emptyResult(mapped.ref, mapped.oid)
   }
+  return writeResult(mapped.name, mapped.ref, mapped.oid, mapped.oldOid, { tree: mapped.tree, pushBytes: mapped.pushBytes })
 }

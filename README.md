@@ -46,9 +46,9 @@ its binding is the Worker's only other binding. `GET /` prints the usage text.
 | DELETE | `/v1/branch` | `{remote, ref, oid?}` | `{outcome:"deleted", ref, deleted}`. CAS on `oid` (default: the oid ls-refs shows now) |
 | POST | `/v1/tag` | `{remote, name, target, annotated?, message?, tagger?}` | 201 `{outcome:"tag", ref, oid, commit, annotated}`. Lightweight unless `annotated`, `message`, or `tagger` is set. `target` is a branch or a commit id |
 | DELETE | `/v1/tag` | `{remote, name, oid?}` | same compare-and-swap as `DELETE /v1/branch` |
-| POST | `/v1/merge` | `{remote, ref?, from, author?, message?, fastForwardOnly?, noFastForward?}` | `{outcome, ref, oid, oldOid, noop, …}` where outcome is `merge`, `fast_forward`, or `up_to_date`. `from` is a branch name. A `committer` must equal `author` |
-| POST | `/v1/rebase` | `{remote, ref, onto?, committer, author?, squash?, message?}` | `{outcome, ref, oid, oldOid, …}` where outcome is `rebase`, `squash`, `fast_forward`, or `up_to_date`. `onto` is a branch name. `author.time` must equal `committer.time` |
-| POST | `/v1/cherry-pick`, `/v1/revert` | `{remote, ref?, commit, committer, message?, allowEmpty?}` | `{outcome, ref, oid, oldOid, noop, tree?}`. A patch already present is `{outcome:"empty", noop:true, oid:<tip>}`. `allowEmpty:true` writes that empty commit |
+| POST | `/v1/merge` | `{remote, ref?, from, author?, committer?, message?, fastForwardOnly?, noFastForward?}` | `{outcome, ref, oid, oldOid, noop, …}` where outcome is `merge`, `fast_forward`, or `up_to_date`. `from` is a branch or a 40-hex commit. `author` and `committer` are separate stamps, each with its own `time` and `tz` |
+| POST | `/v1/rebase` | `{remote, ref, onto?, committer, author?, squash?, message?}` | `{outcome, ref, oid, oldOid, …}` where outcome is `rebase`, `squash`, `fast_forward`, or `up_to_date`. `onto` is a branch or a 40-hex commit. `author.time` and `committer.time` are independent |
+| POST | `/v1/cherry-pick`, `/v1/revert` | `{remote, ref?, commit, committer, message?, allowEmpty?}` | `{outcome, ref, oid, oldOid, noop, tree?}`. A patch already applied, and only when both sides added and deleted the same paths, is `{outcome:"empty", noop:true, oid:<tip>}`. `allowEmpty:true` writes that empty commit. If the target also has its own adds or deletes, the response is 409 `merge_conflict` (`allowEmpty` does not override it) |
 
 - `ref` defaults to the remote's HEAD branch. On an empty repository HEAD is an unborn symref (`refs/heads/main` on
   Artifacts and on `git init -b main`). `GET /v1/commit` reports that as `empty: true` and names the symref.
@@ -61,7 +61,8 @@ its binding is the Worker's only other binding. `GET /` prints the usage text.
   mean `refs/heads/<name>`. A 40-hex string is a commit id, never a branch of that
   name. The zero oid is 400; omit the field to mean "no parent" or "HEAD".
 - `author` and `committer` are `{name, email, tz?, time?}`. `tz` is `+HHMM` or `-HHMM` in the civil range −12:00
-  through +14:00. `time` is unix seconds. Omitted `tz` is `+0000`. Omitted `time` is now.
+  through +14:00 (ply's `validateIdent`; a bad zone is 400 `bad_request`). `time` is unix seconds. Omitted `tz` is
+  `+0000`. Omitted `time` is now. Merge and rebase write each stamp with its own time and zone.
 - One edit is `{path, find, replace}`. An empty or omitted `find` creates the file (`content`, or `replace`, or
   empty). `delete: true` deletes it. `to` renames it. `mode` is `100644` (default), `100755`, or `120000`.
   Several changes go in `changes: [{op, path, content?, find?, replace?, to?, mode?}]` with `op` of `create`,
@@ -99,9 +100,18 @@ Artifacts after deploy (`Git-Token` is the Artifacts bearer). Pass oids from res
 6. `POST /v1/tag` `{remote, name, target, annotated?, message?, tagger?}` and `DELETE /v1/tag` `{remote, name, oid?}`.
 7. `POST /v1/merge` `{remote, ref?, from, author, message?}`.
 8. `POST /v1/rebase` `{remote, ref, onto?, committer, squash?, message?}`.
-9. `POST /v1/cherry-pick` `{remote, ref?, commit, committer, message?, allowEmpty?}` — a patch already in history is
-   200 `{outcome:"empty", noop:true, oid:<tip>}`. `allowEmpty:true` writes an empty commit (same tree, new commit).
+9. `POST /v1/cherry-pick` `{remote, ref?, commit, committer, message?, allowEmpty?}` — a patch already applied, when both
+   sides added and deleted the same paths, is 200 `{outcome:"empty", noop:true, oid:<tip>}`. `allowEmpty:true` writes
+   an empty commit (same tree, new commit). A target branch that also has its own adds or deletes is 409
+   `merge_conflict`: ply will not guess which rename git would pair. `allowEmpty` does not apply to that 409.
 10. `POST /v1/revert` `{remote, ref?, commit, committer, message?, allowEmpty?}`.
+
+An empty repository's HEAD is an unborn symref only when the server advertises `ls-refs=unborn` (git's default, and
+git's own client sends the argument only then). The first HEAD read against an origin in an isolate pays one
+`info/refs` GET so ply can see that bit (`git.upload-pack discover` in the trace, phase `ls-refs` in `x-artifacts-ray`
+and `Server-Timing`). The bit is remembered for the isolate and passed back to ply, so later HEAD reads on that origin
+are the ls-refs alone. A server configured `lsrefs.unborn=allow` or `ignore` is reported as an absent HEAD, matching
+`git ls-remote`.
 
 `GET /` prints the same sequence.
 - JSON request bodies are capped at 1 MiB (413 above that). `WRITES` (a text binding in `cloudflare.config.ts`) must be `on` for the

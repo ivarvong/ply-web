@@ -115,14 +115,15 @@ old value is the zero oid; that zero is not returned as oldCommit).
   POST   /v1/tag         {remote, name, target, annotated?, message?, tagger?}
                          lightweight unless annotated, message, or tagger is set. target is a branch or a commit id.
   DELETE /v1/tag         {remote, name, oid?}            same compare-and-swap as DELETE /v1/branch
-  POST   /v1/merge       {remote, ref?, from, author?, message?, fastForwardOnly?, noFastForward?}
-                         from is a branch name. committer, when sent, must equal author.
+  POST   /v1/merge       {remote, ref?, from, author?, committer?, message?, fastForwardOnly?, noFastForward?}
+                         from is a branch or a 40-hex commit. author and committer are separate stamps.
   POST   /v1/rebase      {remote, ref, onto?, committer, author?, squash?, message?}
-                         onto is a branch name. author.time must equal committer.time.
+                         onto is a branch or a 40-hex commit. author.time and committer.time are independent.
   POST   /v1/cherry-pick {remote, ref?, commit, committer, message?, allowEmpty?}
   POST   /v1/revert      {remote, ref?, commit, committer, message?, allowEmpty?}
-                         a patch already in the target history is 200 {outcome:"empty", noop:true, oid:<tip>}.
-                         allowEmpty:true writes that empty commit (same tree, new commit) instead.
+                         a patch already applied, with the same adds and deletes on both sides, is
+                         200 {outcome:"empty", noop:true, oid:<tip>}. allowEmpty:true writes that empty commit.
+                         A target that also has its own adds or deletes is 409 merge_conflict.
 
 Empty repository, replayed in order (Git-Token on Artifacts; no git seeding). HEAD is an unborn symref to refs/heads/main.
 

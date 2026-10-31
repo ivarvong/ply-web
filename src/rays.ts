@@ -226,11 +226,14 @@ type OtlpAttribute = { key: string; value: { stringValue: string } | { intValue:
 type OtlpSpan = { name?: string; startTimeUnixNano?: string; attributes?: OtlpAttribute[] };
 type OtlpLine = { resourceSpans?: { scopeSpans?: { spans?: OtlpSpan[] }[] }[] };
 
-/** Span names that wrap exactly one git HTTP exchange. */
+/**
+ * Span names that wrap exactly one git HTTP exchange, in the order those exchanges start.
+ * `git.head` is not one of them: it is the parent of a discover GET (the first time an origin is seen) and an
+ * ls-refs POST, and each of those has its own span. Counting the parent would pair rays with the wrong exchange.
+ */
 const SPAN_PHASE: Readonly<Record<string, Phase>> = {
   'git.upload-pack ls-refs': 'ls-refs',
   'git.upload-pack discover': 'ls-refs',
-  'git.head': 'ls-refs',
   'git.upload-pack fetch': 'fetch',
   'git.receive-pack': 'receive-pack',
   'git.receive-pack advertise': 'receive-pack',

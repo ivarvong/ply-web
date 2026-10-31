@@ -52,6 +52,17 @@ export function branchRef(value: unknown, field: string): string {
   return validateRef(fullRef(value)) as string;
 }
 
+/**
+ * A merge `from` or a rebase `onto`. A lowercase 40-hex string is that commit (ply fetches it and 404s a non-commit).
+ * The zero oid is rejected here, before a transport opens. Anything else is a branch name.
+ */
+export function refOrCommit(value: unknown, field: string): string {
+  if (typeof value !== 'string' || value === '') throw fail('bad_request', `${field} is required`);
+  if (isZeroOid(value)) throw fail('bad_request', `${field} must not be the zero oid`);
+  if (isOid(value)) return value;
+  return branchRef(value, field);
+}
+
 export function tagRef(value: unknown): string {
   if (typeof value !== 'string' || value === '') throw fail('bad_request', 'name is required');
   if (isOid(value) || isZeroOid(value)) throw fail('bad_request', 'name must be a tag name, not an object id');

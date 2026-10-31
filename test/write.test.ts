@@ -1,13 +1,14 @@
-// Pure pieces of the write API: request parsing, ident stamps, tree edits, the unborn HEAD line, the shared result.
+// Pure pieces of the write API: request parsing, ident stamps, tree edits, the HEAD listing, the shared result.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { encodeTag, hashObject } from 'ply'
 import { MODE_BLOB } from '../src/write/constants.ts'
-import { parseTz, parseTime, stamp, nowSeconds } from '../src/write/identity.ts'
-import { headFromLines, parseHeadLine } from '../src/write/head.ts'
+import { parseTime, stamp, nowSeconds } from '../src/write/identity.ts'
+import { headFromListing } from '../src/write/head.ts'
 import { isZeroOid } from '../src/write/oid.ts'
-import { asBody, parseBase, parseEdit } from '../src/write/request.ts'
+import { mapPickOutcome } from '../src/write/pick.ts'
+import { asBody, parseBase, parseEdit, refOrCommit } from '../src/write/request.ts'
 import { unifyPly, writeResult } from '../src/write/result.ts'
 import { emptyDir, encodeMem, fileLeaf, lookup, putAt, removeAt, renameAt, replaceOnce } from '../src/write/tree.ts'
 
@@ -46,14 +47,17 @@ test('parseEdit: empty find creates, delete and rename, changes xor path', () =>
 })
 
 test('timezone offsets and unix seconds', () => {
-  assert.equal(parseTz('+0530', 'tz'), '+0530')
-  assert.equal(parseTz('-1200', 'tz'), '-1200')
-  assert.equal(code(() => parseTz('+9999', 'tz'))?.code, 'bad_request')
-  assert.equal(code(() => parseTz('-1201', 'tz'))?.code, 'bad_request')
+  const now = nowSeconds()
+  const india = stamp({ name: 'w', email: 'w@x', tz: '+0530', time: 1700000000 }, 'author', now)
+  assert.equal(india.line, 'w <w@x> 1700000000 +0530')
+  const west = stamp({ name: 'w', email: 'w@x', tz: '-1200', time: 1700000000 }, 'author', now)
+  assert.equal(west.tz, '-1200')
+  assert.equal(code(() => stamp({ name: 'w', email: 'w@x', tz: '+9999' }, 'author', now))?.code, 'bad_request')
+  assert.equal(code(() => stamp({ name: 'w', email: 'w@x', tz: '-1201' }, 'author', now))?.code, 'bad_request')
   assert.equal(parseTime(0, 'time'), 0)
   assert.equal(code(() => parseTime(-1, 'time'))?.code, 'bad_request')
-  const s = stamp({ name: 'w', email: 'w@x', tz: '+0530', time: 1700000000 }, 'author', nowSeconds())
-  assert.equal(s.line, 'w <w@x> 1700000000 +0530')
+  const utc = stamp({ name: 'w', email: 'w@x', time: 1700000000 }, 'author', now)
+  assert.equal(utc.line, 'w <w@x> 1700000000 +0000')
 })
 
 test('tree edits prune empty directories and refuse a rename into itself', () => {
@@ -83,11 +87,37 @@ test('replaceOnce counts every non-overlapping match and replaces exactly one', 
   if (one.kind === 'replaced') assert.equal(new TextDecoder().decode(one.data), 'acc')
 })
 
-test('unborn HEAD line is the symref git reports for an empty repository', () => {
-  const line = parseHeadLine('unborn HEAD symref-target:refs/heads/main')
-  assert.deepEqual(headFromLines([line]), { kind: 'unborn', ref: 'refs/heads/main' })
-  const born = parseHeadLine(`${'a'.repeat(40)} HEAD symref-target:refs/heads/main`)
-  assert.equal(headFromLines([born]).kind, 'born')
+test('HEAD listing: unborn, born, detached, absent', () => {
+  const oid = 'a'.repeat(40)
+  assert.deepEqual(headFromListing({ refs: new Map(), head: null, unborn: { target: 'refs/heads/main' } }), { kind: 'unborn', ref: 'refs/heads/main' })
+  const bornRefs = new Map([['HEAD', { oid }]])
+  assert.deepEqual(headFromListing({ refs: bornRefs, head: 'refs/heads/main', unborn: null }), { kind: 'born', ref: 'refs/heads/main', oid })
+  // an unborn line wins even if a HEAD ref is also listed
+  assert.equal(headFromListing({ refs: bornRefs, head: 'refs/heads/main', unborn: { target: 'refs/heads/trunk' } }).kind, 'unborn')
+  assert.deepEqual(headFromListing({ refs: new Map([['HEAD', { oid }]]), head: null, unborn: null }), { kind: 'detached', oid })
+  assert.deepEqual(headFromListing({ refs: new Map(), head: null, unborn: null }), { kind: 'absent' })
+})
+
+test('refOrCommit accepts a branch or a 40-hex commit and rejects zero', () => {
+  assert.equal(refOrCommit('main', 'from'), 'refs/heads/main')
+  const oid = 'b'.repeat(40)
+  assert.equal(refOrCommit(oid, 'onto'), oid)
+  assert.equal(code(() => refOrCommit('0'.repeat(40), 'from'))?.code, 'bad_request')
+  assert.equal(code(() => refOrCommit('', 'from'))?.code, 'bad_request')
+})
+
+test('cherry-pick outcomes map exhaustively: empty, ok, and nothing else', () => {
+  const ref = 'refs/heads/main'
+  const oid = 'c'.repeat(40)
+  const onto = 'd'.repeat(40)
+  assert.deepEqual(mapPickOutcome({ outcome: 'empty', ref, oid }, false), { kind: 'empty', ref, oid })
+  assert.deepEqual(mapPickOutcome({ outcome: 'ok', ref, oid, tree: 't', onto, pushBytes: 12 }, false), {
+    kind: 'applied', name: 'cherry_pick', ref, oid, oldOid: onto, tree: 't', pushBytes: 12,
+  })
+  const reverted = mapPickOutcome({ outcome: 'ok', ref, oid }, true)
+  assert.equal(reverted.kind, 'applied')
+  if (reverted.kind === 'applied') assert.equal(reverted.name, 'revert')
+  assert.equal(code(() => mapPickOutcome({ outcome: 'applied', ref, oid }, false))?.code, 'internal')
 })
 
 test('write results share oid aliases and empty outcomes are noops', () => {

@@ -1,7 +1,7 @@
 // Author and committer stamps. ply's validateIdent is the gate (name, email, civil zone, non-negative time) and
 // brands the object ident() will accept. This module is the HTTP shape: {name, email, tz?, time?}.
+// The zone check lives in validateIdent; a bad tz is still 400 bad_request, with ply's message.
 import { fail, ident, validateIdent } from 'ply';
-import { IDENT_TZ_DIGITS, IDENT_TZ_HOUR_MAX, IDENT_TZ_HOUR_MIN, IDENT_TZ_MINUTE_MAX } from './constants.ts';
 
 declare const tzBrand: unique symbol;
 declare const timeBrand: unique symbol;
@@ -23,20 +23,6 @@ export type Stamp = {
   readonly line: string;
 };
 
-const TZ_TEXT = new RegExp(`^[+-][0-9]{${IDENT_TZ_DIGITS}}$`);
-const HOUR_DIGITS = IDENT_TZ_DIGITS / 2;
-
-export function parseTz(value: unknown, field: string): TzOffset {
-  if (typeof value !== 'string' || !TZ_TEXT.test(value)) throw fail('bad_request', `${field} must be a sign and four digits (+0530)`);
-  const sign = value[0] === '-' ? -1 : 1;
-  const hours = sign * Number(value.slice(1, 1 + HOUR_DIGITS));
-  const minutes = Number(value.slice(1 + HOUR_DIGITS));
-  if (minutes < 0 || minutes > IDENT_TZ_MINUTE_MAX) throw fail('bad_request', `${field} minutes are out of range`);
-  if (hours < IDENT_TZ_HOUR_MIN || hours > IDENT_TZ_HOUR_MAX) throw fail('bad_request', `${field} hours are out of range`);
-  if ((hours === IDENT_TZ_HOUR_MAX || hours === IDENT_TZ_HOUR_MIN) && minutes !== 0) throw fail('bad_request', `${field} at the extreme offset must be on the hour`);
-  return value as TzOffset;
-}
-
 export function parseTime(value: unknown, field: string): UnixSeconds {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw fail('bad_request', `${field} must be a non-negative integer (unix seconds)`);
   return value as UnixSeconds;
@@ -53,8 +39,8 @@ function rawOf(value: unknown, field: string): Raw {
 export function stamp(value: unknown, field: string, now: UnixSeconds): Stamp {
   const raw = rawOf(value, field);
   const time = raw.time === undefined ? now : parseTime(raw.time, `${field}.time`);
-  const tz = raw.tz === undefined ? undefined : parseTz(raw.tz, `${field}.tz`);
-  const person = validateIdent({ name: raw.name, email: raw.email, time, tz });
+  // Omitted tz is validateIdent's UTC. A present tz is checked there (sign, four digits, civil range).
+  const person = validateIdent({ name: raw.name, email: raw.email, time, tz: raw.tz });
   return { name: person.name, email: person.email, tz: person.tz as TzOffset, time: person.time as UnixSeconds, person, line: ident(person) };
 }
 
@@ -62,7 +48,12 @@ export function nowSeconds(): UnixSeconds {
   return Math.floor(Date.now() / 1000) as UnixSeconds;
 }
 
-/** What editFile / mergeBranch / rebaseBranch take: the pieces, plus our time passed separately. */
+/** What editFile takes. It still stamps author and committer as one person; time is a separate argument. */
 export function plyPerson(s: Stamp): { name: string; email: string; tz: TzOffset } {
   return { name: s.name, email: s.email, tz: s.tz };
+}
+
+/** What mergeBranch, rebaseBranch and pickCommit take: each stamp carries its own time and zone. */
+export function plyStamp(s: Stamp): { name: string; email: string; tz: TzOffset; time: UnixSeconds } {
+  return { name: s.name, email: s.email, tz: s.tz, time: s.time };
 }

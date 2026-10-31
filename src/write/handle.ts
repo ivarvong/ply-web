@@ -5,16 +5,12 @@ import { type CallOpts } from './call.ts'
 import { createBranch, deleteRef } from './branch.ts'
 import { commitEdit } from './commit.ts'
 import { readHead, type HeadState } from './head.ts'
-import { nowSeconds, plyPerson, stamp, type Stamp } from './identity.ts'
+import { nowSeconds, plyStamp, stamp } from './identity.ts'
 import { parseCommitOid } from './oid.ts'
 import { pick } from './pick.ts'
-import { asBody, branchRef, parseDeleteOid, parseEdit, sameBranch } from './request.ts'
+import { asBody, branchRef, parseDeleteOid, parseEdit, refOrCommit, sameBranch } from './request.ts'
 import { unifyPly, type WriteOutcome } from './result.ts'
 import { createTag, removeTag } from './tag.ts'
-
-function sameStamp(a: Stamp, b: Stamp): boolean {
-  return a.name === b.name && a.email === b.email && a.tz === b.tz && a.time === b.time
-}
 
 async function readHeadState(remote: string, opts: CallOpts, op: string): Promise<HeadState> {
   return operation(op, remote, opts, async ({ t, outcome }) => outcome('ok', await readHead(t)))
@@ -28,8 +24,8 @@ async function bornRef(remote: string, opts: CallOpts, field: string): Promise<s
   throw fail('bad_request', `${field} is required when the remote HEAD is absent`)
 }
 
-async function requireRef(remote: string, opts: CallOpts, given: unknown, field: string): Promise<string> {
-  if (given !== undefined && given !== null && given !== '') return branchRef(given, field)
+async function requireRef(remote: string, opts: CallOpts, given: unknown, field: string, parse: (value: unknown, name: string) => string = branchRef): Promise<string> {
+  if (given !== undefined && given !== null && given !== '') return parse(given, field)
   return bornRef(remote, opts, field)
 }
 
@@ -66,21 +62,18 @@ export async function handleBranchDelete(remote: string, body: unknown, opts: Ca
 export async function handleMerge(remote: string, body: unknown, opts: CallOpts): Promise<{ body: Record<string, unknown> }> {
   const raw = asBody(body)
   const ref = await requireRef(remote, opts, raw.ref, 'ref')
-  const from = branchRef(raw.from, 'from')
+  const from = refOrCommit(raw.from, 'from')
   const now = nowSeconds()
   const author = raw.author === undefined ? null : stamp(raw.author, 'author', now)
-  if (raw.committer !== undefined) {
-    const committer = stamp(raw.committer, 'committer', now)
-    if (!author || !sameStamp(author, committer)) throw fail('bad_request', 'merge has one identity; committer must match author (ply stamps both with the author)')
-  }
+  const committer = raw.committer === undefined ? null : stamp(raw.committer, 'committer', now)
   const message = textOr(raw.message, 'message')
   try {
     const result = await mergeBranch(remote, {
       ref,
       from,
-      author: author ? plyPerson(author) : undefined,
+      author: author ? plyStamp(author) : undefined,
+      committer: committer ? plyStamp(committer) : undefined,
       message,
-      time: author ? author.time : undefined,
       fastForwardOnly: !!raw.fastForwardOnly,
       noFastForward: !!raw.noFastForward,
     }, opts) as Record<string, unknown>
@@ -94,19 +87,17 @@ export async function handleMerge(remote: string, body: unknown, opts: CallOpts)
 export async function handleRebase(remote: string, body: unknown, opts: CallOpts): Promise<{ body: Record<string, unknown> }> {
   const raw = asBody(body)
   const ref = branchRef(raw.ref, 'ref')
-  const onto = await requireRef(remote, opts, raw.onto, 'onto')
+  const onto = await requireRef(remote, opts, raw.onto, 'onto', refOrCommit)
   const now = nowSeconds()
   const committer = stamp(raw.committer, 'committer', now)
   const author = raw.author === undefined ? null : stamp(raw.author, 'author', now)
-  if (author && author.time !== committer.time) throw fail('bad_request', 'rebase author.time must equal committer.time; ply stamps one time for both')
   const message = raw.message === undefined ? null : textOr(raw.message, 'message') ?? null
   try {
     const result = await rebaseBranch(remote, {
       ref,
       onto,
-      committer: plyPerson(committer),
-      author: author ? plyPerson(author) : undefined,
-      time: committer.time,
+      committer: plyStamp(committer),
+      author: author ? plyStamp(author) : undefined,
       squash: !!raw.squash,
       message,
     }, opts) as Record<string, unknown>
