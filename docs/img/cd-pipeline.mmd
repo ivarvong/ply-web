@@ -1,0 +1,30 @@
+%% Operator pipeline. One color per stage kind.
+%% The happy path is the ==> chain. Each --> is that stage's failure, drawn on the same row.
+%% mermaid-cli's layered layout drops those failures onto the next row and drifts the spine.
+%% docs/img/render-cd-pipeline.py reads this file and writes cd-pipeline.svg on a grid.
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '18px', 'fontFamily': 'ui-sans-serif, system-ui, sans-serif', 'lineColor': '#334155'}, 'flowchart': {'htmlLabels': false, 'nodeSpacing': 28, 'rankSpacing': 36, 'padding': 12, 'wrappingWidth': 280}}}%%
+flowchart TB
+  bump["Gate · bump the ply pin, then the local gate"]:::gate ==> deploy["Deploy · new version at 0%, old stays at 100%"]:::deploy
+  deploy ==> smoke["Smoke · pinned empty-repo lifecycle"]:::smoke
+  smoke ==> tel["Telemetry · canary window, both checks must pass"]:::telemetry
+  tel ==> ramp["Ramp · 1, 5, 10, 25, 50, 75, 100"]:::ramp
+  ramp ==> liveSmoke["Smoke · live, unpinned, must be the new version"]:::smoke
+  liveSmoke ==> liveTel["Telemetry · live window"]:::telemetry
+  liveTel ==> done["Done · 100% on the new version"]:::done
+
+  bump --> stopBump["Stop · tree unchanged, nothing uploaded"]:::halt
+  deploy --> stopDeploy["Stop · canary left at 0%"]:::halt
+  smoke --> stopSmoke["Stop · stay at 0%, do not ramp"]:::halt
+  tel --> stopTel["Stop · stay at 0%, do not ramp"]:::halt
+  ramp --> rollRamp["Rollback · 100% back on the old version"]:::rollback
+  liveSmoke --> rollSmoke["Rollback · 100% back on the old version"]:::rollback
+  liveTel --> rollTel["Rollback · 100% back on the old version"]:::rollback
+
+  classDef gate fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px,color:#0f172a
+  classDef deploy fill:#ede9fe,stroke:#6d28d9,stroke-width:2px,color:#0f172a
+  classDef smoke fill:#dcfce7,stroke:#15803d,stroke-width:2px,color:#0f172a
+  classDef telemetry fill:#ccfbf1,stroke:#0f766e,stroke-width:2px,color:#0f172a
+  classDef ramp fill:#ffedd5,stroke:#c2410c,stroke-width:2px,color:#0f172a
+  classDef rollback fill:#fee2e2,stroke:#b91c1c,stroke-width:2px,color:#0f172a
+  classDef halt fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#0f172a
+  classDef done fill:#f8fafc,stroke:#0f172a,stroke-width:2px,color:#0f172a
