@@ -36,6 +36,7 @@ import { ADVERTISED_REF_PREFIXES, isAbbreviatedOid, matchAbbreviatedOid } from '
 import { JSON_CACHE_VARY, jsonCacheControl } from './json-cache.ts';
 import { directoryReadMessage, isDirectoryRead } from './read-status.ts';
 import { BUILD_HEADER, plyBuildValue } from './version.ts';
+import { holdLastChunk } from './hold-last.ts';
 
 export { checkRemote };
 
@@ -286,9 +287,9 @@ const READS = {
     try { r = await readFile(remote, { ref: q.get('ref') || null, path: q.get('path') }, opts); }
     catch (e) { if (isDirectoryRead(e)) throw fail('bad_request', directoryReadMessage(String(e.message ?? e))); throw e; }
     const fixed = new FixedLengthStream(r.size);
-    // a verification failure mid-stream aborts the body short of its Content-Length: the client sees a truncated
-    // response, never a clean one with the wrong bytes
-    ctx.waitUntil(r.stream.pipeTo(fixed.writable).then(() => log({ stream: 'ok' }), e => log({ stream: 'error', stream_code: e?.code ?? 'error' })));
+    // a verification failure aborts the body short of its Content-Length: the client sees a truncated response, never a
+    // clean one with the wrong bytes. holdLastChunk keeps the final bytes back until the blob verified (src/hold-last.ts).
+    ctx.waitUntil(holdLastChunk(r.stream).pipeTo(fixed.writable).then(() => log({ stream: 'ok' }), e => log({ stream: 'error', stream_code: e?.code ?? 'error' })));
     const headers = { 'content-type': 'application/octet-stream', 'x-ply-ref': r.ref, 'x-ply-commit': r.commit, 'x-ply-blob': r.blob, 'x-ply-mode': r.mode, 'x-ply-size': String(r.size) };
     const summary = traceSummary(spans());
     if (q.get('trace') === '1' && summary) headers['x-ply-trace'] = summary;
