@@ -13,7 +13,8 @@ type RawSpan = {
 };
 
 const SHOW = [
-  'http.response.status_code', 'git.response.bytes', 'git.response.cache', 'git.response.duration_ms',
+  'http.response.status_code', 'git.upstream.cf_ray', 'git.upstream.phase', 'git.upstream.dur_ms',
+  'git.response.bytes', 'git.response.cache', 'git.response.duration_ms',
   'git.fetch.filter', 'git.fetch.filter.requested', 'git.fetch.filter.fallback', 'git.fetch.filter.learned',
   'git.fetch.wants', 'git.fetch.haves.count', 'git.fetch.deepen', 'git.fetch.thin_pack', 'git.fetch.ofs_delta',
   'git.server.agent', 'git.server.object_format', 'git.server.caps', 'git.server.fetch', 'git.protocol.version',

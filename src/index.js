@@ -36,6 +36,7 @@ import { ADVERTISED_REF_PREFIXES, isAbbreviatedOid, matchAbbreviatedOid } from '
 import { directoryReadMessage, isDirectoryRead } from './read-status.ts';
 import { BUILD_HEADER, plyBuildValue } from './version.ts';
 import { holdLastChunk } from './hold-last.ts';
+import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from './rays.ts';
 
 export { checkRemote };
 
@@ -161,6 +162,14 @@ and branch-from require the missing field (ref, onto, or from) by name. An expli
 Errors: {code, message, retry} with retry in yes|fresh|no|read. ref_exists is retry "no". stale_expected is retry
 "fresh" and includes the actual oid. ?trace=1 adds ply's spans to JSON responses (and an x-ply-trace timing summary
 header on /v1/read when that summary is non-empty).
+Every /v1 response that talked to the remote carries x-artifacts-ray and Server-Timing, including 4xx and 5xx.
+x-artifacts-ray is the upstream cf-ray log, in start order:
+  ls-refs=<16 hex>-<colo>;dur=<ms>, fetch=<ray>;dur=<ms>, receive-pack=<ray>;dur=<ms>
+  info/refs and v2 ls-refs are phase ls-refs. upload-pack fetches (and a blob:none retry) are fetch.
+  receive-pack advertisement and the push are receive-pack. A response with no cf-ray is "-".
+  A call that failed before headers is "no-response". Past 32 entries the rest are "overflow=<count>".
+  Server-Timing repeats those phases and durations, then total for the Worker. Spans gain
+  git.upstream.cf_ray, git.upstream.phase, and git.upstream.dur_ms.
 Every response carries x-ply-version: <Workers version id> and ${BUILD_HEADER}: ply=<commit> ply-web=<commit>.
 
 Public read-only viewer (no token, no git credential):  GET /view   and   GET /r/<name>
@@ -392,6 +401,14 @@ const worker = {
     if (WRITES[key] && !writes) return done(json(501, { code: 'unsupported', message: 'writes are disabled on this deployment', retry: 'no' }, scrub));
     const exporter = arrayExporter();
     const spans = () => exporter.lines.flatMap(flattenLine);
+    let rays = null;
+    const attachRays = res => {
+      if (!rays) return res;
+      const report = rays.report();
+      stampUpstreamSpans(exporter.lines, report);
+      applyUpstreamHeaders(res.headers, report, Date.now() - t0);
+      return res;
+    };
     try {
       const body = WRITES[key] ? await readJson(req) : {};
       const allow = (env.ALLOW_REMOTE_ORIGINS ?? '').split(',').map(s => s.trim()).filter(Boolean);
@@ -412,7 +429,9 @@ const worker = {
       // (Workers Caching); everything else, every credentialed request included, goes straight upstream.
       const direct = withPublicReadCredential(globalThis.fetch.bind(globalThis), publicTokens);
       const loopback = env.PACK_CACHE === 'off' ? null : () => ctx.exports?.GitCache;
-      const fetchImpl = createGuardedFetch(createLoopbackFetch(direct, loopback), remoteUrl, allow);
+      rays = createRayLog();
+      // Inside the guard, so each hop (including a redirect the guard follows) is one entry.
+      const fetchImpl = createGuardedFetch(observeUpstream(createLoopbackFetch(direct, loopback), rays), remoteUrl, allow);
       const opts = { auth: cred.auth, tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), fetchImpl };
       if (!WRITES[key] && presentedRef && isAbbreviatedOid(presentedRef.toLowerCase())) {
         const prefix = presentedRef.toLowerCase();
@@ -425,18 +444,31 @@ const worker = {
         }
       }
       const out = await handler({ remote, q: url.searchParams, body, opts, spans, ctx, log });
-      const s = spans();
-      const stats = { spans: s.length, rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length, wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length, cache_hits: s.filter(x => x.attrs['git.response.cache'] === 'HIT').length };
       if (out instanceof Response) {
         out.headers.set('cache-control', NO_STORE);
+        attachRays(out);
+        const s = spans();
+        const stats = { spans: s.length, rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length, wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length, cache_hits: s.filter(x => x.attrs['git.response.cache'] === 'HIT').length };
         return done(out, stats);
       }
-      const payload = url.searchParams.get('trace') === '1' ? { ...out.body, trace: s.map(spanView) } : out.body;
-      return done(json(out.status ?? 200, payload, scrub, { 'server-timing': `total;dur=${Date.now() - t0}` }), stats);
+      const res = json(out.status ?? 200, out.body, scrub);
+      attachRays(res);
+      const s = spans();
+      if (url.searchParams.get('trace') === '1') {
+        const traced = json(out.status ?? 200, { ...out.body, trace: s.map(spanView) }, scrub);
+        for (const [name, value] of res.headers) if (name !== 'content-type' && name !== 'cache-control') traced.headers.set(name, value);
+        const stats = { spans: s.length, rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length, wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length, cache_hits: s.filter(x => x.attrs['git.response.cache'] === 'HIT').length };
+        return done(traced, stats);
+      }
+      const stats = { spans: s.length, rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length, wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length, cache_hits: s.filter(x => x.attrs['git.response.cache'] === 'HIT').length };
+      return done(res, stats);
     } catch (e) {
       const payload = errorBody(e);
+      if (rays) stampUpstreamSpans(exporter.lines, rays.report());
       if (url.searchParams.get('trace') === '1') payload.trace = spans().map(spanView);
-      return done(json(statusOf(e), payload, scrub), { code: payload.code, rtt: spans().filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length });
+      const res = json(statusOf(e), payload, scrub);
+      if (rays) applyUpstreamHeaders(res.headers, rays.report(), Date.now() - t0);
+      return done(res, { code: payload.code, rtt: spans().filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length });
     }
   },
 };

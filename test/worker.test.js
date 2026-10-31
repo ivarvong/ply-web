@@ -19,7 +19,7 @@ const PORT = 18900 + (process.pid % 50), PORT_RO = PORT + 50;
 const PLY = 'test-ply-token-' + 'x'.repeat(20);
 const SECRET = 'gitcred_' + 'S3cr3tT0k3n'.repeat(3);          // the git credential the auth proxy expects
 const EXPECT = `Bearer ${SECRET}`;
-let root, cleanup, srv, authSrv, echoSrv, artProxy, redirSrv, proc, logs = '';
+let root, cleanup, srv, authSrv, echoSrv, artProxy, redirSrv, raySrv, proc, logs = '';
 const A = { name: 'w', email: 'w@x' };
 
 // a git host that requires `Authorization: Bearer SECRET` (401 without, 403 with a wrong one) in front of http-backend
@@ -59,6 +59,49 @@ function redirector(upstream) {
   return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({ url: `http://127.0.0.1:${s.address().port}`, hits, close: () => new Promise(r => { s.closeAllConnections?.(); s.close(r); }) })));
 }
 
+// git http-backend with a cf-ray on every response. `beforeReceive` runs before a receive-pack POST is forwarded,
+// so a test can move the ref and make git itself reject the push.
+function rayProxy(upstream) {
+  const up = new URL(upstream);
+  const seen = [];
+  let n = 0;
+  let beforeReceive = null;
+  const s = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      const body = Buffer.concat(chunks);
+      const ray = `${(++n).toString(16).padStart(16, '0')}-IAD`;
+      const path = req.url ?? '';
+      const hit = { ray, method: req.method ?? 'GET', path, head: body.subarray(0, 64).toString('latin1'), hook: 'skip' };
+      seen.push(hit);
+      const forward = () => {
+        const u = http.request({ host: up.hostname, port: up.port, path: req.url, method: req.method, headers: { ...req.headers, host: up.host } }, r => {
+          const headers = { ...r.headers, 'cf-ray': ray };
+          res.writeHead(r.statusCode ?? 502, headers);
+          r.pipe(res);
+        });
+        u.on('error', () => { if (!res.headersSent) { res.writeHead(502, { 'cf-ray': ray, 'content-type': 'text/plain' }); res.end('upstream'); } });
+        u.end(body);
+      };
+      Promise.resolve().then(() => {
+        if (!(beforeReceive && req.method === 'POST' && path.split('?')[0].endsWith('/git-receive-pack'))) return;
+        hit.hook = 'run';
+        return beforeReceive();
+      }).then(forward, err => {
+        hit.hook = `err:${err}`;
+        if (!res.headersSent) res.writeHead(500, { 'cf-ray': ray, 'content-type': 'text/plain' });
+        res.end(`ray hook: ${err}`);
+      });
+    });
+  });
+  return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({
+    url: `http://127.0.0.1:${s.address().port}`, seen,
+    setBeforeReceive(fn) { beforeReceive = fn; },
+    close: () => new Promise(r => { s.closeAllConnections?.(); s.close(r); }),
+  })));
+}
+
 before(async () => {
   if (!WORKERD) return;
   ({ root, cleanup } = tmpRoot());
@@ -68,9 +111,10 @@ before(async () => {
   redirSrv = await redirector(srv.url);
   const filterOf = b => /filter ([^\n]+)\n/.exec(Buffer.from(b).toString('latin1'))?.[1] ?? null;
   artProxy = await startProxy(srv.url, ctx => (ctx.stage === 'fetch' && filterOf(ctx.reqBody) && filterOf(ctx.reqBody) !== 'blob:none' ? { type: 'status', status: 400, contentType: 'text/plain', body: 'Unsupported Git fetch filter; only blob:none is supported.' } : { type: 'pass' }));
+  raySrv = await rayProxy(srv.url);
   const out = join(root, 'wk'); mkdirSync(out, { recursive: true });
   copyCfBundle(join(out, 'worker.mjs'));
-  const allow = [srv.url, authSrv.url, echoSrv.url, artProxy.url, redirSrv.url].join(',');
+  const allow = [srv.url, authSrv.url, echoSrv.url, artProxy.url, redirSrv.url, raySrv.url].join(',');
   const worker = writes => `(modules = [ (name = "worker.mjs", esModule = embed "worker.mjs") ], compatibilityDate = "2026-10-18", globalOutbound = "internet",
     bindings = [ (name = "PLY_TOKEN", text = "${PLY}"), (name = "WRITES", text = "${writes}"), (name = "ALLOW_REMOTE_ORIGINS", text = "${allow}") ])`;
   writeFileSync(join(out, 'config.capnp'), `using Workerd = import "/workerd/workerd.capnp";
@@ -83,7 +127,7 @@ const config :Workerd.Config = (
   proc.stdout.on('data', d => { logs += d; }); proc.stderr.on('data', d => { logs += d; });
   for (let i = 0; i < 80; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/`)).ok) break; } catch { } await new Promise(r => setTimeout(r, 100)); }
 });
-after(async () => { if (!WORKERD) return; proc.kill(); await Promise.all([srv.close(), authSrv.close(), echoSrv.close(), artProxy.close(), redirSrv.close()]); cleanup(); });
+after(async () => { if (!WORKERD) return; proc.kill(); await Promise.all([srv.close(), authSrv.close(), echoSrv.close(), artProxy.close(), redirSrv.close(), raySrv.close()]); cleanup(); });
 
 const W = (path, { method = 'GET', body, headers = {}, port = PORT, auth = true } = {}) => fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { ...(auth ? { authorization: `Bearer ${PLY}` } : {}), ...(body ? { 'content-type': 'application/json' } : {}), ...headers }, body: body ? JSON.stringify(body) : undefined });
 const qs = o => new URLSearchParams(Object.entries(o).filter(([, v]) => v !== undefined)).toString();
@@ -570,4 +614,150 @@ test('redirects: same-origin hops followed by the Worker (reads and a push), cro
     assert.equal(JSON.stringify(body).includes(token), false);
   }
   assert.equal(logs.includes(token), false);
+});
+
+const RAY_ENTRY = /^([a-z-]+)=([0-9a-f]{16}-[A-Z]{3}|-|no-response);dur=(\d+)$/;
+const RAY_SPAN = {
+  'git.upload-pack ls-refs': 'ls-refs',
+  'git.upload-pack discover': 'ls-refs',
+  'git.head': 'ls-refs',
+  'git.upload-pack fetch': 'fetch',
+  'git.receive-pack': 'receive-pack',
+  'git.receive-pack advertise': 'receive-pack',
+};
+
+function phaseOfHit(hit) {
+  const path = hit.path.split('?')[0];
+  if (path.endsWith('/info/refs')) {
+    const service = new URL(hit.path, 'http://ray.invalid').searchParams.get('service');
+    if (service === 'git-upload-pack') return 'ls-refs';
+    if (service === 'git-receive-pack') return 'receive-pack';
+    return null;
+  }
+  if (hit.method === 'POST' && path.endsWith('/git-receive-pack')) return 'receive-pack';
+  if (hit.method === 'POST' && path.endsWith('/git-upload-pack')) {
+    if (hit.head.includes('command=ls-refs')) return 'ls-refs';
+    if (hit.head.includes('command=fetch')) return 'fetch';
+  }
+  return null;
+}
+
+function parseRayHeader(header) {
+  assert.ok(header, 'x-artifacts-ray');
+  const entries = [];
+  let overflow = null;
+  for (const part of header.split(', ')) {
+    const over = /^overflow=(\d+)$/.exec(part);
+    if (over) { overflow = Number(over[1]); continue; }
+    const m = RAY_ENTRY.exec(part);
+    assert.ok(m, part);
+    entries.push({ phase: m[1], ray: m[2], dur: Number(m[3]) });
+  }
+  return { entries, overflow };
+}
+
+function assertRaysMatch(header, hits, timing) {
+  const parsed = parseRayHeader(header);
+  const want = hits.flatMap(hit => {
+    const phase = phaseOfHit(hit);
+    return phase ? [{ phase, ray: hit.ray }] : [];
+  });
+  assert.deepEqual(parsed.entries.map(e => ({ phase: e.phase, ray: e.ray })), want, header);
+  assert.equal(parsed.overflow, null);
+  assert.equal(header.includes('/'), false, header);
+  const st = timing ?? '';
+  for (const phase of new Set(parsed.entries.map(e => e.phase))) assert.match(st, new RegExp(`${phase};dur=\\d+`));
+  assert.match(st, /total;dur=\d+/);
+  return parsed;
+}
+
+function assertSpanRays(trace, entries) {
+  const spans = trace.filter(s => RAY_SPAN[s.name]);
+  assert.deepEqual(spans.map(s => RAY_SPAN[s.name]), entries.map(e => e.phase), JSON.stringify(spans.map(s => s.name)));
+  spans.forEach((s, i) => {
+    assert.equal(s.attrs['git.upstream.phase'], entries[i].phase);
+    assert.equal(s.attrs['git.upstream.cf_ray'], entries[i].ray);
+    assert.equal(s.attrs['git.upstream.dur_ms'], entries[i].dur);
+  });
+}
+
+test('x-artifacts-ray: a read, an empty-repo first commit, a delta push, and a CAS 409', { skip }, async () => {
+  const r = repo({ 'README.md': 'one\n' }, () => raySrv.url);
+  const noauth = await W(`/v1/read?${qs({ remote: r.remote, path: 'README.md' })}`, { auth: false });
+  assert.equal(noauth.status, 401);
+  assert.equal(noauth.headers.get('x-artifacts-ray'), null);
+  await noauth.arrayBuffer();
+
+  const fromRead = raySrv.seen.length;
+  const read = await W(`/v1/read?${qs({ remote: r.remote, path: 'README.md' })}`);
+  assert.equal(read.status, 200);
+  assert.equal(Buffer.from(await read.arrayBuffer()).toString(), 'one\n');
+  const readRays = assertRaysMatch(read.headers.get('x-artifacts-ray'), raySrv.seen.slice(fromRead), read.headers.get('server-timing'));
+  assert.ok(readRays.entries.some(e => e.phase === 'ls-refs'));
+  assert.ok(readRays.entries.some(e => e.phase === 'fetch'));
+
+  const fromTree = raySrv.seen.length;
+  const treeRes = await W(`/v1/tree?${qs({ remote: r.remote, trace: '1' })}`);
+  const tree = await treeRes.json();
+  assert.equal(treeRes.status, 200, JSON.stringify(tree));
+  const treeRays = assertRaysMatch(treeRes.headers.get('x-artifacts-ray'), raySrv.seen.slice(fromTree), treeRes.headers.get('server-timing'));
+  assertSpanRays(tree.trace, treeRays.entries);
+
+  const fromMiss = raySrv.seen.length;
+  const miss = await W(`/v1/read?${qs({ remote: r.remote, path: 'nope' })}`);
+  const missBody = await miss.json();
+  assert.equal(miss.status, 404);
+  assert.equal(missBody.code, 'not_found');
+  const missRays = assertRaysMatch(miss.headers.get('x-artifacts-ray'), raySrv.seen.slice(fromMiss), miss.headers.get('server-timing'));
+  assert.ok(missRays.entries.some(e => e.phase === 'ls-refs' || e.phase === 'fetch'));
+
+  const name = `ray${n++}`;
+  const bare = makeBareRepo(root, name);
+  const remote = `${raySrv.url}/${name}.git`;
+  const author = { name: 'w', email: 'w@x', tz: '+0000', time: 1700000000 };
+  const post = async body => {
+    const from = raySrv.seen.length;
+    const res = await W('/v1/edit?trace=1', { method: 'POST', body: { remote, ...body } });
+    const json = await res.json();
+    return { res, json, hits: raySrv.seen.slice(from) };
+  };
+
+  const first = await post({ message: 'init', author, changes: [{ op: 'create', path: 'a.txt', content: 'v1\n' }] });
+  assert.equal(first.res.status, 200, JSON.stringify(first.json));
+  assert.equal(first.json.outcome, 'commit');
+  assert.equal(first.json.oldOid, null);
+  assert.equal(gitBuf(bare, ['cat-file', 'commit', first.json.oid]).toString().split('\n').some(l => l.startsWith('parent ')), false);
+  const firstRays = assertRaysMatch(first.res.headers.get('x-artifacts-ray'), first.hits, first.res.headers.get('server-timing'));
+  assert.ok(firstRays.entries.some(e => e.phase === 'receive-pack'));
+  assertSpanRays(first.json.trace, firstRays.entries);
+
+  const delta = await post({ message: 'second', author, changes: [{ op: 'edit', path: 'a.txt', find: 'v1', replace: 'v2' }] });
+  assert.equal(delta.res.status, 200, JSON.stringify(delta.json));
+  assert.match(gitBuf(bare, ['cat-file', 'commit', delta.json.oid]).toString(), new RegExp(`parent ${first.json.oid}\\n`));
+  const deltaRays = assertRaysMatch(delta.res.headers.get('x-artifacts-ray'), delta.hits, delta.res.headers.get('server-timing'));
+  assert.ok(deltaRays.entries.some(e => e.phase === 'receive-pack'));
+  assertSpanRays(delta.json.trace, deltaRays.entries);
+
+  raySrv.setBeforeReceive(() => {
+    const parent = git(bare, ['rev-parse', 'HEAD']).trim();
+    const tree = git(bare, ['rev-parse', 'HEAD^{tree}']).trim();
+    const neu = git(bare, ['commit-tree', tree, '-p', parent, '-m', 'raced'], {
+      env: { ...process.env, GIT_AUTHOR_NAME: 'w', GIT_AUTHOR_EMAIL: 'w@x', GIT_COMMITTER_NAME: 'w', GIT_COMMITTER_EMAIL: 'w@x' },
+    }).trim();
+    git(bare, ['update-ref', 'refs/heads/main', neu, parent]);
+  });
+  try {
+    const cas = await post({ message: 'conflict', author, changes: [{ op: 'edit', path: 'a.txt', find: 'v2', replace: 'v3' }] });
+    assert.equal(cas.res.status, 409, JSON.stringify({ code: cas.json.code, message: cas.json.message, hooks: cas.hits.filter(h => h.path.includes('receive-pack')).map(h => ({ path: h.path, method: h.method, hook: h.hook, ray: h.ray })) }));
+    assert.ok(cas.json.code === 'cas_conflict' || cas.json.code === 'not_fast_forward', cas.json.code);
+    const casRays = assertRaysMatch(cas.res.headers.get('x-artifacts-ray'), cas.hits, cas.res.headers.get('server-timing'));
+    const pushed = casRays.entries.filter(e => e.phase === 'receive-pack');
+    assert.ok(pushed.length >= 1, cas.res.headers.get('x-artifacts-ray'));
+    assert.notEqual(pushed.at(-1).ray, '-');
+    assert.notEqual(pushed.at(-1).ray, 'no-response');
+    assertSpanRays(cas.json.trace, casRays.entries);
+    assert.equal(gitBuf(bare, ['show', 'main:a.txt']).toString(), 'v2\n');
+  } finally {
+    raySrv.setBeforeReceive(null);
+  }
 });

@@ -121,11 +121,15 @@ test('serveGitCache: policy per kind, the key is bound to the request, the token
   assert.equal(pack.headers.get('cache-control'), NO_STORE, 'bytes that are not a verifiable pack are passed on but never stored');
   assert.match(pack.headers.get('x-ply-gc-verified') ?? '', /^failed/);
   assert.equal(await pack.text(), 'PACK');
+  answer = () => new Response('PACK', { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result', 'cf-ray': '0123456789abcdef-IAD' } });
+  assert.equal((await serveGitCache(await gcRequest('pack', `${PUB}/git-upload-pack`, FETCH), tokens(), ctx, up)).headers.get('cf-ray'), '0123456789abcdef-IAD');
+  answer = () => new Response('PACK', { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result', 'cf-ray': 'https://user:tok@github.com/secret/repo.git' } });
+  assert.equal((await serveGitCache(await gcRequest('pack', `${PUB}/git-upload-pack`, FETCH), tokens(), ctx, up)).headers.get('cf-ray'), null, 'a non-ray cf-ray is not copied');
   assert.equal(seen[0]!.auth, `Bearer ${TOKEN}`, 'the public namespace gets the Worker read token');
   assert.equal(seen[0]!.via, 'gitcache');
   const refs = await serveGitCache(await gcRequest('refs', `${GH}/git-upload-pack`, LSREFS), tokens(), ctx, up);
   assert.equal(refs.headers.get('cache-control'), REFS_CACHE);
-  assert.equal(seen[1]!.auth, null, 'a forge gets no credential');
+  assert.equal(seen.at(-1)!.auth, null, 'a forge gets no credential');
   answer = () => new Response(`${pkt('version 2\n')}${pkt('ls-refs\n')}0000`, { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-advertisement' } });
   assert.equal((await serveGitCache(await gcRequest('discover', `${PUB}/info/refs?service=git-upload-pack`, null), tokens(), ctx, up)).headers.get('cache-control'), DISCOVER_V2_CACHE);
   answer = () => new Response(`${pkt('# service=git-upload-pack\n')}0000${pkt(`${OID} HEAD\0side-band\n`)}0000`, { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-advertisement' } });
