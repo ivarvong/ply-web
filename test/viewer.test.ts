@@ -223,7 +223,7 @@ test('abbreviated oids, failure copy, tag order, cache headers, and version text
   assert.match(refPage, /href="\/view\/github\.com\/shot\/shot\?ref=refs\/heads\/main"/);
   assert.match(refPage, />v1\.10\.0</);
   assert.equal(refPage.includes('Check the owner'), false);
-  assert.equal(refPage.includes('401'), false);
+  assert.doesNotMatch(refPage, /HTTP 401|answers 401/); // not a bare '401': request ids and timings on the page can contain it
   const pathPage = String(renderError(404, 'not_found', 'path component missing not found', trace, 'github.com', 'o/r', 'main', 1, 'src/missing', {
     nearby: [],
     path: { missing: 'missing', existingPath: 'src', notDirectory: false },
@@ -231,7 +231,7 @@ test('abbreviated oids, failure copy, tag order, cache headers, and version text
   assert.match(pathPage, /No path src\/missing in o\/r/);
   assert.match(pathPage, /No entry named missing/);
   assert.match(pathPage, /href="\/view\/github\.com\/o\/r\?ref=main&amp;path=src"/);
-  assert.equal(pathPage.includes('401'), false);
+  assert.doesNotMatch(pathPage, /HTTP 401|answers 401/); // not a bare '401': request ids and timings on the page can contain it
   assert.equal(pathPage.includes('Check the owner'), false);
   // Names from the URL (ref, path) and from the remote (nearby refs, path cue) are text, never markup.
   const evil = '"><img src=x onerror=alert(1)>'
@@ -665,7 +665,7 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
     assert.match(missingHtml, /ref picker/);
     assert.match(missingHtml, /href="\/view\/github\.com\/demo\.git\?ref=refs\/heads\/main"/);
     assert.equal(missingHtml.includes('Check the owner'), false);
-    assert.equal(missingHtml.includes('401'), false);
+    assert.doesNotMatch(missingHtml, /HTTP 401|answers 401/); // not a bare '401': request ids and timings on the page can contain it
     assert.match(missingHtml, /href="\/view\/github\.com\/demo\.git"/);
     const missingPath = await handleViewer(new Request(`https://ply.ivar.workers.dev${repoPath}?path=missing`), env, {}, { fetchImpl });
     assert.equal(missingPath.status, 404);
@@ -673,7 +673,7 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
     assert.match(missingPathHtml, /No path missing in demo/);
     assert.match(missingPathHtml, /No entry named missing/);
     assert.match(missingPathHtml, /the repository root/);
-    assert.equal(missingPathHtml.includes('401'), false);
+    assert.doesNotMatch(missingPathHtml, /HTTP 401|answers 401/); // not a bare '401': request ids and timings on the page can contain it
     const fileAsDir = await handleViewer(new Request(`https://ply.ivar.workers.dev${repoPath}?path=README.md/extra`), env, {}, { fetchImpl });
     assert.equal(fileAsDir.status, 404);
     const fileAsDirHtml = await fileAsDir.text();
