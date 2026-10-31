@@ -37,6 +37,8 @@ test('a ramp rollback does not roll back again, and a live failure does', () => 
 test('a harness fault or a state conflict holds the split', () => {
   assert.equal(run({ phase: 'smoke-live', smoke: 'pass' }, 'harness-stop'), 'halt')
   assert.equal(run({ phase: 'smoke-canary', smoke: null }, 'harness-stop'), 'halt')
+  assert.equal(run({ phase: 'telemetry-canary', smoke: 'pass' }, 'harness-stop'), 'halt')
+  assert.equal(run({ phase: 'telemetry-live', smoke: 'pass' }, 'harness-stop'), 'halt')
   assert.equal(run({ phase: 'ramp', smoke: 'pass' }, 'state-conflict'), 'halt')
   assert.equal(run({ phase: 'telemetry-live', smoke: 'pass' }, 'state-conflict'), 'halt')
 })

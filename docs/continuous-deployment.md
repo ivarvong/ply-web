@@ -95,7 +95,7 @@ cd: PASS 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 | --- | --- | --- |
 | `cd: PASS <version id>` | 0 | The new version is at 100%, and the live smoke and telemetry passed. |
 | `cd: FAIL <stage>: <reason>` | 1 | That stage stopped the run. If the line is from ramp or from the live checks, traffic is already back on `previous` unless the line says the rollback itself failed. |
-| `cd: harness_fault <stage>: <reason>` | 1 | A request got no response, a 403 named the token this stage minted, or the script failed before it could judge the version (bad cf output, a parse failure, a preflight miss). The split is unchanged. This is not a change failure. |
+| `cd: harness_fault <stage>: <reason>` | 1 | A request got no response, a 403 named the token this stage minted, the telemetry query or span join could not be trusted, or the script failed before it could judge the version (bad cf output, a parse failure, a preflight miss). The split is unchanged. This is not a change failure. |
 | `cd: state_conflict <stage>: <reason>` | 1 | The deployment was not the expected prior split, so the write was skipped. The split is unchanged. |
 | a usage line, no `cd: PASS` / `cd: FAIL` | 2 | The arguments were wrong. Traffic was not touched. |
 
@@ -177,7 +177,7 @@ Live (after the ramp, or any time you want to see who is actually serving). No o
 npm run cd -- smoke --expect-version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 ```
 
-The smoke creates an **empty** repo in `ply-loadgen` (prefix `ply-web-cd-`), mints a write token immediately before the requests, and replays the git lifecycle over `/v1`. It does not seed the repo with stock git. The token is revoked after those requests finish. On a pass the repo is deleted. On a fail the repo name is in the verdict and the token is still revoked. A request that gets no response, or a 403 naming that token as invalid or expired, stops the run as `harness_fault`. The split stays where it is. The operator decides what to do next. There is no retry and no rollback for that fault.
+The smoke creates an **empty** repo in `ply-loadgen` (prefix `ply-web-cd-`), mints a write token immediately before the requests, and replays the git lifecycle over `/v1`. It does not seed the repo with stock git. The token is revoked after those requests finish. Each token minted this run is then checked with a `GET` of the repo's `info/refs`: Artifacts must answer 403. That check is a `request` event (method, url, status). The token is not in the event, the URL, or the run directory. On a pass the repo is deleted. On a fail the repo name is in the verdict and the token is still revoked. A request that gets no response, a 403 naming that token as invalid or expired, or a revoke that does not stick as 403, stops the run as `harness_fault`. The split stays where it is. The operator decides what to do next. There is no retry and no rollback for that fault.
 
 A 409 is a pass when that step expects it. The ones that matter after the current write API:
 
@@ -246,7 +246,9 @@ Ceilings for this smoke (a tiny repo, cold isolates included; tighten them after
 | Worker CPU | 250 ms | 3000 ms |
 | Artifacts `fetch` span | 2000 ms | 15000 ms |
 
-If `cf o11y` cannot be queried, the stage fails. It does not treat a missing query as a pass.
+Span events have `$metadata.requestId` null. They carry `traceId` and `rayId`. The smoke CSV records each request's `cf-ray`, and the join uses that ray, then `traceId` when the ray does not match. A request id still on a span is only a last resort.
+
+If `cf o11y` cannot be queried, or the span join matches implausibly few of the invocations the worker logged, the stage is `harness_fault`. The split stays where it is. There is no rollback and no retry. It does not treat a missing query as a pass, and it does not label that miss as a worker fault. A 5xx, an exception, or a latency ceiling on samples the join did find is still a worker fault.
 
 ## 5. Ramp
 
@@ -262,7 +264,7 @@ Without `--verdict`, or with a verdict that is not a pass for that version, the 
 
 The schedule is `1, 5, 10, 25, 50, 75, 100`. Each step waits `40000` ms. During that wait the ramp probes at `PLY_RAMP_PROBE_RPS` (default 2) **on each version**: `GET /` (the usage text, 200, no bearer) and `GET /v1/discover?remote=…` for the public `ply` mirror with the bearer from `PLY_TOKEN_FILE`. Each call sends `Cloudflare-Workers-Version-Overrides` for the new version and, separately, for the previous one, so both arms are sampled at the probe rate rather than at the traffic split. There is no `/health` route. A non-2xx answer from the **new** version fails the step. A probe that gets no response stops the ramp as `harness_fault` and leaves the current split in place. Before each percentage change the ramp reads the deployment and writes only when it is still the previous step's split. Otherwise it stops with `state_conflict` and does not roll back.
 
-Then it reads `cf o11y` for **both** versions over that step's window. Span events have no `$workers.scriptVersion.id`, so traces are queried by service only and joined to a version by `$metadata.requestId`.
+Then it reads `cf o11y` for **both** versions over that step's window. Span events have no `$workers.scriptVersion.id` and a null `$metadata.requestId`, so traces are queried by service only and joined on `rayId`, then `traceId`.
 
 The step decision is the new version's SLO burn, not a hand-tuned rate delta. Burn rate is `(bad / total) / (1 − target)`. Definitions are in [Metrics](#metrics).
 
@@ -401,7 +403,7 @@ cd: FAIL rollback: rollback to 1aa0bb11-… failed: …
 | A ramp line with `decision=rollback`, then `cd: FAIL ramp:` | Previous at 100% | Relay the line. The new version is off traffic. |
 | `cd: FAIL ramp:` and the text says rollback failed | **Not** safe | Run `npm run cd -- rollback --to <previous>` and read the deployment list. The id to restore is the one in that sentence. |
 | `cd: FAIL smoke:` or `cd: FAIL telemetry:` after ramp lines that reached `percent=100` | Previous at 100% if rollback landed | Same as a ramp rollback. The live check is what rejected it. |
-| `cd: harness_fault` | The split where the run stopped | The version was not blamed. No retry and no rollback. Decide from the request that got no response, or the 403 on the token this stage minted. |
+| `cd: harness_fault` | The split where the run stopped | The version was not blamed. No retry and no rollback. Decide from the request that got no response, the 403 on the token this stage minted, or the telemetry query or span join. |
 | `cd: state_conflict` | The split that was already there | Something else changed the deployment. Do not apply the step again until you have read `cf workers deployments list`. |
 
 ## Metrics
@@ -450,9 +452,9 @@ npm run cd -- report
 
 | Metric | Formula |
 | --- | --- |
-| Deployment frequency | deploys / days. A deploy is a `run_finished` with a version id. Days are the span from the first such timestamp to the last. One timestamp has no rate. |
+| Deployment frequency | deploys / days. A deploy is a `run_finished` that reached 100% (`liveAt` set) and whose `fault` is not `harness_fault`. Aborted runs, held runs, and `harness_fault` runs are counted on their own lines and are not deploys. Days are the span from the first deploy timestamp to the last. One timestamp has no rate. |
 | Lead time | `liveAt − plyMergedAt` on a passing deploy. `liveAt` is when the ramp reached 100%. `plyMergedAt` is the ply commit's committer time from the GitHub API, or null if that fetch fails (the deploy still finishes). Report p50 and p90. |
-| Change failure rate | rollbacks / deploys, excluding a run whose `fault` is `harness_fault` |
+| Change failure rate | rollbacks / deploys. A harness fault is not in either number. |
 | Time to restore | `restoredAt − failedAt` for a rolled-back deploy. p50 and p90. |
 | Stage duration | p50 and p90 of each stage's `durationMs`, across runs. Percentile is `sorted[floor((n − 1) · p)]`. |
 

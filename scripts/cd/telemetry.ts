@@ -1,5 +1,5 @@
 import { lossAllowance, verdict, type CanaryVerdict } from '../canary-verdict.mjs'
-import { QUERY_SLACK_MS, TELEMETRY_PAGE, type LatencyCeiling } from './baseline.ts'
+import { CF_RAY_HEX_LENGTH, JOIN_MIN_LOGGED, JOIN_MIN_SHARE, QUERY_SLACK_MS, TELEMETRY_PAGE, type LatencyCeiling } from './baseline.ts'
 import { asRecord } from './json.ts'
 import type { V1Request } from './slo.ts'
 
@@ -18,6 +18,15 @@ export type SmokeRequest = {
   readonly step: string
   readonly status: number
   readonly expected: readonly number[]
+  /** cf-ray of the smoke response. Span events join on this. Null when the response had none. */
+  readonly ray: string | null
+}
+
+/** A telemetry query that threw. The type has no worker variant: a query failure is the harness. */
+export type QueryFault = { readonly kind: 'harness_fault'; readonly reason: string }
+
+export function queryFault(reason: string): QueryFault {
+  return { kind: 'harness_fault', reason }
 }
 
 export type Filter = {
@@ -101,9 +110,123 @@ function versionOf(event: Record<string, unknown>): string | null {
   return typeof script?.id === 'string' ? script.id : null
 }
 
+function stringField(value: unknown): string | null {
+  return typeof value === 'string' && value !== '' ? value : null
+}
+
 function requestIdOf(event: Record<string, unknown>): string | null {
   const meta = asRecord(event.$metadata)
-  return typeof meta?.requestId === 'string' ? meta.requestId : null
+  return stringField(meta?.requestId) ?? stringField(event.requestId)
+}
+
+function traceIdOf(event: Record<string, unknown>): string | null {
+  const meta = asRecord(event.$metadata)
+  return stringField(event.traceId) ?? stringField(event.trace_id) ?? stringField(meta?.traceId) ?? stringField(meta?.trace_id)
+}
+
+function rayIdOf(event: Record<string, unknown>): string | null {
+  const meta = asRecord(event.$metadata)
+  return stringField(event.rayId) ?? stringField(event.ray_id) ?? stringField(meta?.rayId) ?? stringField(meta?.ray_id)
+}
+
+type JoinKey = {
+  readonly requestId: string | null
+  readonly traceId: string | null
+  readonly rayId: string | null
+}
+
+function joinKeyOf(event: Record<string, unknown>): JoinKey {
+  return { requestId: requestIdOf(event), traceId: traceIdOf(event), rayId: rayIdOf(event) }
+}
+
+/** The 16-hex body of a cf-ray, or null when `ray` is not that shape. */
+function rayBody(ray: string): string | null {
+  const dash = ray.indexOf('-')
+  const body = dash === -1 ? ray : ray.slice(0, dash)
+  if (body.length !== CF_RAY_HEX_LENGTH || !/^[0-9a-f]+$/i.test(body)) return null
+  return body.toLowerCase()
+}
+
+function sameRay(left: string, right: string): boolean {
+  if (left === right) return true
+  const a = rayBody(left)
+  const b = rayBody(right)
+  return a !== null && a === b
+}
+
+type TraceMarks = {
+  readonly rays: readonly string[]
+  readonly traces: readonly string[]
+  readonly strings: ReadonlySet<string>
+}
+
+function traceMarks(trace: unknown): TraceMarks {
+  const rays: string[] = []
+  const traces: string[] = []
+  const strings = new Set<string>()
+  walk(trace, rec => {
+    const ray = rayIdOf(rec)
+    const traceId = traceIdOf(rec)
+    if (ray) rays.push(ray)
+    if (traceId) traces.push(traceId)
+    for (const value of Object.values(rec)) {
+      if (typeof value === 'string' && value !== '') strings.add(value)
+    }
+  }, new Set())
+  return { rays, traces, strings }
+}
+
+function rayHit(rays: readonly string[], want: string): boolean {
+  for (const ray of rays) if (sameRay(ray, want)) return true
+  return false
+}
+
+/**
+ * Span events carry `rayId` and `traceId`. `$metadata.requestId` is null on those events,
+ * so it is only a last resort for a span that still has one.
+ */
+function keysMatch(marks: TraceMarks, keys: readonly JoinKey[]): boolean {
+  for (const key of keys) if (key.rayId && rayHit(marks.rays, key.rayId)) return true
+  for (const key of keys) if (key.traceId && marks.traces.includes(key.traceId)) return true
+  for (const key of keys) if (key.requestId && marks.strings.has(key.requestId)) return true
+  return false
+}
+
+type SmokeKeys = {
+  rays: string[]
+  traces: string[]
+  requestIds: string[]
+}
+
+function smokeKeys(): SmokeKeys {
+  return { rays: [], traces: [], requestIds: [] }
+}
+
+function addKey(into: SmokeKeys, key: JoinKey): void {
+  const rayId = key.rayId
+  const traceId = key.traceId
+  const requestId = key.requestId
+  if (rayId && !into.rays.some(ray => sameRay(ray, rayId))) into.rays.push(rayId)
+  if (traceId && !into.traces.includes(traceId)) into.traces.push(traceId)
+  if (requestId && !into.requestIds.includes(requestId)) into.requestIds.push(requestId)
+}
+
+function smokeMatched(marks: TraceMarks, keysBySmoke: ReadonlyMap<string, SmokeKeys>, smokeIds: ReadonlySet<string>, platformToSmoke: ReadonlyMap<string, string>): Set<string> {
+  const matched = new Set<string>()
+  for (const [id, keys] of keysBySmoke) {
+    if (keys.rays.some(ray => rayHit(marks.rays, ray))) matched.add(id)
+  }
+  if (matched.size > 0) return matched
+  for (const [id, keys] of keysBySmoke) {
+    if (keys.traces.some(traceId => marks.traces.includes(traceId))) matched.add(id)
+  }
+  if (matched.size > 0) return matched
+  for (const value of marks.strings) {
+    if (smokeIds.has(value)) matched.add(value)
+    const smoke = platformToSmoke.get(value)
+    if (smoke) matched.add(smoke)
+  }
+  return matched
 }
 
 function isLog(event: Record<string, unknown>): boolean {
@@ -147,14 +270,6 @@ function walk(node: unknown, visit: (rec: Record<string, unknown>) => void, seen
   const rec = node as Record<string, unknown>
   visit(rec)
   for (const value of Object.values(rec)) walk(value, visit, seen)
-}
-
-function collectStrings(node: unknown, into: Set<string>, seen: Set<object>): void {
-  walk(node, rec => {
-    for (const value of Object.values(rec)) {
-      if (typeof value === 'string') into.add(value)
-    }
-  }, seen)
 }
 
 export type VersionStats = {
@@ -219,27 +334,18 @@ function v1From(events: readonly unknown[]): V1Request[] {
   return out
 }
 
-/** Fetch spans have no script version. Attribute a span when its trace names a request id from `events`. */
+/** Fetch spans have no script version. Join on rayId, then traceId, then a request id the span still carries. */
 function fetchMsJoined(events: readonly unknown[], traces: readonly unknown[]): number[] {
-  const ids = new Set<string>()
+  const keys: JoinKey[] = []
   for (const item of events) {
     const event = asRecord(item)
     if (!event) continue
-    const id = requestIdOf(event)
-    if (id) ids.add(id)
+    const key = joinKeyOf(event)
+    if (key.requestId || key.traceId || key.rayId) keys.push(key)
   }
   const fetchMs: number[] = []
   for (const trace of traces) {
-    const strings = new Set<string>()
-    collectStrings(trace, strings, new Set())
-    let hit = false
-    for (const id of ids) {
-      if (strings.has(id)) {
-        hit = true
-        break
-      }
-    }
-    if (!hit) continue
+    if (!keysMatch(traceMarks(trace), keys)) continue
     const seen = new Set<object>()
     walk(trace, rec => {
       if (rec.name !== 'fetch') return
@@ -294,6 +400,8 @@ export type SmokeSummary = {
   readonly cpuMs: readonly number[]
   readonly fetchMs: readonly number[]
   readonly tracedIds: ReadonlySet<string>
+  /** Fetch invocations of this version in the window. The span join is compared with this. */
+  readonly invocations: number
 }
 
 /** Reduce a version's events and traces to the smoke-id view the gate judges. */
@@ -301,10 +409,22 @@ export function summarizeTelemetry(version: string, requests: readonly SmokeRequ
   const want = new Set(requests.map(request => request.id))
   const loggedBy = new Map<string, Set<string>>()
   const platformToSmoke = new Map<string, string>()
+  const keysBySmoke = new Map<string, SmokeKeys>()
+  const keysFor = (id: string): SmokeKeys => {
+    const existing = keysBySmoke.get(id)
+    if (existing) return existing
+    const created = smokeKeys()
+    keysBySmoke.set(id, created)
+    return created
+  }
+  for (const request of requests) {
+    if (request.ray) keysFor(request.id).rays.push(request.ray)
+  }
   let fivexx = 0
   let errorLogs = 0
   let nonOk = 0
   let exceptions = 0
+  let invocations = 0
   const smokePlatform = new Set<string>()
   for (const item of events) {
     const event = asRecord(item)
@@ -316,6 +436,7 @@ export function summarizeTelemetry(version: string, requests: readonly SmokeRequ
         const versions = loggedBy.get(id) ?? new Set<string>()
         if (saw) versions.add(saw)
         loggedBy.set(id, versions)
+        addKey(keysFor(id), joinKeyOf(event))
         const platform = requestIdOf(event)
         if (platform && saw === version) {
           platformToSmoke.set(platform, id)
@@ -330,6 +451,7 @@ export function summarizeTelemetry(version: string, requests: readonly SmokeRequ
       }
     }
     if (saw !== version || !isFetchInvocation(event)) continue
+    invocations += 1
     if (exceptionCount(event) > 0) exceptions += 1
     const workers = asRecord(event.$workers)
     if (workers?.outcome !== undefined && workers.outcome !== 'ok') nonOk += 1
@@ -345,17 +467,27 @@ export function summarizeTelemetry(version: string, requests: readonly SmokeRequ
     if (typeof workers?.wallTimeMs === 'number') wallMs.push(workers.wallTimeMs)
     if (typeof workers?.cpuTimeMs === 'number') cpuMs.push(workers.cpuTimeMs)
   }
+  for (const item of events) {
+    const event = asRecord(item)
+    if (!event) continue
+    const key = joinKeyOf(event)
+    const requestId = key.requestId
+    let smoke = requestId ? platformToSmoke.get(requestId) ?? null : null
+    const rayId = key.rayId
+    if (!smoke && rayId) {
+      for (const [id, keys] of keysBySmoke) {
+        if (keys.rays.some(ray => sameRay(ray, rayId))) {
+          smoke = id
+          break
+        }
+      }
+    }
+    if (smoke) addKey(keysFor(smoke), key)
+  }
   const tracedIds = new Set<string>()
   const fetchMs: number[] = []
   for (const trace of traces) {
-    const strings = new Set<string>()
-    collectStrings(trace, strings, new Set())
-    const matched = new Set<string>()
-    for (const value of strings) {
-      if (want.has(value)) matched.add(value)
-      const smoke = platformToSmoke.get(value)
-      if (smoke) matched.add(smoke)
-    }
+    const matched = smokeMatched(traceMarks(trace), keysBySmoke, want, platformToSmoke)
     if (matched.size === 0) continue
     for (const id of matched) tracedIds.add(id)
     const seen = new Set<object>()
@@ -372,14 +504,38 @@ export function summarizeTelemetry(version: string, requests: readonly SmokeRequ
     cpuMs,
     fetchMs,
     tracedIds,
+    invocations,
   }
 }
 
-export type SmokeJudge = {
-  readonly pass: boolean
-  readonly failures: readonly TelemetryFailure[]
-  readonly line: string
-  readonly verdict: CanaryVerdict
+/**
+ * A join or query failure is `harness_fault` and has no worker label.
+ * A version that answered badly is `worker`. Those two cannot be confused.
+ */
+export type SmokeJudge =
+  | { readonly kind: 'pass'; readonly line: string; readonly failures: readonly []; readonly verdict: CanaryVerdict }
+  | { readonly kind: 'worker'; readonly line: string; readonly failures: readonly TelemetryFailure[]; readonly verdict: CanaryVerdict }
+  | { readonly kind: 'harness_fault'; readonly line: string; readonly reason: string; readonly verdict: CanaryVerdict }
+
+/** Below half of the invocations the worker logged, the span join is the harness, not the version. */
+export function implausibleJoin(input: { readonly smoke: number; readonly invocations: number; readonly joined: number }): boolean {
+  const compared = Math.min(input.invocations, input.smoke)
+  if (compared < JOIN_MIN_LOGGED) return false
+  return input.joined / compared < JOIN_MIN_SHARE
+}
+
+function isVersionFault(failure: TelemetryFailure): boolean {
+  switch (failure.kind) {
+    case 'exception':
+    case 'unexpected-status':
+    case 'log-error':
+    case 'other-version':
+    case 'latency':
+      return true
+    case 'missing':
+    case 'trace-count':
+      return false
+  }
 }
 
 function latencyFailures(
@@ -440,9 +596,23 @@ export function judgeSmokeTelemetry(input: {
   if (decided.unconfirmed.length > 0 || decided.lost.length > decided.allowance) {
     failures.push({ kind: 'missing', detail: decided.reasons.join('; ') || 'smoke ids missing from telemetry' })
   }
-  const pass = failures.length === 0 && decided.pass
-  const line = pass ? decided.line : `${decided.line}${failures.length ? `; ${failures.map(failure => failure.kind).join(', ')}` : ''}`
-  return { pass, failures, line, verdict: decided }
+  const line = failures.length === 0 && decided.pass
+    ? decided.line
+    : `${decided.line}${failures.length ? `; ${failures.map(failure => failure.kind).join(', ')}` : ''}`
+  const versionFault = failures.some(isVersionFault) || summary.health.fivexx > 0 || summary.health.nonOk > 0
+  let fromLogs = 0
+  for (const request of requests) {
+    if (summary.loggedBy.get(request.id)?.has(version)) fromLogs += 1
+  }
+  const joined = summary.tracedIds.size
+  const join = { smoke: requests.length, invocations: Math.max(summary.invocations, fromLogs), joined }
+  if (!versionFault && implausibleJoin(join)) {
+    const compared = Math.min(join.invocations, join.smoke)
+    const reason = `span join matched ${joined}/${compared} invocations the worker logged`
+    return { kind: 'harness_fault', line: `telemetry: harness_fault: ${reason}`, reason, verdict: decided }
+  }
+  if (failures.length === 0 && decided.pass) return { kind: 'pass', failures: [], line, verdict: decided }
+  return { kind: 'worker', failures, line, verdict: decided }
 }
 
 export function telemetryMarkdown(input: {
@@ -465,9 +635,11 @@ export function telemetryMarkdown(input: {
     `- wall p50/p99 ${percentile(summary.wallMs, 0.5) ?? '-'} / ${percentile(summary.wallMs, 0.99) ?? '-'} ms`,
     `- cpu p50/p99 ${percentile(summary.cpuMs, 0.5) ?? '-'} / ${percentile(summary.cpuMs, 0.99) ?? '-'} ms`,
     `- fetch p50/p99 ${percentile(summary.fetchMs, 0.5) ?? '-'} / ${percentile(summary.fetchMs, 0.99) ?? '-'} ms`,
-    `- traces for ${summary.tracedIds.size} smoke requests`,
+    `- traces for ${summary.tracedIds.size} smoke requests; ${summary.invocations} invocations logged by the worker`,
   ]
-  if (judge.failures.length) {
+  if (judge.kind === 'harness_fault') {
+    lines.push('', '## Harness fault', '', judge.reason)
+  } else if (judge.failures.length) {
     lines.push('', '## Failures', '')
     for (const failure of judge.failures) lines.push(`- ${failure.kind}: ${'detail' in failure ? failure.detail : JSON.stringify(failure)}`)
   }

@@ -69,7 +69,7 @@ export type LifecycleFinished = {
   readonly liveAt: string | null
   readonly failedAt: string | null
   readonly restoredAt: string | null
-  /** Null on a pass. `harness_fault` is a script or preflight error and is not a change failure. */
+  /** Null on a pass. `harness_fault` is a script, query, or join error and is not a change failure. */
   readonly fault: Fault | null
 }
 

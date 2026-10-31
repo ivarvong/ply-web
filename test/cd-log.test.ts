@@ -241,18 +241,29 @@ test('dora metrics use run_finished', () => {
       ...over,
     },
   })
+  const rollback = { ...finished({ rolledBack: true, verdict: 'fail', failedAt: '2026-10-31T22:00:00Z', restoredAt: '2026-10-31T22:01:30Z', liveAt: '2026-11-01T20:50:00Z', plyMergedAt: null }), run_id: 's', ts: '2026-11-01T21:00:00.000+00:00' }
   const text = doraText([
     finished({}),
-    { ...finished({ rolledBack: true, verdict: 'fail', failedAt: '2026-10-31T22:00:00Z', restoredAt: '2026-10-31T22:01:30Z', liveAt: null, plyMergedAt: null }), run_id: 's', ts: '2026-11-01T21:00:00.000+00:00' },
+    rollback,
+    { ...finished({ verdict: 'fail', liveAt: null, rolledBack: false, fault: 'worker', plyMergedAt: null }), run_id: 'held', ts: '2026-11-03T21:00:00.000+00:00' },
+    { ...finished({ fault: 'harness_fault', verdict: 'fail', liveAt: null, rolledBack: false, plyMergedAt: null }), run_id: 'h', ts: '2026-11-04T21:00:00.000+00:00' },
+    { ...finished({ verdict: 'fail', liveAt: null, rolledBack: true, fault: 'worker', failedAt: '2026-11-05T21:00:00Z', restoredAt: '2026-11-05T21:10:00Z', plyMergedAt: null }), run_id: 'aborted', ts: '2026-11-05T21:00:00.000+00:00' },
   ])
+  assert.match(text, /runs: 5/)
+  assert.match(text, /deploys: 2/)
+  assert.match(text, /excluded from deploys: 3/)
+  assert.match(text, /aborted: 1/)
+  assert.match(text, /held: 1/)
+  assert.match(text, /harness_fault: 1/)
   assert.match(text, /deployment frequency: 2\.000 \/ day/)
   assert.match(text, /lead time p50: 3600s/)
   assert.match(text, /change failure rate: 0\.500/)
   const withHarness = doraText([
     finished({}),
-    { ...finished({ rolledBack: true, verdict: 'fail', failedAt: '2026-10-31T22:00:00Z', restoredAt: '2026-10-31T22:01:30Z', liveAt: null, plyMergedAt: null }), run_id: 's', ts: '2026-11-01T21:00:00.000+00:00' },
+    rollback,
     { ...finished({ fault: 'harness_fault', rolledBack: true, verdict: 'fail' }), run_id: 'h', ts: '2026-11-02T21:00:00.000+00:00' },
   ])
+  assert.match(withHarness, /deploys: 2/)
   assert.match(withHarness, /change failure rate: 0\.500/)
   assert.match(text, /time to restore p50: 90s/)
   assert.match(text, /bump p50 2s/)
