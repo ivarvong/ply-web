@@ -209,7 +209,15 @@ export async function serveGitCache(req: Request, tokens: TokenSource | null, ct
   if (ua) headers.set('user-agent', ua);
   if (body) { headers.set('content-type', 'application/x-git-upload-pack-request'); headers.set('accept', 'application/x-git-upload-pack-result'); }
   const fetchUp = withPublicReadCredential(upstream, tokens);
-  const res = await fetchUp(url, { method, headers, body: (body ?? undefined) as BodyInit | undefined, redirect: 'manual', signal: req.signal });
+  let res: Response;
+  try {
+    res = await fetchUp(url, { method, headers, body: (body ?? undefined) as BodyInit | undefined, redirect: 'manual', signal: req.signal });
+  } catch (e) {
+    // A failure before any upstream answer (the read-token mint: no such repo, binding down; the network). Answer with
+    // the HTTP status ply maps back to the same code (http.js httpCode): 404 → not_found, else 502 → upstream_5xx.
+    const code = (e as { code?: string })?.code;
+    return plain(code === 'not_found' ? 404 : 502, code === 'not_found' ? 'repository not found' : 'upstream unavailable');
+  }
   const ct = res.headers.get('content-type') ?? '';
   const out = new Headers({ 'content-type': ct || 'application/octet-stream', 'x-ply-gc-kind': kind, 'cache-tag': `ply-gc-v${CACHE_VERSION},ply-gc-${kind}` });
   const location = res.headers.get('location');
