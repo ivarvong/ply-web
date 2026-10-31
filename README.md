@@ -154,7 +154,10 @@ SHA-256 of `CF-Connecting-IP` (clients with no header share one shard). Each sha
 timestamps per bucket, not addresses.
 Immutable upload-pack responses are cached in the Workers Cache by SHA-256 of url + body; the viewer sends no
 `Authorization`, so it cannot read a pack `/v1` cached under a credential. Cache hits do not spend the subrequest
-budget. HTML is `no-store` and escaped. CSP is `default-src 'none'; style-src 'self'; script-src 'none'; img-src 'none'`,
+budget. ply's pack cache does not cache a blob fetch (it has no filter line), so the viewer keeps its own: verified blob
+bytes up to the 256 KiB display cap, keyed by SHA-256 of repo URL + blob oid, written only after the git hash check
+and hashed again on every hit (a bad entry is refetched, never served). A warm file, raw, or README view makes no
+blob round trip. HTML is `no-store` and escaped. CSP is `default-src 'none'; style-src 'self'; script-src 'none'; img-src 'none'`,
 plus `X-Content-Type-Options: nosniff`. There is no inline script and `unsafe-inline` is not allowed.
 
 `cloudflare.config.ts` declares `ViewerRateLimit` as a live SQLite class in `worker.exports`. The namespace already exists (created by migration tag `v1-viewer-rate`, namespace id `656fdd50f0d6428393eb2d9250ceee67`). Declaring it keeps that namespace and its data.

@@ -10,7 +10,7 @@ import { cachedFetch, makeTracer, plyCode, spanCollector } from './ply.ts'
 import { parseViewerRequest, routeOptsFromEnv, type ViewerRoute } from './route.ts'
 import { renderError, renderHome, renderLoaded } from './render.tsx'
 import { VIEWER_CSS } from './styles.ts'
-import { loadRepo } from './session.ts'
+import { blobStore, loadRepo } from './session.ts'
 import { buildTrace, traceHeader } from './traceview.ts'
 import { LAYOUT } from './layout.ts'
 import { listPublicRepos, tokenSourceFor, withPublicReadCredential } from '../public.ts'
@@ -120,7 +120,8 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
   const cache = call.opts.cache === undefined ? (env.PACK_CACHE === 'off' ? null : defaultCache()) : call.opts.cache
   const fetchImpl: FetchLike = cache ? cachedFetch(guard, cache, promise => { try { call.ctx.waitUntil?.(promise) } catch { /* already settled */ } }) : guard
   try {
-    const loaded = await loadRepo(route, { tracer, fetchImpl, signal: pageSignal, budget })
+    const blobs = blobStore(cache, promise => { try { call.ctx.waitUntil?.(promise) } catch { /* already settled */ } })
+    const loaded = await loadRepo(route, { tracer, fetchImpl, signal: pageSignal, budget, blobs })
     const trace = buildTrace(collected.lines, call.cfRay, call.requestId)
     call.opts.note?.({ host: route.loc.host, rtt: trace.bars.length, bytes: budget.bytes, code: 'ok' })
     if (loaded.kind === 'raw') {
