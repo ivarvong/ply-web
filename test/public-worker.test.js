@@ -328,7 +328,7 @@ test('/v1 without a bearer: another namespace, another host, traversal, unknown 
     assert.equal(res.status, 401, `${r} → ${res.status}`);
     assert.equal(res.json().code, 'unauthorized');
   }
-  for (const [m, p] of [['POST', '/v1/edit'], ['POST', '/v1/branch'], ['DELETE', '/v1/branch'], ['POST', '/v1/merge'], ['POST', '/v1/rebase'], ['POST', '/v1/cherry-pick'], ['POST', '/v1/revert']]) {
+  for (const [m, p] of [['POST', '/v1/edit'], ['POST', '/v1/branch'], ['DELETE', '/v1/branch'], ['POST', '/v1/merge'], ['POST', '/v1/rebase'], ['POST', '/v1/cherry-pick'], ['POST', '/v1/revert'], ['POST', '/v1/tag'], ['DELETE', '/v1/tag']]) {
     assert.equal((await W(p, { method: m, body: { remote: remote('ply'), ref: 'main', path: 'README.md', find: 'ply', replace: 'x', from: 'main', commit: plyRepo.head, author: { name: 'a', email: 'a@x' }, committer: { name: 'a', email: 'a@x' }, message: 'm' } })).status, 401, `${m} ${p}`);
   }
   assert.deepEqual(since(i), [], 'nothing was fetched');
@@ -381,7 +381,7 @@ test('writes to public-v0 are 403 read_only with a bearer, with a caller git cre
   const i = mark();
   const body = { ref: 'main', path: 'README.md', find: 'ply', replace: 'x', from: 'main', commit: plyRepo.head, author: { name: 'a', email: 'a@x' }, committer: { name: 'a', email: 'a@x' }, message: 'm' };
   for (const r of [remote('ply'), `${ORIGIN}/git/${NS}/ply`, `${ORIGIN}/git/${NS.toUpperCase()}/ply.git`, `${ORIGIN}/git/${NS}/new.git`, `${ORIGIN}/git/${NS}/a/b.git`]) {
-    for (const [m, p] of [['POST', '/v1/edit'], ['POST', '/v1/branch'], ['DELETE', '/v1/branch'], ['POST', '/v1/merge'], ['POST', '/v1/rebase'], ['POST', '/v1/cherry-pick'], ['POST', '/v1/revert']]) {
+    for (const [m, p] of [['POST', '/v1/edit'], ['POST', '/v1/branch'], ['DELETE', '/v1/branch'], ['POST', '/v1/merge'], ['POST', '/v1/rebase'], ['POST', '/v1/cherry-pick'], ['POST', '/v1/revert'], ['POST', '/v1/tag'], ['DELETE', '/v1/tag']]) {
       for (const headers of [bearer, { ...bearer, 'git-token': OTHER }, { ...bearer, 'git-authorization': `Bearer ${OTHER}` }]) {
         const res = await W(p, { method: m, body: { ...body, remote: r }, headers });
         assert.equal(res.status, 403, `${m} ${p} ${r}`);
