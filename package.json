@@ -15,7 +15,7 @@
     "publish": "node scripts/publish.mjs",
     "worker:deploy": "cf deploy",
     "worker:deploy:dry-run": "cf deploy --dry-run",
-    "test": "node test/cf-bundle.js && PLY_WEB_BUNDLE_BUILT=1 node --test --test-concurrency=1 test/worker.test.js test/public-worker.test.js && PLY_WEB_BUNDLE_BUILT=1 node --experimental-strip-types --import ./test/register-tsx.mjs --test test/viewer.test.ts test/security.test.ts test/public.test.ts test/gitcache.test.ts test/mirror.test.ts test/pinned.test.ts",
+    "test": "node test/cf-bundle.js && PLY_WEB_BUNDLE_BUILT=1 node --test --test-concurrency=1 test/worker.test.js test/public-worker.test.js && PLY_WEB_BUNDLE_BUILT=1 node --experimental-strip-types --import ./test/register-tsx.mjs --test test/write.test.ts test/viewer.test.ts test/security.test.ts test/public.test.ts test/gitcache.test.ts test/mirror.test.ts test/pinned.test.ts",
     "test:worker": "node --test test/worker.test.js",
     "worker:test": "node --test test/worker.test.js",
     "test:viewer": "node --experimental-strip-types --import ./test/register-tsx.mjs --test test/viewer.test.ts",

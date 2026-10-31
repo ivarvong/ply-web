@@ -96,7 +96,7 @@ function repo(files, host = () => srv.url) {
 
 test('GET / is public usage text; everything else needs the PLY bearer (missing or wrong → 401)', { skip }, async () => {
   const u = await W('/', { auth: false }); assert.equal(u.status, 200); const usage = await u.text(); assert.match(usage, /Authorization: Bearer <PLY_TOKEN>/); assert.match(usage, /GET +\/v1\/commit\?remote=&ref=/);
-  for (const [m, p] of [['GET', '/v1/refs'], ['GET', '/v1/read'], ['GET', '/v1/tree'], ['GET', '/v1/discover'], ['GET', '/v1/commit'], ['POST', '/v1/edit'], ['POST', '/v1/branch'], ['DELETE', '/v1/branch'], ['POST', '/v1/merge'], ['POST', '/v1/rebase'], ['POST', '/v1/cherry-pick'], ['POST', '/v1/revert'], ['GET', '/nope']]) {
+  for (const [m, p] of [['GET', '/v1/refs'], ['GET', '/v1/read'], ['GET', '/v1/tree'], ['GET', '/v1/discover'], ['GET', '/v1/commit'], ['POST', '/v1/edit'], ['POST', '/v1/branch'], ['DELETE', '/v1/branch'], ['POST', '/v1/merge'], ['POST', '/v1/rebase'], ['POST', '/v1/cherry-pick'], ['POST', '/v1/revert'], ['POST', '/v1/tag'], ['DELETE', '/v1/tag'], ['GET', '/nope']]) {
     for (const headers of [{}, { authorization: `Bearer ${PLY}x` }, { authorization: `Bearer ${PLY.slice(0, -1)}` }, { authorization: `Basic ${btoa(`x:${PLY}`)}` }]) {
       const r = await W(`${p}?remote=${encodeURIComponent(srv.url + '/x.git')}`, { method: m, headers, auth: false });
       assert.equal(r.status, 401, `${m} ${p} ${JSON.stringify(headers)}`); assert.equal((await r.json()).code, 'unauthorized');
@@ -243,6 +243,167 @@ test('a server that refuses tree:0 (Artifacts mode): reads and an edit still mat
   assert.ok(e.trace.some(s => s.attrs['git.fetch.filter.fallback'] === 'blob:none'));
 });
 
+test('empty repo lifecycle: first commit through history, with no git seeding', { skip }, async () => {
+  const name = `e${n++}`;
+  const bare = makeBareRepo(root, name);
+  const remote = `${srv.url}/${name}.git`;
+  const post = (p, body, method = 'POST') => W(p + (p.includes('?') ? '' : ''), { method, body: { remote, ...body } }).then(async res => ({ status: res.status, body: await res.json() }));
+  const ZERO = '0'.repeat(40);
+  assert.equal(git(bare, ['symbolic-ref', 'HEAD']).trim(), 'refs/heads/main');
+  assert.throws(() => git(bare, ['rev-parse', '--verify', 'HEAD']));
+  const empty = await (await W(`/v1/commit?${qs({ remote })}`)).json();
+  assert.deepEqual(empty, { empty: true, ref: 'refs/heads/main', oid: null, tree: null, parents: [], author: null, committer: null, message: null, signed: false });
+  assert.deepEqual(await (await W(`/v1/commit?${qs({ remote, ref: 'main' })}`)).json(), empty);
+  assert.equal((await W(`/v1/commit?${qs({ remote, ref: 'nope' })}`)).status, 404);
+  const refs = await (await W(`/v1/refs?${qs({ remote })}`)).json();
+  assert.equal(refs.head, null); assert.equal(refs.empty, true); assert.equal(refs.unborn, 'refs/heads/main');
+  let x = await post('/v1/branch', { ref: 'tmp' });
+  assert.equal(x.status, 400, JSON.stringify(x.body)); assert.match(x.body.message, /from is required when the remote HEAD is unborn \(refs\/heads\/main\)/);
+  x = await post('/v1/branch', { ref: 'tmp', from: ZERO });
+  assert.equal(x.status, 400, JSON.stringify(x.body)); assert.match(x.body.message, /zero oid/);
+  assert.throws(() => git(bare, ['rev-parse', '--verify', '-q', 'refs/heads/tmp']));
+  x = await post('/v1/merge', { from: 'main' });
+  assert.equal(x.status, 400, JSON.stringify(x.body)); assert.match(x.body.message, /ref is required when the remote HEAD is unborn \(refs\/heads\/main\)/);
+  x = await post('/v1/edit', { base: ZERO, path: 'a.txt', content: 'a\n', author: A, message: 'no' });
+  assert.equal(x.status, 400, JSON.stringify(x.body)); assert.match(x.body.message, /zero oid/);
+  const author = { ...A, tz: '+0530', time: 1700000000 };
+  x = await post('/v1/edit?trace=1', { message: 'init', author, changes: [
+    { op: 'create', path: 'README.md', content: 'hello\n' },
+    { op: 'create', path: 'src/a.txt', content: 'v1\n' },
+    { op: 'create', path: 'src/keep.txt', content: 'keep\n' },
+    { op: 'create', path: 'old.txt', content: 'x\n' },
+    { op: 'create', path: 'bin/run', content: '#!/bin/sh\n', mode: '100755' },
+    { op: 'create', path: 'link', content: 'README.md', mode: '120000' },
+  ] });
+  assert.equal(x.status, 200, JSON.stringify(x.body));
+  assert.equal(x.body.outcome, 'commit'); assert.equal(x.body.ref, 'refs/heads/main'); assert.equal(x.body.oldOid, null); assert.equal(x.body.oldCommit, null); assert.equal(x.body.noop, false);
+  const c0 = x.body.oid;
+  assert.equal(x.body.newCommit, c0);
+  assert.equal(git(bare, ['rev-parse', 'main']).trim(), c0);
+  assert.ok(x.body.trace.some(s => s.name === 'git.commit' || s.name === 'git.head'), JSON.stringify(x.body.trace?.map(s => s.name)));
+  const raw0 = gitBuf(bare, ['cat-file', 'commit', c0]).toString();
+  assert.equal(raw0.split('\n').some(l => l.startsWith('parent ')), false);
+  assert.match(raw0, /author w <w@x> 1700000000 \+0530\n/);
+  assert.match(raw0, /committer w <w@x> 1700000000 \+0530\n/);
+  assert.match(git(bare, ['ls-tree', '-r', c0]), /100755 blob [0-9a-f]{40}\tbin\/run/);
+  assert.match(git(bare, ['ls-tree', '-r', c0]), /120000 blob [0-9a-f]{40}\tlink/);
+  assert.equal(gitBuf(bare, ['cat-file', '-p', `${c0}:link`]).toString(), 'README.md');
+  const born = await (await W(`/v1/commit?${qs({ remote })}`)).json();
+  assert.equal(born.oid, c0); assert.equal(born.parents.length, 0); assert.equal(born.author.tz, '+0530'); assert.equal(born.author.epoch, 1700000000); assert.equal(born.empty, undefined);
+  const bornRefs = await (await W(`/v1/refs?${qs({ remote })}`)).json();
+  assert.equal(bornRefs.head, 'refs/heads/main'); assert.equal(bornRefs.refs['refs/heads/main'], c0); assert.equal(bornRefs.empty, undefined);
+  x = await post('/v1/edit', { message: 'second', author: { ...A, time: 1700000100 }, committer: { name: 'c', email: 'c@x', tz: '-0800', time: 1700000100 }, changes: [
+    { op: 'edit', path: 'src/a.txt', find: 'v1', replace: 'v2' },
+    { op: 'delete', path: 'src/keep.txt' },
+    { op: 'create', path: 'ADDED.txt', content: 'added\n' },
+    { op: 'rename', path: 'old.txt', to: 'new.txt' },
+  ] });
+  assert.equal(x.status, 200, JSON.stringify(x.body));
+  const c1 = x.body.oid;
+  assert.equal(x.body.oldOid, c0); assert.equal(git(bare, ['rev-parse', 'main']).trim(), c1);
+  const raw1 = gitBuf(bare, ['cat-file', 'commit', c1]).toString();
+  assert.match(raw1, new RegExp(`parent ${c0}\\n`));
+  assert.match(raw1, /author w <w@x> 1700000100 \+0000\n/);
+  assert.match(raw1, /committer c <c@x> 1700000100 -0800\n/);
+  assert.equal(gitBuf(bare, ['show', 'main:src/a.txt']).toString(), 'v2\n');
+  assert.equal(gitBuf(bare, ['show', 'main:ADDED.txt']).toString(), 'added\n');
+  assert.equal(gitBuf(bare, ['show', 'main:new.txt']).toString(), 'x\n');
+  assert.throws(() => git(bare, ['cat-file', '-e', 'main:src/keep.txt']));
+  assert.throws(() => git(bare, ['cat-file', '-e', 'main:old.txt']));
+  x = await post('/v1/branch', { ref: 'other', from: c0 });
+  assert.equal(x.status, 201, JSON.stringify(x.body)); assert.equal(x.body.outcome, 'created'); assert.equal(x.body.oid, c0); assert.equal(x.body.oldOid, null);
+  x = await post('/v1/edit', { ref: 'other', message: 'other same', author: A, changes: [
+    { op: 'edit', path: 'src/a.txt', find: 'v1', replace: 'v2' },
+    { op: 'delete', path: 'src/keep.txt' },
+    { op: 'create', path: 'ADDED.txt', content: 'added\n' },
+    { op: 'rename', path: 'old.txt', to: 'new.txt' },
+  ] });
+  assert.equal(x.status, 200, JSON.stringify(x.body));
+  const otherTip = x.body.oid;
+  assert.equal(git(bare, ['rev-parse', 'other^{tree}']).trim(), git(bare, ['rev-parse', `${c1}^{tree}`]).trim());
+  x = await post('/v1/cherry-pick', { ref: 'other', commit: c1, committer: A });
+  assert.equal(x.status, 200, JSON.stringify(x.body)); assert.equal(x.body.outcome, 'empty'); assert.equal(x.body.noop, true); assert.equal(x.body.oid, otherTip);
+  assert.equal(git(bare, ['rev-parse', 'other']).trim(), otherTip);
+  x = await post('/v1/cherry-pick', { ref: 'other', commit: c1, committer: A, allowEmpty: true });
+  assert.equal(x.status, 200, JSON.stringify(x.body)); assert.equal(x.body.outcome, 'cherry_pick'); assert.equal(x.body.noop, false);
+  const emptyPick = x.body.oid;
+  assert.notEqual(emptyPick, otherTip);
+  assert.equal(git(bare, ['rev-parse', 'other']).trim(), emptyPick);
+  assert.equal(git(bare, ['rev-parse', 'other^{tree}']).trim(), git(bare, ['rev-parse', `${otherTip}^{tree}`]).trim());
+  assert.equal(git(bare, ['rev-parse', 'other^']).trim(), otherTip);
+  x = await post('/v1/branch', { ref: 'feat', from: c1 });
+  assert.equal(x.status, 201); assert.equal(x.body.oid, c1);
+  x = await post('/v1/edit', { ref: 'feat', message: 'feat file', author: A, changes: [{ op: 'create', path: 'feat.txt', content: 'feat\n' }] });
+  assert.equal(x.status, 200, JSON.stringify(x.body));
+  const feat = x.body.oid;
+  x = await post('/v1/cherry-pick', { commit: feat, committer: A });
+  assert.equal(x.status, 200, JSON.stringify(x.body)); assert.equal(x.body.outcome, 'cherry_pick');
+  assert.equal(gitBuf(bare, ['show', 'main:feat.txt']).toString(), 'feat\n');
+  const picked = x.body.oid;
+  x = await post('/v1/revert', { commit: picked, committer: A });
+  assert.equal(x.status, 200, JSON.stringify(x.body)); assert.equal(x.body.outcome, 'revert');
+  assert.throws(() => git(bare, ['cat-file', '-e', 'main:feat.txt']));
+  const mainNow = x.body.oid;
+  x = await post('/v1/branch', { ref: 'side', from: mainNow });
+  assert.equal(x.status, 201); assert.equal(x.body.oid, mainNow);
+  x = await post('/v1/edit', { ref: 'side', path: 'README.md', find: 'hello', replace: 'hello side', author: A, message: 'side readme' });
+  assert.equal(x.status, 200, JSON.stringify(x.body));
+  const side = x.body.oid;
+  x = await post('/v1/edit', { path: 'ADDED.txt', find: 'added', replace: 'added main', author: A, message: 'main added' });
+  assert.equal(x.status, 200, JSON.stringify(x.body));
+  const mainMoved = x.body.oid;
+  assert.equal(git(bare, ['rev-parse', 'side']).trim(), side);
+  assert.equal(git(bare, ['rev-parse', 'main']).trim(), mainMoved);
+  x = await post('/v1/merge', { from: 'side', author: { ...A, tz: '+0530', time: 1700000200 }, message: 'merge side' });
+  assert.equal(x.status, 200, JSON.stringify(x.body)); assert.equal(x.body.outcome, 'merge');
+  assert.equal(git(bare, ['rev-parse', 'main']).trim(), x.body.oid);
+  assert.equal(gitBuf(bare, ['show', 'main:README.md']).toString(), 'hello side\n');
+  assert.equal(gitBuf(bare, ['show', 'main:ADDED.txt']).toString(), 'added main\n');
+  x = await post('/v1/merge', { from: 'side', author: A, committer: { name: 'c', email: 'c@x' } });
+  assert.equal(x.status, 400, JSON.stringify(x.body)); assert.match(x.body.message, /one identity/);
+  x = await post('/v1/branch', { ref: 'reb', from: c0 });
+  assert.equal(x.status, 201);
+  x = await post('/v1/edit', { ref: 'reb', message: 'reb file', author: A, changes: [{ op: 'create', path: 'reb.txt', content: 'reb\n' }] });
+  assert.equal(x.status, 200, JSON.stringify(x.body));
+  x = await post('/v1/rebase', { ref: 'reb', onto: 'main', committer: A });
+  assert.equal(x.status, 200, JSON.stringify(x.body)); assert.equal(x.body.outcome, 'rebase');
+  assert.equal(gitBuf(bare, ['show', 'reb:reb.txt']).toString(), 'reb\n');
+  assert.equal(git(bare, ['merge-base', 'reb', 'main']).trim(), git(bare, ['rev-parse', 'main']).trim());
+  x = await post('/v1/edit', { ref: 'from-oid', base: c0, message: 'from oid', author: A, changes: [{ op: 'create', path: 'from-oid.txt', content: 'p\n' }] });
+  assert.equal(x.status, 200, JSON.stringify(x.body));
+  const fromOid = x.body.oid;
+  assert.equal(x.body.oldOid, null);
+  assert.match(gitBuf(bare, ['cat-file', 'commit', fromOid]).toString(), new RegExp(`parent ${c0}\\n`));
+  x = await post('/v1/merge', { from: c0, author: A });
+  assert.equal(x.status, 400, JSON.stringify(x.body)); assert.match(x.body.message, /branch name, not a commit id/);
+  x = await post('/v1/cherry-pick', { commit: ZERO, committer: A });
+  assert.equal(x.status, 400, JSON.stringify(x.body));
+  x = await post('/v1/tag', { name: 'v1', target: c0 });
+  assert.equal(x.status, 201, JSON.stringify(x.body)); assert.equal(x.body.outcome, 'tag'); assert.equal(x.body.oid, c0);
+  assert.equal(git(bare, ['rev-parse', 'refs/tags/v1']).trim(), c0);
+  x = await post('/v1/tag', { name: 'v2', target: c1, annotated: true, message: 'version two\n', tagger: author });
+  assert.equal(x.status, 201, JSON.stringify(x.body)); assert.equal(x.body.outcome, 'tag'); assert.equal(x.body.commit, c1);
+  assert.equal(git(bare, ['cat-file', '-t', x.body.oid]).trim(), 'tag');
+  assert.equal(git(bare, ['rev-parse', 'v2^{}']).trim(), c1);
+  x = await post('/v1/tag', { name: 'v1', target: c0 });
+  assert.equal(x.status, 409); assert.equal(x.body.code, 'ref_exists'); assert.equal(x.body.retry, 'no'); assert.equal(x.body.oid, c0);
+  x = await post('/v1/branch', { ref: 'tmp', from: c0 });
+  assert.equal(x.status, 201); assert.equal(x.body.oid, c0);
+  x = await post('/v1/branch', { ref: 'tmp', from: c0 });
+  assert.equal(x.status, 409); assert.equal(x.body.code, 'ref_exists'); assert.equal(x.body.retry, 'no'); assert.equal(x.body.oid, c0);
+  x = await post('/v1/branch', { ref: 'tmp', oid: c1 }, 'DELETE');
+  assert.equal(x.status, 409); assert.equal(x.body.code, 'stale_expected'); assert.equal(x.body.retry, 'fresh'); assert.equal(x.body.expected, c1); assert.equal(x.body.actual, c0); assert.equal(x.body.oid, c0);
+  assert.equal(git(bare, ['rev-parse', 'tmp']).trim(), c0);
+  x = await post('/v1/branch', { ref: 'tmp', oid: c0 }, 'DELETE');
+  assert.equal(x.status, 200); assert.equal(x.body.outcome, 'deleted'); assert.equal(x.body.deleted, c0);
+  assert.throws(() => git(bare, ['rev-parse', '--verify', '-q', 'refs/heads/tmp']));
+  x = await post('/v1/tag', { name: 'v1', oid: c1 }, 'DELETE');
+  assert.equal(x.status, 409); assert.equal(x.body.code, 'stale_expected'); assert.equal(x.body.actual, c0);
+  x = await post('/v1/tag', { name: 'v1', oid: c0 }, 'DELETE');
+  assert.equal(x.status, 200); assert.equal(x.body.deleted, c0);
+  assert.equal(git(bare, ['fsck', '--strict', '--no-dangling']).trim(), '');
+});
+
 test('writes equal git: edit, branch create/delete, merge, rebase, cherry-pick, revert; CAS → 409; conflicts → 409/422', { skip }, async () => {
   const r = repo({ 'f.txt': 'one MARK\n', 'x.txt': 'x1\nx2\nx3\n', 'y.txt': 'y\n' });
   const post = (p, body, method = 'POST') => W(p, { method, body: { remote: r.remote, ...body } }).then(async res => ({ status: res.status, body: await res.json() }));
@@ -263,8 +424,8 @@ test('writes equal git: edit, branch create/delete, merge, rebase, cherry-pick, 
   assert.equal(x.status, 200); const f1 = x.body.newCommit; assert.equal(git(r.bare, ['rev-parse', 'feat']).trim(), f1);
   // branch create (409 if it exists), delete with CAS (stale → 409), delete current
   x = await post('/v1/branch', { ref: 'tmp', from: 'main' }); assert.equal(x.status, 201); assert.equal(x.body.oid, c2); assert.equal(git(r.bare, ['rev-parse', 'tmp']).trim(), c2);
-  x = await post('/v1/branch', { ref: 'tmp', from: 'main' }); assert.equal(x.status, 409); assert.equal(x.body.code, 'cas_conflict');
-  x = await post('/v1/branch', { ref: 'tmp', oid: r.head }, 'DELETE'); assert.equal(x.status, 409); assert.equal(x.body.code, 'cas_conflict');
+  x = await post('/v1/branch', { ref: 'tmp', from: 'main' }); assert.equal(x.status, 409); assert.equal(x.body.code, 'ref_exists'); assert.equal(x.body.retry, 'no'); assert.equal(x.body.oid, c2);
+  x = await post('/v1/branch', { ref: 'tmp', oid: r.head }, 'DELETE'); assert.equal(x.status, 409); assert.equal(x.body.code, 'stale_expected'); assert.equal(x.body.retry, 'fresh'); assert.equal(x.body.expected, r.head); assert.equal(x.body.actual, c2); assert.equal(x.body.oid, c2);
   x = await post('/v1/branch', { ref: 'tmp', oid: c2 }, 'DELETE'); assert.equal(x.status, 200); assert.equal(x.body.deleted, c2);
   assert.throws(() => git(r.bare, ['rev-parse', '--verify', '-q', 'refs/heads/tmp']));
   x = await post('/v1/branch', { ref: 'tmp' }, 'DELETE'); assert.equal(x.status, 404);
@@ -304,7 +465,7 @@ test('writes equal git: edit, branch create/delete, merge, rebase, cherry-pick, 
 
 test('writes switch: WRITES=off → 501 on every write endpoint, reads still served', { skip }, async () => {
   const r = repo({ 'f.txt': 'MARK\n' });
-  for (const [m, p] of [['POST', '/v1/edit'], ['POST', '/v1/branch'], ['DELETE', '/v1/branch'], ['POST', '/v1/merge'], ['POST', '/v1/rebase'], ['POST', '/v1/cherry-pick'], ['POST', '/v1/revert']]) {
+  for (const [m, p] of [['POST', '/v1/edit'], ['POST', '/v1/branch'], ['DELETE', '/v1/branch'], ['POST', '/v1/merge'], ['POST', '/v1/rebase'], ['POST', '/v1/cherry-pick'], ['POST', '/v1/revert'], ['POST', '/v1/tag'], ['DELETE', '/v1/tag']]) {
     const res = await W(p, { method: m, port: PORT_RO, body: { remote: r.remote, path: 'f.txt', find: 'MARK', replace: 'X', author: A, message: 'm' } });
     assert.equal(res.status, 501, `${m} ${p}`); assert.equal((await res.json()).code, 'unsupported');
   }
