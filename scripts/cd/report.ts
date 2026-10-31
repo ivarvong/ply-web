@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { parseEvent, type CdEvent } from './log.ts'
+import type { Fault } from './result.ts'
 
 export type FinishedRun = {
   readonly runId: string
@@ -11,6 +12,7 @@ export type FinishedRun = {
   readonly liveAt: string | null
   readonly failedAt: string | null
   readonly restoredAt: string | null
+  readonly fault: Fault | null
   readonly stages: readonly { readonly name: string; readonly durationMs: number }[]
 }
 
@@ -32,6 +34,7 @@ export function finishedRuns(events: readonly CdEvent[]): FinishedRun[] {
       liveAt: payload.liveAt,
       failedAt: payload.failedAt,
       restoredAt: payload.restoredAt,
+      fault: payload.fault,
       stages,
     })
   }
@@ -58,7 +61,9 @@ function stamp(value: string | null): number | null {
 /**
  * DORA figures from run_finished events.
  * Frequency is deploys / days between the first and last deploy. One timestamp has no rate.
- * Lead time is plyMergedAt → liveAt on a passing deploy. Change failure is rollbacks / deploys.
+ * Lead time is plyMergedAt → liveAt on a passing deploy.
+ * Change failure is rollbacks / deploys, excluding a harness_fault. That is a script,
+ * cf, parse, or preflight error, not a bad version.
  * Time to restore is failedAt → restoredAt.
  */
 export function doraText(events: readonly CdEvent[]): string {
@@ -86,10 +91,11 @@ export function doraText(events: readonly CdEvent[]): string {
   })
   lines.push(`lead time p50: ${seconds(quantile(leads, 0.5))}  p90: ${seconds(quantile(leads, 0.9))}`)
   lines.push(`  ply merge → 100% live, ${leads.length} passing deploy${leads.length === 1 ? '' : 's'} with both timestamps`)
-  const failed = deploys.filter(run => run.rolledBack).length
-  const rate = deploys.length === 0 ? 0 : failed / deploys.length
+  const counted = deploys.filter(run => run.fault !== 'harness_fault')
+  const failed = counted.filter(run => run.rolledBack).length
+  const rate = counted.length === 0 ? 0 : failed / counted.length
   lines.push(`change failure rate: ${rate.toFixed(3)}`)
-  lines.push(`  ${failed} rollbacks / ${deploys.length} deploys`)
+  lines.push(`  ${failed} rollbacks / ${counted.length} deploys`)
   const restores = deploys.flatMap(run => {
     if (!run.rolledBack) return []
     const from = stamp(run.failedAt)

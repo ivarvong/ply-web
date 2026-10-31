@@ -1,4 +1,9 @@
+import { Secret } from './secret.ts'
+
 const MIN_SECRET = 8
+
+/** Any Artifacts token version. A backstop for text that was never wrapped as a Secret. */
+export const ARTIFACTS_TOKEN = /art_v\d+_[^\s"'\\]+/g
 
 /** Replace every secret, and the Basic form git would send, with `[redacted]`. Short strings are left alone. */
 export function redact(text: string, secrets: readonly string[]): string {
@@ -13,23 +18,27 @@ export function redact(text: string, secrets: readonly string[]): string {
     const basic = Buffer.from(`x-access-token:${bare}`).toString('base64')
     if (basic.length >= MIN_SECRET) out = out.split(basic).join('[redacted]')
   }
-  return out
+  return out.replace(ARTIFACTS_TOKEN, '[redacted]')
 }
 
-const ARTIFACTS_TOKEN = /art_v1_[^\s"'\\]+/g
-
-/** Pull Artifacts token plaintexts out of a cf JSON value. Mutates `into`. */
-export function harvestSecrets(value: unknown, into: string[]): void {
-  if (typeof value === 'string') {
-    const found = value.match(ARTIFACTS_TOKEN)
-    if (found) into.push(...found)
-    return
+/**
+ * Every `plaintext` string in a cf JSON value, wrapped as a Secret at the moment it is read.
+ * The field name is what cf returns. The token text is not required to start with a prefix.
+ */
+export function harvestSecrets(value: unknown): Secret[] {
+  const out: Secret[] = []
+  const visit = (node: unknown, key: string | null): void => {
+    if (key === 'plaintext' && typeof node === 'string' && node.length > 0) {
+      out.push(new Secret(node))
+      return
+    }
+    if (typeof node !== 'object' || node === null) return
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, null)
+      return
+    }
+    for (const [child, item] of Object.entries(node)) visit(item, child)
   }
-  if (Array.isArray(value)) {
-    for (const item of value) harvestSecrets(item, into)
-    return
-  }
-  if (value !== null && typeof value === 'object') {
-    for (const item of Object.values(value)) harvestSecrets(item, into)
-  }
+  visit(value, null)
+  return out
 }

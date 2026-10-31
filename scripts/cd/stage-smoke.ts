@@ -70,6 +70,15 @@ function tokenIds(value: unknown): string[] {
   return ids
 }
 
+function remember(value: unknown, secrets: string[]): ReturnType<typeof harvestSecrets> {
+  const found = harvestSecrets(value)
+  for (const secret of found) {
+    secrets.push(secret.reveal())
+    activeLog()?.concealSecret(secret)
+  }
+  return found
+}
+
 async function cfJson(args: readonly string[], secrets: readonly string[]): Promise<unknown> {
   const stdout = await cfOk(args, secrets)
   return extractJson(stdout)
@@ -302,7 +311,7 @@ export async function stageSmoke(
       'artifacts', 'namespaces', 'repos', 'create', config.namespace,
       '--name', name, '--default-branch', 'main', '--description', 'ply-web operator smoke (deleted after a pass)',
     ], secrets)
-    harvestSecrets(created, secrets)
+    remember(created, secrets)
     remote = findRemote(created) ?? ''
     if (!REMOTE.test(remote)) throw new Error('cf did not return an Artifacts remote')
     for (const id of await listTokenIds(config, name, secrets)) {
@@ -312,13 +321,13 @@ export async function stageSmoke(
       'artifacts', 'namespaces', 'tokens', 'create', config.namespace,
       '--repo', name, '--scope', 'write', '--ttl', String(TOKEN_TTL_SECONDS),
     ], secrets)
-    harvestSecrets(mintedJson, secrets)
+    const found = remember(mintedJson, secrets)
     const rec = asRecord(mintedJson)
-    gitToken = typeof rec?.plaintext === 'string' ? rec.plaintext : secrets.find(secret => secret.startsWith('art_v1_')) ?? ''
     if (typeof rec?.id === 'string') minted.push(rec.id)
-    if (!gitToken.startsWith('art_v1_')) throw new Error('cf returned no write token')
-    secrets.push(gitToken)
-    activeLog()?.conceal(gitToken)
+    const plain = typeof rec?.plaintext === 'string' ? rec.plaintext : ''
+    const writeToken = found.find(secret => secret.reveal() === plain)
+    if (!writeToken) throw new Error('cf returned no write token')
+    gitToken = writeToken.reveal()
     for (const step of lifecycle()) {
       const result = await oneCall(config, step, saved, remote, opts.token, gitToken, opts.version, opts.pin)
       rows.push(result.row)
@@ -341,6 +350,7 @@ export async function stageSmoke(
     passed = detail === 'ok'
   } catch (error) {
     detail = redact(errorMessage(error), secrets)
+    harness = true
   } finally {
     await writeText(opts.runDir, opts.pin ? 'smoke.csv' : 'live-smoke.csv', csvDocument(rows), secrets)
     const pending = [...new Set([...minted, ...await listTokenIds(config, name, secrets)])]
@@ -351,6 +361,7 @@ export async function stageSmoke(
     if (passed && stuck.length > 0) {
       detail = `smoke passed but a token for ${name} was not revoked`
       passed = false
+      harness = true
     }
     if (passed) {
       const removed = await runCf(['artifacts', 'namespaces', 'repos', 'delete', name, '--namespace', config.namespace, '--force'], secrets)
@@ -358,6 +369,7 @@ export async function stageSmoke(
       if (!deleted) {
         detail = `smoke passed but repo ${name} was not deleted`
         passed = false
+        harness = true
       }
     }
   }

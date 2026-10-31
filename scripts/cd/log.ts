@@ -4,6 +4,7 @@ import { appendFile, mkdir, readdir, readFile, writeFile } from 'node:fs/promise
 import { dirname, join, relative } from 'node:path'
 import { asRecord } from './json.ts'
 import { redact } from './redact.ts'
+import type { Fault } from './result.ts'
 import { isSecret, type Secret } from './secret.ts'
 import type { CommandNote } from './trace.ts'
 
@@ -68,10 +69,18 @@ export type LifecycleFinished = {
   readonly liveAt: string | null
   readonly failedAt: string | null
   readonly restoredAt: string | null
+  /** Null on a pass. `harness_fault` is a script or preflight error and is not a change failure. */
+  readonly fault: Fault | null
+}
+
+/** Appended when `--sha` continues an unfinished run. The run id stays the one on this log. */
+export type LifecycleResumed = {
+  readonly event: 'resumed'
+  readonly sha: string
 }
 
 export type CdEvent =
-  | (Base & { readonly kind: 'lifecycle'; readonly payload: LifecycleStarted | LifecycleFinished })
+  | (Base & { readonly kind: 'lifecycle'; readonly payload: LifecycleStarted | LifecycleFinished | LifecycleResumed })
   | (Base & {
     readonly kind: 'command'
     readonly payload: {
@@ -140,11 +149,12 @@ export type RunFacts = {
   liveAt: string | null
   failedAt: string | null
   restoredAt: string | null
+  fault: Fault | null
 }
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$/
-const ARTIFACTS_TOKEN = /art_v1_[^\s"'\\]+/g
 const OUTCOMES = new Set<DecisionOutcome>(['advance', 'hold', 'insufficient_data', 'rollback', 'stop', 'harness_fault', 'state_conflict'])
+const FAULTS = new Set<Fault>(['worker', 'harness_fault', 'state_conflict'])
 
 export function isoOffset(date: Date): string {
   const pad = (value: number, width = 2) => String(Math.trunc(Math.abs(value))).padStart(width, '0')
@@ -230,7 +240,13 @@ function rules(value: unknown): RuleRef[] {
   })
 }
 
-function parseLifecycle(payload: Record<string, unknown>): LifecycleStarted | LifecycleFinished {
+function parseFault(value: unknown): Fault | null {
+  if (value === undefined || value === null) return null
+  if (typeof value === 'string' && FAULTS.has(value as Fault)) return value as Fault
+  throw new Error('fault is not a known kind')
+}
+
+function parseLifecycle(payload: Record<string, unknown>): LifecycleStarted | LifecycleFinished | LifecycleResumed {
   const event = needString(payload, 'event')
   if (event === 'run_started') {
     const tools = needRecord(payload.tools, 'tools')
@@ -243,6 +259,7 @@ function parseLifecycle(payload: Record<string, unknown>): LifecycleStarted | Li
       host: needString(payload, 'host'),
     }
   }
+  if (event === 'resumed') return { event, sha: needString(payload, 'sha') }
   if (event === 'run_finished') {
     const smoke = needRecord(payload.smoke, 'smoke')
     if (!Array.isArray(payload.stages) || !Array.isArray(payload.steps)) throw new Error('run_finished needs stages and steps')
@@ -279,6 +296,7 @@ function parseLifecycle(payload: Record<string, unknown>): LifecycleStarted | Li
       liveAt: stringOrNull(payload.liveAt, 'liveAt'),
       failedAt: stringOrNull(payload.failedAt, 'failedAt'),
       restoredAt: stringOrNull(payload.restoredAt, 'restoredAt'),
+      fault: parseFault(payload.fault),
     }
   }
   throw new Error(`unknown lifecycle event ${event}`)
@@ -395,7 +413,7 @@ function isObservationRef(value: unknown): value is ObservationRef {
 }
 
 function scrub(text: string, secrets: readonly string[]): string {
-  return redact(text, secrets).replace(ARTIFACTS_TOKEN, '[redacted]')
+  return redact(text, secrets)
 }
 
 async function filesIn(dir: string, root = dir): Promise<string[]> {
@@ -435,6 +453,7 @@ export class RunLog {
     liveAt: null,
     failedAt: null,
     restoredAt: null,
+    fault: null,
   }
 
   private constructor(dir: string, ledger: string, runId: string) {
@@ -446,6 +465,24 @@ export class RunLog {
   static async open(dir: string, ledger: string, runId: string): Promise<RunLog> {
     await mkdir(dir, { recursive: true })
     return new RunLog(dir, ledger, runId)
+  }
+
+  /** Continue an unfinished run. Seq follows the last event. A sealed log is not reopened here. */
+  static async reopen(dir: string, ledger: string): Promise<RunLog> {
+    const events = await readEvents(dir)
+    const first = events[0]
+    if (!first) throw new Error('run has no events')
+    const log = new RunLog(dir, ledger, first.run_id)
+    log.#events = events.slice()
+    log.#seq = (events[events.length - 1]?.seq ?? 0) + 1
+    log.#started = events.some(event => event.kind === 'lifecycle' && event.payload.event === 'run_started')
+    log.#finished = events.some(event => event.kind === 'lifecycle' && event.payload.event === 'run_finished')
+    const started = events.find(event => event.kind === 'lifecycle' && event.payload.event === 'run_started')
+    if (started && started.kind === 'lifecycle' && started.payload.event === 'run_started') {
+      log.facts.plySha = started.payload.plySha
+      log.facts.plyWebSha = started.payload.plyWebSha
+    }
+    return log
   }
 
   get runId(): string {
@@ -498,6 +535,12 @@ export class RunLog {
     this.facts.smokeFailed += failed
   }
 
+  async resumed(sha: string): Promise<void> {
+    await this.#enqueue(async () => {
+      await this.#append('lifecycle', { event: 'resumed', sha }, 'run')
+    })
+  }
+
   async started(input: Omit<LifecycleStarted, 'event'>): Promise<void> {
     await this.#enqueue(async () => {
       if (this.#started) throw new Error('run already started')
@@ -528,6 +571,7 @@ export class RunLog {
         liveAt: this.facts.liveAt,
         failedAt: this.facts.failedAt,
         restoredAt: this.facts.restoredAt,
+        fault: this.facts.fault,
       }
       await this.#append('lifecycle', payload, 'run')
     })
@@ -553,6 +597,7 @@ export class RunLog {
   async noteCommand(note: CommandNote): Promise<void> {
     await this.#enqueue(async () => {
       const seq = this.#seq
+      for (const part of note.argv) if (isSecret(part)) this.conceal(part.reveal())
       const argv = note.argv.map(part => (isSecret(part) ? '<redacted>' : part))
       const stdout = scrub(note.stdout, this.#concealed)
       const stderr = scrub(note.stderr, this.#concealed)

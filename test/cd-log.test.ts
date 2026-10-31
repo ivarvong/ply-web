@@ -6,9 +6,10 @@ import { join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { chartPng } from '../scripts/cd/charts.ts'
 import { cfWorkdir } from '../scripts/cd/cf.ts'
-import { writeDebrief } from '../scripts/cd/debrief.ts'
+import { canarySplit, writeDebrief } from '../scripts/cd/debrief.ts'
 import { fullSplit, isTrafficSplit, trafficSplit } from '../scripts/cd/deploy-plan.ts'
 import { parseEvent, readEvents, RunLog, validateRun, type CdEvent } from '../scripts/cd/log.ts'
+import { harvestSecrets } from '../scripts/cd/redact.ts'
 import { checkNode } from '../scripts/cd/preflight.ts'
 import { doraText } from '../scripts/cd/report.ts'
 import { Secret } from '../scripts/cd/secret.ts'
@@ -105,6 +106,49 @@ test('events round-trip and a decision must cite an observation', async () => {
   }))
 })
 
+test('plaintext is a Secret and does not require a token prefix', () => {
+  const token = 'art_v2_plaintext_token_value'
+  const found = harvestSecrets({ id: 'tok', plaintext: token, nested: { plaintext: 'art_v2_also_a_secret_value' } })
+  assert.deepEqual(found.map(secret => secret.reveal()), [token, 'art_v2_also_a_secret_value'])
+  assert.equal(harvestSecrets({ token: 'art_v1_not_a_plaintext_field' }).length, 0)
+  assert.equal(harvestSecrets({ plaintext: '' }).length, 0)
+})
+
+test('a v2 token never reaches captures', async () => {
+  const v2 = 'art_v2_NEVER_LOG_THIS_TOKEN'
+  const exact = new Secret('exact-match-secret-value')
+  const dir = await temp()
+  const runDir = join(dir, 'run')
+  const log = await RunLog.open(runDir, join(dir, 'ledger.jsonl'), 'run-v2')
+  await log.noteCommand({
+    argv: ['cf', 'tokens', 'create'],
+    cwd: '/workspace',
+    exitCode: 0,
+    durationMs: 1,
+    stdout: `plaintext ${v2}`,
+    stderr: '',
+  })
+  await log.noteCommand({
+    argv: ['cf', exact],
+    cwd: '/workspace',
+    exitCode: 0,
+    durationMs: 1,
+    stdout: exact.reveal(),
+    stderr: exact.reveal(),
+  })
+  await log.finish(0, null)
+  const cap1 = await readFile(join(runDir, 'captures', '1.stdout'), 'utf8')
+  const cap2 = await readFile(join(runDir, 'captures', '2.stdout'), 'utf8')
+  const cap2err = await readFile(join(runDir, 'captures', '2.stderr'), 'utf8')
+  const events = await readFile(join(runDir, 'events.jsonl'), 'utf8')
+  assert.equal(cap1.includes(v2), false)
+  assert.equal(cap1.includes('art_v2_'), false)
+  assert.equal(events.includes(v2), false)
+  assert.equal(cap2.includes('exact-match-secret-value'), false)
+  assert.equal(cap2err.includes('exact-match-secret-value'), false)
+  assert.equal(events.includes('exact-match-secret-value'), false)
+})
+
 test('a Secret never appears in an event', async () => {
   const secret = new Secret('art_v1_NEVER_LOG_THIS_TOKEN')
   assert.throws(() => JSON.stringify(secret), /Secret cannot be serialized/)
@@ -193,6 +237,7 @@ test('dora metrics use run_finished', () => {
       liveAt: '2026-10-31T21:00:00Z',
       failedAt: null,
       restoredAt: null,
+      fault: null,
       ...over,
     },
   })
@@ -203,9 +248,36 @@ test('dora metrics use run_finished', () => {
   assert.match(text, /deployment frequency: 2\.000 \/ day/)
   assert.match(text, /lead time p50: 3600s/)
   assert.match(text, /change failure rate: 0\.500/)
+  const withHarness = doraText([
+    finished({}),
+    { ...finished({ rolledBack: true, verdict: 'fail', failedAt: '2026-10-31T22:00:00Z', restoredAt: '2026-10-31T22:01:30Z', liveAt: null, plyMergedAt: null }), run_id: 's', ts: '2026-11-01T21:00:00.000+00:00' },
+    { ...finished({ fault: 'harness_fault', rolledBack: true, verdict: 'fail' }), run_id: 'h', ts: '2026-11-02T21:00:00.000+00:00' },
+  ])
+  assert.match(withHarness, /change failure rate: 0\.500/)
   assert.match(text, /time to restore p50: 90s/)
   assert.match(text, /bump p50 2s/)
   assert.throws(() => validateRun([finished({}), finished({})]))
+})
+
+test('split.png includes the 0% canary', async () => {
+  const dir = await temp()
+  const runDir = join(dir, 'run')
+  const log = await RunLog.open(runDir, join(dir, 'ledger.jsonl'), 'run-split')
+  await log.stateChange({
+    before: [{ versionId: PREVIOUS, percentage: 100 }],
+    after: [{ versionId: VERSION, percentage: 0 }, { versionId: PREVIOUS, percentage: 100 }],
+    deploymentId: 'dep',
+  })
+  await log.stateChange({
+    before: [{ versionId: VERSION, percentage: 0 }, { versionId: PREVIOUS, percentage: 100 }],
+    after: [{ versionId: VERSION, percentage: 1 }, { versionId: PREVIOUS, percentage: 99 }],
+    deploymentId: 'dep',
+  })
+  await log.finish(0, null)
+  assert.deepEqual(canarySplit(log.recorded()).map(point => point.percent), [0, 1])
+  await log.seal()
+  const markdown = await readFile(await writeDebrief(runDir), 'utf8')
+  assert.match(markdown, /0% canary/)
 })
 
 test('chart png is a png', () => {

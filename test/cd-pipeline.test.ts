@@ -44,6 +44,13 @@ test('a harness fault or a state conflict holds the split', () => {
 test('usage and a bad version exit as argument errors', () => {
   assert.equal(parseArgs(['help']).kind, 'usage')
   assert.equal(parseArgs(['cd', '--sha', 'abc']).kind, 'error')
+  assert.equal(parseArgs(['--sha', 'abc']).kind, 'error')
+  const sha = '1274f2dd05b83d70f8d421cdcc79628692d848df'
+  assert.deepEqual(parseArgs(['cd', '--sha', sha]), { kind: 'cd', sha, noBump: false })
+  assert.deepEqual(parseArgs(['--sha', sha]), { kind: 'cd', sha, noBump: false })
+  assert.deepEqual(parseArgs(['--no-bump']), { kind: 'cd', sha: null, noBump: true })
+  assert.deepEqual(parseArgs(['cd', '--no-bump']), { kind: 'cd', sha: null, noBump: true })
+  assert.equal(parseArgs(['--no-bump', '--sha', sha]).kind, 'error')
   assert.equal(parseArgs(['smoke']).kind, 'error')
   const version = '8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e'
   assert.deepEqual(parseArgs(['smoke', '--version', version]), { kind: 'smoke', version, expectVersion: null })
