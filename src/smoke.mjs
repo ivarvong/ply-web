@@ -4,7 +4,8 @@
 //   node src/smoke.mjs <base-url> gate  [--out file.json]
 //   env -u CLOUDFLARE_API_TOKEN node src/smoke.mjs <base-url> read|write [--out file.json] [--outdir dir]
 //   --version <id>: every request to the Worker carries Cloudflare-Workers-Version-Overrides: ply="<id>", so a version routed
-//   at 0% answers it (scripts/deploy.sh). Each step records the x-ply-request-id it got back.
+//   at 0% answers it (scripts/deploy.sh); a step answered by any other version (x-ply-version) fails. Each step records the
+//   x-ply-request-id and x-ply-version it got back.
 //
 // PLY token: ~/.config/ply/worker-token. `read` and `write` each run against a scratch Artifacts repo that
 // src/smoke-seed.mjs creates, seeds with a fixed history, and deletes (tokens revoked) when the run ends, so runs are
@@ -37,7 +38,9 @@ async function call(name, method, path, { body, headers = {}, ply = true, expect
   if (pass && check) { try { const r = await check({ res, buf, json }); if (r && typeof r === 'object') evidence += `; ${r.info}`; else if (r !== true && r !== undefined) { pass = false; if (typeof r === 'string') evidence += `; ${r}`; } } catch (e) { pass = false; evidence += `; check threw: ${e.message}`; } }
   if (!pass && json) evidence += `; body ${short(JSON.stringify(json))}`;
   if (json?.code && json.code !== 'unauthorized') evidence += `; code=${json.code}`;
-  const step = { name, method, path: path.replace(/remote=[^&]+/, m => short(decodeURIComponent(m))), status: res.status, expect, pass, ms, requestId: res.headers.get('x-ply-request-id'), serverTiming: res.headers.get('server-timing'), plyTrace: res.headers.get('x-ply-trace'), evidence: clean(evidence) };
+  const answeredBy = res.headers.get('x-ply-version');
+  if (VERSION && answeredBy !== VERSION) { pass = false; evidence += `; answered by version ${answeredBy}, not ${VERSION}`; }
+  const step = { name, method, path: path.replace(/remote=[^&]+/, m => short(decodeURIComponent(m))), status: res.status, expect, pass, ms, version: answeredBy, requestId: res.headers.get('x-ply-request-id'), serverTiming: res.headers.get('server-timing'), plyTrace: res.headers.get('x-ply-trace'), evidence: clean(evidence) };
   steps.push(step);
   console.log(`${pass ? 'PASS' : 'FAIL'}  ${String(ms).padStart(5)} ms  ${res.status}  ${name}  ${clean(evidence).slice(0, 200)}`);
   return { res, buf, json, step };
