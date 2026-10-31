@@ -10,13 +10,20 @@ const CF = join(ROOT, 'node_modules', '.bin', 'cf');
 // cf's Build Output Specification, version 0. One Worker, named "default" because it is the only one.
 const WORKER_OUTPUT = join(ROOT, '.cloudflare', 'output', 'v0', 'workers', 'default');
 
-/** Runs `cf build` once per process and returns the absolute path of the bundled main module. */
+// `npm test` builds once (`node test/cf-bundle.js`) and sets PLY_WEB_BUNDLE_BUILT=1 for the suites, which node --test runs
+// in separate processes. Without it each of the three workerd suites ran its own `cf build` (2.5 s CPU, 33-39 s wall on a loaded
+// machine, 2026-10-31). A suite run on its own still builds.
+const PREBUILT = process.env.PLY_WEB_BUNDLE_BUILT === '1';
+
+/** Runs `cf build` once per process (or once per `npm test`) and returns the absolute path of the bundled main module. */
 let built;
 export function cfBundle() {
   built ??= (() => {
-    if (!existsSync(CF)) throw new Error(`cf is not installed at ${CF}. Run npm ci.`);
-    const run = spawnSync(CF, ['build', '--quiet'], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, CF_SEND_TELEMETRY: 'false' } });
-    if (run.status !== 0) throw new Error(`cf build exited ${run.status}\n${run.stdout}\n${run.stderr}`);
+    if (!PREBUILT) {
+      if (!existsSync(CF)) throw new Error(`cf is not installed at ${CF}. Run npm ci.`);
+      const run = spawnSync(CF, ['build', '--quiet'], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, CF_SEND_TELEMETRY: 'false' } });
+      if (run.status !== 0) throw new Error(`cf build exited ${run.status}\n${run.stdout}\n${run.stderr}`);
+    }
     const { manifest } = JSON.parse(readFileSync(join(WORKER_OUTPUT, 'worker.config.json'), 'utf8'));
     const bundleDir = join(WORKER_OUTPUT, 'bundle');
     const modules = readdirSync(bundleDir).filter(name => name.endsWith('.js'));
@@ -33,3 +40,6 @@ export function cfBundle() {
 export function copyCfBundle(dest) {
   copyFileSync(cfBundle(), dest);
 }
+
+// `node test/cf-bundle.js` builds and checks the bundle once, before the suites.
+if (process.argv[1] === fileURLToPath(import.meta.url)) cfBundle();
