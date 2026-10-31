@@ -71,7 +71,7 @@ back first). Merge conflicts add `conflicts` and `reasons`. `match_count` adds `
 | `auth` | 401 or 403, the upstream's own status | the caller needs to know whether its credential was missing or not good enough |
 | `not_found` | 404 | ref, path or repo |
 | `cas_conflict` | 409 | the branch moved, so re-read and retry (`retry: fresh`). git 2.50 and later say `incorrect old value provided`; ply classifies that string as `cas_conflict` |
-| `merge_conflict`, `not_fast_forward`, `push_rejected` | 409 | conflict with the repository's current state |
+| `merge_conflict`, `not_fast_forward`, `push_rejected`, `push_partial` | 409 | conflict with the repository's current state |
 | `match_count`, `lfs_pointer`, `not_linear`, `unrelated_histories` | 422 | the request is well-formed but cannot apply to this content. Retrying it unchanged cannot work, even against a fresh state. That is the difference from 409 |
 | `limit_exceeded` | 413 | |
 | `rate_limited` | 429 | |
