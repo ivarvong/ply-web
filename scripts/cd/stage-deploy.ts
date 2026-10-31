@@ -31,7 +31,19 @@ async function pinReady(config: CdConfig, version: string): Promise<boolean> {
   return streak >= PIN_CONFIRMATIONS
 }
 
-export async function stageDeploy(config: CdConfig): Promise<StageResult<DeployValue>> {
+async function versionTagged(worker: string, tag: string): Promise<string | null> {
+  const listed = await cfOk(['workers', 'versions', 'list', '--worker-id', worker, '--page', '1', '--per-page', '100'])
+  let payload: unknown = listed
+  try {
+    payload = extractJson(listed)
+  } catch {
+    payload = listed
+  }
+  const found = versionByTag(payload, tag)
+  return found.ok ? found.versionId : null
+}
+
+export async function stageDeploy(config: CdConfig, tag?: string): Promise<StageResult<DeployValue>> {
   const mainRef = await requireOriginMain(ROOT)
   if (!mainRef.ok) {
     const reason = originMainReason(mainRef)
@@ -44,31 +56,29 @@ export async function stageDeploy(config: CdConfig): Promise<StageResult<DeployV
   const status = await run('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: ROOT })
   if (status.code !== 0) return fail('deploy-canary', `git status failed: ${status.stderr.slice(0, 300)}`, false, 'harness_fault')
   if (status.stdout.trim()) return fail('deploy-canary', 'tracked files are modified; deploy a commit', false, 'harness_fault')
-  const sha = await run('git', ['rev-parse', '--short=12', 'HEAD'], { cwd: ROOT })
-  if (sha.code !== 0) return fail('deploy-canary', 'git rev-parse failed', false, 'harness_fault')
-  const tag = sha.stdout.trim()
+  let resolved = tag ?? ''
+  if (!resolved) {
+    const sha = await run('git', ['rev-parse', '--short=12', 'HEAD'], { cwd: ROOT })
+    if (sha.code !== 0) return fail('deploy-canary', 'git rev-parse failed', false, 'harness_fault')
+    resolved = sha.stdout.trim()
+  }
   try {
-    await cfOk(['build', '--mode', 'production'])
-    await cfOk([
-      'workers', 'versions', 'create', '--prebuilt', '--mode', 'production',
-      '--worker', config.worker, '--tag', tag, '--message', `cd canary ${tag}`.slice(0, 100),
-    ])
-    const listed = await cfOk(['workers', 'versions', 'list', '--worker-id', config.worker, '--page', '1', '--per-page', '100'])
-    let payload: unknown = listed
-    try {
-      payload = extractJson(listed)
-    } catch {
-      payload = listed
+    let version = tag ? await versionTagged(config.worker, resolved) : null
+    if (!version) {
+      await cfOk(['build', '--mode', 'production'])
+      await cfOk([
+        'workers', 'versions', 'create', '--prebuilt', '--mode', 'production',
+        '--worker', config.worker, '--tag', resolved, '--message', `cd canary ${resolved}`.slice(0, 100),
+      ])
+      version = await versionTagged(config.worker, resolved)
     }
-    const found = versionByTag(payload, tag)
-    if (!found.ok) return fail('deploy-canary', `${found.kind}: no version tagged ${found.tag}`, false, 'harness_fault')
-    const version = found.versionId
+    if (!version) return fail('deploy-canary', `version-not-found: no version tagged ${resolved}`, false, 'harness_fault')
     const shares = await readShares(config.worker)
     const plan = planCanary(shares, version)
     if (plan.kind === 'refuse') return fail('deploy-canary', plan.reason, false, 'harness_fault')
     const want = trafficSplit(0, version, plan.live)
     if (!isTrafficSplit(want)) return fail('deploy-canary', `${want.reason}; traffic was not changed`, false, 'harness_fault')
-    const applied = await applySplit(config.worker, `canary ${tag}`, want, shares)
+    const applied = await applySplit(config.worker, `canary ${resolved}`, want, shares)
     if (!applied.ok && applied.kind === 'state_conflict') return fail('deploy-canary', applied.reason, false, 'state_conflict')
     if (!applied.ok) {
       const seen = await readShares(config.worker)

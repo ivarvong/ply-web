@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { publicRemote } from '../../src/public.ts'
 import { SMOKE_HTTP_MS } from './baseline.ts'
 import type { CdConfig } from './config.ts'
-import { isTrafficSplit, trafficSplit, type VersionShare } from './deploy-plan.ts'
+import { isTrafficSplit, sameSplit, trafficSplit, type VersionShare } from './deploy-plan.ts'
 import { queryCaptured } from './o11y.ts'
 import { errorMessage } from './proc.ts'
 import { activeLog } from './log.ts'
@@ -156,44 +156,71 @@ export async function stageRamp(
     readonly runDir: string
     readonly token: string
     readonly log: (line: string) => void
+    /** When set, the version is already at this ramp percent. Do not write it again. */
+    readonly fromPercent?: number
   },
 ): Promise<StageResult<RampValue>> {
-  if (!opts.verdictPath) return fail('ramp', 'ramp needs a PASS verdict file (--verdict); traffic was not changed')
-  let verdictText = ''
-  try {
-    verdictText = await readFile(opts.verdictPath, 'utf8')
-  } catch {
-    return fail('ramp', `cannot read ${opts.verdictPath}; traffic was not changed`)
+  // Traffic already on a ramp step means an earlier run opened the canary gate.
+  if (opts.fromPercent === undefined) {
+    if (!opts.verdictPath) return fail('ramp', 'ramp needs a PASS verdict file (--verdict); traffic was not changed')
+    let verdictText = ''
+    try {
+      verdictText = await readFile(opts.verdictPath, 'utf8')
+    } catch {
+      return fail('ramp', `cannot read ${opts.verdictPath}; traffic was not changed`)
+    }
+    const verdict = readPassVerdict(verdictText, opts.version)
+    if (!verdict.ok) return fail('ramp', `${verdict.reason}; traffic was not changed`)
   }
-  const verdict = readPassVerdict(verdictText, opts.version)
-  if (!verdict.ok) return fail('ramp', `${verdict.reason}; traffic was not changed`)
   let previous = opts.previous
   let expected: VersionShare[]
+  const fromPercent = opts.fromPercent
   try {
     const shares = await readShares(config.worker)
-    const live = shares.find(share => share.percentage === 100)
-    const dark = shares.find(share => share.versionId === opts.version)
-    if (!live) return fail('ramp', 'no version at 100%; traffic was not changed')
-    if (!previous) previous = live.versionId
-    if (live.versionId !== previous || live.percentage !== 100) {
-      return fail('ramp', `expected ${previous} at 100% before the ramp; traffic was not changed`)
-    }
-    if (!dark || dark.percentage !== 0 || shares.length !== 2) {
-      return fail('ramp', `expected ${opts.version} at 0% beside ${previous}; traffic was not changed`)
+    if (fromPercent !== undefined) {
+      const mine = shares.find(share => share.versionId === opts.version)
+      const beside = shares.filter(share => share.versionId !== opts.version)
+      const other = beside[0]
+      if (!mine || !other || shares.length !== 2 || mine.percentage !== fromPercent || other.percentage !== 100 - fromPercent) {
+        return fail('ramp', `expected ${opts.version} at ${fromPercent}% beside the previous version; traffic was not changed`)
+      }
+      if (previous && previous !== other.versionId) {
+        return fail('ramp', `expected ${previous} beside ${opts.version}; traffic was not changed`)
+      }
+      previous = other.versionId
+    } else {
+      const live = shares.find(share => share.percentage === 100)
+      const dark = shares.find(share => share.versionId === opts.version)
+      if (!live) return fail('ramp', 'no version at 100%; traffic was not changed')
+      if (!previous) previous = live.versionId
+      if (live.versionId !== previous || live.percentage !== 100) {
+        return fail('ramp', `expected ${previous} at 100% before the ramp; traffic was not changed`)
+      }
+      if (!dark || dark.percentage !== 0 || shares.length !== 2) {
+        return fail('ramp', `expected ${opts.version} at 0% beside ${previous}; traffic was not changed`)
+      }
     }
     expected = shares.map(share => ({ versionId: share.versionId, percentage: share.percentage }))
   } catch (error) {
     return fail('ramp', `${errorMessage(error)}; traffic was not changed`)
   }
+  if (!previous) return fail('ramp', 'no previous version; traffic was not changed')
   const target = previous
+  const schedule = fromPercent === undefined
+    ? config.schedule
+    : { ...config.schedule, percents: config.schedule.percents.filter(percent => percent >= fromPercent) }
+  if (fromPercent !== undefined && schedule.percents.length === 0) {
+    return fail('ramp', `schedule has no step at or above ${fromPercent}%`)
+  }
   const logPath = join(opts.runDir, 'ramp.jsonl')
-  const result = await runRamp(config.schedule, {
+  const result = await runRamp(schedule, {
     now: () => Date.now(),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     dwell: ms => dwell(config, opts.version, target, opts.token, ms, config.schedule.probeRps),
     applySplit: async percent => {
       const want = trafficSplit(percent, opts.version, target)
       if (!isTrafficSplit(want)) return want.reason
+      if (percent === fromPercent && sameSplit(expected, want.versions)) return null
       try {
         const applied = await applySplit(config.worker, `ramp ${opts.version} ${percent}%`, want, expected)
         if (applied.ok) expected = want.versions.map(share => ({ versionId: share.versionId, percentage: share.percentage }))

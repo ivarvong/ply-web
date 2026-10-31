@@ -27,7 +27,11 @@ function burnsOf(value: unknown): { readonly [slo: string]: number | null } {
 }
 
 function summarize(event: CdEvent): string {
-  if (event.kind === 'lifecycle') return event.payload.event === 'run_started' ? 'run started' : `run finished ${event.payload.verdict}`
+  if (event.kind === 'lifecycle') {
+    if (event.payload.event === 'run_started') return 'run started'
+    if (event.payload.event === 'resumed') return `resumed ${event.payload.sha.slice(0, 12)}`
+    return `run finished ${event.payload.verdict}`
+  }
   if (event.kind === 'command') return `${event.payload.argv.join(' ')} exit ${event.payload.exitCode}`.slice(0, 120)
   if (event.kind === 'observation') {
     const source = measurement(event)?.source

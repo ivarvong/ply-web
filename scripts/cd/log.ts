@@ -73,8 +73,14 @@ export type LifecycleFinished = {
   readonly fault: Fault | null
 }
 
+/** Appended when `--sha` continues an unfinished run. The run id stays the one on this log. */
+export type LifecycleResumed = {
+  readonly event: 'resumed'
+  readonly sha: string
+}
+
 export type CdEvent =
-  | (Base & { readonly kind: 'lifecycle'; readonly payload: LifecycleStarted | LifecycleFinished })
+  | (Base & { readonly kind: 'lifecycle'; readonly payload: LifecycleStarted | LifecycleFinished | LifecycleResumed })
   | (Base & {
     readonly kind: 'command'
     readonly payload: {
@@ -240,7 +246,7 @@ function parseFault(value: unknown): Fault | null {
   throw new Error('fault is not a known kind')
 }
 
-function parseLifecycle(payload: Record<string, unknown>): LifecycleStarted | LifecycleFinished {
+function parseLifecycle(payload: Record<string, unknown>): LifecycleStarted | LifecycleFinished | LifecycleResumed {
   const event = needString(payload, 'event')
   if (event === 'run_started') {
     const tools = needRecord(payload.tools, 'tools')
@@ -253,6 +259,7 @@ function parseLifecycle(payload: Record<string, unknown>): LifecycleStarted | Li
       host: needString(payload, 'host'),
     }
   }
+  if (event === 'resumed') return { event, sha: needString(payload, 'sha') }
   if (event === 'run_finished') {
     const smoke = needRecord(payload.smoke, 'smoke')
     if (!Array.isArray(payload.stages) || !Array.isArray(payload.steps)) throw new Error('run_finished needs stages and steps')
@@ -460,6 +467,24 @@ export class RunLog {
     return new RunLog(dir, ledger, runId)
   }
 
+  /** Continue an unfinished run. Seq follows the last event. A sealed log is not reopened here. */
+  static async reopen(dir: string, ledger: string): Promise<RunLog> {
+    const events = await readEvents(dir)
+    const first = events[0]
+    if (!first) throw new Error('run has no events')
+    const log = new RunLog(dir, ledger, first.run_id)
+    log.#events = events.slice()
+    log.#seq = (events[events.length - 1]?.seq ?? 0) + 1
+    log.#started = events.some(event => event.kind === 'lifecycle' && event.payload.event === 'run_started')
+    log.#finished = events.some(event => event.kind === 'lifecycle' && event.payload.event === 'run_finished')
+    const started = events.find(event => event.kind === 'lifecycle' && event.payload.event === 'run_started')
+    if (started && started.kind === 'lifecycle' && started.payload.event === 'run_started') {
+      log.facts.plySha = started.payload.plySha
+      log.facts.plyWebSha = started.payload.plyWebSha
+    }
+    return log
+  }
+
   get runId(): string {
     return this.#runId
   }
@@ -508,6 +533,12 @@ export class RunLog {
   addSmoke(passed: number, failed: number): void {
     this.facts.smokePassed += passed
     this.facts.smokeFailed += failed
+  }
+
+  async resumed(sha: string): Promise<void> {
+    await this.#enqueue(async () => {
+      await this.#append('lifecycle', { event: 'resumed', sha }, 'run')
+    })
   }
 
   async started(input: Omit<LifecycleStarted, 'event'>): Promise<void> {

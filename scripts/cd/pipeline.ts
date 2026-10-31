@@ -1,8 +1,13 @@
+import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { CdConfig } from './config.ts'
-import { fullSplit, isTrafficSplit } from './deploy-plan.ts'
+import { cfOk } from './cf.ts'
+import { fullSplit, isTrafficSplit, versionByTag, type VersionShare } from './deploy-plan.ts'
+import { asRecord, extractJson } from './json.ts'
 import { isoOffset, type RunLog } from './log.ts'
-import { nextPhase, pipelineStart, type PhaseOutcome } from './pipeline-plan.ts'
+import { nextPhase, pipelineStart, type PhaseOutcome, type PipelineState } from './pipeline-plan.ts'
+import { errorMessage } from './proc.ts'
+import { liveSmokeAlreadyPassed, reconcile, reconcileReason, type Reconcile } from './reconcile.ts'
 import { fail, type Fail, type StageResult } from './result.ts'
 import { writeJson } from './run-dir.ts'
 import { stageBump } from './stage-bump.ts'
@@ -11,6 +16,7 @@ import { stageRamp } from './stage-ramp.ts'
 import { stageRollback } from './stage-rollback.ts'
 import { stageSmoke } from './stage-smoke.ts'
 import { reportPath, stageTelemetry } from './stage-telemetry.ts'
+import { readDeployment } from './traffic.ts'
 
 export type PipelineExit = {
   readonly code: number
@@ -35,6 +41,79 @@ async function plyMergedAt(sha: string): Promise<string | null> {
     return typeof date === 'string' ? date : null
   } catch {
     return null
+  }
+}
+
+async function previousFromDeploy(runDir: string, version: string): Promise<string | null> {
+  try {
+    const rec = asRecord(JSON.parse(await readFile(join(runDir, 'deploy.json'), 'utf8')))
+    if (!rec || rec.kind !== 'pass') return null
+    const value = asRecord(rec.value)
+    if (!value || value.version !== version || typeof value.previous !== 'string' || value.previous === '') return null
+    return value.previous
+  } catch {
+    return null
+  }
+}
+
+async function readReconcile(config: CdConfig, sha: string, runLog: RunLog): Promise<Reconcile> {
+  const at = Date.now()
+  let versionId: string | null = null
+  let split: VersionShare[] = []
+  let liveSmokePassed = false
+  let error: string | null = null
+  try {
+    const listed = await cfOk(['workers', 'versions', 'list', '--worker-id', config.worker, '--page', '1', '--per-page', '100'])
+    let payload: unknown = listed
+    try {
+      payload = extractJson(listed)
+    } catch {
+      payload = listed
+    }
+    const found = versionByTag(payload, sha)
+    versionId = found.ok ? found.versionId : null
+    split = (await readDeployment(config.worker)).versions.map(share => ({ versionId: share.versionId, percentage: share.percentage }))
+    if (versionId) liveSmokePassed = await liveSmokeAlreadyPassed(config.runRoot, versionId)
+  } catch (caught) {
+    error = errorMessage(caught)
+  }
+  const decision = error
+    ? { stage: 'refuse' as const, reason: error }
+    : reconcile({ sha, versionId, split, liveSmokePassed, rampPercents: config.schedule.percents })
+  runLog.useStage('reconcile')
+  const ref = await runLog.observation({
+    measurement: {
+      source: 'reconcile',
+      sha,
+      versionId,
+      split,
+      liveSmokePassed,
+      ...(error ? { error } : {}),
+    },
+    query: { source: 'cf workers deployments list', worker: config.worker, tag: sha },
+    from: at,
+    to: Date.now(),
+    raw: JSON.stringify({ sha, versionId, split, liveSmokePassed, error }),
+  })
+  await runLog.decision({
+    inputs: [ref],
+    rules: [{ name: 'reconcile', value: decision.stage }],
+    outcome: decision.stage === 'refuse' ? 'harness_fault' : 'advance',
+    reason: reconcileReason(decision),
+  })
+  return decision
+}
+
+function jumpedState(next: Exclude<Reconcile, { stage: 'upload' | 'refuse' }>): PipelineState {
+  switch (next.stage) {
+    case 'smoke-canary':
+      return { phase: 'smoke-canary', smoke: null }
+    case 'ramp':
+      return { phase: 'ramp', smoke: 'pass' }
+    case 'smoke-live':
+      return { phase: 'smoke-live', smoke: 'pass' }
+    case 'done':
+      return { phase: 'done', smoke: 'pass' }
   }
 }
 
@@ -71,6 +150,8 @@ export async function runPipeline(
   let failure: Fail | null = null
   let version = ''
   let previous = ''
+  let fromPercent: number | undefined
+  let reconciled = false
   const note = async (result: StageResult<unknown>) => {
     if (result.kind === 'fail' && !failure) {
       failure = result
@@ -112,7 +193,33 @@ export async function runPipeline(
       continue
     }
     if (state.phase === 'deploy-canary') {
-      const result = await span(runLog, 'deploy-canary', () => stageDeploy(config))
+      if (opts.sha && !reconciled) {
+        reconciled = true
+        const next = await readReconcile(config, opts.sha, runLog)
+        opts.log(`reconcile: ${reconcileReason(next)}`)
+        if (next.stage === 'refuse') {
+          await note(fail('deploy-canary', next.reason, false, 'harness_fault'))
+          state = { phase: 'halt', smoke: null }
+          continue
+        }
+        if (next.stage !== 'upload') {
+          version = next.versionId
+          runLog.patch({ versionId: version })
+          opts.log(`version: ${version}`)
+          if (next.stage === 'smoke-canary' || next.stage === 'ramp') {
+            previous = next.previous
+            opts.log(`previous: ${previous}`)
+          }
+          if (next.stage === 'smoke-live') {
+            previous = await previousFromDeploy(runDir, next.versionId) ?? ''
+            if (previous) opts.log(`previous: ${previous}`)
+          }
+          if (next.stage === 'ramp') fromPercent = next.percent
+          state = jumpedState(next)
+          continue
+        }
+      }
+      const result = await span(runLog, 'deploy-canary', () => stageDeploy(config, opts.sha ?? undefined))
       await writeJson(runDir, 'deploy.json', result, [opts.token])
       await note(result)
       if (result.kind === 'pass') {
@@ -156,6 +263,7 @@ export async function runPipeline(
         runDir,
         token: opts.token,
         log: opts.log,
+        ...(fromPercent === undefined ? {} : { fromPercent }),
       }))
       await note(result)
       if (result.kind === 'pass') runLog.patch({ liveAt: isoOffset(new Date()) })

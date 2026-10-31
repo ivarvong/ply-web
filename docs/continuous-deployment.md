@@ -58,6 +58,18 @@ npm run cd -- cd --sha 1274f2dd05b83d70f8d421cdcc79628692d848df
 npm run cd -- --sha 1274f2dd05b83d70f8d421cdcc79628692d848df
 ```
 
+Running the same sha again is safe. The command reads the current deployment and the version tagged with that sha, records the observation, and decides the next stage (rule `reconcile`):
+
+| What is live | Next |
+| --- | --- |
+| No version tagged with the sha | Upload, then pin it at 0% |
+| That version at 0% | Pinned smoke, then telemetry |
+| That version at a ramp percent | Ramp onward from that percent |
+| That version at 100% | Live smoke, then telemetry |
+| Live smoke already passed for that version | Done |
+
+A re-entry appends `resumed` on the unfinished run directory for that sha and keeps the same run id. A finished run starts a new one. Each smoke mints a fresh repo and a fresh token. Every traffic write still compares the deployment to the split it expects, and does not write when they differ.
+
 `--no-bump` skips the pin and deploys the checkout as it is. The run records that as a decision (`no_bump`, outcome `advance`):
 
 ```sh
@@ -126,7 +138,7 @@ You push `bump-ply` yourself if you want a pull request for the pin. Deploy runs
 npm run cd -- deploy-canary
 ```
 
-Fetches `origin main` first. Unless `HEAD` is that commit, it stops with `not-on-origin-main` (or `origin-main-unavailable` when the fetch fails), writes that typed error on the run, and uploads nothing. Otherwise it builds and uploads a version with `cf workers versions create`. The version id is the row in `cf workers versions list` whose tag is the 12-character HEAD sha. The create command's own text is not parsed. A missing tag stops before traffic changes. It then routes that version to **0%** beside the single version that is at 100%, and only when the deployment is still the split it just read. A mismatch stops with `state_conflict` and leaves the split alone. It will not upload into a 50/50 split, a deployment with more than two versions, or a version that is already the live one. If a different version is already sitting at 0%, that slot is replaced. The new version is never given traffic here.
+Fetches `origin main` first. Unless `HEAD` is that commit, it stops with `not-on-origin-main` (or `origin-main-unavailable` when the fetch fails), writes that typed error on the run, and uploads nothing. Otherwise it builds and uploads a version with `cf workers versions create`. The version id is the row in `cf workers versions list` whose tag is the 12-character HEAD sha. The full pipeline (`--sha`) tags the version with that sha instead, and reuses the version when the tag is already there. The create command's own text is not parsed. A missing tag stops before traffic changes. It then routes that version to **0%** beside the single version that is at 100%, and only when the deployment is still the split it just read. A mismatch stops with `state_conflict` and leaves the split alone. It will not upload into a 50/50 split, a deployment with more than two versions, or a version that is already the live one. If a different version is already sitting at 0%, that slot is replaced. The new version is never given traffic here.
 
 Pass:
 
@@ -458,10 +470,10 @@ The event log is the record of the run. Every line is one JSON object:
 
 | Kind | Payload |
 | --- | --- |
-| `lifecycle` | `run_started` (config, node/cf/git versions, ply and ply-web shas, host) or `run_finished` (verdict, rollback, smoke counts, stage timings, per-step burns, live/fail/restore times, `fault`) |
+| `lifecycle` | `run_started` (config, node/cf/git versions, ply and ply-web shas, host), `resumed` (the same run id and the sha), or `run_finished` (verdict, rollback, smoke counts, stage timings, per-step burns, live/fail/restore times, `fault`) |
 | `command` | argv with secrets already replaced by `<redacted>`, cwd, exit code, duration, sha256 of stdout and stderr, and the paths of those captures |
 | `observation` | The measurement, the exact `cf o11y` query (or the smoke source) and its window, and `responsePath` of the raw body under `raw/` |
-| `decision` | `inputs` (one or more earlier observation seqs), `rules` (`name` and `value` from `slo.ts`, or the smoke rule), `outcome` (`advance`, `hold`, `insufficient_data`, `rollback`, `stop`), and `reason` |
+| `decision` | `inputs` (one or more earlier observation seqs), `rules` (`name` and `value` from `slo.ts`, the smoke rule, or `reconcile` with the next stage), `outcome` (`advance`, `hold`, `insufficient_data`, `rollback`, `stop`, `harness_fault`, `state_conflict`), and `reason` |
 | `state_change` | Traffic split before and after, and the deployment id when cf returned one |
 | `request` | One smoke or probe call: method, url, status, version, latency, `cf-ray`, `x-ply-request-id`, `x-artifacts-ray` |
 | `error` | An unexpected failure and a JSON context |

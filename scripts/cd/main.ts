@@ -10,6 +10,7 @@ import { RunLog, withRun } from './log.ts'
 import { runPipeline } from './pipeline.ts'
 import { checkNode } from './preflight.ts'
 import { errorMessage, run } from './proc.ts'
+import { unfinishedRunDir } from './reconcile.ts'
 import { reportLedger } from './report.ts'
 import { createRunDir, writeJson } from './run-dir.ts'
 import { stageBump } from './stage-bump.ts'
@@ -199,16 +200,26 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
       return finish(log, 1, `cd: harness_fault preflight: ${errorMessage(error)}`)
     }
   }
-  const runDir = await createRunDir(config.runRoot)
-  const runLog = await RunLog.open(runDir, config.ledgerPath, basename(runDir))
-  const started = await identity(config)
+  const resumeSha = parsed.kind === 'cd' ? parsed.sha : null
+  const existing = resumeSha ? await unfinishedRunDir(config.runRoot, resumeSha) : null
+  const runDir = existing ?? await createRunDir(config.runRoot)
+  const runLog = existing
+    ? await RunLog.reopen(runDir, config.ledgerPath)
+    : await RunLog.open(runDir, config.ledgerPath, basename(runDir))
   log(`run: ${runDir}`)
+  if (existing) log(`resume: ${runDir}`)
   return withRun(runLog, () => withCommandSink(note => runLog.noteCommand(note), async () => {
     let code = 1
     let reason: string | null = 'run ended before finish'
     try {
-      await runLog.started(started)
       if (token) runLog.conceal(token)
+      if (existing && resumeSha) {
+        await runLog.resumed(resumeSha)
+      } else {
+        const started = await identity(config)
+        const recorded = resumeSha ? { ...started, config: { ...started.config, sha: resumeSha } } : started
+        await runLog.started(recorded)
+      }
       const outcome = await dispatch(parsed, config, token, runDir, runLog, log)
       code = outcome.code
       reason = outcome.reason
