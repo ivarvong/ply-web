@@ -304,8 +304,11 @@ npm run dev                              # cf dev: Vite + the Cloudflare plugin 
 npm run typecheck                        # tsc for the app, then cf workers types + tsc for cloudflare.config.ts
 npm run worker:deploy:dry-run            # cf deploy --dry-run: build and validate, no credentials, no upload
 npm run worker:deploy                    # cf deploy
-node src/smoke.mjs https://ply.ivar.workers.dev read --out smoke.json
+node src/smoke.mjs https://ply.ivar.workers.dev gate                     # public + auth + allowlist checks, no Artifacts
+env -u CLOUDFLARE_API_TOKEN node src/smoke.mjs https://ply.ivar.workers.dev read|write --out smoke.json
 ```
+
+`read` and `write` each create a scratch Artifacts repo in namespace `default` (`src/smoke-seed.mjs`), seed it with a fixed history (fixed identities and dates, so the seeded oids are the same every run), mint a 15-minute read or write token for it, compare the Worker's answers with that seeded local clone, then revoke every token and delete the repo, also on failure or Ctrl-C. A run killed harder than that leaves `ply-web-smoke-*`; the next run deletes ones older than an hour. Tokens go to git only through `GIT_CONFIG_*` and never reach argv, stdout or the JSON report. Runs are repeatable back to back. They need a cf login with Artifacts access.
 
 The Worker is built and deployed with the Cloudflare CLI, [`cf`](https://developers.cloudflare.com/cf/), pinned as a dev dependency. `cloudflare.config.ts` is the Worker config (name, compatibility date, bindings, Durable Object exports, observability, limits). `vite.config.ts` holds build settings only: `cf build` delegates bundling to Vite and the Cloudflare Vite plugin and writes Build Output to `.cloudflare/output`. The workerd suites in `npm test` run that same bundle (`test/cf-bundle.js`). Nothing here needs Docker: the Vite plugin runs `docker image ls` after every build even with no containers (execFileSync, no timeout, so a hung daemon hung the build), and `vite.config.ts` sets `WRANGLER_DOCKER_BIN=false` so that call fails at once and is skipped.
 

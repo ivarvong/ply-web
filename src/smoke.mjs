@@ -1,21 +1,22 @@
 // Production smoke for the ply Worker. Every step is recorded (request, status, latency, evidence, request id) to a JSON
 // file; nothing secret is printed or written (tokens are read from files and only ever sent as headers).
 //
-//   node src/smoke.mjs <base-url> read  [--out file.json]
-//   node src/smoke.mjs <base-url> write --repo <create.json> --work <seeded clone dir> [--out file.json]
+//   node src/smoke.mjs <base-url> gate  [--out file.json]
+//   env -u CLOUDFLARE_API_TOKEN node src/smoke.mjs <base-url> read|write [--out file.json] [--outdir dir]
 //
-// PLY token: ~/.config/ply/worker-token. Artifacts read token: $PLY_SMOKE_READ_JSON (default: the session scratchpad's
-// repo-create.json), field `token`. Expected README bytes: `git show a0f7f4c:README.md` in this repo.
+// PLY token: ~/.config/ply/worker-token. `read` and `write` each run against a scratch Artifacts repo that
+// src/smoke-seed.mjs creates, seeds with a fixed history, and deletes (tokens revoked) when the run ends, so runs are
+// repeatable back to back. Expected bytes, trees and commits come from that seeded local clone. Needs a cf login.
 import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createScratchRepo, gitAuthEnv } from './smoke-seed.mjs';
 
 const [base, phase] = process.argv.slice(2);
 const arg = k => { const i = process.argv.indexOf(`--${k}`); return i > 0 ? process.argv[i + 1] : null; };
 if (!base || !['read', 'write', 'gate'].includes(phase)) { console.error('usage: smoke.mjs <base> read|write|gate [...]'); process.exit(2); }
 const PLY = readFileSync(join(homedir(), '.config/ply/worker-token'), 'utf8').trim();
-const ROOT = new URL('..', import.meta.url).pathname;
 const steps = [];
 const short = s => (s.length > 160 ? s.slice(0, 160) + '…' : s);
 const secrets = [PLY];
@@ -55,31 +56,35 @@ if (phase === 'gate' || phase === 'read') {
     await call(`allowlist refuses ${r}`, 'GET', '/v1/refs' + q({ remote: r, trace: '1' }), { expect: 400, check: ({ json }) => (json.code === 'bad_request' && json.trace.length === 0) || 'not refused before I/O' });
 }
 
+// read and write run against a fresh scratch repo; teardown runs on success, failure, and Ctrl-C.
+const scratch = phase === 'gate' ? null : createScratchRepo(phase);
+if (scratch) { secrets.push(scratch.token); for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { scratch.teardown(); process.exit(130); }); }
+try {
 if (phase === 'read') {
-  const rj = JSON.parse(readFileSync(process.env.PLY_SMOKE_READ_JSON ?? (() => { throw new Error('set PLY_SMOKE_READ_JSON to the repo-create JSON (remote + token)'); })(), 'utf8'));
-  secrets.push(rj.token);
+  const rj = scratch, SEED = scratch.work;
   const art = rj.remote;
-  const want = execFileSync('git', ['-C', ROOT, 'show', 'a0f7f4c:README.md']);
+  const want = execFileSync('git', ['-C', SEED, 'show', 'main:README.md']);
+  const wantBlob = execFileSync('git', ['-C', SEED, 'rev-parse', 'main:README.md']).toString().trim();
   const artH = form => (form === 'bearer' ? { 'git-authorization': `Bearer ${rj.token}` } : form === 'basic' ? { 'git-authorization': `Basic ${Buffer.from(`x-access-token:${rj.token}`).toString('base64')}` } : { 'git-token': rj.token });
-  await call('Artifacts default/ply refs', 'GET', '/v1/refs' + q({ remote: art }), { headers: artH('token'), expect: 200, check: ({ json, buf }) => (json.head === 'refs/heads/main' && /^[0-9a-f]{40}$/.test(json.refs['refs/heads/main']) && leakCheck(buf.toString(), [rj.token])) || `head=${json.head}` });
+  await call('Artifacts scratch refs', 'GET', '/v1/refs' + q({ remote: art }), { headers: artH('token'), expect: 200, check: ({ json, buf }) => (json.head === 'refs/heads/main' && /^[0-9a-f]{40}$/.test(json.refs['refs/heads/main']) && leakCheck(buf.toString(), [rj.token])) || `head=${json.head}` });
   for (const form of ['bearer', 'basic', 'token']) {
-    await call(`Artifacts default/ply read README.md (${form}) == git show a0f7f4c:README.md`, 'GET', '/v1/read' + q({ remote: art, path: 'README.md', trace: '1' }), { headers: artH(form), expect: 200, check: ({ res, buf }) =>
-      (buf.equals(want) && res.headers.get('content-length') === String(want.length) && res.headers.get('x-ply-blob') === execFileSync('git', ['-C', ROOT, 'rev-parse', 'a0f7f4c:README.md']).toString().trim()) || `bytes ${buf.length} vs ${want.length}, equal=${buf.equals(want)}, commit ${res.headers.get('x-ply-commit')}` });
+    await call(`Artifacts scratch read README.md (${form}) == seeded git show main:README.md`, 'GET', '/v1/read' + q({ remote: art, path: 'README.md', trace: '1' }), { headers: artH(form), expect: 200, check: ({ res, buf }) =>
+      (buf.equals(want) && res.headers.get('content-length') === String(want.length) && res.headers.get('x-ply-blob') === wantBlob) || `bytes ${buf.length} vs ${want.length}, equal=${buf.equals(want)}, commit ${res.headers.get('x-ply-commit')}` });
   }
-  await call('Artifacts default/ply tree /', 'GET', '/v1/tree' + q({ remote: art, trace: '1' }), { headers: artH('token'), expect: 200, check: ({ json, buf }) => {
-    const ls = execFileSync('git', ['-C', ROOT, 'ls-tree', 'a0f7f4c']).toString().trim().split('\n').map(l => l.split('\t')[1]);
+  await call('Artifacts scratch tree /', 'GET', '/v1/tree' + q({ remote: art, trace: '1' }), { headers: artH('token'), expect: 200, check: ({ json, buf }) => {
+    const ls = execFileSync('git', ['-C', SEED, 'ls-tree', 'main']).toString().trim().split('\n').map(l => l.split('\t')[1]);
     const names = json.entries.map(e => e.name);
     const wide = json.trace.filter(s => s.attrs['git.fetch.filter.fallback']).map(s => s.attrs['git.fetch.wide.extra_bytes']);
     return (JSON.stringify(names) === JSON.stringify(ls) && leakCheck(buf.toString(), [rj.token])) || `names ${names.join(',')} vs ${ls.join(',')}; wide extra_bytes ${wide}`;
   } });
-  await call('Artifacts default/ply commit (HEAD) == git log/cat-file in this repo', 'GET', '/v1/commit' + q({ remote: art, trace: '1' }), { headers: artH('token'), expect: 200, check: ({ json, buf }) => {
+  await call('Artifacts scratch commit (HEAD) == git log/cat-file in the seeded clone', 'GET', '/v1/commit' + q({ remote: art, trace: '1' }), { headers: artH('token'), expect: 200, check: ({ json, buf }) => {
     if (!leakCheck(buf.toString(), [rj.token])) return 'token in response';
-    try { return sameCommit(json, gitCommitView(ROOT, json.oid)); } catch { return `commit ${json.oid} not in the local repo to compare`; }
+    try { return sameCommit(json, gitCommitView(SEED, json.oid)); } catch { return `commit ${json.oid} not in the seeded clone to compare`; }
   } });
-  await call('Artifacts default/ply commit ref=no-such-branch → 404', 'GET', '/v1/commit' + q({ remote: art, ref: 'no-such-branch' }), { headers: artH('token'), expect: 404, check: ({ json }) => json.code === 'not_found' || json.code });
-  await call('Artifacts default/ply read src/ (dir) → 404', 'GET', '/v1/read' + q({ remote: art, path: 'src' }), { headers: artH('token'), expect: 404 });
-  await call('Artifacts default/ply wrong credential → 401/403', 'GET', '/v1/refs' + q({ remote: art }), { headers: { 'git-token': 'art_v1_' + 'x'.repeat(40) }, expect: [401, 403], check: ({ json }) => ({ info: `upstreamStatus=${json.upstreamStatus}` }) });
-  await call('Artifacts default/ply no credential → 401', 'GET', '/v1/refs' + q({ remote: art }), { expect: 401 });
+  await call('Artifacts scratch commit ref=no-such-branch → 404', 'GET', '/v1/commit' + q({ remote: art, ref: 'no-such-branch' }), { headers: artH('token'), expect: 404, check: ({ json }) => json.code === 'not_found' || json.code });
+  await call('Artifacts scratch read src/ (dir) → 404', 'GET', '/v1/read' + q({ remote: art, path: 'src' }), { headers: artH('token'), expect: 404 });
+  await call('Artifacts scratch wrong credential → 401/403', 'GET', '/v1/refs' + q({ remote: art }), { headers: { 'git-token': 'art_v1_' + 'x'.repeat(40) }, expect: [401, 403], check: ({ json }) => ({ info: `upstreamStatus=${json.upstreamStatus}` }) });
+  await call('Artifacts scratch no credential → 401', 'GET', '/v1/refs' + q({ remote: art }), { expect: 401 });
   await call('Artifacts discover', 'GET', '/v1/discover' + q({ remote: art }), { headers: artH('token'), expect: 200, check: ({ json }) => ({ info: `agent=${json.agent} fetch=${json.fetch.join(' ')}` }) });
   // GitHub, public, no credential
   const gh = 'https://github.com/git/git.git';
@@ -104,16 +109,19 @@ if (phase === 'read') {
   }
   await call('GitHub git/git discover', 'GET', '/v1/discover' + q({ remote: gh }), { expect: 200, check: ({ json }) => ({ info: `agent=${json.agent}` }) });
   await call('GitHub nonexistent repo → 401/404', 'GET', '/v1/refs' + q({ remote: 'https://github.com/ivarvong/this-repo-does-not-exist-ply.git' }), { expect: [401, 403, 404], check: ({ json }) => ({ info: `code=${json.code} upstream=${json.upstreamStatus}` }) });
-  // no author: with writes off → 501; with writes on → 400 before anything is pushed (this must never edit default/ply)
+  // no author: with writes off → 501; with writes on → 400 before anything is pushed (nothing is pushed)
   await call('write gate (POST /v1/edit without author: 501 off, 400 on)', 'POST', '/v1/edit', { body: { remote: art, path: 'README.md', find: 'x', replace: 'y', message: 'm' }, headers: artH('token'), expect: arg('write-status') ? Number(arg('write-status')) : [400, 501], check: ({ json }) => ({ info: `code=${json.code}` }) });
 }
 
 if (phase === 'write') {
-  const repo = JSON.parse(readFileSync(arg('repo'), 'utf8')); secrets.push(repo.token);
+  const repo = scratch;
   const remote = repo.remote, H = { 'git-token': repo.token }, A = { name: 'ply smoke', email: 'smoke@ply.invalid' };
-  const work = arg('work');
+  // A committer distinct from the rebase's: with the same committer in the same second, the cherry-pick of the rebased
+  // tip onto main would reproduce that very commit and main would just fast-forward to it (ply-web #9).
+  const CP = { name: 'ply smoke cherry-pick', email: 'cherry-pick@ply.invalid' };
+  const work = repo.work;
   const W = (name, method, path, body, expect, check) => call(name, method, path, { body: { remote, ...body }, headers: H, expect, check });
-  const gitEnv = { ...process.env, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.extraHeader', GIT_CONFIG_VALUE_0: `Authorization: Bearer ${repo.token}` }; // token never in argv
+  const gitEnv = { ...process.env, ...gitAuthEnv(repo.token) }; // token never in argv
   const lsRemote = () => Object.fromEntries(execFileSync('git', ['-C', work, 'ls-remote', remote], { env: gitEnv }).toString().trim().split('\n').map(l => l.split('\t').reverse()));
   const head0 = (await call('refs', 'GET', '/v1/refs' + q({ remote }), { headers: H, expect: 200 })).json.refs['refs/heads/main'];
   const e1 = await W('edit main:notes/a.txt MARK→EDITED', 'POST', '/v1/edit?trace=1', { path: 'notes/a.txt', find: 'MARK', replace: 'EDITED', author: A, message: 'smoke: edit' }, 200, ({ json }) => ({ info: `newCommit=${json.newCommit} pushBytes=${json.pushBytes} wide=${json.trace.filter(s => s.attrs['git.fetch.filter.fallback']).length}` }));
@@ -131,12 +139,15 @@ if (phase === 'write') {
   await W('edit creating feat-rebase from main~ (via base=refs/tags/smoke-base)', 'POST', '/v1/edit', { ref: 'feat-rebase', base: 'refs/tags/smoke-base', path: 'rebase/r.txt', find: 'r1', replace: 'r1 rebased', author: A, message: 'smoke: to rebase' }, 200);
   await W('rebase feat-rebase onto main', 'POST', '/v1/rebase?trace=1', { ref: 'feat-rebase', onto: 'main', committer: A }, 200, ({ json }) => ({ info: `outcome=${json.outcome} commits=${json.commits} oid=${json.oid}` }));
   const rb = lsRemote()['refs/heads/feat-rebase'];
-  const cp = await W('cherry-pick feat-rebase tip onto main', 'POST', '/v1/cherry-pick', { commit: rb, committer: A }, 200, ({ json }) => ({ info: `oid=${json.oid} tree=${json.tree}` }));
+  const cp = await W('cherry-pick feat-rebase tip onto main', 'POST', '/v1/cherry-pick', { commit: rb, committer: CP }, 200, ({ json }) => (json.oid !== rb ? { info: `oid=${json.oid} tree=${json.tree}` } : `no-op: cherry-pick returned the source commit ${rb}`));
   await W('revert the cherry-pick', 'POST', '/v1/revert', { commit: cp.json?.oid, committer: A }, 200, ({ json }) => ({ info: `oid=${json.oid} tree=${json.tree}` }));
   await W('merge conflict → 409', 'POST', '/v1/merge', { ref: 'conflict-a', from: 'conflict-b', author: A }, 409, ({ json }) => ({ info: `conflicts=${JSON.stringify(json.conflicts)}` }));
   await call('wrong git credential → 401/403', 'GET', '/v1/refs' + q({ remote }), { headers: { 'git-token': 'art_v1_' + 'y'.repeat(40) }, expect: [401, 403], check: ({ json }) => ({ info: `upstream=${json.upstreamStatus}` }) });
   await call('missing PLY bearer on a write → 401', 'POST', '/v1/edit', { ply: false, body: { remote }, expect: 401 });
   writeFileSync(join(arg('outdir') ?? tmpdir(), 'smoke-write-refs.json'), JSON.stringify({ head0, c1, merge: mg.json, refs: lsRemote() }, null, 2));
+}
+} finally {
+  scratch?.teardown();
 }
 
 const out = arg('out');
