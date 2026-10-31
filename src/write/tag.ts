@@ -1,0 +1,94 @@
+// Lightweight tags point the ref at a commit. Annotated tags add a tag object and point the ref at that.
+// Delete uses the same compare-and-swap as a branch delete.
+import { fail, fetchObject, hashObject, ident, lsRefs, operation, push, resolveCommit, TYPE, ZERO_OID } from 'ply'
+import { refExists } from './errors.ts'
+import { nowSeconds, stamp, type Stamp } from './identity.ts'
+import { isOid, parseCommitOid } from './oid.ts'
+import { asBody, parseDeleteOid, tagRef } from './request.ts'
+import { writeResult } from './result.ts'
+import { deleteRef } from './branch.ts'
+
+type Root = { set: (attrs: Record<string, unknown>) => void }
+type Outcome = (kind: string, result: unknown) => unknown
+type Transport = { limits: object }
+
+function messageBody(message: string): string {
+  return message.endsWith('\n') ? message : `${message}\n`
+}
+
+/**
+ * Annotated tag object. ply's encodeTag (src/objects.js) is not exported, and the bytes are the four
+ * headers git writes (`object`, `type`, `tag`, `tagger`) plus a blank line and the message.
+ * A well-formed string encodes as UTF-8, which is what ply's encodeBytes does for one.
+ */
+export function encodeTagObject(spec: { object: string; type: string; tag: string; tagger: string; message: string }): Uint8Array {
+  for (const [what, value] of [['object', spec.object], ['type', spec.type], ['tag', spec.tag], ['tagger', spec.tagger]] as const) {
+    if (/[\0\n]/.test(value)) throw fail('bad_request', `${what} must not contain NUL or newline`)
+  }
+  if (spec.message.includes('\0')) throw fail('bad_request', 'message must not contain NUL')
+  const text = `object ${spec.object}\ntype ${spec.type}\ntag ${spec.tag}\ntagger ${spec.tagger}\n\n${spec.message}`
+  return new TextEncoder().encode(text)
+}
+
+async function commitOf(t: Transport, target: string): Promise<string> {
+  if (isOid(target)) {
+    parseCommitOid(target, 'target')
+    try {
+      await fetchObject(t, { oid: target, filter: 'tree:0', deepen: 1, expectType: TYPE.COMMIT })
+    } catch (e) {
+      const code = (e as { code?: string })?.code
+      if (code === 'pack_corrupt' || code === 'remote_error' || code === 'not_found') throw fail('not_found', `commit ${target} not found`)
+      throw e
+    }
+    return target
+  }
+  return (await resolveCommit(t, target) as { commit: string }).commit
+}
+
+export async function createTag(remote: string, body: unknown, opts: object): Promise<Record<string, unknown>> {
+  const raw = asBody(body)
+  const ref = tagRef(raw.name)
+  const target = raw.target
+  if (typeof target !== 'string' || target === '') throw fail('bad_request', 'target is required')
+  if (isOid(target)) parseCommitOid(target, 'target')
+  const annotated = raw.annotated === true || raw.message !== undefined || raw.tagger !== undefined
+  const tagger: Stamp | null = annotated ? stamp(raw.tagger, 'tagger', nowSeconds()) : null
+  const message = typeof raw.message === 'string' ? raw.message : null
+  if (raw.message !== undefined && typeof raw.message !== 'string') throw fail('bad_request', 'message must be a string')
+  if (raw.annotated !== undefined && typeof raw.annotated !== 'boolean') throw fail('bad_request', 'annotated must be true or false')
+  const short = ref.replace(/^refs\/tags\//, '')
+  return operation('tag_create', remote, { ...opts, attrs: { 'git.tag.ref': ref, 'git.tag.annotated': annotated } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
+    const existing = (await lsRefs(t, [ref])).refs.get(ref)?.oid as string | undefined
+    if (existing) throw refExists(ref, existing)
+    const commit = await commitOf(t, target)
+    let newOid = commit
+    const objects: { type: number; data: Uint8Array }[] = []
+    if (annotated && tagger) {
+      const data = encodeTagObject({
+        object: commit,
+        type: 'commit',
+        tag: short,
+        tagger: ident(tagger.person) as string,
+        message: messageBody(message ?? short),
+      })
+      newOid = hashObject('tag', data) as string
+      objects.push({ type: TYPE.TAG, data })
+    }
+    root.set({ 'git.tag.commit': commit, 'git.tag.oid': newOid })
+    try {
+      const pushed = await push(t, { ref, oldOid: ZERO_OID, newOid, objects }) as { packBytes: number }
+      return outcome('tag', writeResult('tag', ref, newOid, null, { commit, annotated, pushBytes: pushed.packBytes }))
+    } catch (e) {
+      if ((e as { code?: string })?.code === 'cas_conflict') {
+        const cur = (await lsRefs(t, [ref])).refs.get(ref)?.oid as string | undefined
+        throw refExists(ref, cur ?? newOid)
+      }
+      throw e
+    }
+  }) as Promise<Record<string, unknown>>
+}
+
+export async function removeTag(remote: string, body: unknown, opts: object): Promise<Record<string, unknown>> {
+  const raw = asBody(body)
+  return deleteRef(remote, tagRef(raw.name), parseDeleteOid(raw.oid), opts, 'tag_delete')
+}
