@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { PIN } from './bump-plan.ts'
 import { ROOT } from './cf.ts'
 import { loadConfig, publicConfig, type CdConfig } from './config.ts'
 import { writeDebrief } from './debrief.ts'
@@ -50,7 +51,13 @@ function uuid(value: string | null): string | null {
   return value
 }
 
-function parseCd(argv: readonly string[]): Parsed {
+/** `--no-bump` may name a sha only when that sha is already this checkout's ply pin. */
+export function noBumpSha(sha: string, pin: string | null): string | null {
+  if (sha === pin) return null
+  return '--no-bump deploys the checkout; --sha must equal the current pin'
+}
+
+function parseCd(argv: readonly string[], pin: string | null): Parsed {
   let sha: string | null = null
   let noBump = false
   for (let i = 0; i < argv.length; i++) {
@@ -70,15 +77,18 @@ function parseCd(argv: readonly string[]): Parsed {
     }
     return { kind: 'error', reason: arg.startsWith('--') ? `unknown option ${arg}` : `unknown command ${arg}` }
   }
-  if (noBump && sha) return { kind: 'error', reason: '--no-bump deploys the checkout; it does not take --sha' }
+  if (noBump && sha) {
+    const mismatch = noBumpSha(sha, pin)
+    if (mismatch) return { kind: 'error', reason: mismatch }
+  }
   return { kind: 'cd', sha, noBump }
 }
 
-export function parseArgs(argv: readonly string[]): Parsed {
+export function parseArgs(argv: readonly string[], pin: string | null = null): Parsed {
   const [command, ...rest] = argv
   if (command === 'help' || command === '--help' || command === '-h') return { kind: 'usage' }
   if (!command || command === 'cd' || command.startsWith('--')) {
-    return parseCd(command === 'cd' ? rest : argv)
+    return parseCd(command === 'cd' ? rest : argv, pin)
   }
   if (command === 'bump') {
     const sha = flag(rest, 'sha')
@@ -166,10 +176,19 @@ async function identity(config: CdConfig) {
   }
 }
 
+async function checkoutPlyPin(): Promise<string | null> {
+  try {
+    const pkg = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8')) as { dependencies?: { ply?: string } }
+    return PIN.exec(pkg.dependencies?.ply ?? '')?.[1] ?? null
+  } catch {
+    return null
+  }
+}
+
 export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: (line: string) => void = console.log): Promise<number> {
   const nodeError = checkNode(process.version)
   if (nodeError) return finish(log, 1, `cd: harness_fault preflight: ${nodeError}`)
-  const parsed = parseArgs(argv)
+  const parsed = parseArgs(argv, await checkoutPlyPin())
   if (parsed.kind === 'usage') return finish(log, 2, usageText())
   if (parsed.kind === 'error') return finish(log, 2, parsed.reason)
   let config: CdConfig

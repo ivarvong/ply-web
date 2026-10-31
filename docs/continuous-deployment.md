@@ -70,11 +70,12 @@ Running the same sha again is safe. The command reads the current deployment and
 
 A re-entry appends `resumed` on the unfinished run directory for that sha and keeps the same run id. A finished run starts a new one. Each smoke mints a fresh repo and a fresh token. Every traffic write still compares the deployment to the split it expects, and does not write when they differ.
 
-`--no-bump` skips the pin and deploys the checkout as it is. The run records that as a decision (`no_bump`, outcome `advance`):
+`--no-bump` skips the pin and deploys the checkout as it is. The run records that as a decision (`no_bump`, outcome `advance`). `--sha` may be passed with it only when that sha is already the pin; a different sha is an argument error.
 
 ```sh
 npm run cd -- --no-bump
 npm run cd -- cd --no-bump
+npm run cd -- --sha <current pin> --no-bump
 ```
 
 What prints, in order:
@@ -181,7 +182,7 @@ The smoke creates an **empty** repo in `ply-loadgen` (prefix `ply-web-cd-`), min
 A 409 is a pass when that step expects it. The ones that matter after the current write API:
 
 - Cherry-pick or revert of a patch that is already on the target, with the same adds and deletes, is `200` `empty`.
-- The same patch onto a target that also has its own extra file is `409` `merge_conflict`. `allowEmpty` does not turn that into a commit.
+- Cherry-pick of that patch onto a target that also has its own extra file is `409` `merge_conflict`. `allowEmpty` does not turn that into a commit. Revert of the picked commit onto a branch that then added an unrelated file is `200` `revert`.
 - A merge may stamp author and committer as two different people.
 - `from` and `onto` may be a 40-hex commit. Forty zeros is `400` and pushes nothing.
 
