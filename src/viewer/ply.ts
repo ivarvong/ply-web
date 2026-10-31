@@ -66,7 +66,7 @@ export const viewCommit: (data: Uint8Array, limits: object) => CommitView = loos
 export const treeEntryType: (mode: string) => string = loose(entryTypeJs);
 export const treeMode: (mode: string) => string = loose(lsModeJs);
 export const readObject: (transport: GitTransport, opts: { oid: string; filter?: string; deepen?: number; expectType?: number | null }) => Promise<Fetched> = loose(fetchObjectJs);
-export const readPack: (transport: GitTransport, opts: object, extra?: { resolve?: boolean; attrs?: Record<string, unknown> }) => Promise<{ parsed: ParsedPack | null }> = loose(fetchPackJs);
+export const readPack: (transport: GitTransport, opts: object, extra?: { resolve?: boolean; attrs?: Record<string, unknown> }) => Promise<{ parsed: ParsedPack | null; objects?: Map<string, { type: number; data: Uint8Array }> | null }> = loose(fetchPackJs);
 export const filterRejected: (err: unknown) => boolean = loose(isFilterRejectionJs);
 export const streamPack: (transport: GitTransport, opts: object, span: ViewerSpan) => AsyncIterable<Uint8Array> = loose(packStreamJs);
 export const cursorInit: () => PackCursor = loose(spInitJs);

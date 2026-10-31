@@ -1,6 +1,7 @@
 // Public viewer: URL/SSRF rules, caps, escaping, a real pack fixture, the credential-stripping fetch,
 // a local git http-backend, the SQLite rate-limit object under workerd, and (when reachable) GitHub.
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
+import { resetQuirks } from '../src/quirks.ts';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, copyFileSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
@@ -31,6 +32,9 @@ import { parseViewerRoute, routeOptsFromEnv } from '../src/viewer/route.ts';
 import { VIEWER_CSP } from '../src/viewer/script.ts';
 import { ALLOWED_HOSTS, allowlistFromEnv, assertUpstreamUrl, validatePublicRepoUrl, type AllowedHost, type RepoLocation } from '../src/viewer/url.ts';
 
+
+// Every test dials a local server under the github.com origin; the isolate-wide quirks map must not carry over.
+beforeEach(() => resetQuirks());
 const FIXTURE = fileURLToPath(new URL('./fixtures/viewer/small.pack', import.meta.url));
 const FIXTURE_SHA = 'a86b269e52e69445e10d4c1dd7c5a89b323c0988f1d73b1f0b0c7c1d112f846a';
 
@@ -708,3 +712,38 @@ test('same-repo redirects are resolved by the viewer fetch before ply sees them;
   }
 });
 
+
+test('history in one call: on a tree:0 server the page fetches the head and its parents with one deepen fetch', async () => {
+  const { root, cleanup } = tmpRoot();
+  const srv = await startGitServer(root);
+  try {
+    const bare = makeBareRepo(root, 'hist');
+    const work = join(root, 'w-hist');
+    mkdirSync(work);
+    git(work, ['init', '-q', '-b', 'main']);
+    commitFiles(work, bare, { 'README.md': 'history\n' }, 'subject-0');
+    for (let i = 1; i <= 6; i++) {
+      git(work, ['-c', 'user.name=seed', '-c', 'user.email=seed@x', 'commit', '--allow-empty', '-q', '-m', `subject-${i}`]);
+    }
+    git(work, ['push', '-q', bare, 'HEAD:refs/heads/main']);
+    const calls: { method: string; body: string }[] = [];
+    const dial = rewriteAllowlisted(srv.url);
+    const fetchImpl: typeof fetch = async (input, init) => {
+      calls.push({ method: init?.method ?? 'GET', body: init?.body instanceof Uint8Array ? Buffer.from(init.body).toString('latin1') : '' });
+      return dial(input, init);
+    };
+    const page = await handleViewer(new Request('https://ply.ivar.workers.dev/view/github.com/hist.git'), viewerEnv(), {}, { fetchImpl });
+    assert.equal(page.status, 200);
+    const html = await page.text();
+    for (let i = 6; i >= 2; i--) assert.match(html, new RegExp(`subject-${i}\\b`), `subject-${i} in the log`);
+    const fetches = calls.filter(c => c.body.includes('command=fetch'));
+    const history = fetches.filter(c => /deepen 5\n/.test(c.body) && /filter tree:0\n/.test(c.body));
+    assert.equal(history.length, 1, 'one history fetch');
+    assert.equal(fetches.filter(c => /deepen 1\n/.test(c.body)).length, 0, 'no per-commit fetches');
+    // discover + ls-refs + history + root tree + README blob
+    assert.equal(calls.length, 5, calls.map(c => c.body.slice(4, 30)).join(' | '));
+  } finally {
+    await srv.close();
+    cleanup();
+  }
+});
