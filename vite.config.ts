@@ -1,6 +1,24 @@
 // Build settings for `cf build` / `cf dev`. Worker settings and bindings live in cloudflare.config.ts.
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { cloudflare } from "@cloudflare/vite-plugin";
 import { defineConfig } from "vite";
+
+const SHA1_HEX = /^[0-9a-f]{40}$/;
+
+function plyPin(): string {
+	const pkg = JSON.parse(readFileSync(`${import.meta.dirname}/package.json`, "utf8")) as { dependencies?: { ply?: string } };
+	const spec = pkg.dependencies?.ply ?? "";
+	const sha = spec.slice(spec.lastIndexOf("#") + 1);
+	if (!SHA1_HEX.test(sha)) throw new Error("package.json ply dependency must be pinned to a 40-hex commit");
+	return sha;
+}
+
+function webSha(): string {
+	const sha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+	if (!SHA1_HEX.test(sha)) throw new Error("git rev-parse HEAD did not return a 40-hex sha");
+	return sha;
+}
 
 // This Worker declares no containers, so no build step needs Docker. The Cloudflare Vite plugin (2.0.0-beta.v.5) still
 // runs `docker image ls --filter reference=cloudflare-build/…` after every build (buildAndWriteContainerOutput →
@@ -12,5 +30,9 @@ import { defineConfig } from "vite";
 process.env.WRANGLER_DOCKER_BIN = "false";
 
 export default defineConfig({
+	define: {
+		__PLY_SHA__: JSON.stringify(plyPin()),
+		__PLY_WEB_SHA__: JSON.stringify(webSha()),
+	},
 	plugins: [cloudflare()],
 });

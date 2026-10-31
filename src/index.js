@@ -10,7 +10,7 @@
 //                                       oauth2, Artifacts and others → Bearer)
 // Neither git credential appears in logs, spans, error messages or responses (scrubbed at the edge as defense in depth;
 // ply itself never records them).
-import { readFile, listTree, readCommit, resolveCommit } from 'ply';
+import { readFile, listTree, readCommit, resolveCommit, refCandidates } from 'ply';
 import { editFile } from 'ply';
 import { mergeBranch } from 'ply';
 import { rebaseBranch, cherryPick, revertCommit } from 'ply';
@@ -35,8 +35,11 @@ import { parseViewerRoute, routeOptsFromEnv } from './viewer/route.ts';
 import { ALLOWED_HOSTS } from './viewer/url.ts';
 import { viewerErrorDocument } from './viewer/safehtml.ts';
 import { admitClient } from './viewer/app.tsx';
-import { viewerHref } from './viewer/url.ts';
-import { PUBLIC_GIT_HOST, PUBLIC_NAMESPACE, isPublicNamespaceRemote, isPublicRepoName, publicRepoOfRemote, scrubSecrets, tokenSourceFor, withPublicReadCredential } from './public.ts';
+import { PUBLIC_GIT_HOST, PUBLIC_NAMESPACE, isPublicNamespaceRemote, publicRepoOfRemote, scrubSecrets, tokenSourceFor, withPublicReadCredential } from './public.ts';
+import { ADVERTISED_REF_PREFIXES, isAbbreviatedOid, matchAbbreviatedOid } from './abbrev.ts';
+import { jsonCacheControl } from './json-cache.ts';
+import { directoryReadMessage, isDirectoryRead } from './read-status.ts';
+import { VERSION_HEADER, plyVersionValue } from './version.ts';
 
 export { checkRemote };
 
@@ -86,11 +89,15 @@ Every endpoint except GET / needs  Authorization: Bearer <PLY_TOKEN>.
 Git credential (optional, forwarded upstream):  Git-Authorization: <Authorization value>  or  Git-Token: <token>.
 remote= is an https git URL (no userinfo, no IP literals, no private hosts, default port only).
 ref= defaults to the remote's HEAD. Short names resolve like git rev-parse (tags before branches).
+An abbreviated oid (7–39 lowercase hex) resolves when it matches exactly one advertised ref (branch tip, tag tip, or
+peeled tag commit). Otherwise the response is 400 bad_request: pass a full 40-hex oid. A full oid is cached briefly
+(private, max-age=60). Every other JSON response is cache-control: no-store.
 
   GET    /v1/refs?remote=&prefix=              {refs:{name:oid}, head, peeled}
   GET    /v1/discover?remote=                  server capabilities (protocol v2)
   GET    /v1/read?remote=&ref=&path=           file bytes, streamed; x-ply-commit, x-ply-blob, x-ply-mode, content-length
-  GET    /v1/tree?remote=&ref=&path=           [{name, mode, oid, type}]
+                                               a directory is 400 bad_request (list it with GET /v1/tree), not 404
+  GET    /v1/tree?remote=&ref=&path=           {ref, commit, tree, entries:[{name, mode, oid, type}]}
   GET    /v1/commit?remote=&ref=               {ref, oid, tree, parents, author, committer, message, signed}
                          author/committer: {name, email, time (ISO-8601 UTC), epoch, tz (as written, e.g. +0530)}
   POST   /v1/edit        {remote, ref?, base?, path, find, replace, author:{name,email}, message, head?, hint?}
@@ -103,11 +110,14 @@ ref= defaults to the remote's HEAD. Short names resolve like git rev-parse (tags
   POST   /v1/revert      {remote, ref?, commit, committer, message?}
 
 Errors: {code, message, retry} with retry in yes|fresh|no|read. ?trace=1 adds ply's spans to JSON responses
-(and an x-ply-trace timing summary header on /v1/read).
+(and an x-ply-trace timing summary header on /v1/read when that summary is non-empty).
+Every response carries ${VERSION_HEADER}: ply=<commit> ply-web=<commit>.
 
-Public read-only viewer (no token, no git credential):  GET /view   and   GET /view/<host>/<owner>/<repo>?ref=&path=
+Public read-only viewer (no token, no git credential):  GET /view   and   GET /r/<name>
+  The long form GET /view/<host>/<owner>/<repo>?ref=&path= still works. at= and commit= redirect to ref=.
 
-Public namespace (read-only, no token):  GET /r/<repo>  redirects to the viewer for ${PUBLIC_NAMESPACE}/<repo>, and
+Public namespace (read-only, no token):  GET /r  and  GET /r/  list ${PUBLIC_NAMESPACE}.
+  GET /r/<repo> is that repo (404 when it does not exist). A missing name is not redirected.
   GET /v1/{refs,discover,tree,read,commit}?remote=https://${PUBLIC_GIT_HOST}/git/${PUBLIC_NAMESPACE}/<repo>.git
   need no Authorization (rate-limited per client). Writes to that namespace are 403 read_only, with or without a bearer.
 `;
@@ -142,18 +152,6 @@ export const scrubber = secrets => {
 function isPublicReadRemote(raw) {
   if (typeof raw !== 'string' || !raw) return false;
   try { return publicRepoOfRemote(checkRemote(raw).href) !== null; } catch { return false; }
-}
-
-const PUBLIC_REDIRECT_QUERY = ['ref', 'at', 'path', 'raw'];
-
-function publicRedirect(req, url) {
-  const name = url.pathname.slice('/r/'.length);
-  const headers = { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' };
-  if (req.method !== 'GET' && req.method !== 'HEAD') return new Response('method not allowed\n', { status: 405, headers: { ...headers, allow: 'GET, HEAD' } });
-  if (!isPublicRepoName(name)) return new Response(`not a repository in ${PUBLIC_NAMESPACE}\n`, { status: 404, headers });
-  const query = {};
-  for (const k of PUBLIC_REDIRECT_QUERY) { const v = url.searchParams.get(k); if (v) query[k] = v; }
-  return new Response(null, { status: 302, headers: { location: viewerHref(PUBLIC_GIT_HOST, `git/${PUBLIC_NAMESPACE}/${name}.git`, query), 'cache-control': 'no-store' } });
 }
 
 // Viewer responses are HTML or text and at most a few hundred KiB. Each text body and each header passes the public
@@ -196,7 +194,7 @@ async function headBranch(remote, opts) {
   return head;
 }
 
-const json = (status, obj, scrub, extra = {}) => new Response(scrub(JSON.stringify(obj)), { status, headers: { 'content-type': 'application/json; charset=utf-8', ...extra } });
+const json = (status, obj, scrub, extra = {}, cacheRef = null) => new Response(scrub(JSON.stringify(obj)), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': jsonCacheControl(status, cacheRef), ...extra } });
 
 function errorBody(e) {
   const code = isPlyCode(e?.code) ? e.code : 'internal';
@@ -234,13 +232,16 @@ const READS = {
   },
   'GET /v1/commit': async ({ remote, q, opts }) => ({ body: await readCommit(remote, { ref: q.get('ref') || null }, opts) }),
   'GET /v1/read': async ({ remote, q, opts, spans, ctx, log }) => {
-    const r = await readFile(remote, { ref: q.get('ref') || null, path: q.get('path') }, opts);
+    let r;
+    try { r = await readFile(remote, { ref: q.get('ref') || null, path: q.get('path') }, opts); }
+    catch (e) { if (isDirectoryRead(e)) throw fail('bad_request', directoryReadMessage(String(e.message ?? e))); throw e; }
     const fixed = new FixedLengthStream(r.size);
     // a verification failure mid-stream aborts the body short of its Content-Length: the client sees a truncated
     // response, never a clean one with the wrong bytes
     ctx.waitUntil(r.stream.pipeTo(fixed.writable).then(() => log({ stream: 'ok' }), e => log({ stream: 'error', stream_code: e?.code ?? 'error' })));
     const headers = { 'content-type': 'application/octet-stream', 'x-ply-ref': r.ref, 'x-ply-commit': r.commit, 'x-ply-blob': r.blob, 'x-ply-mode': r.mode, 'x-ply-size': String(r.size) };
-    if (q.get('trace') === '1') headers['x-ply-trace'] = traceSummary(spans());
+    const summary = traceSummary(spans());
+    if (q.get('trace') === '1' && summary) headers['x-ply-trace'] = summary;
     return new Response(fixed.readable, { status: 200, headers });
   },
 };
@@ -334,15 +335,15 @@ const worker = {
     const log = extra => console.log(scrub(JSON.stringify({ ...record, ...extra })));
     const done = (res, extra = {}) => {
       res.headers.set('x-ply-request-id', id);
+      res.headers.set(VERSION_HEADER, plyVersionValue());
       applySecurityHeaders(res.headers);
       log({ status: res.status, ms: Date.now() - t0, ...extra });
       return res;
     };
-    if (req.method === 'GET' && url.pathname === '/') return done(new Response(USAGE, { headers: { 'content-type': 'text/plain; charset=utf-8' } }));
-    // Friendly name for a public-namespace repo: /r/<repo> → the viewer's canonical URL. No fetch, so no rate limit.
-    if (url.pathname === '/r' || url.pathname.startsWith('/r/')) return done(publicRedirect(req, url));
-    // Public viewer. Before the token gate, and it never reads Authorization / Git-Token / Cookie.
-    if (url.pathname === '/view.css' || /^\/view\.[0-9a-f]{12}\.css$/.test(url.pathname) || url.pathname === '/view' || url.pathname.startsWith('/view/')) {
+    if (req.method === 'GET' && url.pathname === '/') return done(new Response(USAGE, { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } }));
+    // Public viewer, including the public-namespace index (/r) and short repo URLs (/r/<name>).
+    // Before the token gate, and it never reads Authorization / Git-Token / Cookie.
+    if (url.pathname === '/view.css' || /^\/view\.[0-9a-f]{12}\.css$/.test(url.pathname) || url.pathname === '/view' || url.pathname.startsWith('/view/') || url.pathname === '/r' || url.pathname.startsWith('/r/')) {
       if (url.pathname.includes('@') || url.pathname.toLowerCase().includes('%40')) record.path = '/view/redacted';
       // A raw file at a pinned commit is cached whole (src/pinned.ts): rate-limit here, then ask Pinned.
       const pinKey = isInternal(req) ? null : pinnedViewKey(url, req.method, isPublicViewLoc(env));
@@ -404,6 +405,8 @@ const worker = {
       const remoteUrl = checkRemote(WRITES[key] ? body.remote : url.searchParams.get('remote'), allow);
       const remote = remoteUrl.href;
       record.host = remoteUrl.host;
+      const presentedRef = WRITES[key] ? null : url.searchParams.get('ref');
+      const cacheRef = presentedRef && /^[0-9a-fA-F]{40}$/.test(presentedRef) ? presentedRef.toLowerCase() : presentedRef;
       // Read-only means read-only: no write reaches the public namespace, whatever bearer or git credential came with it.
       if (WRITES[key] && isPublicNamespaceRemote(remote)) return done(json(403, { code: 'read_only', message: `the ${PUBLIC_NAMESPACE} namespace is read-only`, retry: 'no' }, scrub));
       const cred = gitAuth(req.headers, remoteUrl.hostname);
@@ -418,12 +421,25 @@ const worker = {
       const loopback = env.PACK_CACHE === 'off' ? null : () => ctx.exports?.GitCache;
       const fetchImpl = createGuardedFetch(createLoopbackFetch(direct, loopback), remoteUrl, allow);
       const opts = { auth: cred.auth, tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), fetchImpl };
+      if (!WRITES[key] && presentedRef && isAbbreviatedOid(presentedRef.toLowerCase())) {
+        const prefix = presentedRef.toLowerCase();
+        const cands = refCandidates(prefix);
+        const { refs } = await lsRefs(createTransport(remote, opts), [...new Set([...cands, ...ADVERTISED_REF_PREFIXES])]);
+        if (!cands.some(name => refs.has(name))) {
+          const match = matchAbbreviatedOid(prefix, refs);
+          if (match.kind !== 'unique') throw fail('bad_request', match.message);
+          url.searchParams.set('ref', match.oid);
+        }
+      }
       const out = await handler({ remote, q: url.searchParams, body, opts, spans, ctx, log });
       const s = spans();
       const stats = { spans: s.length, rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length, wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length, cache_hits: s.filter(x => x.attrs['git.response.cache'] === 'HIT').length };
-      if (out instanceof Response) return done(out, stats);
+      if (out instanceof Response) {
+        out.headers.set('cache-control', jsonCacheControl(out.status, cacheRef));
+        return done(out, stats);
+      }
       const payload = url.searchParams.get('trace') === '1' ? { ...out.body, trace: s.map(spanView) } : out.body;
-      return done(json(out.status ?? 200, payload, scrub, { 'server-timing': `total;dur=${Date.now() - t0}` }), stats);
+      return done(json(out.status ?? 200, payload, scrub, { 'server-timing': `total;dur=${Date.now() - t0}` }, cacheRef), stats);
     } catch (e) {
       const payload = errorBody(e);
       if (url.searchParams.get('trace') === '1') payload.trace = spans().map(spanView);

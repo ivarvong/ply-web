@@ -179,9 +179,11 @@ test('read endpoints equal git: refs, discover, tree, read (bytes, headers, cont
   }
   const tr1 = await W(`/v1/read?${qs({ remote: r.remote, path: 'README.md', trace: '1' })}`);
   assert.match(tr1.headers.get('x-ply-trace'), /ls-refs;dur=\d+/); await tr1.arrayBuffer();
-  for (const [path, code, status] of [['nope', 'not_found', 404], ['a/b', 'not_found', 404], ['README.md/x', 'not_found', 404], ['../x', 'bad_request', 400]]) {
+  for (const [path, code, status] of [['nope', 'not_found', 404], ['a/b', 'bad_request', 400], ['README.md/x', 'not_found', 404], ['../x', 'bad_request', 400]]) {
     const res = await W(`/v1/read?${qs({ remote: r.remote, path })}`); const b = await res.json();
     assert.equal(res.status, status, path); assert.equal(b.code, code); assert.equal(b.retry, 'no');
+    if (path === 'a/b') assert.match(b.message, /GET \/v1\/tree/);
+    assert.equal(res.headers.get('x-ply-trace'), null);
   }
   const nr = await W(`/v1/read?${qs({ remote: r.remote, path: 'README.md', ref: 'nope' })}`); assert.equal(nr.status, 404);
   const trace = await (await W(`/v1/tree?${qs({ remote: r.remote, trace: '1' })}`)).json();
@@ -211,6 +213,27 @@ test('GET /v1/commit equals git log / cat-file (HEAD, short, full, tag, oid, mer
   }
   const m = await (await W(`/v1/commit?${qs({ remote: r.remote })}`)).json();
   assert.equal(m.parents.length, 2); assert.equal(m.parents[1], side);
+  const shortRes = await W(`/v1/commit?${qs({ remote: r.remote, ref: side.slice(0, 8) })}`);
+  const shortBody = await shortRes.json();
+  assert.equal(shortRes.status, 200, JSON.stringify(shortBody));
+  assert.equal(shortBody.oid, side);
+  assert.equal(shortRes.headers.get('cache-control'), 'no-store', 'an abbreviated oid is not a full oid');
+  const pinnedRes = await W(`/v1/commit?${qs({ remote: r.remote, ref: side })}`);
+  assert.equal(pinnedRes.status, 200);
+  assert.equal(pinnedRes.headers.get('cache-control'), 'private, max-age=60');
+  await pinnedRes.json();
+  const noneRes = await W(`/v1/commit?${qs({ remote: r.remote, ref: 'abcdef1' })}`);
+  const noneBody = await noneRes.json();
+  assert.equal(noneRes.status, 400, JSON.stringify(noneBody));
+  assert.equal(noneBody.code, 'bad_request');
+  assert.match(noneBody.message, /40-hex/);
+  const usage = await W('/');
+  assert.equal(usage.status, 200);
+  const usageText = await usage.text();
+  assert.match(usageText, /entries:\[\{name, mode, oid, type\}\]/);
+  assert.match(usageText, /GET \/view/);
+  assert.match(usageText, /GET \/r\/<name>/);
+  assert.match(usage.headers.get('x-ply-version') ?? '', /^ply=[0-9a-f]{40} ply-web=[0-9a-f]{40}$/);
   const s = await (await W(`/v1/commit?${qs({ remote: r.remote, ref: 'side' })}`)).json();
   assert.deepEqual(s.author, { name: 'Zoë Ångström', email: 'z@ë.x', time: '2023-11-14T22:13:20Z', epoch: 1700000000, tz: '+0530' }); assert.equal(s.message, 'side: Zoë\n\nline two\nline three\n');
   for (const [ref, status, code] of [['nope', 404, 'not_found'], ['f'.repeat(40), 404, 'not_found'], [git(r.bare, ['rev-parse', 'main:f.txt']).trim(), 404, 'not_found'], ['a..b', 400, 'bad_request']]) {

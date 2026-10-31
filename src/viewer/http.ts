@@ -26,16 +26,17 @@ export function statusOf(err: { code?: string; status?: number }): number {
 }
 
 export function htmlResponse(status: number, body: SafeHtml, trace: TraceModel, requestId: string, extra: Record<string, string> = {}): Response {
-  const timing = [`total;dur=${Math.max(0, trace.totalMs)}`, traceHeader(trace)].filter(Boolean).join(', ').slice(0, LAYOUT.serverTimingChars)
+  const summary = traceHeader(trace)
+  const timing = [`total;dur=${Math.max(0, trace.totalMs)}`, summary].filter(Boolean).join(', ').slice(0, LAYOUT.serverTimingChars)
   const headers = new Headers({
     ...SECURITY,
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',
     'x-ply-request-id': requestId,
     'server-timing': timing,
-    'x-ply-trace': traceHeader(trace),
     ...extra,
   })
+  if (summary) headers.set('x-ply-trace', summary)
   return new Response(body, { status, headers })
 }
 
