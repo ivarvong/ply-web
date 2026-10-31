@@ -1,9 +1,10 @@
 // The /v1 write handlers. Parsing that can fail with bad_request happens before a transport is opened.
 // An unborn HEAD is read only when a call needs the default branch or a not_found might be that empty ref.
 import { fail, mergeBranch, operation, readCommit, rebaseBranch } from 'ply'
+import { type CallOpts } from './call.ts'
 import { createBranch, deleteRef } from './branch.ts'
 import { commitEdit } from './commit.ts'
-import { readHead, type HeadState, type HeadTransport } from './head.ts'
+import { readHead, type HeadState } from './head.ts'
 import { nowSeconds, plyPerson, stamp, type Stamp } from './identity.ts'
 import { parseCommitOid } from './oid.ts'
 import { pick } from './pick.ts'
@@ -11,17 +12,15 @@ import { asBody, branchRef, parseDeleteOid, parseEdit, sameBranch } from './requ
 import { unifyPly, type WriteOutcome } from './result.ts'
 import { createTag, removeTag } from './tag.ts'
 
-type OutcomeFn = (kind: string, value: HeadState) => HeadState
-
 function sameStamp(a: Stamp, b: Stamp): boolean {
   return a.name === b.name && a.email === b.email && a.tz === b.tz && a.time === b.time
 }
 
-async function readHeadState(remote: string, opts: object, op: string): Promise<HeadState> {
-  return operation(op, remote, opts, async ({ t, outcome }: { t: HeadTransport; outcome: OutcomeFn }) => outcome('ok', await readHead(t))) as Promise<HeadState>
+async function readHeadState(remote: string, opts: CallOpts, op: string): Promise<HeadState> {
+  return operation(op, remote, opts, async ({ t, outcome }) => outcome('ok', await readHead(t)))
 }
 
-async function bornRef(remote: string, opts: object, field: string): Promise<string> {
+async function bornRef(remote: string, opts: CallOpts, field: string): Promise<string> {
   const head = await readHeadState(remote, opts, 'head')
   if (head.kind === 'born') return head.ref
   if (head.kind === 'unborn') throw fail('bad_request', `${field} is required when the remote HEAD is unborn (${head.ref})`)
@@ -29,12 +28,12 @@ async function bornRef(remote: string, opts: object, field: string): Promise<str
   throw fail('bad_request', `${field} is required when the remote HEAD is absent`)
 }
 
-async function requireRef(remote: string, opts: object, given: unknown, field: string): Promise<string> {
+async function requireRef(remote: string, opts: CallOpts, given: unknown, field: string): Promise<string> {
   if (given !== undefined && given !== null && given !== '') return branchRef(given, field)
   return bornRef(remote, opts, field)
 }
 
-async function clarifyUnborn(remote: string, opts: object, err: unknown, verb: string): Promise<unknown> {
+async function clarifyUnborn(remote: string, opts: CallOpts, err: unknown, verb: string): Promise<unknown> {
   if ((err as { code?: string })?.code !== 'not_found') return err
   const message = String((err as { message?: string })?.message ?? '')
   try {
@@ -50,21 +49,21 @@ function textOr(value: unknown, field: string): string | undefined {
   return value
 }
 
-export async function handleEdit(remote: string, body: unknown, opts: object): Promise<{ body: Record<string, unknown> }> {
+export async function handleEdit(remote: string, body: unknown, opts: CallOpts): Promise<{ body: Record<string, unknown> }> {
   return { body: await commitEdit(remote, parseEdit(asBody(body), nowSeconds()), opts) }
 }
 
-export async function handleBranchCreate(remote: string, body: unknown, opts: object): Promise<{ status: number; body: Record<string, unknown> }> {
+export async function handleBranchCreate(remote: string, body: unknown, opts: CallOpts): Promise<{ status: number; body: Record<string, unknown> }> {
   const raw = asBody(body)
   return { status: 201, body: await createBranch(remote, raw.ref, raw.from, opts) }
 }
 
-export async function handleBranchDelete(remote: string, body: unknown, opts: object): Promise<{ body: Record<string, unknown> }> {
+export async function handleBranchDelete(remote: string, body: unknown, opts: CallOpts): Promise<{ body: Record<string, unknown> }> {
   const raw = asBody(body)
   return { body: await deleteRef(remote, branchRef(raw.ref, 'ref'), parseDeleteOid(raw.oid), opts, 'branch_delete') }
 }
 
-export async function handleMerge(remote: string, body: unknown, opts: object): Promise<{ body: Record<string, unknown> }> {
+export async function handleMerge(remote: string, body: unknown, opts: CallOpts): Promise<{ body: Record<string, unknown> }> {
   const raw = asBody(body)
   const ref = await requireRef(remote, opts, raw.ref, 'ref')
   const from = branchRef(raw.from, 'from')
@@ -92,7 +91,7 @@ export async function handleMerge(remote: string, body: unknown, opts: object): 
   }
 }
 
-export async function handleRebase(remote: string, body: unknown, opts: object): Promise<{ body: Record<string, unknown> }> {
+export async function handleRebase(remote: string, body: unknown, opts: CallOpts): Promise<{ body: Record<string, unknown> }> {
   const raw = asBody(body)
   const ref = branchRef(raw.ref, 'ref')
   const onto = await requireRef(remote, opts, raw.onto, 'onto')
@@ -118,7 +117,7 @@ export async function handleRebase(remote: string, body: unknown, opts: object):
   }
 }
 
-async function handlePick(remote: string, body: unknown, opts: object, revert: boolean): Promise<{ body: Record<string, unknown> }> {
+async function handlePick(remote: string, body: unknown, opts: CallOpts, revert: boolean): Promise<{ body: Record<string, unknown> }> {
   const raw = asBody(body)
   const ref = await requireRef(remote, opts, raw.ref, 'ref')
   const commit = parseCommitOid(raw.commit, 'commit')
@@ -132,18 +131,19 @@ async function handlePick(remote: string, body: unknown, opts: object, revert: b
   }
 }
 
-export const handleCherryPick = (remote: string, body: unknown, opts: object) => handlePick(remote, body, opts, false)
-export const handleRevert = (remote: string, body: unknown, opts: object) => handlePick(remote, body, opts, true)
+export const handleCherryPick = (remote: string, body: unknown, opts: CallOpts) => handlePick(remote, body, opts, false)
+export const handleRevert = (remote: string, body: unknown, opts: CallOpts) => handlePick(remote, body, opts, true)
 
-export const handleTagCreate = async (remote: string, body: unknown, opts: object) => ({ status: 201, body: await createTag(remote, body, opts) })
-export const handleTagDelete = async (remote: string, body: unknown, opts: object) => ({ body: await removeTag(remote, body, opts) })
+export const handleTagCreate = async (remote: string, body: unknown, opts: CallOpts) => ({ status: 201, body: await createTag(remote, body, opts) })
+export const handleTagDelete = async (remote: string, body: unknown, opts: CallOpts) => ({ body: await removeTag(remote, body, opts) })
 
 const EMPTY_COMMIT = { empty: true, oid: null, tree: null, parents: [], author: null, committer: null, message: null, signed: false }
 
 /** A born commit is ply's readCommit body, unchanged. An unborn HEAD (or that same branch by name) is the empty-repo body. */
-export async function readCommitOrEmpty(remote: string, ref: string | null, opts: object): Promise<Record<string, unknown>> {
+export async function readCommitOrEmpty(remote: string, ref: string | null, opts: CallOpts): Promise<Record<string, unknown>> {
   try {
-    return await readCommit(remote, { ref }, opts) as Record<string, unknown>
+    // The declaration types `ref` as null, which is only the default. A branch name or oid is what readCommit resolves.
+    return await readCommit(remote, { ref } as { ref?: null }, opts) as Record<string, unknown>
   } catch (e) {
     if ((e as { code?: string })?.code !== 'not_found') throw e
     try {
@@ -156,7 +156,7 @@ export async function readCommitOrEmpty(remote: string, ref: string | null, opts
 }
 
 /** Extra fields for GET /v1/refs when ply's ls-refs could not see an unborn HEAD. Born repositories are unchanged. */
-export async function unbornFields(remote: string, opts: object, head: string | null): Promise<Record<string, unknown>> {
+export async function unbornFields(remote: string, opts: CallOpts, head: string | null): Promise<Record<string, unknown>> {
   if (head) return {}
   try {
     const state = await readHeadState(remote, opts, 'head')

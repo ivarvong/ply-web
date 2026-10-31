@@ -11,6 +11,7 @@
 // update with the right old oid). An update larger than MAX_SYNC_PACK is refused and logged; publish it with
 // scripts/publish.mjs, which chunks.
 import { Tracer, ZERO_OID, arrayExporter, createTransport, fetchPack, lsRefs, push, withLimits } from 'ply';
+import type { Transport } from 'ply/transport';
 import { checkRemote, createGuardedFetch } from './remote.ts';
 import { PUBLIC_GIT_ORIGIN, publicRemote, type ArtifactsNamespace, type TokenSource } from './public.ts';
 
@@ -33,11 +34,14 @@ export type SyncResult = {
   pushBytes?: number; ms: number; code?: string; message?: string;
 };
 
+// ply's .d.ts types Tracer's exporter as `() => void`; it is called with each span line, which arrayExporter takes.
+type TracerExporter = NonNullable<NonNullable<ConstructorParameters<typeof Tracer>[0]>['exporter']>;
+
 function tracer() {
-  return new Tracer({ exporter: arrayExporter(), resource: { 'service.name': 'ply-mirror' } });
+  return new Tracer({ exporter: arrayExporter() as unknown as TracerExporter, resource: { 'service.name': 'ply-mirror' } });
 }
 
-async function tip(t: unknown, branch: string): Promise<string | null> {
+async function tip(t: Transport, branch: string): Promise<string | null> {
   const ref = `refs/heads/${branch}`;
   const { refs } = await lsRefs(t, [ref]);
   return refs.get(ref)?.oid ?? null;
@@ -58,7 +62,9 @@ export async function syncMirror(m: Mirror, deps: { binding: ArtifactsNamespace;
     if (!want) return { repo: m.repo, outcome: 'error', code: 'not_found', message: `source has no ${m.branch}`, ms: Date.now() - t0 };
     if (want === have) return { repo: m.repo, outcome: 'in-sync', from: have, to: want, ms: Date.now() - t0 };
     const r = await fetchPack(srcT, { wants: [want], haves: have ? [have] : [], ofsDelta: true, thinPack: false, done: true }, { resolve: true });
-    const objects = r.objects ? [...r.objects.values()] : [];
+    // fetchPack's objects carry Uint8Array<ArrayBufferLike>; push's PackInput declares Uint8Array<ArrayBuffer>. ply allocates
+    // every object buffer itself (never a SharedArrayBuffer), so the narrowing holds.
+    const objects = (r.objects ? [...r.objects.values()] : []) as NonNullable<Parameters<typeof push>[1]['objects']>;
     const handle = await deps.binding.get(m.repo);
     let writeToken = '';
     try {

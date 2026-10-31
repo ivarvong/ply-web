@@ -2,15 +2,16 @@
 // An existing ref is ref_exists (retry no). A delete whose expected oid is stale is stale_expected and carries
 // the oid the ref actually points at.
 import { fail, fetchObject, lsRefs, operation, push, resolveCommit, TYPE, ZERO_OID } from 'ply'
+import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
 import { refExists, staleExpected } from './errors.ts'
-import { readHead, type HeadTransport } from './head.ts'
+import { readHead } from './head.ts'
 import { isOid, isZeroOid } from './oid.ts'
 import { branchRef } from './request.ts'
 import { writeResult } from './result.ts'
 
-type Root = { set: (attrs: Record<string, unknown>) => void }
-type Outcome = (kind: string, result: unknown) => unknown
-type Transport = HeadTransport & { limits: object }
+type Transport = GitTransport
+type Root = GitSpan
+type Outcome = GitOutcome
 
 async function tipOf(t: Transport, from: string): Promise<string> {
   if (isOid(from)) {
@@ -34,7 +35,7 @@ async function bornTip(t: Transport): Promise<string> {
   throw fail('bad_request', 'from is required when the remote HEAD is absent')
 }
 
-export async function createBranch(remote: string, refName: unknown, from: unknown, opts: object): Promise<Record<string, unknown>> {
+export async function createBranch(remote: string, refName: unknown, from: unknown, opts: CallOpts): Promise<Record<string, unknown>> {
   const ref = branchRef(refName, 'ref')
   // Zero is refused here, before operation() opens a transport, so receive-pack is never called.
   if (isZeroOid(from)) throw fail('bad_request', 'from must not be the zero oid')
@@ -58,7 +59,7 @@ export async function createBranch(remote: string, refName: unknown, from: unkno
   }) as Promise<Record<string, unknown>>
 }
 
-export async function deleteRef(remote: string, ref: string, expected: string | null, opts: object, op: 'branch_delete' | 'tag_delete'): Promise<Record<string, unknown>> {
+export async function deleteRef(remote: string, ref: string, expected: string | null, opts: CallOpts, op: 'branch_delete' | 'tag_delete'): Promise<Record<string, unknown>> {
   return operation(op, remote, { ...opts, attrs: { [`git.${op}.ref`]: ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
     const current = (await lsRefs(t, [ref])).refs.get(ref)?.oid as string | undefined
     if (!current) throw fail('not_found', `ref ${ref} not found`)

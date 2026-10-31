@@ -1,8 +1,9 @@
 // HEAD, including an unborn symref. ply's lsRefs does not send the `unborn` argument and drops `unborn` lines
 // (src/lsrefs.js: an unborn line parses as null), so an empty repository's HEAD — which git reports as
 // `unborn HEAD symref-target:refs/heads/main` — is invisible through it. This speaks that one ls-refs itself.
-import { fail, pkts } from 'ply';
+import { fail, pkts, type Span } from 'ply';
 import { KIND } from 'ply';
+import { type GitTransport } from './call.ts';
 import { LS_REFS_COMMAND, LS_REFS_DELIM_AFTER, LS_REFS_SYMREF_TARGET, LS_REFS_UNBORN } from './constants.ts';
 import { asOid, type Oid } from './oid.ts';
 
@@ -12,26 +13,21 @@ export type HeadState =
   | { readonly kind: 'unborn'; readonly ref: string }
   | { readonly kind: 'absent' };
 
-type Frame = { kind: string; payload?: Uint8Array };
-type Span = { set: (attrs: Record<string, unknown>) => unknown };
-export type HeadTransport = {
-  parent: unknown;
-  tracer: { span: (name: string, opts: object, fn: (span: Span) => Promise<HeadState>) => Promise<HeadState> };
-  frames: (service: string, body: Uint8Array, span: Span) => AsyncIterable<Frame>;
-};
+/** The transport `operation` hands the callback. An unborn HEAD is read through its `frames`. */
+export type HeadTransport = GitTransport;
 
 const HEAD = 'HEAD';
 const ERR = 'ERR ';
 const textDecoder = new TextDecoder();
 
-export function unbornLsRefsBody(): Uint8Array {
+export function unbornLsRefsBody(): Uint8Array<ArrayBuffer> {
   return pkts([
     LS_REFS_COMMAND,
     'peel\n',
     'symrefs\n',
     `${LS_REFS_UNBORN}\n`,
     `ref-prefix ${HEAD}\n`,
-  ], { delimAfter: LS_REFS_DELIM_AFTER }) as Uint8Array;
+  ], { delimAfter: LS_REFS_DELIM_AFTER });
 }
 
 function lineOf(payload: Uint8Array): string {
@@ -74,7 +70,7 @@ export async function readHead(t: HeadTransport): Promise<HeadState> {
     parent: t.parent,
     kind: KIND.CLIENT,
     attrs: { 'git.command': 'ls-refs', 'git.ls_refs.unborn': true, 'git.ls_refs.prefixes': [HEAD] },
-  }, async span => {
+  }, async (span: Span) => {
     const lines: Listed[] = [];
     let ended = false;
     for await (const frame of t.frames('git-upload-pack', unbornLsRefsBody(), span)) {

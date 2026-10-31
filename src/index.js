@@ -330,6 +330,7 @@ const worker = {
     const log = extra => console.log(scrub(JSON.stringify({ ...record, ...extra })));
     const done = (res, extra = {}) => {
       res.headers.set('x-ply-request-id', id);
+      if (env.VERSION?.id) res.headers.set('x-ply-version', env.VERSION.id);
       applySecurityHeaders(res.headers);
       log({ status: res.status, ms: Date.now() - t0, ...extra });
       return res;

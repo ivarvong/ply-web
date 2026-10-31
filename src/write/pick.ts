@@ -3,13 +3,15 @@
 // commit's post-image in the target tree, this returns outcome `empty` instead. `allowEmpty` writes that empty
 // commit (same tree, new commit). A real conflict, where the post-image does not match, stays a merge_conflict.
 import { cherryPick, encodeCommit, fail, fetchObject, hashObject, lsRefs, operation, parseCommit, parseTree, push, revertCommit, TYPE } from 'ply'
+import { arrayBufferBytes } from './bytes.ts'
+import { type CallOpts, type GitOutcome, type GitTransport } from './call.ts'
 import { MODE_TREE } from './constants.ts'
 import { type Stamp } from './identity.ts'
 import { writeResult } from './result.ts'
 
-type Transport = { limits: object }
+type Transport = GitTransport
 type Entry = { readonly mode: string; readonly oid: string }
-type Outcome = (kind: string, result: unknown) => unknown
+type Outcome = GitOutcome
 
 function messageBody(message: string): string {
   return message.endsWith('\n') ? message : `${message}\n`
@@ -79,7 +81,7 @@ function emptyResult(ref: string, oid: string): Record<string, unknown> {
   return writeResult('empty', ref, oid, oid, {})
 }
 
-async function writeEmpty(remote: string, opts: object, ref: string, commit: string, who: Stamp, message: string | null, revert: boolean): Promise<Record<string, unknown>> {
+async function writeEmpty(remote: string, opts: CallOpts, ref: string, commit: string, who: Stamp, message: string | null, revert: boolean): Promise<Record<string, unknown>> {
   const op = revert ? 'revert' : 'cherry_pick'
   return operation(op, remote, { ...opts, attrs: { [`git.${op}.ref`]: ref, [`git.${op}.commit`]: commit, [`git.${op}.allow_empty`]: true } }, async ({ t, outcome }: { t: Transport; outcome: Outcome }) => {
     const tip = (await lsRefs(t, [ref])).refs.get(ref)?.oid as string | undefined
@@ -94,14 +96,14 @@ async function writeEmpty(remote: string, opts: object, ref: string, commit: str
       author,
       committer: who.line,
       message: messageBody(message ?? fallback),
-    }) as Uint8Array
-    const oid = hashObject('commit', data) as string
-    const pushed = await push(t, { ref, oldOid: tip, newOid: oid, objects: [{ type: TYPE.COMMIT, data }] }) as { packBytes: number }
+    })
+    const oid = hashObject('commit', data)
+    const pushed = await push(t, { ref, oldOid: tip, newOid: oid, objects: [{ type: TYPE.COMMIT, data: arrayBufferBytes(data) }] })
     return outcome(op, writeResult(revert ? 'revert' : 'cherry_pick', ref, oid, tip, { tree: target.tree, pushBytes: pushed.packBytes }))
   }) as Promise<Record<string, unknown>>
 }
 
-export async function pick(remote: string, opts: object, spec: { ref: string; commit: string; committer: Stamp; message: string | null; allowEmpty: boolean; revert: boolean }): Promise<Record<string, unknown>> {
+export async function pick(remote: string, opts: CallOpts, spec: { ref: string; commit: string; committer: Stamp; message: string | null; allowEmpty: boolean; revert: boolean }): Promise<Record<string, unknown>> {
   const run = spec.revert ? revertCommit : cherryPick
   try {
     const result = await run(remote, {

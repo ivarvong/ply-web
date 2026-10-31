@@ -11,13 +11,15 @@ export type TzOffset = string & { readonly [tzBrand]: 'TzOffset' };
 /** Unix seconds. git ident timestamp: a non-negative safe integer. fsck refuses a date that overflows time_t. */
 export type UnixSeconds = number & { readonly [timeBrand]: 'UnixSeconds' };
 
+/** The object validateIdent brands. ident() refuses a copy, so the line is taken from this value. */
+type Person = ReturnType<typeof validateIdent>;
+
 export type Stamp = {
   readonly name: string;
   readonly email: string;
   readonly tz: TzOffset;
   readonly time: UnixSeconds;
-  /** The validated ply person. ident() refuses a copy, so the line is taken from this object. */
-  readonly person: { readonly name: string; readonly email: string; readonly time: number; readonly tz: string };
+  readonly person: Person;
   readonly line: string;
 };
 
@@ -52,8 +54,8 @@ export function stamp(value: unknown, field: string, now: UnixSeconds): Stamp {
   const raw = rawOf(value, field);
   const time = raw.time === undefined ? now : parseTime(raw.time, `${field}.time`);
   const tz = raw.tz === undefined ? undefined : parseTz(raw.tz, `${field}.tz`);
-  const person = validateIdent({ name: raw.name, email: raw.email, time, tz }) as Stamp['person'];
-  return { name: person.name, email: person.email, tz: person.tz as TzOffset, time: person.time as UnixSeconds, person, line: ident(person) as string };
+  const person = validateIdent({ name: raw.name, email: raw.email, time, tz });
+  return { name: person.name, email: person.email, tz: person.tz as TzOffset, time: person.time as UnixSeconds, person, line: ident(person) };
 }
 
 export function nowSeconds(): UnixSeconds {

@@ -53,24 +53,8 @@ export type PackMap = {
   unresolved: boolean;
 };
 
-export type ParsedPack = {
-  objects: ParsedObject[];
-  stats: { version: number; count: number; ofsDelta: number; refDelta: number; byType: Record<string, number> };
-  trailer: string;
-  bytes: number;
-};
-
-type ParsedObject = {
-  offset: number;
-  headerBytes: number;
-  type: number;
-  size: number;
-  compressed: number;
-  data: Uint8Array;
-  baseOffset?: number;
-  baseOid?: string;
-  oid?: string;
-};
+// ply's own parsed-pack type: resolvePack needs each object's inflate stats, which a hand-written copy left out.
+export type ParsedPack = ReturnType<typeof parsePack>;
 
 type ResolvedObject = {
   oid: string;

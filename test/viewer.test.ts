@@ -314,7 +314,8 @@ async function ofsChain(deltaCount: number): Promise<Uint8Array> {
   const payload = new TextEncoder().encode('x');
   const baseZ = await zlibDeflate(payload);
   const delta = spliceDelta({ baseLen: payload.length, off: 0, oldLen: 0, insert: new Uint8Array() }).delta;
-  const deltaZ = await zlibDeflate(delta);
+  // ply types spliceDelta's output as Uint8Array<ArrayBufferLike> and zlibDeflate's input as Uint8Array<ArrayBuffer>.
+  const deltaZ = await zlibDeflate(delta as Uint8Array<ArrayBuffer>);
   const header = new Uint8Array(12);
   header.set([0x50, 0x41, 0x43, 0x4b]);
   new DataView(header.buffer).setUint32(4, 2);

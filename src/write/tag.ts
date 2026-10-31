@@ -1,6 +1,8 @@
 // Lightweight tags point the ref at a commit. Annotated tags add a tag object and point the ref at that.
 // Delete uses the same compare-and-swap as a branch delete.
 import { fail, fetchObject, hashObject, ident, lsRefs, operation, push, resolveCommit, TYPE, ZERO_OID } from 'ply'
+import { arrayBufferBytes } from './bytes.ts'
+import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
 import { refExists } from './errors.ts'
 import { nowSeconds, stamp, type Stamp } from './identity.ts'
 import { isOid, parseCommitOid } from './oid.ts'
@@ -8,9 +10,9 @@ import { asBody, parseDeleteOid, tagRef } from './request.ts'
 import { writeResult } from './result.ts'
 import { deleteRef } from './branch.ts'
 
-type Root = { set: (attrs: Record<string, unknown>) => void }
-type Outcome = (kind: string, result: unknown) => unknown
-type Transport = { limits: object }
+type Transport = GitTransport
+type Root = GitSpan
+type Outcome = GitOutcome
 
 function messageBody(message: string): string {
   return message.endsWith('\n') ? message : `${message}\n`
@@ -45,7 +47,7 @@ async function commitOf(t: Transport, target: string): Promise<string> {
   return (await resolveCommit(t, target) as { commit: string }).commit
 }
 
-export async function createTag(remote: string, body: unknown, opts: object): Promise<Record<string, unknown>> {
+export async function createTag(remote: string, body: unknown, opts: CallOpts): Promise<Record<string, unknown>> {
   const raw = asBody(body)
   const ref = tagRef(raw.name)
   const target = raw.target
@@ -62,17 +64,17 @@ export async function createTag(remote: string, body: unknown, opts: object): Pr
     if (existing) throw refExists(ref, existing)
     const commit = await commitOf(t, target)
     let newOid = commit
-    const objects: { type: number; data: Uint8Array }[] = []
+    const objects: { type: number; data: Uint8Array<ArrayBuffer> }[] = []
     if (annotated && tagger) {
       const data = encodeTagObject({
         object: commit,
         type: 'commit',
         tag: short,
-        tagger: ident(tagger.person) as string,
+        tagger: ident(tagger.person),
         message: messageBody(message ?? short),
       })
       newOid = hashObject('tag', data) as string
-      objects.push({ type: TYPE.TAG, data })
+      objects.push({ type: TYPE.TAG, data: arrayBufferBytes(data) })
     }
     root.set({ 'git.tag.commit': commit, 'git.tag.oid': newOid })
     try {
@@ -88,7 +90,7 @@ export async function createTag(remote: string, body: unknown, opts: object): Pr
   }) as Promise<Record<string, unknown>>
 }
 
-export async function removeTag(remote: string, body: unknown, opts: object): Promise<Record<string, unknown>> {
+export async function removeTag(remote: string, body: unknown, opts: CallOpts): Promise<Record<string, unknown>> {
   const raw = asBody(body)
   return deleteRef(remote, tagRef(raw.name), parseDeleteOid(raw.oid), opts, 'tag_delete')
 }

@@ -1,23 +1,21 @@
 // Build a commit from create/write/edit/delete/rename and push it. A missing ref is created (old oid = zero):
 // that is the root commit on an empty repository, and a new branch when `base` names another ref or a commit.
 // One find/replace on an existing file still goes through ply's editFile, which streams the blob.
-import { fail, editFile, encodeCommit, fetchObject, hashObject, isLfsPointerPrefix, lsRefs, operation, parseCommit, parseTree, push, resolveCommit, TYPE, validatePath, KIND } from 'ply'
+import { fail, editFile, encodeCommit, fetchObject, hashObject, isLfsPointerPrefix, lsRefs, operation, parseCommit, parseTree, push, resolveCommit, TYPE, validatePath, KIND, type Span } from 'ply'
+import { arrayBufferBytes } from './bytes.ts'
+import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
 import { MODE_TREE, BLOB_MODES } from './constants.ts'
 import { refExists } from './errors.ts'
-import { readHead, type HeadTransport } from './head.ts'
+import { readHead } from './head.ts'
 import { plyPerson, type Stamp } from './identity.ts'
 import { ZERO_OID, asOid, type Oid } from './oid.ts'
 import { sameBranch, type Change, type EditRequest } from './request.ts'
 import { writeResult } from './result.ts'
 import { emptyDir, encodeMem, fileLeaf, isTree, lazyNode, lookup, putAt, removeAt, renameAt, replaceOnce, setChild, type Mem } from './tree.ts'
 
-type Root = { set: (attrs: Record<string, unknown>) => void }
-type Outcome = (kind: string, result: unknown, extra?: Record<string, unknown>) => unknown
-type Transport = {
-  limits: object
-  parent: unknown
-  tracer: { span: (name: string, opts: object, fn: (span: { set: (attrs: Record<string, unknown>) => void }) => Promise<Mem>) => Promise<Mem> }
-}
+type Transport = GitTransport
+type Root = GitSpan
+type Outcome = GitOutcome
 
 type Target = { readonly ref: string; readonly oid: Oid | null }
 type Parent = { readonly oid: Oid | null; readonly tree: string | null }
@@ -45,7 +43,7 @@ function messageBody(message: string): string {
 
 async function resolveTarget(t: Transport, ref: string | null): Promise<Target> {
   if (ref === null) {
-    const head = await readHead(t as unknown as HeadTransport)
+    const head = await readHead(t)
     if (head.kind === 'born') return { ref: head.ref, oid: head.oid }
     if (head.kind === 'unborn') return { ref: head.ref, oid: null }
     if (head.kind === 'detached') throw fail('bad_request', 'remote HEAD is detached; pass ref explicitly')
@@ -166,7 +164,7 @@ function singleEdit(req: EditRequest): { path: string; find: string; replace: st
   return change?.kind === 'edit' ? change : null
 }
 
-async function streamEdit(remote: string, req: EditRequest, target: Target, edit: { path: string; find: string; replace: string }, creating: boolean, opts: object): Promise<Record<string, unknown>> {
+async function streamEdit(remote: string, req: EditRequest, target: Target, edit: { path: string; find: string; replace: string }, creating: boolean, opts: CallOpts): Promise<Record<string, unknown>> {
   const base = req.base.kind === 'ref' ? req.base.ref : target.ref
   const head = req.head.kind === 'oid' ? { head: req.head.oid, strictHead: true } : req.hint ? { head: req.hint } : {}
   const edited = await editFile(remote, {
@@ -178,7 +176,7 @@ async function streamEdit(remote: string, req: EditRequest, target: Target, edit
     author: plyPerson(req.author),
     message: req.message,
     time: req.author.time,
-  }, { ...opts, ...head }) as { noop: boolean; newCommit: string; oldCommit: string; newTree: string; pushBytes: number }
+  }, { ...opts, ...head } as unknown as Parameters<typeof editFile>[2]) as { noop: boolean; newCommit: string; oldCommit: string; newTree: string; pushBytes: number }
   const oid = edited.newCommit
   const oldOid = edited.noop || !creating ? edited.oldCommit : null
   return writeResult(edited.noop ? 'noop' : 'commit', target.ref, oid, oldOid, {
@@ -193,7 +191,7 @@ async function streamEdit(remote: string, req: EditRequest, target: Target, edit
  * `author` stamps both author and committer unless `committer` is set, in which case the commit is built here
  * (editFile has only one identity).
  */
-export async function commitEdit(remote: string, req: EditRequest, opts: object): Promise<Record<string, unknown>> {
+export async function commitEdit(remote: string, req: EditRequest, opts: CallOpts): Promise<Record<string, unknown>> {
   return operation('commit', remote, {
     ...opts,
     attrs: { 'git.commit.ops': req.changes.map(change => change.kind), 'git.commit.ref': req.ref ?? 'HEAD' },
@@ -228,7 +226,7 @@ export async function commitEdit(remote: string, req: EditRequest, opts: object)
       parent: root,
       kind: KIND.CLIENT,
       attrs: { 'git.commit.ops': req.changes.map(change => change.kind), 'git.commit.creating': creating },
-    }, async span => {
+    }, async (span: Span) => {
       for (const change of req.changes) mem = await applyOne(t, mem, change, blobs, trees)
       span.set({ 'git.commit.applied': req.changes.length })
       return mem
@@ -245,14 +243,14 @@ export async function commitEdit(remote: string, req: EditRequest, opts: object)
       author: req.author.line,
       committer: committer.line,
       message: messageBody(req.message),
-    }) as Uint8Array
-    const oid = hashObject('commit', data) as string
+    })
+    const oid = hashObject('commit', data)
     const seen = new Set<string>()
     const used = new Set<string>()
     referencedBlobs(mem, used)
-    const objects: { type: number; data: Uint8Array }[] = [{ type: TYPE.COMMIT, data }]
-    for (const tree of built.trees) if (!seen.has(tree.oid)) { seen.add(tree.oid); objects.push({ type: TYPE.TREE, data: tree.data }) }
-    for (const [blob, bytes] of blobs.created) if (used.has(blob) && !seen.has(blob)) { seen.add(blob); objects.push({ type: TYPE.BLOB, data: bytes }) }
+    const objects: { type: number; data: Uint8Array<ArrayBuffer> }[] = [{ type: TYPE.COMMIT, data: arrayBufferBytes(data) }]
+    for (const tree of built.trees) if (!seen.has(tree.oid)) { seen.add(tree.oid); objects.push({ type: TYPE.TREE, data: arrayBufferBytes(tree.data) }) }
+    for (const [blob, bytes] of blobs.created) if (used.has(blob) && !seen.has(blob)) { seen.add(blob); objects.push({ type: TYPE.BLOB, data: arrayBufferBytes(bytes) }) }
     root.set({ 'git.commit.tree': built.oid, 'git.commit.oid': oid, 'git.commit.parent': parent.oid ?? '', 'git.commit.objects': objects.length })
     const oldOid = creating ? ZERO_OID : target.oid
     try {

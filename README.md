@@ -348,10 +348,13 @@ npm test                                 # /v1 + public-namespace workerd suites
 npm run dev                              # cf dev: Vite + the Cloudflare plugin on local workerd
 npm run typecheck                        # tsc for the app, then cf workers types + tsc for cloudflare.config.ts
 npm run worker:deploy:dry-run            # cf deploy --dry-run: build and validate, no credentials, no upload
-npm run worker:deploy                    # cf deploy
+scripts/deploy.sh "<message>"            # prod: gate, upload, 0% canary smoked pinned + telemetry gate, promote, smoke (below)
+npm run worker:deploy                    # cf deploy straight to 100% (no canary; emergencies only)
 node src/smoke.mjs https://ply.ivar.workers.dev gate                     # public + auth + allowlist checks, no Artifacts
 env -u CLOUDFLARE_API_TOKEN node src/smoke.mjs https://ply.ivar.workers.dev read|write --out smoke.json
 ```
+
+`scripts/deploy.sh` (OAuth: it runs cf with `CLOUDFLARE_API_TOKEN` unset) deploys the checked-out commit: gate, `cf workers versions create --prebuilt`, a deployment with the new version at 0% beside the current one at 100%, then `smoke.mjs gate|read|write --version <id>` and `visual-smoke.mjs` with `PLY_VERSION=<id>` (every request carries `Cloudflare-Workers-Version-Overrides: ply="<id>"`), then `scripts/canary-o11y.mjs`, which requires every smoke `x-ply-request-id` in a `ply.request` log line of the new version and 0 non-ok invocations, 0 5xx, 0 error logs. A failure routes 100% back to the previous version. Then it promotes, smokes unpinned and re-runs the telemetry gate; a failure there also routes back.
 
 `read` and `write` each create a scratch Artifacts repo in namespace `default` (`src/smoke-seed.mjs`), seed it with a fixed history (fixed identities and dates, so the seeded oids are the same every run), mint a 15-minute read or write token for it, compare the Worker's answers with that seeded local clone, then revoke every token and delete the repo, also on failure or Ctrl-C. A run killed harder than that leaves `ply-web-smoke-*`; the next run deletes ones older than an hour. Tokens go to git only through `GIT_CONFIG_*` and never reach argv, stdout or the JSON report. Runs are repeatable back to back. They need a cf login with Artifacts access.
 
