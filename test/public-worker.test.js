@@ -171,6 +171,8 @@ test('a server that refuses tree:0: the viewer learns it once per isolate, a 2,1
   assert.equal(dir.status, 200);
   assert.match(dir.text, /A\.md/);
   assert.equal((await W(publicView('wide', '?path=docs%2Flib%2Fopts'))).status, 200, 'an encoded slash in path is accepted');
+  // the cap still applies to the tree that is shown: the 2,135-entry directory itself is over the viewer's 2,000
+  assert.equal((await W(publicView('wide', '?path=tests/data'))).status, 413);
   assert.equal((await W(publicView('wide', '?path=docs%2F%2E%2E%2Fsecret'))).status, 400, 'an encoded dot is not');
   const refused = since(i).filter(h => h.filter === 'tree:0');
   assert.ok(refused.length <= 1, `tree:0 was refused ${refused.length} times; the isolate should learn it once`);

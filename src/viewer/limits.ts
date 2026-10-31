@@ -19,9 +19,9 @@ export const VIEWER_CAPS = Object.freeze({
   maxRedirects: 2,
   maxRefs: 2_000,
   maxBranchesShown: 200,
-  // 10,000, not 2,000: on a server that refuses tree:0 (Artifacts), ply's blob:none fallback checks every tree under the
-  // commit against this cap, not only the one shown (curl's tests/data has 2,135 entries, so every curl page was a 413).
-  maxTreeEntries: 10_000,
+  // Back to 2,000 (it was 10,000 while ply's blob:none fallback checked every tree in the wide pack against it; ply #47
+  // checks only what was asked for and skips an over-limit extra). test/public-worker.test.js keeps a 2,135-entry sibling.
+  maxTreeEntries: 2_000,
   maxTreeShown: 500,
   maxLogCommits: 10,
   maxPreviewChars: 2_000,

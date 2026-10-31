@@ -1,6 +1,6 @@
 # ply Worker — `https://ply.ivar.workers.dev`
 
-A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#a7a724ead41ad7fab01f97736ffa6c7f101f82b6` (an exact commit of ply `main`; `bump-ply.yml` moves the pin). The `/v1` API has no
+A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#0b9a6dc8a190067f15269991f52d7ef441517195` (an exact commit of ply `main`; `bump-ply.yml` moves the pin). The `/v1` API has no
 storage. `GET /view` is a public repository viewer, rate-limited by client through a SQLite Durable Object. One Artifacts
 namespace, `public-v0`, is served read-only with no token (`/r/<repo>`, see [Public namespace](#public-namespace-public-v0));
 its binding is the Worker's only other binding. `GET /` prints the usage text.
@@ -156,7 +156,7 @@ paths (plus a `.git` suffix). `createViewerFetch` follows them before ply sees t
 | per-call timeout | 12 s |
 | page timeout | 20 s |
 | refs retained | 2000 (200 branches shown) |
-| tree entries retained / shown | 10000 / 500 |
+| tree entries retained / shown | 2000 / 500 |
 | parent commits shown | 5 |
 | page rate | 60 / minute / client |
 | pack-map rate | 20 / minute / client |
