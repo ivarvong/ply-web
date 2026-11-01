@@ -34,6 +34,30 @@ export type ProbeCalibration = {
   readonly headroom: string
 }
 
+/**
+ * Citation for the probe scheduler, per issue #73.
+ * Run 2026-11-01T19-40-35-485Z (web 22bfb79), 50% step: healthy p50 41–101ms on
+ * both versions, then a client stall at ~69830ms. 128 issued, 10 never answered.
+ */
+export type ProbeScheduleCalibration = {
+  readonly source: string
+  readonly date: string
+  readonly window: string
+  readonly n: number
+  readonly responded: number
+  readonly lost: number
+  readonly healthyN: number
+  readonly web: string
+  readonly oldVersion: string
+  readonly newVersion: string
+  readonly healthyP50Ms: string
+  readonly observedStallMs: number
+  readonly dwellMs: number
+  readonly observedRate: string
+  readonly percentile: string
+  readonly headroom: string
+}
+
 export type RolloutStep = {
   readonly percent: number
   readonly dwellMs: number
@@ -137,10 +161,23 @@ export type RolloutPolicy = {
   readonly probe: {
     readonly rps: number
     readonly calls: readonly ProbeCall[]
-    /** Fraction of probes in (0, 1] that may be lost before the step is a harness fault. */
+    /** Fraction of issued probes in (0, 1] that may be lost before the step is a harness fault. */
     readonly maxLossRate: number
     readonly onHarnessFault: ProbeFaultAction
     readonly calibration: ProbeCalibration
+    /** Per-request deadline. A probe that hits it is `timed_out`, not a transport error. */
+    readonly timeoutMs: number
+    /** Outstanding probes. The next tick is `shed` once another batch would pass this. */
+    readonly maxInFlight: number
+    /** Issued probes required before the loss-rate gate can fail the step. */
+    readonly minSamples: number
+    /** A response at or above this, on both versions, is the same stall. */
+    readonly stallLatencyMs: number
+    /** How many dwells a harness stall may run, including the first. */
+    readonly windowAttempts: number
+    /** Wait between a stalled dwell and its re-run. */
+    readonly windowBackoffMs: number
+    readonly schedule: ProbeScheduleCalibration
   }
   readonly gates: RolloutGates
   readonly burn: {
@@ -250,6 +287,46 @@ function calibrationOf(value: unknown): ProbeCalibration {
     observedRate: textOf(rec.observedRate, 'probe.calibration.observedRate'),
     percentile: textOf(rec.percentile, 'probe.calibration.percentile'),
     headroom: textOf(rec.headroom, 'probe.calibration.headroom'),
+  }
+}
+
+function scheduleOf(value: unknown): ProbeScheduleCalibration {
+  const rec = record(value, 'probe.schedule')
+  exactKeys(rec, 'probe.schedule', [
+    'source',
+    'date',
+    'window',
+    'n',
+    'responded',
+    'lost',
+    'healthyN',
+    'web',
+    'oldVersion',
+    'newVersion',
+    'healthyP50Ms',
+    'observedStallMs',
+    'dwellMs',
+    'observedRate',
+    'percentile',
+    'headroom',
+  ])
+  return {
+    source: textOf(rec.source, 'probe.schedule.source'),
+    date: textOf(rec.date, 'probe.schedule.date'),
+    window: textOf(rec.window, 'probe.schedule.window'),
+    n: integer(rec.n, 'probe.schedule.n', 1),
+    responded: integer(rec.responded, 'probe.schedule.responded', 0),
+    lost: integer(rec.lost, 'probe.schedule.lost', 0),
+    healthyN: integer(rec.healthyN, 'probe.schedule.healthyN', 1),
+    web: textOf(rec.web, 'probe.schedule.web'),
+    oldVersion: textOf(rec.oldVersion, 'probe.schedule.oldVersion'),
+    newVersion: textOf(rec.newVersion, 'probe.schedule.newVersion'),
+    healthyP50Ms: textOf(rec.healthyP50Ms, 'probe.schedule.healthyP50Ms'),
+    observedStallMs: integer(rec.observedStallMs, 'probe.schedule.observedStallMs', 0),
+    dwellMs: integer(rec.dwellMs, 'probe.schedule.dwellMs', 1),
+    observedRate: textOf(rec.observedRate, 'probe.schedule.observedRate'),
+    percentile: textOf(rec.percentile, 'probe.schedule.percentile'),
+    headroom: textOf(rec.headroom, 'probe.schedule.headroom'),
   }
 }
 
@@ -406,7 +483,20 @@ function validate(value: unknown): RolloutPolicy {
   const rec = record(value, 'policy')
   exactKeys(rec, 'policy', ['steps', 'ingestWaitMs', 'probe', 'gates', 'burn', 'split', 'cleanup'], ['warmupMs', 'telemetry'])
   const probe = record(rec.probe, 'probe')
-  exactKeys(probe, 'probe', ['rps', 'calls', 'maxLossRate', 'onHarnessFault', 'calibration'])
+  exactKeys(probe, 'probe', [
+    'rps',
+    'calls',
+    'maxLossRate',
+    'onHarnessFault',
+    'calibration',
+    'timeoutMs',
+    'maxInFlight',
+    'minSamples',
+    'stallLatencyMs',
+    'windowAttempts',
+    'windowBackoffMs',
+    'schedule',
+  ])
   const rps = probe.rps
   if (typeof rps !== 'number' || !Number.isFinite(rps) || rps < 0) reject('probe.rps', 'must be a number >= 0')
   const calls = callsOf(probe.calls)
@@ -424,6 +514,13 @@ function validate(value: unknown): RolloutPolicy {
       maxLossRate: rate(probe.maxLossRate, 'probe.maxLossRate'),
       onHarnessFault,
       calibration: calibrationOf(probe.calibration),
+      timeoutMs: integer(probe.timeoutMs, 'probe.timeoutMs', 1),
+      maxInFlight: integer(probe.maxInFlight, 'probe.maxInFlight', 1),
+      minSamples: integer(probe.minSamples, 'probe.minSamples', 1),
+      stallLatencyMs: integer(probe.stallLatencyMs, 'probe.stallLatencyMs', 1),
+      windowAttempts: integer(probe.windowAttempts, 'probe.windowAttempts', 1),
+      windowBackoffMs: integer(probe.windowBackoffMs, 'probe.windowBackoffMs', 0),
+      schedule: scheduleOf(probe.schedule),
     },
     gates: gatesOf(rec.gates),
     burn: {
@@ -466,6 +563,30 @@ function policyBody(policy: RolloutPolicy): Json {
         headroom: policy.probe.calibration.headroom,
       },
       calls: policy.probe.calls.map(call => ({ method: call.method, path: call.path, auth: call.auth })),
+      timeoutMs: policy.probe.timeoutMs,
+      maxInFlight: policy.probe.maxInFlight,
+      minSamples: policy.probe.minSamples,
+      stallLatencyMs: policy.probe.stallLatencyMs,
+      windowAttempts: policy.probe.windowAttempts,
+      windowBackoffMs: policy.probe.windowBackoffMs,
+      schedule: {
+        source: policy.probe.schedule.source,
+        date: policy.probe.schedule.date,
+        window: policy.probe.schedule.window,
+        n: policy.probe.schedule.n,
+        responded: policy.probe.schedule.responded,
+        lost: policy.probe.schedule.lost,
+        healthyN: policy.probe.schedule.healthyN,
+        web: policy.probe.schedule.web,
+        oldVersion: policy.probe.schedule.oldVersion,
+        newVersion: policy.probe.schedule.newVersion,
+        healthyP50Ms: policy.probe.schedule.healthyP50Ms,
+        observedStallMs: policy.probe.schedule.observedStallMs,
+        dwellMs: policy.probe.schedule.dwellMs,
+        observedRate: policy.probe.schedule.observedRate,
+        percentile: policy.probe.schedule.percentile,
+        headroom: policy.probe.schedule.headroom,
+      },
     },
     gates: {
       smoke: policy.gates.smoke,

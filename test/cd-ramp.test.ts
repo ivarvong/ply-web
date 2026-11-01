@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
+import { none } from '../src/option.ts'
 import { parsePolicy, type RolloutPolicy } from '../scripts/cd/policy.ts'
+import type { ProbeOutcome } from '../scripts/cd/probe.ts'
 import { applyRamp, decideRampStep, progressLine, rampStart, runRamp, type Observation } from '../scripts/cd/ramp.ts'
 import type { VersionStats } from '../scripts/cd/telemetry.ts'
 import { routedShare } from '../scripts/cd/slo.ts'
@@ -204,11 +206,15 @@ test('a harness fault during the dwell rolls back and records the loss', async (
   const result = await runRamp(policy([{ percent: 100, dwellMs: 1 }]), {
     now: () => 0,
     sleep: async () => {},
-    dwell: async () => ({
-      outcomes: [
-        { kind: 'lost', id: '1 GET https://ply.ivar.workers.dev/', reason: 'aborted' },
-      ],
-    }),
+    dwell: async () => {
+      const outcomes: ProbeOutcome[] = []
+      for (let index = 0; index < 998; index += 1) {
+        outcomes.push({ kind: 'responded', id: `ok-${index}`, status: 200, ray: none(), latencyMs: 50, version: none() })
+      }
+      outcomes.push({ kind: 'lost', id: '1 GET https://ply.ivar.workers.dev/', reason: 'aborted' })
+      outcomes.push({ kind: 'lost', id: '2 GET https://ply.ivar.workers.dev/', reason: 'aborted' })
+      return { outcomes }
+    },
     applySplit: async () => null,
     observe: async () => {
       observed += 1
@@ -222,7 +228,7 @@ test('a harness fault during the dwell rolls back and records the loss', async (
   assert.equal(result.state.kind, 'stopped')
   if (result.state.kind === 'stopped' && result.state.fault === 'harness_fault') {
     assert.equal(result.state.traffic, 'rolled_back')
-    assert.match(result.state.reason, /probe loss 1\/1/)
+    assert.match(result.state.reason, /probe loss 2\/1000/)
   }
   assert.equal(rolled, 1)
   assert.equal(observed, 0)
@@ -231,7 +237,9 @@ test('a harness fault during the dwell rolls back and records the loss', async (
   assert.equal(recorded.probeLoss.ids[0], '1 GET https://ply.ivar.workers.dev/')
   const recordedLine = result.lines[0]
   if (!recordedLine) throw new Error('missing probe line')
-  assert.match(recordedLine, /probe_loss=1\/1/)
+  assert.match(recordedLine, /probe_loss=2\/1000/)
+  assert.match(recordedLine, /timed_out=0/)
+  assert.match(recordedLine, /shed=0/)
 })
 
 test('a state conflict stops and does not roll back', async () => {

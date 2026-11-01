@@ -20,6 +20,10 @@ export function withCommandSink<T>(sink: Sink, fn: () => Promise<T>): Promise<T>
   return current.run(sink, fn)
 }
 
+export function commandSinkActive(): boolean {
+  return Boolean(current.getStore())
+}
+
 export function traceCommand(note: CommandNote): Promise<void> {
   const sink = current.getStore()
   return sink ? sink(note) : Promise.resolve()

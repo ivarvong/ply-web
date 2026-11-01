@@ -13,6 +13,7 @@ import { cfOk } from './cf.ts'
 import { extractJson } from './json.ts'
 import { activeLog } from './log.ts'
 import { errorMessage } from './proc.ts'
+import { HarnessFault, withTrafficLock, withWriteIntent, type WriteIntent } from './traffic-gate.ts'
 
 export type Deployment = {
   readonly id: string | null
@@ -41,37 +42,56 @@ export type ApplyResult =
 /**
  * Compare-and-swap. Read the deployment and put `split` only when it is still `expected`.
  * A mismatch emits `state_conflict` and does not call cf. The caller stops; it does not roll back.
+ * The write runs under the process lock, and only for `intent`.
  */
 export async function applySplit(
   worker: string,
   message: string,
   split: TrafficSplit,
   expected: readonly VersionShare[],
+  intent: WriteIntent,
   secrets: readonly string[] = [],
+): Promise<ApplyResult> {
+  return withTrafficLock(() => withWriteIntent(intent, () => writeSplit(worker, message, split, expected, secrets)))
+}
+
+async function requireLog(reason: string) {
+  const log = activeLog()
+  if (!log) throw new HarnessFault(reason)
+  return log
+}
+
+async function writeSplit(
+  worker: string,
+  message: string,
+  split: TrafficSplit,
+  expected: readonly VersionShare[],
+  secrets: readonly string[],
 ): Promise<ApplyResult> {
   const before = await readDeployment(worker, secrets)
   if (!sameSplit(before.versions, expected)) {
     const reason = 'deployment does not match the expected prior state'
-    const ref = await activeLog()?.observation({
+    const log = await requireLog('state conflict with no active log')
+    const at = Date.now()
+    const ref = await log.observation({
       measurement: { source: 'state_conflict', expected: [...expected], actual: [...before.versions] },
       query: { source: 'cf workers deployments list', worker },
-      from: Date.now(),
-      to: Date.now(),
+      from: at,
+      to: at,
       raw: JSON.stringify({ expected, actual: before.versions }),
     })
-    if (ref) {
-      await activeLog()?.decision({
-        inputs: [ref],
-        rules: [{ name: 'deployment_cas', value: 'expected_prior' }],
-        outcome: 'state_conflict',
-        reason,
-      })
-    }
+    await log.decision({
+      inputs: [ref],
+      rules: [{ name: 'deployment_cas', value: 'expected_prior' }],
+      outcome: 'state_conflict',
+      reason,
+    })
     return { ok: false, kind: 'state_conflict', reason }
   }
   await putSplit(worker, message, split, secrets)
   const after = await readDeployment(worker, secrets)
-  await activeLog()?.stateChange({ before: before.versions, after: after.versions, deploymentId: after.id })
+  const log = await requireLog('deployment read-back with no active log')
+  await log.stateChange({ before: before.versions, after: after.versions, deploymentId: after.id })
   const mismatch = assertSplit(after.versions, split)
   if (mismatch) return { ok: false, kind: 'rejected', reason: mismatch }
   return { ok: true }
@@ -96,12 +116,13 @@ export async function rollbackTo(
   const split = fullSplit(previous)
   if (!isTrafficSplit(split)) return { ok: false, kind: 'rejected', reason: `rollback refused: ${split.reason}` }
   try {
-    const applied = await applySplit(worker, `rollback ${previous}`, split, expected, secrets)
+    const applied = await withTrafficLock(() => withWriteIntent({ kind: 'rollback' }, () => writeSplit(worker, `rollback ${previous}`, split, expected, secrets)))
     if (!applied.ok) return applied
     const versions = await readShares(worker, secrets)
     if (isFullRollback(versions, previous)) return { ok: true }
     return { ok: false, kind: 'rejected', reason: `rollback did not land on ${previous} at 100%` }
   } catch (error) {
+    if (error instanceof HarnessFault) throw error
     return { ok: false, kind: 'rejected', reason: `rollback to ${previous} failed: ${errorMessage(error)}` }
   }
 }

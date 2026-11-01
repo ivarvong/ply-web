@@ -3,6 +3,7 @@ import { errorMessage } from './proc.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import type { CdConfig } from './config.ts'
 import { readShares, rollbackTo } from './traffic.ts'
+import { HarnessFault } from './traffic-gate.ts'
 
 export async function stageRollback(
   config: CdConfig,
@@ -16,6 +17,7 @@ export async function stageRollback(
     if (!applied.ok) return fail('rollback', applied.reason)
     return pass('rollback', { version })
   } catch (error) {
+    if (error instanceof HarnessFault) return fail('rollback', error.message, false, 'harness_fault')
     return fail('rollback', errorMessage(error))
   }
 }

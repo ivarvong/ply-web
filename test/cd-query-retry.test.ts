@@ -41,7 +41,7 @@ function policy(): RolloutPolicy {
 function probes(count: number, status: number): ProbeOutcome[] {
   const outcomes: ProbeOutcome[] = []
   for (let index = 0; index < count; index += 1) {
-    outcomes.push({ kind: 'responded', id: `probe-${index}`, status, ray: none() })
+    outcomes.push({ kind: 'responded', id: `probe-${index}`, status, ray: none(), latencyMs: 50, version: none() })
   }
   return outcomes
 }
@@ -149,7 +149,7 @@ test('a persistent timeout records each attempt and does not fault a clean probe
 test('a persistent timeout still rolls back when a responded probe was a 5xx', async () => {
   const rollout = policy()
   const sample = probes(rollout.burn.minSamples - 1, 200)
-  sample.push({ kind: 'responded', id: 'probe-500', status: 500, ray: none() })
+  sample.push({ kind: 'responded', id: 'probe-500', status: 500, ray: none(), latencyMs: 50, version: none() })
   const loss = accountProbeLoss(sample, rollout.probe.maxLossRate)
   const decision = decideWithoutTelemetry(loss, rollout, 'telemetry unavailable: timeout')
   assert.equal(decision.outcome, 'rollback')

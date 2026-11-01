@@ -84,7 +84,7 @@ export async function stageDeploy(config: CdConfig, release: ReleaseId): Promise
     if (plan.kind === 'refuse') return fail('deploy-canary', plan.reason, false, 'harness_fault')
     const want = trafficSplit(0, version, plan.live)
     if (!isTrafficSplit(want)) return fail('deploy-canary', `${want.reason}; traffic was not changed`, false, 'harness_fault')
-    const applied = await applySplit(config.worker, canaryMessage(resolved), want, shares)
+    const applied = await applySplit(config.worker, canaryMessage(resolved), want, shares, { kind: 'canary' })
     if (!applied.ok && applied.kind === 'state_conflict') return fail('deploy-canary', applied.reason, false, 'state_conflict')
     if (!applied.ok) {
       const seen = await readShares(config.worker)

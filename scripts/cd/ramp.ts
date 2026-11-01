@@ -3,7 +3,7 @@ import { none, some, type Option } from '../../src/option.ts'
 import { asRecord } from './json.ts'
 import type { ObservationRef } from './log.ts'
 import type { RolloutPolicy } from './policy.ts'
-import { emptyProbeLoss, judgeProbeWindow, type ProbeLoss, type ProbeOutcome } from './probe.ts'
+import { emptyProbeLoss, judgeProbeWindow, type ProbeJudge, type ProbeLoss, type ProbeOutcome, type ProbeWindow } from './probe.ts'
 import { percentile, type VersionStats } from './telemetry.ts'
 import { burnMap, CARRY_WALL_SAMPLES, judgeStep, routedShare, type RoutedShare, type StepVerdict } from './slo.ts'
 
@@ -174,7 +174,9 @@ export function progressLine(input: {
   const latency = input.latency === 'off' ? '' : ` p99_wall_ms=${walls} p99_cpu_ms=${cpu} latency=${input.latency}`
   const routed = `routed_share=${points(input.share.share)} target=${input.percent} tolerance=${tolerance(input.share)} agg=${input.share.n}`
   const internal = internalNote(input.next, input.previous)
-  const probe = input.probe.kind === 'measured' ? ` probe_loss=${input.probe.loss.count}/${input.probe.loss.total}` : ''
+  const probe = input.probe.kind === 'measured'
+    ? ` probe_loss=${input.probe.loss.count}/${input.probe.loss.total} timed_out=${input.probe.loss.timedOut} shed=${input.probe.loss.shed}`
+    : ''
   const head = `ramp step=${input.step}/${input.steps} percent=${input.percent} previous=${previousPercent} samples=${samples} error_rate=${errors} ${routed}${internal}${latency}${probe} decision=${input.decision.outcome}`
   const carried = input.carriedPrevious ? ' previous_sample=carried' : ''
   const informational = input.decision.outcome === 'advance' && input.decision.reason.includes('informational:')
@@ -281,7 +283,88 @@ async function settleHarnessFault(
 function withProbeRules(decision: RampDecision, loss: ProbeLoss): RampDecision {
   return {
     ...decision,
-    rules: [...decision.rules, { name: 'probe_loss_count', value: loss.count }, { name: 'probe_loss_rate', value: loss.rate }],
+    rules: [
+      ...decision.rules,
+      { name: 'probe_loss_count', value: loss.count },
+      { name: 'probe_loss_rate', value: loss.rate },
+      { name: 'probe_timed_out', value: loss.timedOut },
+      { name: 'probe_shed', value: loss.shed },
+    ],
+  }
+}
+
+function probeJudge(policy: RolloutPolicy): ProbeJudge {
+  return {
+    maxLossRate: policy.probe.maxLossRate,
+    respondedMin: policy.burn.minSamples,
+    minSamples: policy.probe.minSamples,
+    stallLatencyMs: policy.probe.stallLatencyMs,
+    fivexxHard: policy.gates.fivexx === 'hard',
+  }
+}
+
+function probeWindowDecision(policy: RolloutPolicy, window: ProbeWindow): RampDecision {
+  switch (window.kind) {
+    case 'harness_fault':
+      return {
+        outcome: 'harness_fault',
+        reason: window.reason,
+        rules: [{ name: 'probe_max_loss_rate', value: policy.probe.maxLossRate }],
+        burns: burnMap([]),
+      }
+    case 'insufficient_samples':
+      return {
+        outcome: 'insufficient_samples',
+        reason: window.reason,
+        rules: [{ name: 'probe_min_samples', value: policy.probe.minSamples }],
+        burns: burnMap([]),
+      }
+    case 'rollback':
+      return {
+        outcome: 'rollback',
+        reason: window.reason,
+        rules: [{ name: 'max_new_5xx', value: 0 }],
+        burns: burnMap([]),
+      }
+    case 'retry':
+      return {
+        outcome: 'insufficient_samples',
+        reason: window.reason,
+        rules: [{ name: 'probe_window_attempts', value: policy.probe.windowAttempts }],
+        burns: burnMap([]),
+      }
+    case 'ok':
+      throw new Error('an ok probe window is not a fault')
+    default:
+      return assertNever(window)
+  }
+}
+
+/** A stalled dwell is re-run up to `windowAttempts`. The last retry becomes a hold, not a rollback. */
+async function probeWindows(
+  policy: RolloutPolicy,
+  io: RampIo,
+  dwell: (ms: number, percent: number) => Promise<{ readonly outcomes: readonly ProbeOutcome[] }>,
+  dwellMs: number,
+  percent: number,
+): Promise<ProbeWindow> {
+  const judge = probeJudge(policy)
+  let window: ProbeWindow = { kind: 'ok', loss: emptyProbeLoss(policy.probe.maxLossRate) }
+  let retryReason = 'harness/network stall'
+  const limit = policy.probe.windowAttempts
+  let attempt = 0
+  while (attempt < limit) {
+    attempt += 1
+    const probed = await dwell(dwellMs, percent)
+    window = judgeProbeWindow(probed.outcomes, judge)
+    if (window.kind !== 'retry') return window
+    retryReason = window.reason
+    if (attempt < limit && policy.probe.windowBackoffMs > 0) await io.sleep(policy.probe.windowBackoffMs)
+  }
+  return {
+    kind: 'insufficient_samples',
+    loss: window.loss,
+    reason: `${retryReason}; ${limit} windows exhausted; ${window.loss.serverErrors} server errors, not rolling back`,
   }
 }
 
@@ -321,14 +404,12 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
     if (policy.warmupMs > 0) await io.sleep(policy.warmupMs)
     const from = io.now()
     let probeLoss = emptyProbeLoss(policy.probe.maxLossRate)
-    if (io.dwell) {
-      const probed = await io.dwell(step.dwellMs, percent)
-      const window = judgeProbeWindow(probed.outcomes, policy.probe.maxLossRate, policy.burn.minSamples)
+    const dwell = io.dwell
+    if (dwell) {
+      const window = await probeWindows(policy, io, dwell, step.dwellMs, percent)
       probeLoss = window.loss
       if (window.kind !== 'ok') {
-        const decision: RampDecision = window.kind === 'harness_fault'
-          ? { outcome: 'harness_fault', reason: window.reason, rules: [{ name: 'probe_max_loss_rate', value: policy.probe.maxLossRate }], burns: burnMap([]) }
-          : { outcome: 'insufficient_samples', reason: window.reason, rules: [{ name: 'probe_min_samples', value: policy.burn.minSamples }], burns: burnMap([]) }
+        const decision = probeWindowDecision(policy, window)
         const noted = withProbeRules(decision, probeLoss)
         const line = progressLine({
           step: index + 1,
@@ -348,6 +429,14 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
           const settled = await settleHarnessFault(policy, io, percent, window.reason, lastPassed)
           state = settled.state
           rollbackError = settled.rollbackError
+        } else if (window.kind === 'rollback') {
+          const rolled = await io.rollback()
+          const rolledConflict = asConflict(rolled)
+          if (rolledConflict) state = { kind: 'stopped', reason: rolledConflict.reason, fault: 'state_conflict' }
+          else {
+            rollbackError = typeof rolled === 'string' ? rolled : null
+            state = { kind: 'rolled-back', reason: window.reason }
+          }
         } else {
           state = { kind: 'held', reason: window.reason, outcome: 'insufficient_samples' }
         }
