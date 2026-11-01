@@ -1,9 +1,9 @@
 # ply Worker — `https://ply.ivar.workers.dev`
 
-A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#9ca64714709141cf25aabbe189454139caebff03` (an exact commit of ply `main`; an operator moves the pin with `npm run cd -- bump`). The `/v1` API has no
+A Cloudflare Worker that exposes [ply](https://github.com/ivarvong/ply) as an HTTP API against any smart-HTTP git host. The git client is `github:ivarvong/ply#9ca64714709141cf25aabbe189454139caebff03` (an exact commit of ply `main`; an operator moves the pin with `npm run cd -- bump`). The `/v1` git API has no
 storage. `GET /view` is a public repository viewer, rate-limited by client through a SQLite Durable Object. One Artifacts
-namespace, `public-v0`, is served read-only with no token (`/r/<repo>`, see [Public namespace](#public-namespace-public-v0));
-its binding is the Worker's only other binding. `GET /` prints the usage text.
+namespace, `public-v0`, is served read-only with no token (`/r/<repo>`, see [Public namespace](#public-namespace-public-v0)).
+Feature flags are one R2 object and a service binding ([Feature flags](docs/feature-flags.md)). `GET /` prints the usage text.
 
 ## Auth
 
@@ -49,6 +49,10 @@ its binding is the Worker's only other binding. `GET /` prints the usage text.
 | POST | `/v1/merge` | `{remote, ref?, from, author?, committer?, message?, fastForwardOnly?, noFastForward?}` | `{outcome, ref, oid, oldOid, noop, …}` where outcome is `merge`, `fast_forward`, or `up_to_date`. `from` is a branch or a 40-hex commit. `author` and `committer` are separate stamps, each with its own `time` and `tz` |
 | POST | `/v1/rebase` | `{remote, ref, onto?, committer, author?, squash?, message?}` | `{outcome, ref, oid, oldOid, …}` where outcome is `rebase`, `squash`, `fast_forward`, or `up_to_date`. `onto` is a branch or a 40-hex commit. `author.time` and `committer.time` are independent |
 | POST | `/v1/cherry-pick`, `/v1/revert` | `{remote, ref?, commit, committer, message?, allowEmpty?}` | `{outcome, ref, oid, oldOid, noop, tree?}`. A patch already applied, and only when both sides added and deleted the same paths, is `{outcome:"empty", noop:true, oid:<tip>}`. `allowEmpty:true` writes that empty commit. If the target also has its own adds or deletes, the response is 409 `merge_conflict` (`allowEmpty` does not override it) |
+| GET | `/v1/flags` | | the cached flag ruleset `{revision, cache, environment, flags}`. Writes are not this route |
+| POST | `/v1/flags/eval` | `{unit, attributes?, keys?}` | `{revision, cache, flags:[{key, variant, reason, bucket}]}`. Per-unit; the response is `no-store` |
+
+Flag writes are `FlagsControl` RPC (`setRollout`, `setTargeting`, `getConfig`) on the `FLAGS_CONTROL` service binding, not HTTP. The design, the ramp schedule, and the staleness bound are in [Feature flags](docs/feature-flags.md).
 
 - `ref` defaults to the remote's HEAD branch. On an empty repository HEAD is an unborn symref (`refs/heads/main` on
   Artifacts and on `git init -b main`). `GET /v1/commit` reports that as `empty: true` and names the symref.

@@ -38,6 +38,10 @@ import { directoryReadMessage, isDirectoryRead } from './read-status.ts';
 import { BUILD_HEADER, plyBuildValue } from './version.ts';
 import { holdLastChunk } from './hold-last.ts';
 import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from './rays.ts';
+import { usageNote } from './flags/client.ts';
+import { handleFlagHttp } from './flags/http.ts';
+
+export { FlagsCache, FlagsControl } from './flags/entry.ts';
 
 export { checkRemote };
 
@@ -151,6 +155,12 @@ Empty repository, replayed in order (Git-Token on Artifacts; no git seeding). HE
 Pass oids returned by these responses into later requests. When HEAD is unborn, merge, rebase, cherry-pick, revert,
 and branch-from require the missing field (ref, onto, or from) by name. An explicit unborn ref is 404
 "ref refs/heads/main is unborn; create a commit before …".
+
+Feature flags (same bearer as /v1). The ruleset is one R2 object. Writes are not HTTP: FlagsControl.setRollout,
+setTargeting, and getConfig, over the FLAGS_CONTROL service binding. See docs/feature-flags.md.
+  GET  /v1/flags                         cached ruleset {revision, cache, environment, flags}
+  POST /v1/flags/eval  {unit, attributes?, keys?}
+                                         {revision, cache, flags:[{key, variant, reason, bucket}]}
 
 Errors: {code, message, retry} with retry in yes|fresh|no|read. ref_exists is retry "no". stale_expected is retry
 "fresh" and includes the actual oid. ?trace=1 adds ply's spans to JSON responses (and an x-ply-trace timing summary
@@ -345,7 +355,15 @@ const worker = {
       log({ status: res.status, ms: Date.now() - t0, ...extra });
       return res;
     };
-    if (req.method === 'GET' && url.pathname === '/') return done(new Response(USAGE, { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } }));
+    if (req.method === 'GET' && url.pathname === '/') {
+      // ply.usage.note is off unless the flag ruleset says otherwise. A missing binding leaves this text unchanged.
+      let body = USAGE;
+      try {
+        const note = await usageNote(env, ctx, req.headers.get('x-ply-unit'));
+        if (note) body = `${USAGE}\n${note}\n`;
+      } catch { /* a flag outage does not change GET / */ }
+      return done(new Response(body, { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } }));
+    }
     // Public viewer, including the public-namespace index (/r) and short repo URLs (/r/<name>).
     // Before the token gate, and it never reads Authorization / Git-Token / Cookie.
     if (url.pathname === '/view.css' || /^\/view\.[0-9a-f]{12}\.css$/.test(url.pathname) || url.pathname === '/view' || url.pathname.startsWith('/view/') || url.pathname === '/r' || url.pathname.startsWith('/r/')) {
@@ -390,6 +408,13 @@ const worker = {
       if (!token) return done(json(500, { code: 'internal', message: 'PLY_TOKEN is not configured', retry: 'no' }, scrub));
       const presented = /^Bearer\s+(.+)$/i.exec(req.headers.get('authorization') ?? '')?.[1] ?? '';
       if (!presented || !(await timingSafeTokenEqual(presented, token))) return done(json(401, { code: 'unauthorized', message: 'Authorization: Bearer <PLY_TOKEN> required', retry: 'no' }, scrub, { 'www-authenticate': 'Bearer realm="ply"' }));
+    }
+    if (url.pathname === '/v1/flags' || url.pathname === '/v1/flags/eval') {
+      try { return done(await handleFlagHttp(req, env, ctx)); }
+      catch (e) {
+        const payload = errorBody(e);
+        return done(json(statusOf(e), payload, scrub), { code: payload.code });
+      }
     }
     const writes = env.WRITES === 'on';
     const handler = READS[key] ?? WRITES[key];
