@@ -1,6 +1,8 @@
 // Lightweight tags point the ref at a commit. Annotated tags add a tag object and point the ref at that.
 // Delete uses the same compare-and-swap as a branch delete.
-import { encodeTag, fail, fetchCommit, hashObject, ident, lsRefs, operation, parseCommitId, parseOid, push, resolveCommit, TYPE, ZERO_OID } from 'ply'
+import { encodeTag, fail, fetchCommit, hashObject, ident, operation, parseCommitId, parseOid, push, resolveCommit, TYPE, ZERO_OID } from 'ply'
+import { recordGet } from '../absent.ts'
+import { advertisedOid, hasErrorCode } from './advertised.ts'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
 import { assertNever, refExists } from './errors.ts'
 import { nowSeconds, stamp, type Stamp } from './identity.ts'
@@ -56,14 +58,17 @@ export async function createTag(remote: string, body: unknown, opts: CallOpts): 
     const parsed = parseCommitId(target)
     if (!parsed.ok) throw parsed.error
   }
-  const annotated = raw.annotated === true || raw.message !== undefined || raw.tagger !== undefined
+  const messageField = recordGet(raw, 'message')
+  const taggerField = recordGet(raw, 'tagger')
+  const annotatedField = recordGet(raw, 'annotated')
+  const annotated = (annotatedField.tag === 'some' && annotatedField.value === true) || messageField.tag === 'some' || taggerField.tag === 'some'
   const tagger: Stamp | null = annotated ? stamp(raw.tagger, 'tagger', nowSeconds()) : null
-  const message = typeof raw.message === 'string' ? raw.message : null
-  if (raw.message !== undefined && typeof raw.message !== 'string') throw fail('bad_request', 'message must be a string')
-  if (raw.annotated !== undefined && typeof raw.annotated !== 'boolean') throw fail('bad_request', 'annotated must be true or false')
+  const message = messageField.tag === 'some' && typeof messageField.value === 'string' ? messageField.value : null
+  if (messageField.tag === 'some' && typeof messageField.value !== 'string') throw fail('bad_request', 'message must be a string')
+  if (annotatedField.tag === 'some' && typeof annotatedField.value !== 'boolean') throw fail('bad_request', 'annotated must be true or false')
   const short = ref.replace(/^refs\/tags\//, '')
   return operation('tag_create', remote, { ...opts, attrs: { 'git.tag.ref': ref, 'git.tag.annotated': annotated } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
-    const existing = (await lsRefs(t, [ref])).refs.get(ref)?.oid as string | undefined
+    const existing = await advertisedOid(t, ref)
     if (existing) throw refExists(ref, existing)
     const commit = await commitOf(t, target)
     let newOid = commit
@@ -74,7 +79,7 @@ export async function createTag(remote: string, body: unknown, opts: CallOpts): 
         type: 'commit',
         tag: short,
         tagger: ident(tagger.person),
-        message: messageBody(message ?? short),
+        message: messageBody(message === null ? short : message),
       })
       newOid = hashObject('tag', data) as string
       objects.push({ type: TYPE.TAG, data })
@@ -84,9 +89,9 @@ export async function createTag(remote: string, body: unknown, opts: CallOpts): 
       const pushed = await push(t, { ref, oldOid: ZERO_OID, newOid, objects }) as { packBytes: number }
       return outcome('tag', writeResult('tag', ref, newOid, null, { commit, annotated, pushBytes: pushed.packBytes }))
     } catch (e) {
-      if ((e as { code?: string })?.code === 'cas_conflict') {
-        const cur = (await lsRefs(t, [ref])).refs.get(ref)?.oid as string | undefined
-        throw refExists(ref, cur ?? newOid)
+      if (hasErrorCode(e, 'cas_conflict')) {
+        const cur = await advertisedOid(t, ref)
+        throw refExists(ref, cur === null ? newOid : cur)
       }
       throw e
     }

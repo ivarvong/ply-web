@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 154,
-    "optional": 353,
-    "chain": 534,
-    "nullish": 581,
-    "total": 1622
+    "word": 140,
+    "optional": 348,
+    "chain": 519,
+    "nullish": 569,
+    "total": 1576
   },
   "files": {
     "cloudflare.config.ts": {
@@ -504,27 +504,6 @@
       "chain": 0,
       "nullish": 2,
       "total": 11
-    },
-    "src/write/branch.ts": {
-      "word": 5,
-      "optional": 2,
-      "chain": 6,
-      "nullish": 3,
-      "total": 16
-    },
-    "src/write/commit.ts": {
-      "word": 3,
-      "optional": 2,
-      "chain": 6,
-      "nullish": 7,
-      "total": 18
-    },
-    "src/write/tag.ts": {
-      "word": 6,
-      "optional": 1,
-      "chain": 3,
-      "nullish": 2,
-      "total": 12
     },
     "test/cd-flags-smoke.test.ts": {
       "word": 0,
