@@ -50,5 +50,22 @@
   },
   "telemetry": {
     "maxLossRate": 0.5
+  },
+  "cleanup": {
+    "attempts": 3,
+    "backoffMs": 1000,
+    "staleMinutes": 60,
+    "calibration": {
+      "source": "run 2026-11-01T17-29-43-122Z",
+      "date": "2026-11-01",
+      "window": "post-ramp scratch repo delete",
+      "n": 1,
+      "latencyMs": 103000,
+      "web": "9558b10",
+      "namespace": "ply-loadgen",
+      "observed": "APIError timeout exit 1, then 404 [10200] Repository not found",
+      "percentile": "one measured delete, not a percentile",
+      "headroom": "attempts is 3, one past the timeout-then-404 that confirmed deletion. backoffMs 1000 is PRIOR: the confirming retry was immediate. staleMinutes 60 is PRIOR: the previous sweep age, not a measured leak age."
+    }
   }
 }

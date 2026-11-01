@@ -61,6 +61,31 @@ export type SplitAction = 'hold' | 'rollback'
 /** What too few new-version requests does. Rollback is not a choice: thin evidence is not a fault. */
 export type EvidenceAction = 'advance' | 'hold'
 
+/**
+ * Citation for scratch-repo delete, per issue #73.
+ * `latencyMs` is the timed-out delete on run 2026-11-01T17-29-43-122Z (web 9558b10): 103s, then 404.
+ */
+export type CleanupCalibration = {
+  readonly source: string
+  readonly date: string
+  readonly window: string
+  readonly n: number
+  readonly latencyMs: number
+  readonly web: string
+  readonly namespace: string
+  readonly observed: string
+  readonly percentile: string
+  readonly headroom: string
+}
+
+/** How a scratch repo is deleted. `attempts` bounds the retries. A miss is a leak, not a failed release. */
+export type CleanupPolicy = {
+  readonly attempts: number
+  readonly backoffMs: number
+  readonly staleMinutes: number
+  readonly calibration: CleanupCalibration
+}
+
 export type SplitPolicy = {
   /** Half-width of the acceptance band, in standard errors of a binomial at the target percent. */
   readonly z: number
@@ -101,6 +126,7 @@ export type RolloutPolicy = {
   }
   readonly split: SplitPolicy
   readonly telemetry: TelemetryPolicy
+  readonly cleanup: CleanupPolicy
 }
 
 export type LoadedPolicy = {
@@ -267,6 +293,34 @@ function rate(value: unknown, path: string): number {
   return value
 }
 
+function cleanupCalibrationOf(value: unknown): CleanupCalibration {
+  const rec = record(value, 'cleanup.calibration')
+  exactKeys(rec, 'cleanup.calibration', ['source', 'date', 'window', 'n', 'latencyMs', 'web', 'namespace', 'observed', 'percentile', 'headroom'])
+  return {
+    source: textOf(rec.source, 'cleanup.calibration.source'),
+    date: textOf(rec.date, 'cleanup.calibration.date'),
+    window: textOf(rec.window, 'cleanup.calibration.window'),
+    n: integer(rec.n, 'cleanup.calibration.n', 1),
+    latencyMs: integer(rec.latencyMs, 'cleanup.calibration.latencyMs', 0),
+    web: textOf(rec.web, 'cleanup.calibration.web'),
+    namespace: textOf(rec.namespace, 'cleanup.calibration.namespace'),
+    observed: textOf(rec.observed, 'cleanup.calibration.observed'),
+    percentile: textOf(rec.percentile, 'cleanup.calibration.percentile'),
+    headroom: textOf(rec.headroom, 'cleanup.calibration.headroom'),
+  }
+}
+
+function cleanupOf(value: unknown): CleanupPolicy {
+  const rec = record(value, 'cleanup')
+  exactKeys(rec, 'cleanup', ['attempts', 'backoffMs', 'staleMinutes', 'calibration'])
+  return {
+    attempts: integer(rec.attempts, 'cleanup.attempts', 1),
+    backoffMs: integer(rec.backoffMs, 'cleanup.backoffMs', 0),
+    staleMinutes: integer(rec.staleMinutes, 'cleanup.staleMinutes', 1),
+    calibration: cleanupCalibrationOf(rec.calibration),
+  }
+}
+
 function telemetryOf(value: unknown): TelemetryPolicy {
   if (value === undefined) return { maxLossRate: DEFAULT_MAX_LOSS_RATE }
   const rec = record(value, 'telemetry')
@@ -276,7 +330,7 @@ function telemetryOf(value: unknown): TelemetryPolicy {
 
 function validate(value: unknown): RolloutPolicy {
   const rec = record(value, 'policy')
-  exactKeys(rec, 'policy', ['steps', 'ingestWaitMs', 'probe', 'gates', 'burn', 'split'], ['warmupMs', 'telemetry'])
+  exactKeys(rec, 'policy', ['steps', 'ingestWaitMs', 'probe', 'gates', 'burn', 'split', 'cleanup'], ['warmupMs', 'telemetry'])
   const probe = record(rec.probe, 'probe')
   exactKeys(probe, 'probe', ['rps', 'calls', 'maxLossRate', 'onHarnessFault', 'calibration'])
   const rps = probe.rps
@@ -304,6 +358,7 @@ function validate(value: unknown): RolloutPolicy {
     },
     split: splitOf(rec.split),
     telemetry: telemetryOf(rec.telemetry),
+    cleanup: cleanupOf(rec.cleanup),
   }
 }
 
@@ -355,6 +410,23 @@ function policyBody(policy: RolloutPolicy): Json {
       onInsufficient: policy.split.onInsufficient,
     },
     telemetry: { maxLossRate: policy.telemetry.maxLossRate },
+    cleanup: {
+      attempts: policy.cleanup.attempts,
+      backoffMs: policy.cleanup.backoffMs,
+      staleMinutes: policy.cleanup.staleMinutes,
+      calibration: {
+        source: policy.cleanup.calibration.source,
+        date: policy.cleanup.calibration.date,
+        window: policy.cleanup.calibration.window,
+        n: policy.cleanup.calibration.n,
+        latencyMs: policy.cleanup.calibration.latencyMs,
+        web: policy.cleanup.calibration.web,
+        namespace: policy.cleanup.calibration.namespace,
+        observed: policy.cleanup.calibration.observed,
+        percentile: policy.cleanup.calibration.percentile,
+        headroom: policy.cleanup.calibration.headroom,
+      },
+    },
   }
 }
 

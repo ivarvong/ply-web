@@ -3,9 +3,9 @@
   "counts": {
     "word": 190,
     "optional": 363,
-    "chain": 533,
+    "chain": 531,
     "nullish": 599,
-    "total": 1685
+    "total": 1683
   },
   "files": {
     "cloudflare.config.ts": {
@@ -228,9 +228,9 @@
     "scripts/cd/stage-smoke.ts": {
       "word": 1,
       "optional": 0,
-      "chain": 12,
+      "chain": 10,
       "nullish": 10,
-      "total": 23
+      "total": 21
     },
     "scripts/cd/stage-telemetry.ts": {
       "word": 0,

@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { CLEANUP_FILE, cleanupLeakNames } from './cleanup.ts'
 import type { CdConfig } from './config.ts'
 import { cfOk, ROOT } from './cf.ts'
 import { fullSplit, isTrafficSplit, versionsFromList, type VersionShare } from './deploy-plan.ts'
@@ -48,6 +49,20 @@ async function recordedProbeLoss(runDir: string): Promise<readonly { readonly pe
     rows.push({ percent: row.percent, count: row.count, rate: row.rate, ids })
   }
   return rows
+}
+
+async function recordedCleanupLeaks(runDir: string): Promise<readonly string[]> {
+  let text: string
+  try {
+    text = await readFile(join(runDir, CLEANUP_FILE), 'utf8')
+  } catch {
+    return []
+  }
+  try {
+    return cleanupLeakNames(JSON.parse(text) as unknown)
+  } catch {
+    return []
+  }
 }
 
 function outcomeOf(result: StageResult<unknown>): PhaseOutcome {
@@ -352,9 +367,10 @@ export async function runPipeline(
         ? 'insufficient_samples' as const
         : 'fail' as const
   const probeLoss = await recordedProbeLoss(runDir)
+  const cleanupLeak = await recordedCleanupLeaks(runDir)
   const verdict = failure
-    ? { kind: verdictKind, version, previous, stage: failure.stage, reason: failure.reason, rolledBack: failure.rolledBack, fault: failure.fault, failures: [failure.reason], probe_loss: probeLoss }
-    : { kind: 'pass' as const, version, previous, failures: [] as string[], probe_loss: probeLoss }
+    ? { kind: verdictKind, version, previous, stage: failure.stage, reason: failure.reason, rolledBack: failure.rolledBack, fault: failure.fault, failures: [failure.reason], probe_loss: probeLoss, cleanup_leak: cleanupLeak }
+    : { kind: 'pass' as const, version, previous, failures: [] as string[], probe_loss: probeLoss, cleanup_leak: cleanupLeak }
   await writeJson(runDir, 'verdict.json', verdict, [opts.token])
   if (failure) {
     const label = failure.fault === 'worker' ? 'FAIL' : failure.fault
