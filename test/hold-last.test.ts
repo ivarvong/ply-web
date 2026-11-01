@@ -48,7 +48,7 @@ test('holdLastChunk: a failed verification errors the stream with the last chunk
   assert.equal(dec([(await r.read()).value!]), 'abc');
   const pending = r.read();
   g.fail(Object.assign(new Error('blob content hashes to x'), { code: 'pack_corrupt' }));
-  await assert.rejects(pending, (e: { code?: string }) => e.code === 'pack_corrupt');
+  await assert.rejects(pending, (e: Partial<{ code: string }>) => e.code === 'pack_corrupt');
 });
 
 test('holdLastChunk: a single-chunk blob (the common small file) is released only at the end; empty chunks and empty blobs pass', async () => {

@@ -12,11 +12,16 @@ const u = (s: string) => new URL(s, 'https://ply.ivar.workers.dev');
 const q = (o: Record<string, string>) => new URLSearchParams(o).toString();
 const anyPublic = () => true;
 
+/** Null and a missing value take the fallback. An empty string and 0 stay. */
+function fill<T>(value: unknown, fallback: T): T {
+  return value === null || value === void 0 ? fallback : value as T;
+}
+
 test('pinnedViewKey: raw files at a pinned commit on a public repo only', () => {
   const view = `/view/${PUBLIC_GIT_HOST}/git/public-v0/ply.git`;
-  assert.match(pinnedViewKey(u(`${view}?raw=1&ref=${OID}&path=README.md`), 'GET', anyPublic) ?? '', new RegExp(`^/v${CACHE_VERSION}/pinned/view/`));
+  assert.match(fill(pinnedViewKey(u(`${view}?raw=1&ref=${OID}&path=README.md`), 'GET', anyPublic), ''), new RegExp(`^/v${CACHE_VERSION}/pinned/view/`));
   assert.ok(pinnedViewKey(u(`${view}?raw=1&at=${OID}&path=README.md`), 'HEAD', anyPublic));
-  assert.match(pinnedViewKey(u(`/r/ply?raw=1&ref=${OID}&path=README.md`), 'GET', anyPublic) ?? '', new RegExp(`^/v${CACHE_VERSION}/pinned/r/ply\\?`));
+  assert.match(fill(pinnedViewKey(u(`/r/ply?raw=1&ref=${OID}&path=README.md`), 'GET', anyPublic), ''), new RegExp(`^/v${CACHE_VERSION}/pinned/r/ply\\?`));
   assert.equal(pinnedViewKey(u(`/r/ply?ref=${OID}&path=README.md`), 'GET', anyPublic), null, 'html is not pinned');
   assert.equal(pinnedViewKey(u(`/r/not a name?raw=1&ref=${OID}&path=README.md`), 'GET', anyPublic), null);
   for (const s of [`${view}?ref=${OID}&path=README.md`, `${view}?raw=1&ref=main&path=README.md`, `${view}?raw=1&ref=${OID}`, `${view}?raw=1&ref=${OID}&path=a&x=1`, `${view}?raw=1&ref=${OID}&at=${'b'.repeat(40)}&path=a`]) {

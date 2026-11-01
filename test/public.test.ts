@@ -10,6 +10,18 @@ import {
 } from '../src/public.ts';
 import { PUBLIC_NAMESPACE as CONFIG_NAMESPACE } from '../src/public-namespace.ts';
 
+/** Null and a missing value take the fallback. An empty string and 0 stay. */
+function fill<T>(value: unknown, fallback: T): T {
+  return value === null || value === void 0 ? fallback : value as T;
+}
+
+/** One property. A null receiver and a missing key are holes. A stored null stays null. */
+function slot(receiver: unknown, key: string): unknown {
+  if (receiver === null || receiver === void 0) return void 0;
+  if (typeof receiver !== 'object' && typeof receiver !== 'function') return void 0;
+  return (receiver as Record<string, unknown>)[key];
+}
+
 const O = PUBLIC_GIT_ORIGIN;
 const NS = PUBLIC_NAMESPACE;
 const TOKEN = `art_v1_${'ab12'.repeat(10)}?expires=4102444800`;
@@ -115,19 +127,19 @@ test('repo names and remotes: the viewer and /v1 accept one repo directly under 
 
 type Mint = { repo: string; scope: string; ttl: number };
 
-function fakeBinding(opts: { known?: string[]; ttlS?: number; now: () => number; fail?: Error } = { now: Date.now }) {
+function fakeBinding(opts: { now: () => number } & Partial<{ known: string[]; ttlS: number; fail: Error }> = { now: Date.now }) {
   const mints: Mint[] = [];
   let disposed = 0;
   let n = 0;
   const binding: ArtifactsNamespace = {
     async get(name) {
       if (opts.fail) throw opts.fail;
-      if (!(opts.known ?? ['ply']).includes(name)) throw new Error(`repo not found: ${name}`);
+      if (!fill(opts.known, ['ply']).includes(name)) throw new Error(`repo not found: ${name}`);
       return {
         async createToken(scope, ttl) {
           mints.push({ repo: name, scope, ttl });
           n += 1;
-          const exp = Math.floor(opts.now() / 1000) + (opts.ttlS ?? ttl);
+          const exp = Math.floor(opts.now() / 1000) + fill(opts.ttlS, ttl);
           return { plaintext: `art_v1_${String(n).padStart(40, '0')}?expires=${exp}`, expiresAt: new Date(exp * 1000).toISOString() };
         },
         [Symbol.dispose]() { disposed += 1; },
@@ -169,8 +181,8 @@ test('withPublicReadCredential: adds Bearer only on a public upload-pack URL wit
   const fake = fakeBinding({ now: Date.now });
   const src = createTokenSource(fake.binding);
   const seen: { url: string; method: string; auth: string | null }[] = [];
-  const inner = async (input: RequestInfo | URL, init?: RequestInit) => {
-    seen.push({ url: String(input), method: init?.method ?? 'GET', auth: new Headers(init?.headers).get('authorization') });
+  const inner: typeof globalThis.fetch = async (input, init) => {
+    seen.push({ url: String(input), method: fill(slot(init, 'method'), 'GET'), auth: new Headers(slot(init, 'headers') as HeadersInit).get('authorization') });
     return new Response('ok');
   };
   const f = withPublicReadCredential(inner, src);
@@ -186,7 +198,7 @@ test('withPublicReadCredential: adds Bearer only on a public upload-pack URL wit
   // no token source (no binding): pass-through
   const plain = withPublicReadCredential(inner, null);
   await plain(`${O}/git/${NS}/ply.git/info/refs?service=git-upload-pack`);
-  assert.equal(seen.at(-1)?.auth, null);
+  assert.equal(slot(seen.at(-1), 'auth'), null);
 });
 
 test('scrubSecrets removes every form, longest first', () => {

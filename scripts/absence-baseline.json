@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 46,
-    "optional": 106,
-    "chain": 157,
-    "nullish": 193,
-    "total": 502
+    "word": 45,
+    "optional": 79,
+    "chain": 128,
+    "nullish": 160,
+    "total": 412
   },
   "files": {
     "cloudflare.config.ts": {
@@ -344,34 +344,6 @@
       "nullish": 0,
       "total": 8
     },
-    "test/gitcache.test.ts": {
-      "word": 0,
-      "optional": 7,
-      "chain": 3,
-      "nullish": 10,
-      "total": 20
-    },
-    "test/hold-last.test.ts": {
-      "word": 0,
-      "optional": 1,
-      "chain": 0,
-      "nullish": 0,
-      "total": 1
-    },
-    "test/mirror.test.ts": {
-      "word": 0,
-      "optional": 1,
-      "chain": 1,
-      "nullish": 1,
-      "total": 3
-    },
-    "test/pinned.test.ts": {
-      "word": 0,
-      "optional": 0,
-      "chain": 0,
-      "nullish": 2,
-      "total": 2
-    },
     "test/proxy.js": {
       "word": 0,
       "optional": 0,
@@ -386,40 +358,12 @@
       "nullish": 6,
       "total": 16
     },
-    "test/public.test.ts": {
-      "word": 0,
-      "optional": 4,
-      "chain": 3,
-      "nullish": 3,
-      "total": 10
-    },
-    "test/rays.test.ts": {
-      "word": 0,
-      "optional": 8,
-      "chain": 6,
-      "nullish": 5,
-      "total": 19
-    },
-    "test/security.test.ts": {
-      "word": 1,
-      "optional": 4,
-      "chain": 2,
-      "nullish": 11,
-      "total": 18
-    },
     "test/server.js": {
       "word": 0,
       "optional": 0,
       "chain": 1,
       "nullish": 3,
       "total": 4
-    },
-    "test/write.test.ts": {
-      "word": 0,
-      "optional": 2,
-      "chain": 14,
-      "nullish": 1,
-      "total": 17
     },
     "vite.config.ts": {
       "word": 0,

@@ -14,10 +14,23 @@ import { asBody, parseBase, parseEdit, refOrCommit } from '../src/write/request.
 import { unifyPly, writeResult } from '../src/write/result.ts'
 import { emptyDir, encodeMem, fileLeaf, lookup, putAt, removeAt, renameAt, replaceOnce } from '../src/write/tree.ts'
 
+/** Null and a missing value take the fallback. An empty string and 0 stay. */
+function fill<T>(value: unknown, fallback: T): T {
+  return value === null || value === void 0 ? fallback : value as T
+}
+
+/** One property. A null receiver and a missing key are holes. A stored null stays null. */
+function slot(receiver: unknown, key: string): unknown {
+  if (receiver === null || receiver === void 0) return void 0
+  if (typeof receiver !== 'object' && typeof receiver !== 'function') return void 0
+  return (receiver as Record<string, unknown>)[key]
+}
+
+
 const EMPTY_BLOB = 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391'
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 const code = (fn: () => unknown) => {
-  try { fn() } catch (e) { return (e as { code?: string; message?: string }) }
+  try { fn() } catch (e) { return (e as Partial<{ code: string; message: string }>) }
   return null
 }
 const errCode = (err: ReturnType<typeof code>): string => {
@@ -38,8 +51,8 @@ test('parseBase rejects the zero oid and accepts a commit id or a branch', () =>
   const oid = 'a'.repeat(40)
   assert.deepEqual(parseBase(oid), { kind: 'oid', oid })
   const zero = code(() => parseBase('0'.repeat(40)))
-  assert.equal(zero?.code, 'bad_request')
-  assert.match(zero?.message ?? '', /omit base to create a root commit/)
+  assert.equal(slot(zero, 'code'), 'bad_request')
+  assert.match(fill(slot(zero, 'message'), ''), /omit base to create a root commit/)
   assert.equal(ZERO_OID, '0'.repeat(40))
 })
 
@@ -66,14 +79,14 @@ test('parseEdit: empty find creates, delete and rename, changes xor path', () =>
   assert.equal(bad({ changes: null, author, message: 'm' }), 'bad_request')
   assert.equal(bad({ author, message: 'm', changes: [{ op: 'rename', path: null, from: 'a.txt', to: 'b.txt' }] }), 'bad_request')
   const edited = parseEdit(asBody({ path: 'a.txt', find: 'hi', replace: 'yo', author, message: 'm' }), now)
-  assert.equal(edited.changes[0]?.kind, 'edit')
+  assert.equal(slot(edited.changes[0], 'kind'), 'edit')
   const deleted = parseEdit(asBody({ path: 'a.txt', delete: true, author, message: 'm' }), now)
   assert.deepEqual(deleted.changes, [{ kind: 'delete', path: 'a.txt' }])
   const renamed = parseEdit(asBody({ path: 'a.txt', to: 'b.txt', author, message: 'm' }), now)
   assert.deepEqual(renamed.changes, [{ kind: 'rename', from: 'a.txt', to: 'b.txt' }])
   const many = parseEdit(asBody({ author, message: 'm', changes: [{ op: 'write', path: 'a.txt', content: 'z', mode: '100755' }] }), now)
-  assert.equal(many.changes[0]?.kind, 'write')
-  assert.equal(code(() => parseEdit(asBody({ path: 'a', changes: [{ op: 'create', path: 'b' }], author, message: 'm' }), now))?.code, 'bad_request')
+  assert.equal(slot(many.changes[0], 'kind'), 'write')
+  assert.equal(slot(code(() => parseEdit(asBody({ path: 'a', changes: [{ op: 'create', path: 'b' }], author, message: 'm' }), now)), 'code'), 'bad_request')
 })
 
 test('timezone offsets and unix seconds', () => {
@@ -82,10 +95,10 @@ test('timezone offsets and unix seconds', () => {
   assert.equal(india.line, 'w <w@x> 1700000000 +0530')
   const west = stamp({ name: 'w', email: 'w@x', tz: '-1200', time: 1700000000 }, 'author', now)
   assert.equal(west.tz, '-1200')
-  assert.equal(code(() => stamp({ name: 'w', email: 'w@x', tz: '+9999' }, 'author', now))?.code, 'bad_request')
-  assert.equal(code(() => stamp({ name: 'w', email: 'w@x', tz: '-1201' }, 'author', now))?.code, 'bad_request')
+  assert.equal(slot(code(() => stamp({ name: 'w', email: 'w@x', tz: '+9999' }, 'author', now)), 'code'), 'bad_request')
+  assert.equal(slot(code(() => stamp({ name: 'w', email: 'w@x', tz: '-1201' }, 'author', now)), 'code'), 'bad_request')
   assert.equal(parseTime(0, 'time'), 0)
-  assert.equal(code(() => parseTime(-1, 'time'))?.code, 'bad_request')
+  assert.equal(slot(code(() => parseTime(-1, 'time')), 'code'), 'bad_request')
   const utc = stamp({ name: 'w', email: 'w@x', time: 1700000000 }, 'author', now)
   assert.equal(utc.line, 'w <w@x> 1700000000 +0000')
   const omitted = stamp({ name: 'w', email: 'w@x' }, 'author', now)
@@ -99,13 +112,13 @@ test('tree edits prune empty directories and refuse a rename into itself', () =>
   const leaf = fileLeaf(MODE_BLOB, EMPTY_BLOB)
   let mem = putAt(emptyDir(), ['a.txt'], leaf, false, 'a.txt')
   mem = putAt(mem, ['dir', 'b.txt'], leaf, false, 'dir/b.txt')
-  assert.equal(code(() => putAt(mem, ['a.txt'], leaf, false, 'a.txt'))?.code, 'bad_request')
+  assert.equal(slot(code(() => putAt(mem, ['a.txt'], leaf, false, 'a.txt')), 'code'), 'bad_request')
   mem = removeAt(mem, ['dir', 'b.txt'], 'dir/b.txt')
   assert.equal(lookup(mem, ['dir']), null)
   mem = putAt(mem, ['old.txt'], leaf, false, 'old.txt')
   mem = renameAt(mem, ['old.txt'], ['new.txt'])
-  assert.equal(lookup(mem, ['new.txt'])?.kind, 'lazy')
-  assert.equal(code(() => renameAt(mem, ['new.txt'], ['new.txt', 'x']))?.code, 'bad_request')
+  assert.equal(slot(lookup(mem, ['new.txt']), 'kind'), 'lazy')
+  assert.equal(slot(code(() => renameAt(mem, ['new.txt'], ['new.txt', 'x'])), 'code'), 'bad_request')
   const built = encodeMem(emptyDir())
   assert.equal(built.oid, EMPTY_TREE)
   assert.equal(built.trees.length, 1)
@@ -153,8 +166,8 @@ test('refOrCommit accepts a branch or a 40-hex commit and rejects zero', () => {
   assert.equal(refOrCommit('main', 'from'), 'refs/heads/main')
   const oid = 'b'.repeat(40)
   assert.equal(refOrCommit(oid, 'onto'), oid)
-  assert.equal(code(() => refOrCommit('0'.repeat(40), 'from'))?.code, 'bad_request')
-  assert.equal(code(() => refOrCommit('', 'from'))?.code, 'bad_request')
+  assert.equal(slot(code(() => refOrCommit('0'.repeat(40), 'from')), 'code'), 'bad_request')
+  assert.equal(slot(code(() => refOrCommit('', 'from')), 'code'), 'bad_request')
 })
 
 test('cherry-pick outcomes map exhaustively: empty, ok, kept_empty, and nothing else', () => {
@@ -189,7 +202,7 @@ test('cherry-pick outcomes map exhaustively: empty, ok, kept_empty, and nothing 
     assert.equal(numbered.tree, 5)
     assert.equal(numbered.pushBytes, '12')
   }
-  assert.equal(code(() => mapPickOutcome({ outcome: 'applied', ref, oid }, false))?.code, 'internal')
+  assert.equal(slot(code(() => mapPickOutcome({ outcome: 'applied', ref, oid }, false)), 'code'), 'internal')
 })
 
 test('write results share oid aliases and empty outcomes are noops', () => {

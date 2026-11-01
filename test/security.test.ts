@@ -10,6 +10,18 @@ import { parseViewerRequest, routeOptsFromEnv } from '../src/viewer/route.ts';
 import { viewerHref } from '../src/viewer/url.ts';
 import type { Loaded, TraceModel } from '../src/viewer/model.ts';
 
+/** Null and a missing value take the fallback. An empty string and 0 stay. */
+function fill<T>(value: unknown, fallback: T): T {
+  return value === null || value === void 0 ? fallback : value as T;
+}
+
+/** One property. A null receiver and a missing key are holes. A stored null stays null. */
+function slot(receiver: unknown, key: string): unknown {
+  if (receiver === null || receiver === void 0) return void 0;
+  if (typeof receiver !== 'object' && typeof receiver !== 'function') return void 0;
+  return (receiver as Record<string, unknown>)[key];
+}
+
 type Node = DefaultTreeAdapterMap['node'];
 type Element = DefaultTreeAdapterMap['element'];
 
@@ -61,7 +73,7 @@ function assertHtmlSafe(html: string, where: string, markdown = false): void {
     if (!URL_ATTRS.has(attr.name)) continue;
     let compact = '';
     for (const char of attr.value) {
-      const code = char.codePointAt(0) ?? 0;
+      const code = fill<number>(char.codePointAt(0), 0);
       if (code <= 0x1f || code === 0x7f || code === 0x20) continue;
       compact += char;
     }
@@ -133,9 +145,9 @@ test('hostile markdown, filenames, commits, refs, and authors do not break out o
   ];
   const rand = mulberry(0x5ec);
   for (let n = 0; n < 40; n++) {
-    const href = payloads[Math.floor(rand() * payloads.length)] ?? 'x';
-    const label = payloads[Math.floor(rand() * payloads.length)] ?? 'y';
-    const text = payloads[Math.floor(rand() * payloads.length)] ?? 'z';
+    const href = fill(payloads[Math.floor(rand() * payloads.length)], 'x');
+    const label = fill(payloads[Math.floor(rand() * payloads.length)], 'y');
+    const text = fill(payloads[Math.floor(rand() * payloads.length)], 'z');
     const shapes = [
       `# ${text}\n\n[${label}](${href})\n\n- ${text}\n- [${label}](${href})\n\n\`\`\`\n${text}\n\`\`\`\n\n**${text}** \`${label}\``,
       `paragraph ${text} [${label}](${href}) tail`,
@@ -155,10 +167,10 @@ test('hostile markdown, filenames, commits, refs, and authors do not break out o
   }
   const trace: TraceModel = { bars: [], totalMs: 0, cfRay: 'ray', requestId: 'id' };
   for (let n = 0; n < 20; n++) {
-    const name = payloads[n % payloads.length] ?? 'file';
-    const message = payloads[(n + 3) % payloads.length] ?? 'm';
-    const author = payloads[(n + 7) % payloads.length] ?? 'a';
-    const ref = `refs/heads/${payloads[(n + 11) % payloads.length] ?? 'main'}`.slice(0, 80);
+    const name = fill(payloads[n % payloads.length], 'file');
+    const message = fill(payloads[(n + 3) % payloads.length], 'm');
+    const author = fill(payloads[(n + 7) % payloads.length], 'a');
+    const ref = `refs/heads/${fill(payloads[(n + 11) % payloads.length], 'main')}`.slice(0, 80);
     const loaded: Loaded = {
       kind: 'tree',
       header: {
@@ -200,7 +212,7 @@ test('checkRemote rejects a table of hostile URLs and brands the ones it allows'
     'lvh.me', 'foo.lvh.me', 'vcap.me', 'foo.vcap.me', 'lacolhost.com', 'localho.st', 'foo.traefik.me', 'traefik.me',
     '10.0.0.1.example.com', '169.254.169.254.attacker.example',
   ]) {
-    const reason = /(?:^|\.)(?:\d{1,3}\.){3}\d{1,3}(?:\.|$)/.test(host) ? 'ip_literal' : 'wildcard_dns';
+    const reason = /(^|\.)(\d{1,3}\.){3}\d{1,3}(\.|$)/.test(host) ? 'ip_literal' : 'wildcard_dns';
     push(`https://${host}/x.git`, reason);
   }
   for (const host of ['github.com.', 'example.com.', 'localhost.', '127.0.0.1.', 'GitHub.com.']) push(`https://${host}/x.git`, 'trailing_dot');
@@ -252,10 +264,10 @@ test('checkRemote rejects a table of hostile URLs and brands the ones it allows'
 
 test('guarded fetch re-validates every redirect hop and stays on the allowed origin', async () => {
   const remote = mustAllow('https://github.com/acme/widgets.git');
-  const seen: { url: string; redirect: string | undefined }[] = [];
+  const seen: { url: string; redirect: unknown }[] = [];
   const good = createGuardedFetch(async (input, init) => {
     const url = String(input);
-    seen.push({ url, redirect: init?.redirect });
+    seen.push({ url, redirect: slot(init, 'redirect') });
     if (url === 'https://github.com/acme/widgets/info/refs?service=git-upload-pack') {
       return new Response(null, { status: 302, headers: { location: 'https://github.com/acme/widgets.git/info/refs?service=git-upload-pack' } });
     }
@@ -265,7 +277,7 @@ test('guarded fetch re-validates every redirect hop and stays on the allowed ori
   assert.equal(res.status, 200);
   assert.equal(await res.text(), 'ok');
   assert.deepEqual(seen.map(hop => hop.redirect), ['manual', 'manual']);
-  assert.equal(seen[1]?.url, 'https://github.com/acme/widgets.git/info/refs?service=git-upload-pack');
+  assert.equal(slot(seen[1], 'url'), 'https://github.com/acme/widgets.git/info/refs?service=git-upload-pack');
 
   for (const location of [
     'https://127.0.0.1.nip.io/latest',
@@ -283,7 +295,7 @@ test('guarded fetch re-validates every redirect hop and stays on the allowed ori
       hops++;
       return new Response(null, { status: 302, headers: { location } });
     }, remote, []);
-    await assert.rejects(() => fetchImpl(`${remote.href}/info/refs?service=git-upload-pack`), (err: { code?: string }) => err.code === 'bad_request');
+    await assert.rejects(() => fetchImpl(`${remote.href}/info/refs?service=git-upload-pack`), (err: Partial<{ code: string }>) => err.code === 'bad_request');
     assert.equal(hops, 1, location);
   }
 
@@ -336,7 +348,7 @@ test('security headers are present on every viewer route', async () => {
   for (const url of routes) {
     for (const method of ['GET', 'HEAD'] as const) {
       const res = await handleViewer(new Request(url, { method }), {});
-      const csp = res.headers.get('content-security-policy') ?? '';
+      const csp = fill(res.headers.get('content-security-policy'), '');
       assert.equal(res.headers.get('x-content-type-options'), 'nosniff', `${method} ${url}`);
       assert.equal(res.headers.get('referrer-policy'), 'no-referrer', `${method} ${url}`);
       assert.match(csp, /frame-ancestors 'none'/, `${method} ${url}`);
@@ -347,8 +359,8 @@ test('security headers are present on every viewer route', async () => {
   }
   const post = await handleViewer(new Request('https://ply.example/view', { method: 'POST' }), {});
   assert.equal(post.status, 405);
-  assert.match(post.headers.get('content-security-policy') ?? '', /frame-ancestors 'none'/);
-  assert.equal((post.headers.get('content-security-policy') ?? '').includes('unsafe-inline'), false);
+  assert.match(fill(post.headers.get('content-security-policy'), ''), /frame-ancestors 'none'/);
+  assert.equal(fill(post.headers.get('content-security-policy'), '').includes('unsafe-inline'), false);
 });
 
 function mulberry(seed: number): () => number {

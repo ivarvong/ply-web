@@ -15,6 +15,19 @@ import { PUBLIC_GIT_ORIGIN, PUBLIC_NAMESPACE, type TokenSource } from '../src/pu
 import { git, makeBareRepo, startGitServer, tmpRoot, commitFiles } from './server.js';
 import { mkdirSync } from 'node:fs';
 
+/** Null and a missing value take the fallback. An empty string and 0 stay. */
+function fill<T>(value: unknown, fallback: T): T {
+  return value === null || value === void 0 ? fallback : value as T;
+}
+
+/** One property. A null receiver and a missing key are holes. A stored null stays null. */
+function slot(receiver: unknown, key: string): unknown {
+  if (receiver === null || receiver === void 0) return void 0;
+  if (typeof receiver !== 'object' && typeof receiver !== 'function') return void 0;
+  return (receiver as Record<string, unknown>)[key];
+}
+
+
 type GitCacheFailureLog = { msg: 'ply.gitcache'; error_kind: string; stage: string; error_name: string };
 
 function isGitCacheFailure(value: unknown): value is GitCacheFailureLog {
@@ -77,7 +90,7 @@ function fakeLoopback() {
 test('createLoopbackFetch: anonymous public exchanges go to GitCache under /v<CACHE_VERSION>/<kind>/<sha256>; a credential never does', async () => {
   const { calls, binding } = fakeLoopback();
   const direct: { url: string; auth: string | null }[] = [];
-  const f = createLoopbackFetch(async (input, init) => { direct.push({ url: String(input), auth: new Headers(init?.headers).get('authorization') }); return new Response('direct'); }, () => binding);
+  const f = createLoopbackFetch(async (input, init) => { direct.push({ url: String(input), auth: new Headers(slot(init, 'headers') as HeadersInit).get('authorization') }); return new Response('direct'); }, () => binding);
   const r = await f(`${PUB}/git-upload-pack`, { method: 'POST', body: FETCH, headers: { 'git-protocol': 'version=2' } });
   assert.equal(r.headers.get('x-ply-pack-cache'), 'HIT', 'the tier reaches ply as x-ply-pack-cache');
   assert.equal(calls.length, 1);
@@ -112,10 +125,10 @@ function tokens(): TokenSource {
   return { readToken: async () => TOKEN, secrets: () => [TOKEN, TOKEN.split('?')[0] as string] };
 }
 
-async function gcRequest(kind: 'pack' | 'refs' | 'discover', url: string, body: Uint8Array | null, opts: { version?: number; tamperUrl?: string; bust?: boolean } = {}) {
+async function gcRequest(kind: 'pack' | 'refs' | 'discover', url: string, body: Uint8Array | null, opts: Partial<{ version: number; tamperUrl: string; bust: boolean }> = {}) {
   const hash = await keyHash(kind, url, 'version=2', body);
-  const path = opts.bust ? `/v${opts.version ?? CACHE_VERSION}/bust/${kind}/${hash}` : keyPath(kind, hash, opts.version);
-  const headers = new Headers({ 'x-ply-gc-url': opts.tamperUrl ?? url, 'x-ply-gc-proto': 'version=2', 'x-ply-gc-ua': 'ply-test' });
+  const path = opts.bust ? `/v${fill(opts.version, CACHE_VERSION)}/bust/${kind}/${hash}` : keyPath(kind, hash, opts.version);
+  const headers = new Headers({ 'x-ply-gc-url': fill(opts.tamperUrl, url), 'x-ply-gc-proto': 'version=2', 'x-ply-gc-ua': 'ply-test' });
   if (body) headers.set('x-ply-gc-body', btoa(String.fromCharCode(...body)));
   return new Request(`https://gitcache.internal${path}`, { headers });
 }
@@ -123,13 +136,13 @@ async function gcRequest(kind: 'pack' | 'refs' | 'discover', url: string, body: 
 test('serveGitCache: policy per kind, the key is bound to the request, the token goes only to the public namespace, errors are scrubbed and not stored', async () => {
   const seen: { url: string; auth: string | null; via: string | null; method: string }[] = [];
   let answer: () => Response = () => new Response('PACK', { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' } });
-  const up = async (input: RequestInfo | URL, init?: RequestInit) => { const h = new Headers(init?.headers); seen.push({ url: String(input), auth: h.get('authorization'), via: h.get(VIA_HEADER), method: init?.method ?? 'GET' }); return answer(); };
+  const up: typeof globalThis.fetch = async (input, init) => { const h = new Headers(slot(init, 'headers') as HeadersInit); seen.push({ url: String(input), auth: h.get('authorization'), via: h.get(VIA_HEADER), method: fill(slot(init, 'method'), 'GET') }); return answer(); };
   const purged: string[][] = [];
   const ctx = { cache: { purge: async (o: { pathPrefixes: string[] }) => { purged.push(o.pathPrefixes); } } };
   const pack = await serveGitCache(await gcRequest('pack', `${PUB}/git-upload-pack`, FETCH), tokens(), ctx, up);
   assert.equal(pack.status, 200);
   assert.equal(pack.headers.get('cache-control'), NO_STORE, 'bytes that are not a verifiable pack are passed on but never stored');
-  assert.match(pack.headers.get('x-ply-gc-verified') ?? '', /^failed/);
+  assert.match(fill(pack.headers.get('x-ply-gc-verified'), ''), /^failed/);
   assert.equal(await pack.text(), 'PACK');
   answer = () => new Response('PACK', { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result', 'cf-ray': '0123456789abcdef-IAD' } });
   assert.equal((await serveGitCache(await gcRequest('pack', `${PUB}/git-upload-pack`, FETCH), tokens(), ctx, up)).headers.get('cf-ray'), '0123456789abcdef-IAD');
@@ -208,8 +221,8 @@ test('guardrails: no Cache API in src/, and only src/gitcache.ts calls the GitCa
   for (const f of files(src).filter(f => /\.(ts|tsx|js|mjs)$/.test(f))) {
     const text = readFileSync(f, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
     assert.equal(/\bcaches\s*\.|cachingFetch|caches\.default/.test(text), false, `${f} uses the Cache API`);
-    if (!f.endsWith('gitcache.ts') && !f.endsWith('pinned.ts')) assert.equal(/GitCache\??\.fetch\s*\(|binding\.fetch\s*\(/.test(text), false, `${f} calls the GitCache binding directly`);
-    if (/\.exports\??\.GitCache/.test(text)) assert.ok(/createLoopbackFetch/.test(text), `${f} reads ctx.exports.GitCache but not through createLoopbackFetch`);
+    if (!f.endsWith('gitcache.ts') && !f.endsWith('pinned.ts')) assert.equal(/GitCache\?\.fetch\s*\(|GitCache\.fetch\s*\(|binding\.fetch\s*\(/.test(text), false, `${f} calls the GitCache binding directly`);
+    if (/\.exports\?\.GitCache|\.exports\.GitCache/.test(text)) assert.ok(/createLoopbackFetch/.test(text), `${f} reads ctx.exports.GitCache but not through createLoopbackFetch`);
   }
 });
 
@@ -223,9 +236,9 @@ test('pack verification against real git: a genuine pack is immutable; a corrupt
     git(work, ['init', '-q', '-b', 'main']);
     const head = commitFiles(work, bare, { 'README.md': 'verified\n', 'd/e.txt': 'x'.repeat(5000) }, 'seed');
     const blob = git(bare, ['rev-parse', 'main:README.md']).trim();
-    const local = (input: RequestInfo | URL, init?: RequestInit) => fetch(String(input).replace(PUBLIC_GIT_ORIGIN, srv.url).replace(`/git/${PUBLIC_NAMESPACE}/ply.git`, '/v.git'), init);
+    const local: typeof globalThis.fetch = (input, init) => fetch(String(input).replace(PUBLIC_GIT_ORIGIN, srv.url).replace(`/git/${PUBLIC_NAMESPACE}/ply.git`, '/v.git'), init);
     let mangle: ((b: Uint8Array) => Uint8Array) | null = null;
-    const up = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const up: typeof globalThis.fetch = async (input, init) => {
       const r = await local(input, init);
       if (!mangle) return r;
       return new Response(mangle(new Uint8Array(await r.arrayBuffer())) as BodyInit, { status: r.status, headers: r.headers });
@@ -236,22 +249,22 @@ test('pack verification against real git: a genuine pack is immutable; a corrupt
     for (const b of [body(head, `${pkt('filter blob:none\n')}${pkt('deepen 1\n')}`), body(blob)]) {
       const r = await ask(b);
       assert.equal(r.status, 200);
-      assert.equal(r.headers.get('cache-control'), IMMUTABLE, r.headers.get('x-ply-gc-verified') ?? '');
-      assert.match(r.headers.get('x-ply-gc-verified') ?? '', /^ok;objects=\d+/);
+      assert.equal(r.headers.get('cache-control'), IMMUTABLE, fill(r.headers.get('x-ply-gc-verified'), ''));
+      assert.match(fill(r.headers.get('x-ply-gc-verified'), ''), /^ok;objects=\d+/);
     }
     // flip one byte of the compressed object data (just after the 12-byte PACK header and the object header): same
     // length, must no longer verify. (Bytes in band-2 progress text or the trailer would not change any object.)
     mangle = b => { const c = b.slice(); const i = Buffer.from(c).indexOf('PACK') + 16; c[i] = (c[i] as number) ^ 0xff; return c; };
     const bad = await ask(body(blob));
     assert.equal(bad.headers.get('cache-control'), NO_STORE);
-    assert.match(bad.headers.get('x-ply-gc-verified') ?? '', /^failed/);
+    assert.match(fill(bad.headers.get('x-ply-gc-verified'), ''), /^failed/);
     // a valid pack that is not what was asked for (served for another want): not stored
     mangle = null;
     const other = git(bare, ['rev-parse', 'main:d/e.txt']).trim();
-    const swapped = async (input: RequestInfo | URL, init?: RequestInit) => local(input, { ...init, body: body(other) });
+    const swapped: typeof globalThis.fetch = async (input, init) => local(input, { ...init, body: body(other) });
     const wrong = await serveGitCache(await gcRequest('pack', `${PUB}/git-upload-pack`, body(blob)), tokens(), {}, swapped);
     assert.equal(wrong.headers.get('cache-control'), NO_STORE);
-    assert.match(wrong.headers.get('x-ply-gc-verified') ?? '', /not in the pack/);
+    assert.match(fill(wrong.headers.get('x-ply-gc-verified'), ''), /not in the pack/);
   } finally {
     await srv.close();
     cleanup();
