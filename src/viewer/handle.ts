@@ -1,5 +1,7 @@
 // Public viewer entry. No PLY_TOKEN, no git credential, no /v1 handler. Rate limit runs before any git fetch.
 // This module does not import rate.ts: node tests must not load cloudflare:workers. The Worker re-exports the class.
+import { fromNullable } from '../absent.ts'
+import { unwrapOr } from '../option.ts'
 import { openSpan } from '../flags/telemetry.ts'
 import { plyBuildValue, BUILD_HEADER } from '../version.ts'
 import { ok, runRequest, type Result, type UnexpectedFailure } from '../http/machine.ts'
@@ -55,7 +57,7 @@ export async function handleViewer(req: Request, env: ViewerEnv, ctx: ViewerCtx 
   return runRequest(
     {
       parse: () => {
-        span = openSpan(ctx.tracing, 'ply.viewer')
+        span = openSpan(unwrapOr(fromNullable(ctx.tracing), null), 'ply.viewer')
         return ok({ requestId } satisfies ViewerReady)
       },
       authorize: (parsed: ViewerReady) => ok(parsed),

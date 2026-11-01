@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 113,
-    "optional": 309,
-    "chain": 388,
-    "nullish": 419,
-    "total": 1229
+    "word": 108,
+    "optional": 303,
+    "chain": 353,
+    "nullish": 386,
+    "total": 1150
   },
   "files": {
     "cloudflare.config.ts": {
@@ -246,13 +246,6 @@
       "nullish": 2,
       "total": 6
     },
-    "scripts/flags-o11y.ts": {
-      "word": 1,
-      "optional": 4,
-      "chain": 2,
-      "nullish": 5,
-      "total": 12
-    },
     "scripts/flags-propagation.ts": {
       "word": 0,
       "optional": 0,
@@ -289,11 +282,11 @@
       "total": 3
     },
     "src/flags/client.ts": {
-      "word": 4,
+      "word": 3,
       "optional": 9,
       "chain": 3,
       "nullish": 2,
-      "total": 18
+      "total": 17
     },
     "src/flags/entry.ts": {
       "word": 1,
@@ -316,26 +309,12 @@
       "nullish": 3,
       "total": 26
     },
-    "src/flags/report.ts": {
-      "word": 0,
-      "optional": 1,
-      "chain": 1,
-      "nullish": 26,
-      "total": 28
-    },
     "src/flags/store.ts": {
       "word": 1,
       "optional": 5,
       "chain": 1,
       "nullish": 1,
       "total": 8
-    },
-    "src/flags/telemetry.ts": {
-      "word": 3,
-      "optional": 1,
-      "chain": 32,
-      "nullish": 2,
-      "total": 38
     },
     "src/mirror.ts": {
       "word": 0,

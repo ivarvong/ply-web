@@ -4,6 +4,7 @@ import { loadRuleset, type FlagCacheEnv, type FlagsCacheBinding } from './cache.
 import { elapsed, type Clock } from './clock.ts';
 import { parseUnit, type AttributeInput } from './document.ts';
 import { evaluateDocument } from './eval.ts';
+import { some } from '../option.ts';
 import { emitEval, endSpan, openSpan, resolutionSample, type TracingLike } from './telemetry.ts';
 import { USAGE_NOTE_FLAG, USAGE_NOTE_LINE } from './ttl.ts';
 import { EMPTY_DOCUMENT, isEnabledVariant, type CacheStatus, type FlagEvaluation, type FlagSelection, type Unit } from './types.ts';
@@ -43,7 +44,7 @@ export async function resolveFlags(runtime: FlagRuntime, unit: Unit, keys: FlagS
       r2ReadMs: loaded.r2ReadMs,
       unitId: unit.id,
       resolutions: evaluations.map(resolutionSample),
-    }, undefined, span);
+    }, line => console.log(line), some(span));
     return { kind: 'ok', evaluations, revision: loaded.kind === 'ready' ? loaded.revision : null, cache: loaded.cache };
   } finally {
     endSpan(span);

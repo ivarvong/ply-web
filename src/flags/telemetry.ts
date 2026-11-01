@@ -1,6 +1,8 @@
 // One flags.eval span per resolution batch, plus a flags.resolve child per flag.
 // The unit id is a parent-span attribute only. The log lines are the low-cardinality projection the
 // observability script aggregates: cache status, revision, durations, and the resolved variant.
+import { chainGet, fromNullable } from '../absent.ts';
+import { type Option } from '../option.ts';
 import { roundMs } from './clock.ts';
 import { variantKind, variantValue, type CacheStatus, type FlagEvaluation } from './types.ts';
 
@@ -43,18 +45,37 @@ export type TracingLike = {
   enterSpan?(name: string): SpanLike;
 };
 
-export function openSpan(tracing: TracingLike | null | undefined, name: string): SpanLike | null {
+/** Optional method call. A null receiver or a null method does not run. A present method keeps its receiver. */
+function callMethod(receiver: unknown, key: string, args: readonly unknown[]): void {
+  const host = fromNullable(receiver);
+  if (host.tag === 'none') return;
+  const method = chainGet(host.value, key);
+  if (method.tag === 'none') return;
+  const fn = method.value as (...params: unknown[]) => unknown;
+  fn.apply(host.value, [...args]);
+}
+
+function setAttribute(span: SpanLike | null, key: string, value: string | number | boolean): void {
+  callMethod(span, 'setAttribute', [key, value]);
+}
+
+function revisionText(revision: string | null): string {
+  return revision === null ? '' : revision;
+}
+
+export function openSpan(tracing: TracingLike | null, name: string): SpanLike | null {
   // The one-argument form stays open until end(). A platform enterSpan that requires a callback
   // (workerd: parameter 2 must be a Function) is not this form; skip it instead of failing the request.
-  if (!tracing) return null;
-  const enter = tracing.enterSpan;
-  if (typeof enter !== 'function' || enter.length !== 1) return null;
-  const span = enter(name);
-  return span ? span : null;
+  if (tracing === null) return null;
+  const enter = chainGet(tracing, 'enterSpan');
+  if (enter.tag === 'none' || typeof enter.value !== 'function' || enter.value.length !== 1) return null;
+  const enterFn = enter.value as (spanName: string) => unknown;
+  const span = enterFn(name);
+  return span ? span as SpanLike : null;
 }
 
 export function endSpan(span: SpanLike | null): void {
-  span?.end?.();
+  callMethod(span, 'end', []);
 }
 
 export function resolutionSample(evaluation: FlagEvaluation): ResolutionSample {
@@ -99,39 +120,40 @@ export function resolveLog(sample: EvalSample, resolution: ResolutionSample): st
 }
 
 export function emitEval(
-  tracing: TracingLike | null | undefined,
+  tracing: TracingLike | null,
   sample: EvalSample,
-  log: (line: string) => void = line => console.log(line),
-  parent?: SpanLike | null,
+  log: (line: string) => void,
+  parent: Option<SpanLike | null>,
 ): void {
   const write = (span: SpanLike | null): void => {
-    span?.setAttribute?.('flags.cache_status', sample.cacheStatus);
-    span?.setAttribute?.('flags.revision', sample.revision ?? '');
-    span?.setAttribute?.('flags.eval_ms', num(sample.evalMs));
-    span?.setAttribute?.('flags.resolve_ms', num(sample.resolveMs));
-    span?.setAttribute?.('flags.count', sample.resolutions.length);
-    if (sample.r2ReadMs !== null) span?.setAttribute?.('flags.r2_read_ms', sample.r2ReadMs);
-    if (sample.unitId !== null) span?.setAttribute?.('flags.unit_id', sample.unitId);
+    setAttribute(span, 'flags.cache_status', sample.cacheStatus);
+    setAttribute(span, 'flags.revision', revisionText(sample.revision));
+    setAttribute(span, 'flags.eval_ms', num(sample.evalMs));
+    setAttribute(span, 'flags.resolve_ms', num(sample.resolveMs));
+    setAttribute(span, 'flags.count', sample.resolutions.length);
+    if (sample.r2ReadMs !== null) setAttribute(span, 'flags.r2_read_ms', sample.r2ReadMs);
+    if (sample.unitId !== null) setAttribute(span, 'flags.unit_id', sample.unitId);
     log(evalLog(sample));
     for (const resolution of sample.resolutions) {
       const child = openSpan(tracing, 'flags.resolve');
       try {
-        child?.setAttribute?.('flags.key', resolution.key);
-        child?.setAttribute?.('flags.variant_kind', resolution.variantKind);
-        child?.setAttribute?.('flags.variant_value', resolution.variantValue);
-        child?.setAttribute?.('flags.reason', resolution.reason);
-        child?.setAttribute?.('flags.bucket', resolution.bucket);
-        child?.setAttribute?.('flags.revision', sample.revision ?? '');
-        child?.setAttribute?.('flags.cache_status', sample.cacheStatus);
-        child?.setAttribute?.('flags.resolve_ms', num(sample.resolveMs));
+        setAttribute(child, 'flags.key', resolution.key);
+        setAttribute(child, 'flags.variant_kind', resolution.variantKind);
+        setAttribute(child, 'flags.variant_value', resolution.variantValue);
+        setAttribute(child, 'flags.reason', resolution.reason);
+        setAttribute(child, 'flags.bucket', resolution.bucket);
+        setAttribute(child, 'flags.revision', revisionText(sample.revision));
+        setAttribute(child, 'flags.cache_status', sample.cacheStatus);
+        setAttribute(child, 'flags.resolve_ms', num(sample.resolveMs));
         log(resolveLog(sample, resolution));
       } finally {
         endSpan(child);
       }
     }
   };
-  if (parent !== undefined) {
-    write(parent);
+  // none: this call owns the eval span. some: the caller already opened it, including a null span.
+  if (parent.tag === 'some') {
+    write(parent.value);
     return;
   }
   const span = openSpan(tracing, 'flags.eval');

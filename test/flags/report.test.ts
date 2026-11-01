@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { none } from '../../src/option.ts';
 import { emitEval, evalLog, resolveLog, type EvalSample, type SpanLike } from '../../src/flags/telemetry.ts';
 import { MEASUREMENT, flagLogQuery, renderReport, reportFromEvents } from '../../src/flags/report.ts';
 import { measureRounds } from '../../src/flags/propagation.ts';
@@ -26,7 +27,7 @@ describe('telemetry', () => {
         };
       },
     };
-    emitEval(tracing, sample, line => lines.push(line));
+    emitEval(tracing, sample, line => lines.push(line), none());
     const parent = spans.find(span => span.name === 'flags.eval');
     const child = spans.find(span => span.name === 'flags.resolve');
     expect(parent?.attrs['flags.unit_id']).toBe('unit-DO-NOT-LEAK');
@@ -66,7 +67,7 @@ describe('telemetry', () => {
     ]);
     expect(renderReport(report)).toContain('ply.usage.note');
     expect(renderReport(report)).not.toContain('unit_id');
-    const query = JSON.stringify(flagLogQuery('ply', 'flags.resolve', 0, 1));
+    const query = JSON.stringify(flagLogQuery('ply', 'flags.resolve', 0, 1, null));
     expect(query).not.toContain('unit');
     expect(query).toContain('flags.resolve');
   });
