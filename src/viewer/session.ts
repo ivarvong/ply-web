@@ -1,6 +1,8 @@
 // One public page: discover, then either a pack map or a ref → commit → tree walk → optional blob.
 // Quirks are the isolate's per-origin map (src/quirks.ts), shared with /v1: a server that refuses tree:0 costs that 400
 // once per isolate, not once per page. The trace still names the fallback on every fetch that uses it.
+import { atIndex, chainGet, fromNullable, mapGet } from '../absent.ts';
+import { unwrapOr } from '../option.ts';
 import { concat } from 'ply';
 import { fail } from 'ply';
 import { limitError } from 'ply';
@@ -9,7 +11,7 @@ import type { Budget } from './budget.ts';
 import { clampText, safeFilename } from './escape.ts';
 import type { FetchLike } from './fetchguard.ts';
 import { VIEWER_CAPS, VIEWER_GIT_LIMITS, VIEWER_UA } from './limits.ts';
-import { mapParsed } from './packmap.ts';
+import { mapParsed, type ParsedPack } from './packmap.ts';
 import type { CommitInfo, FilterName, Loaded, RepoHeader, ServerInfo, TreeEntry } from './model.ts';
 import { candidates, createGitTransport, cursorFinish, cursorInit, cursorStep, discoverRepo, filterRejected, inflateObject, listRefs, readObject, readPack, streamPack, treeEntryType, treeMode, viewCommit, type GitTransport, type PackCursor, type ViewerTracer } from './ply.ts';
 import type { ViewerRoute } from './route.ts';
@@ -21,8 +23,6 @@ import { isAbbreviatedOid, matchAbbreviatedOid } from '../abbrev.ts';
 import { nearbyRefs, type ViewerHint } from './hint.ts';
 import { tagsFromRefs } from './tags.ts';
 
-type NoCredential = { auth?: never };
-
 export type SessionDeps = {
   tracer: ViewerTracer;
   fetchImpl: FetchLike;
@@ -30,9 +30,9 @@ export type SessionDeps = {
   budget: Budget;
 };
 
-type RefRec = { oid: string; peeled?: string };
+type RefRec = { oid: string };
 
-function openTransport(url: ValidatedPublicRepoUrl, opts: NoCredential & {
+function openTransport(url: ValidatedPublicRepoUrl, opts: {
   tracer: ViewerTracer;
   fetchImpl: FetchLike;
   signal: AbortSignal;
@@ -54,18 +54,26 @@ function serverOf(info: { version: number; agent: string; objectFormat: string; 
   };
 }
 
+function textOrEmpty(value: unknown): string {
+  const present = fromNullable(value);
+  if (present.tag === 'none') return '';
+  return typeof present.value === 'string' ? present.value : String(present.value);
+}
+
 function toCommit(oid: string, data: Uint8Array): CommitInfo {
   const view = viewCommit(data, VIEWER_GIT_LIMITS);
-  const author = view.author ?? { name: '', email: '', time: '', tz: '' };
+  const author = fromNullable(view.author);
+  const who = author.tag === 'some' ? author.value : { name: '', email: '', time: '', tz: '' };
+  const parents = fromNullable(view.parents);
   return {
     oid,
-    tree: view.tree ?? '',
-    parents: view.parents ?? [],
-    authorName: author.name ?? '',
-    authorEmail: author.email ?? '',
-    authorTime: author.time ?? '',
-    authorTz: author.tz ?? '',
-    message: view.message ?? '',
+    tree: textOrEmpty(view.tree),
+    parents: parents.tag === 'none' ? [] : parents.value,
+    authorName: textOrEmpty(who.name),
+    authorEmail: textOrEmpty(who.email),
+    authorTime: textOrEmpty(who.time),
+    authorTz: textOrEmpty(who.tz),
+    message: textOrEmpty(view.message),
     signed: !!view.signed,
   };
 }
@@ -93,14 +101,25 @@ function refMiss(listedRefs: { refs: Map<string, RefRec>; head: string | null },
   throw withHint(fail(code, message), { nearby: nearbyRefs(wanted, catalog.branches, catalog.tags), path: null });
 }
 
+function textRef(ref: string | null): string {
+  return ref === null ? '' : ref;
+}
+
+function peeledOid(rec: RefRec): string {
+  const peeled = chainGet(rec, 'peeled');
+  if (peeled.tag === 'none') return rec.oid;
+  return typeof peeled.value === 'string' ? peeled.value : rec.oid;
+}
+
 function resolveRef(listedRefs: { refs: Map<string, RefRec>; head: string | null }, ref: string | null): { name: string; commit: string } {
   const refs = listedRefs.refs;
   const cands = candidates(ref);
-  if (!cands.length) return { name: ref ?? '', commit: ref ?? '' };
+  if (!cands.length) return { name: textRef(ref), commit: textRef(ref) };
   for (const cand of cands) {
     const rec = refs.get(cand);
     if (!rec) continue;
-    return { name: cand === 'HEAD' ? (listedRefs.head ?? 'HEAD') : cand, commit: rec.peeled ?? rec.oid };
+    const head = listedRefs.head === null ? 'HEAD' : listedRefs.head;
+    return { name: cand === 'HEAD' ? head : cand, commit: peeledOid(rec) };
   }
   if (ref && isAbbreviatedOid(ref)) {
     const match = matchAbbreviatedOid(ref, refs);
@@ -108,7 +127,7 @@ function resolveRef(listedRefs: { refs: Map<string, RefRec>; head: string | null
     refMiss(listedRefs, ref, 'bad_request', match.message);
   }
   const message = cands[0] === 'HEAD' ? 'remote HEAD is unborn or absent; pass ref explicitly' : `ref ${ref} not found`;
-  refMiss(listedRefs, ref ?? '', 'not_found', message);
+  refMiss(listedRefs, textRef(ref), 'not_found', message);
 }
 
 function refCatalog(listedRefs: { refs: Map<string, RefRec>; head: string | null }) {
@@ -141,6 +160,10 @@ function listed(entries: { name: string; mode: string; oid: string }[]): { shown
 // zlib can be a little larger than the inflated file cap. Same slack ply uses before inflate.
 const COMPRESSED_SLACK_BYTES = 64 * 1024;
 
+async function closeIterator(it: AsyncIterator<Uint8Array>): Promise<void> {
+  await (it.return as (this: AsyncIterator<Uint8Array>) => Promise<unknown>).call(it).catch(() => {});
+}
+
 function refuseOversizedChunk(cursor: PackCursor, chunk: Uint8Array): void {
   const next = cursor.bytes + chunk.byteLength;
   if (next > VIEWER_CAPS.maxPackBytes) throw limitError('pack bytes', next, VIEWER_CAPS.maxPackBytes);
@@ -164,7 +187,7 @@ async function readBlob(transport: GitTransport, tracer: ViewerTracer, oid: stri
     if (sp.type !== TYPE.BLOB) throw fail('pack_corrupt', `expected blob, got type ${sp.type}`);
     if (sp.size > VIEWER_CAPS.maxFileDisplayBytes) {
       span.set({ 'git.viewer.blob.too_big': true, 'git.viewer.blob.size': sp.size });
-      await it.return?.().catch(() => {});
+      await closeIterator(it);
       fetchSpan.set({ 'git.viewer.blob.too_big': true, 'git.viewer.blob.size': sp.size });
       fetchSpan.end();
       span.end();
@@ -190,7 +213,7 @@ async function readBlob(transport: GitTransport, tracer: ViewerTracer, oid: stri
     span.end();
     return { size: sp.size, bytes: out, tooBig: false };
   } catch (err) {
-    await it.return?.().catch(() => {});
+    await closeIterator(it);
     fetchSpan.error(err).end();
     span.error(err).end();
     throw err;
@@ -231,11 +254,13 @@ async function loadWindow(transport: GitTransport, head: string, quirks: Quirks)
         result = await wide(true);
       }
     }
-    return result.objects ?? null;
+    const objects = chainGet(result, 'objects');
+    return objects.tag === 'none' ? null : objects.value as Map<string, Held>;
   } catch (err) {
-    const code = (err as { code?: string }).code;
+    const code = chainGet(err, 'code');
+    const message = (err as { message: unknown }).message;
     // Too big for the window (a huge tree under blob:none): fall back to the single-commit read. Timeouts and aborts end the page.
-    if (code === 'limit_exceeded' && !/upstream/.test(String((err as { message?: string }).message))) return null;
+    if (code.tag === 'some' && code.value === 'limit_exceeded' && !/upstream/.test(String(message))) return null;
     throw err;
   }
 }
@@ -262,8 +287,11 @@ export async function listPageRefs(transport: GitTransport, ref: string | null):
   try {
     return await listRefs(transport, refPrefixes(ref));
   } catch (err) {
-    const e = err as { code?: string; what?: string; message?: string };
-    if (e?.code !== 'limit_exceeded' || !/^ls-refs /.test(String(e.what ?? e.message ?? ''))) throw err;
+    const code = chainGet(err, 'code');
+    const what = chainGet(err, 'what');
+    const message = chainGet(err, 'message');
+    const detail = what.tag === 'some' ? String(what.value) : message.tag === 'some' ? String(message.value) : '';
+    if (code.tag !== 'some' || code.value !== 'limit_exceeded' || !/^ls-refs /.test(detail)) throw err;
     return await listRefs(transport, refPrefixes(ref, false));
   }
 }
@@ -274,19 +302,19 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
   const catalog = refCatalog(listedRefs);
   // Raw bytes need no history: read the commit alone. Every page reads the window (it replaces the commit read).
   const held = route.raw ? null : await loadWindow(transport, resolved.commit, quirks);
-  const headObj = held?.get(resolved.commit);
+  const headObj = held === null ? null : unwrapOr(mapGet(held, resolved.commit), null);
   const commitData = headObj && headObj.type === TYPE.COMMIT
     ? headObj.data
     : (await readObject(transport, { oid: resolved.commit, filter: 'tree:0', deepen: 1, expectType: TYPE.COMMIT })).data;
   const commit = toCommit(resolved.commit, commitData);
   const header = headerFor(route.loc, resolved.name, resolved.commit, server);
   const cache = new Map<string, Uint8Array>();
-  for (const [oid, obj] of held ?? []) if (obj.type === TYPE.TREE) cache.set(oid, obj.data);
+  for (const [oid, obj] of held === null ? [] : held) if (obj.type === TYPE.TREE) cache.set(oid, obj.data);
   const comps = route.path ? route.path.split('/') : [];
   let treeOid = commit.tree;
   let file: { mode: string; oid: string } | null = null;
   for (let depth = 0; depth < comps.length; depth++) {
-    const name = comps[depth] ?? '';
+    const name = unwrapOr(atIndex(comps, depth), '');
     const data = await loadTreeBytes(transport, treeOid, cache);
     const entries = parseTree(data, VIEWER_GIT_LIMITS);
     if (entries.length > VIEWER_GIT_LIMITS.maxTreeEntries) throw limitError('tree entries', entries.length, VIEWER_GIT_LIMITS.maxTreeEntries);
@@ -334,7 +362,7 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
           readme = text === null ? { name: hit.name, tooBig: true } : { name: hit.name, text: clampText(text, 20_000) };
         }
       } catch (err) {
-        const code = (err as { code?: string }).code;
+        const code = (err as { code: unknown }).code;
         if (code === 'limit_exceeded' || code === 'timeout' || code === 'aborted') throw err;
         readme = null;
       }
@@ -372,14 +400,15 @@ async function loadPack(transport: GitTransport, route: Extract<ViewerRoute, { k
   } else {
     result = await readPack(transport, { ...common, filter: 'blob:none' }, { resolve: false });
   }
-  if (!result?.parsed) throw fail('pack_corrupt', 'server sent no pack');
+  const parsed = chainGet(result, 'parsed');
+  if (parsed.tag === 'none' || !parsed.value) throw fail('pack_corrupt', 'server sent no pack');
   return {
     kind: 'pack',
-    header: headerFor(route.loc, route.ref ?? 'HEAD', want, server),
+    header: headerFor(route.loc, route.ref === null ? 'HEAD' : route.ref, want, server),
     want,
     filterRequested: requested,
     filterHonoured: honoured,
-    map: mapParsed(result.parsed, VIEWER_GIT_LIMITS),
+    map: mapParsed(parsed.value as ParsedPack, VIEWER_GIT_LIMITS),
     offset: pack.offset,
     askedOfsDelta: true,
     askedThinPack: false,

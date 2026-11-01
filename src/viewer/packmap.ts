@@ -1,4 +1,6 @@
 // Layout of one pack: offsets, types, delta links. Object bytes are not retained; previews are capped text.
+import { atIndex, chainGet, fromAbsent, fromNullable, mapGet } from '../absent.ts';
+import { unwrapOr } from '../option.ts';
 import { limitError } from 'ply';
 import { TYPE, TYPE_NAME, parseCommit, parseTree, hashObject } from 'ply';
 import { parsePack, resolvePack } from 'ply';
@@ -64,12 +66,17 @@ type ResolvedObject = {
   offset: number;
   size: number;
   compressed: number;
-  baseOffset?: number;
-  baseOid?: string;
 };
 
+function textOrEmpty(value: unknown): string {
+  const present = fromNullable(value);
+  if (present.tag === 'none') return '';
+  return typeof present.value === 'string' ? present.value : String(present.value);
+}
+
 function kindOf(type: number): ObjectKind {
-  const name = (TYPE_NAME as Record<number, string | undefined>)[type];
+  const found = fromAbsent((TYPE_NAME as Record<number, string>)[type]);
+  const name = found.tag === 'some' ? found.value : '';
   if (name === 'commit' || name === 'tree' || name === 'blob' || name === 'tag' || name === 'ofs_delta' || name === 'ref_delta') return name;
   return 'blob';
 }
@@ -88,9 +95,9 @@ function previewOf(type: number, data: Uint8Array, limits: object): ObjectPrevie
   try {
     if (type === TYPE.COMMIT) {
       const commit = parseCommit(data, limits);
-      const message = commit.message ?? '';
-      const summary = message.split('\n')[0] ?? '';
-      return { kind: 'commit', summary: clampText(summary, 200), tree: commit.tree ?? '', parents: commit.parents.slice(0, 8) };
+      const message = textOrEmpty(commit.message);
+      const summary = unwrapOr(atIndex(message.split('\n'), 0), '');
+      return { kind: 'commit', summary: clampText(summary, 200), tree: textOrEmpty(commit.tree), parents: commit.parents.slice(0, 8) };
     }
     if (type === TYPE.TREE) {
       const entries = parseTree(data, limits);
@@ -119,7 +126,7 @@ export function mapParsed(parsed: ParsedPack, limits = VIEWER_GIT_LIMITS): PackM
   let maxChain = 0;
   let externalBases = 0;
   try {
-    const out = resolvePack({ objects: parsed.objects }, () => undefined, limits);
+    const out = resolvePack({ objects: parsed.objects }, () => null, limits);
     resolved = out.objects;
     maxChain = out.stats.maxChain;
     externalBases = out.stats.externalBases;
@@ -127,9 +134,10 @@ export function mapParsed(parsed: ParsedPack, limits = VIEWER_GIT_LIMITS): PackM
     // deep, so the resolved chain length is checked here against the viewer cap.
     if (maxChain > limits.maxDeltaChain) throw limitError('delta chain depth', maxChain, limits.maxDeltaChain);
   } catch (err) {
-    const message = String((err as { message?: string })?.message ?? err);
-    const code = (err as { code?: string })?.code;
-    if (code === 'pack_corrupt' && /ref delta base/.test(message)) unresolved = true;
+    const messageField = chainGet(err, 'message');
+    const message = String(messageField.tag === 'some' ? messageField.value : err);
+    const code = chainGet(err, 'code');
+    if (code.tag === 'some' && code.value === 'pack_corrupt' && /ref delta base/.test(message)) unresolved = true;
     else throw err;
   }
   const byOffset = new Map<number, ResolvedObject>();
@@ -137,10 +145,20 @@ export function mapParsed(parsed: ParsedPack, limits = VIEWER_GIT_LIMITS): PackM
   const objects: PackObjectView[] = parsed.objects.map((obj) => {
     const wire = kindOf(obj.type);
     const full = obj.type >= 1 && obj.type <= 4;
-      const oid = byOffset.get(obj.offset)?.oid ?? (full ? hashObject((TYPE_NAME as Record<number, string>)[obj.type] ?? 'blob', obj.data) : null);
-    const resolvedObj = byOffset.get(obj.offset);
-    const resolvedType = resolvedObj ? kindOf(resolvedObj.type) : (full ? wire : null);
-    const data = resolvedObj?.data ?? (full ? obj.data : null);
+    const placed = mapGet(byOffset, obj.offset);
+    const placedOid = placed.tag === 'some' ? chainGet(placed.value, 'oid') : fromNullable(null);
+    const typeLabel = fromAbsent((TYPE_NAME as Record<number, string>)[obj.type]);
+    const label = typeLabel.tag === 'some' ? typeLabel.value : 'blob';
+    const oid = placedOid.tag === 'some' ? (typeof placedOid.value === 'string' ? placedOid.value : String(placedOid.value)) : (full ? hashObject(label, obj.data) : null);
+    const resolvedType = placed.tag === 'some' ? kindOf(placed.value.type) : (full ? wire : null);
+    const dataField = placed.tag === 'some' ? chainGet(placed.value, 'data') : fromNullable(null);
+    const data = dataField.tag === 'some' ? dataField.value as Uint8Array : (full ? obj.data : null);
+    const chainField = placed.tag === 'some' ? chainGet(placed.value, 'chain') : fromNullable(null);
+    const chain = chainField.tag === 'some' && typeof chainField.value === 'number' ? chainField.value : 0;
+    const typeField = placed.tag === 'some' ? chainGet(placed.value, 'type') : fromNullable(null);
+    const previewType = typeField.tag === 'some' && typeof typeField.value === 'number' ? typeField.value : obj.type;
+    const baseOffset = fromAbsent(obj.baseOffset);
+    const baseOid = fromAbsent(obj.baseOid);
     return {
       offset: obj.offset,
       length: obj.headerBytes + obj.compressed,
@@ -150,10 +168,10 @@ export function mapParsed(parsed: ParsedPack, limits = VIEWER_GIT_LIMITS): PackM
       wireType: wire,
       resolvedType,
       oid,
-      baseOffset: obj.baseOffset ?? null,
-      baseOid: obj.baseOid ?? null,
-      chain: resolvedObj?.chain ?? (full ? 0 : 0),
-      preview: data ? previewOf(resolvedObj?.type ?? obj.type, data, limits) : (wire === 'ofs_delta' || wire === 'ref_delta' ? { kind: 'unresolved' } : null),
+      baseOffset: baseOffset.tag === 'some' ? baseOffset.value as number | null : null,
+      baseOid: baseOid.tag === 'some' ? baseOid.value as string | null : null,
+      chain,
+      preview: data ? previewOf(previewType, data, limits) : (wire === 'ofs_delta' || wire === 'ref_delta' ? { kind: 'unresolved' } : null),
     };
   });
   const links: DeltaLink[] = objects.filter(obj => obj.baseOffset !== null || obj.baseOid !== null).map(obj => ({
@@ -164,7 +182,10 @@ export function mapParsed(parsed: ParsedPack, limits = VIEWER_GIT_LIMITS): PackM
   }));
   const thin = unresolved || externalBases > 0 || objects.some(obj => obj.wireType === 'ref_delta' && !objects.some(other => other.oid === obj.baseOid));
   const counts: Record<string, number> = {};
-  for (const obj of objects) counts[obj.wireType] = (counts[obj.wireType] ?? 0) + 1;
+  for (const obj of objects) {
+    const seen = fromAbsent(counts[obj.wireType]);
+    counts[obj.wireType] = (seen.tag === 'some' && typeof seen.value === 'number' ? seen.value : 0) + 1;
+  }
   return {
     bytes: parsed.bytes,
     version: parsed.stats.version,

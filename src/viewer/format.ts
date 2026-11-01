@@ -1,3 +1,5 @@
+import { atIndex, captureGroup, fromAbsent } from '../absent.ts'
+import { unwrapOr } from '../option.ts'
 import { clampText } from './escape.ts'
 import { LAYOUT, RELATIVE_TIME } from './layout.ts'
 
@@ -26,15 +28,25 @@ export type CommitProse = { subject: string; paragraphs: readonly string[]; trai
 
 // git interpret-trailers: `Token: value` lines in the final paragraph. GitHub's closing keywords count too.
 const TRAILER = /^([A-Za-z][A-Za-z0-9-]{0,63}):[ \t]+(\S.*)$/
-const CLOSING = /^((?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)) +((?:[\w.-]+\/[\w.-]+)?#\d+.*)$/i
+const CLOSING = /^(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved) +(([\w.-]+\/[\w.-]+)?#\d+.*)$/i
 
-const KNOWN_TRAILER = /^(?:[A-Za-z-]+-by|change-id|closes?|closed|fix(?:es|ed)?|resolve[sd]?|refs?|see-also|cc|bug|issue|ticket|[A-Za-z]+-session)$/i
+const KNOWN_TRAILER = /^([A-Za-z-]+-by|change-id|closes?|closed|fix(es|ed)?|resolve[sd]?|refs?|see-also|cc|bug|issue|ticket|[A-Za-z]+-session)$/i
+
+function groupText(match: RegExpExecArray | null, index: number): string | null {
+  const group = captureGroup(match, index)
+  if (group.tag === 'none' || group.value === '') return null
+  return group.value
+}
 
 function trailerOf(line: string): Trailer | null {
   const t = TRAILER.exec(line)
-  if (t?.[1] && t[2]) return { key: t[1], value: t[2].trim() }
+  const trailerKey = groupText(t, 1)
+  const trailerValue = groupText(t, 2)
+  if (trailerKey !== null && trailerValue !== null) return { key: trailerKey, value: trailerValue.trim() }
   const c = CLOSING.exec(line)
-  if (c?.[1] && c[2]) return { key: c[1].charAt(0).toUpperCase() + c[1].slice(1).toLowerCase(), value: c[2].trim() }
+  const closingKey = groupText(c, 1)
+  const closingValue = groupText(c, 2)
+  if (closingKey !== null && closingValue !== null) return { key: closingKey.charAt(0).toUpperCase() + closingKey.slice(1).toLowerCase(), value: closingValue.trim() }
   return null
 }
 
@@ -46,14 +58,14 @@ function trailerOf(line: string): Trailer | null {
 export function commitProse(message: string): CommitProse {
   const clamped = clampText(message, LAYOUT.commitMessageChars).replace(/\r\n?/g, '\n')
   const trimmed = clamped.replace(/\s+$/, '')
-  const subject = (trimmed.split('\n')[0] ?? '').trim()
+  const subject = unwrapOr(atIndex(trimmed.split('\n'), 0), '').trim()
   const rest = trimmed.slice(trimmed.indexOf('\n') === -1 ? trimmed.length : trimmed.indexOf('\n')).replace(/^\n+/, '')
   if (!rest.trim()) return { subject, paragraphs: [], trailers: [] }
   const blocks = rest.split(/\n[ \t]*\n/).map(block => block.replace(/^\n+|\s+$/g, '')).filter(block => block.trim().length > 0)
   const trailers: Trailer[] = []
   // Trailers live in the final paragraphs; a run of closing keywords may sit in its own paragraph just above them.
   while (blocks.length) {
-    const lines = (blocks[blocks.length - 1] ?? '').split('\n').map(line => line.trim()).filter(line => line.length > 0)
+    const lines = unwrapOr(atIndex(blocks, blocks.length - 1), '').split('\n').map(line => line.trim()).filter(line => line.length > 0)
     const parsed = lines.map(trailerOf)
     if (!parsed.length || parsed.some(t => t === null)) break
     // "Before: 12 ms / After: 5 ms" is prose, not trailers: ask for one key git or GitHub would recognise.
@@ -119,11 +131,17 @@ export function portions(lengths: readonly number[]): number[] {
   const raw = lengths.map(n => (n / total) * LAYOUT.percentSteps)
   const floors = raw.map(n => Math.floor(n))
   let left = LAYOUT.percentSteps - floors.reduce((sum, n) => sum + n, 0)
-  const order = raw.map((n, i) => [n - (floors[i] ?? 0), i] as const).sort((a, b) => b[0] - a[0])
+  const order = raw.map((n, i) => [n - unwrapOr(atIndex(floors, i), 0), i] as const).sort((a, b) => b[0] - a[0])
   const out = floors.slice()
   for (let i = 0; i < left; i++) {
-    const slot = order[i % order.length]?.[1] ?? 0
-    out[slot] = (out[slot] ?? 0) + 1
+    const pair = atIndex(order, i % order.length)
+    let slot = 0
+    if (pair.tag === 'some') {
+      const index = atIndex(pair.value, 1)
+      if (index.tag === 'some' && typeof index.value === 'number') slot = index.value
+    }
+    const current = fromAbsent(out[slot])
+    out[slot] = (current.tag === 'some' && typeof current.value === 'number' ? current.value : 0) + 1
   }
   return out
 }
