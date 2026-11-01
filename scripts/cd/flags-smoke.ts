@@ -2,7 +2,8 @@
 import { parseDocument } from '../../src/flags/document.ts'
 import { evaluateDocument } from '../../src/flags/eval.ts'
 import { BUCKETS, USAGE_NOTE_FLAG, USAGE_NOTE_LINE } from '../../src/flags/ttl.ts'
-import { EMPTY_DOCUMENT, variantKind, variantValue, type FlagDocument, type Variant } from '../../src/flags/types.ts'
+import { EMPTY_DOCUMENT, parseCacheStatus, variantKind, variantValue, type CacheStatus, type FlagDocument, type Variant } from '../../src/flags/types.ts'
+import { assertNever } from '../../src/never.ts'
 
 /** Unit the eval smoke sends. GET / uses anonymous and is checked separately. */
 export const SMOKE_UNIT_ID = 'user:smoke'
@@ -24,7 +25,8 @@ export const NO_STORE = 'no-store'
 /** GET / starts with this mark. The usage note is a separate line and must be absent. */
 export const USAGE_MARK = 'ply —'
 
-const SMOKE_CACHES = ['HIT', 'MISS', 'STALE', 'UPDATING'] as const
+/** A cached ruleset read. EXPIRED is the first read after invalidate when the entrypoint returns a new body. */
+const CACHED_RULESET_READ = 'HIT, MISS, STALE, UPDATING, EXPIRED, or REVALIDATED'
 
 export type FlagHeaders = {
   readonly cacheControl: string | null
@@ -54,8 +56,39 @@ function isObj(value: unknown): value is Obj {
   return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
-function cacheOk(value: unknown): boolean {
-  return typeof value === 'string' && (SMOKE_CACHES as readonly string[]).includes(value)
+function knownRulesetCacheDetail(status: CacheStatus): string | null {
+  switch (status) {
+    case 'HIT':
+    case 'MISS':
+    case 'STALE':
+    case 'UPDATING':
+    case 'EXPIRED':
+    case 'REVALIDATED':
+      return null
+    case 'BYPASS':
+    case 'DYNAMIC':
+    case 'NONE':
+    case 'UNKNOWN':
+      return `cache ${status}, wanted ${CACHED_RULESET_READ}`
+    default:
+      return assertNever(status)
+  }
+}
+
+/** null when the field is a cached ruleset read. Otherwise the failure detail. */
+function rulesetCacheDetail(value: unknown): string | null {
+  if (typeof value !== 'string') return `cache ${JSON.stringify(value)}, wanted ${CACHED_RULESET_READ}`
+  const parsed = parseCacheStatus(value)
+  switch (parsed.kind) {
+    case 'absent':
+      return `cache ${JSON.stringify(value)}, wanted ${CACHED_RULESET_READ}`
+    case 'unrecognized':
+      return `cache ${JSON.stringify(parsed.value)} is not a Cache API status`
+    case 'known':
+      return knownRulesetCacheDetail(parsed.status)
+    default:
+      return assertNever(parsed)
+  }
 }
 
 type ParsedJson = { readonly ok: true; readonly value: Obj } | { readonly ok: false; readonly reason: string }
@@ -90,7 +123,8 @@ function judgeRules(status: number, bodyText: string): FlagJudgement {
   }
   if (status !== HTTP_OK) return fail(`status ${status}, wanted ${HTTP_OK} or ${HTTP_NOT_FOUND}`)
   if (typeof parsed.revision !== 'string' || parsed.revision.length === 0) return fail('revision is not a string')
-  if (!cacheOk(parsed.cache)) return fail(`cache ${JSON.stringify(parsed.cache)}, wanted HIT, MISS, STALE, or UPDATING`)
+  const cacheDetail = rulesetCacheDetail(parsed.cache)
+  if (cacheDetail) return fail(cacheDetail)
   if (typeof parsed.environment !== 'string') return fail('environment is missing')
   if (!Array.isArray(parsed.flags)) return fail('flags is not an array')
   const document = parseDocument({ environment: parsed.environment, flags: parsed.flags })

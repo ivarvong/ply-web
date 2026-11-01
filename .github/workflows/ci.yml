@@ -50,7 +50,7 @@ jobs:
           node --experimental-strip-types scripts/absence-gate.ts --against "origin/${BASE_REF}"
       - run: npm ci
       - run: npm test
-      - run: npx oxlint
+      - run: npm run lint
       - run: npm run typecheck
       # Builds the Worker and validates the upload without credentials or API calls.
       - run: npx cf deploy --dry-run
