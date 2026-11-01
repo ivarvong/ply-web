@@ -27,15 +27,25 @@ const durableObjects = {
 // Workers Caching (never the Cache API). The default entrypoint is uncached so it always runs (rate limit, logs, scrub,
 // traces). It sends public upload-pack exchanges to the cache-enabled GitCache over ctx.exports (src/gitcache.ts).
 // crossVersionCache keeps immutable packs across deploys; CACHE_VERSION (src/cache-version.ts) is in every key.
-const entrypoints = {
+// Named entrypoints omit `cache` or set `enabled: true`. `enabled: false` does not compile:
+// the versions API rejects that block on a named entrypoint with error 10375. The default
+// entrypoint is the one place the block is accepted. Caching is off when the block is omitted.
+export type NamedWorkerOptions = { cache?: { enabled: true } };
+
+export function namedEntrypoint<const T extends NamedWorkerOptions>(options: T): T {
+	return options;
+}
+
+export const entrypoints = {
 	default: exports.worker({ cache: { enabled: false } }),
-	GitCache: exports.worker({ cache: { enabled: true } }),
+	GitCache: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
 	// Whole responses pinned to a commit oid (src/pinned.ts): /v1 tree/read/commit and viewer raw files.
-	Pinned: exports.worker({ cache: { enabled: true } }),
+	Pinned: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
 	// The one flag ruleset (src/flags/cache.ts). Caching stays off on the default entrypoint, which always runs.
-	FlagsCache: exports.worker({ cache: { enabled: true } }),
-	// RPC writes (src/flags/entry.ts). Not cached: setRollout and setTargeting are not idempotent GETs.
-	FlagControl: exports.worker({ cache: { enabled: false } }),
+	FlagsCache: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
+	// Caching is off by default. An explicit `enabled: false` on a named entrypoint is rejected by the API with 10375.
+	// RPC writes (src/flags/entry.ts): setRollout and setTargeting are not idempotent GETs.
+	FlagControl: exports.worker({} satisfies NamedWorkerOptions),
 } as const;
 
 // A binding can only name a class declared live above. src/index.js re-exports it from src/viewer/rate.ts.
