@@ -79,7 +79,8 @@ export function rulesetRequestProblems(request: Request): readonly string[] {
  */
 export function rulesetCacheProblems(headers: Headers): readonly string[] {
   const problems: string[] = [];
-  const control = headers.get('cache-control') ?? '';
+  const controlField = readHeader(headers, 'cache-control');
+  const control = controlField.kind === 'absent' ? '' : controlField.value;
   if (!/^public, max-age=[1-9]\d*, stale-while-revalidate=\d+$/.test(control)) problems.push(`cache-control ${control || 'missing'}`);
   if (headers.has('set-cookie')) problems.push('set-cookie');
   const vary = headers.get('vary');
@@ -256,6 +257,11 @@ function r2ReadMs(response: Response, cache: CacheStatus): number | null {
   return Number(raw);
 }
 
+async function releaseBody(response: Response): Promise<void> {
+  if (response.body === null) return;
+  await response.body.cancel();
+}
+
 export async function loadRuleset(env: FlagCacheEnv, fetchRuleset: FlagsCacheBinding | null): Promise<LoadedRuleset> {
   if (!env.FLAGS) return { kind: 'unavailable', reason: 'FLAGS binding is not configured' };
   if (!fetchRuleset) return { kind: 'unavailable', reason: 'FlagsCache entrypoint is not configured' };
@@ -268,11 +274,11 @@ export async function loadRuleset(env: FlagCacheEnv, fetchRuleset: FlagsCacheBin
   const cache = normalizeCacheStatus(response.headers.get('cf-cache-status'));
   const readMs = r2ReadMs(response, cache);
   if (response.status === 404) {
-    await response.body?.cancel();
+    await releaseBody(response);
     return { kind: 'absent', cache, r2ReadMs: readMs };
   }
   if (response.status !== 200) {
-    await response.body?.cancel();
+    await releaseBody(response);
     return { kind: 'unavailable', reason: `flag cache returned ${response.status}` };
   }
   const text = await response.text();
