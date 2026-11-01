@@ -1,12 +1,11 @@
 // The /v1 write handlers. Parsing that can fail with bad_request happens before a transport is opened.
 // An unborn HEAD is read only when a call needs the default branch or a not_found might be that empty ref.
-import { fail, mergeBranch, operation, readCommit, rebaseBranch } from 'ply'
+import { fail, mergeBranch, operation, parseCommitId, readCommit, rebaseBranch } from 'ply'
 import { type CallOpts } from './call.ts'
 import { createBranch, deleteRef } from './branch.ts'
 import { commitEdit } from './commit.ts'
 import { readHead, type HeadState } from './head.ts'
 import { nowSeconds, plyStamp, stamp } from './identity.ts'
-import { parseCommitOid } from './oid.ts'
 import { pick } from './pick.ts'
 import { asBody, branchRef, parseDeleteOid, parseEdit, refOrCommit, sameBranch } from './request.ts'
 import { unifyPly, type WriteOutcome } from './result.ts'
@@ -111,7 +110,9 @@ export async function handleRebase(remote: string, body: unknown, opts: CallOpts
 async function handlePick(remote: string, body: unknown, opts: CallOpts, revert: boolean): Promise<{ body: Record<string, unknown> }> {
   const raw = asBody(body)
   const ref = await requireRef(remote, opts, raw.ref, 'ref')
-  const commit = parseCommitOid(raw.commit, 'commit')
+  const parsed = parseCommitId(raw.commit)
+  if (!parsed.ok) throw parsed.error
+  const commit = parsed.value
   const committer = stamp(raw.committer, 'committer', nowSeconds())
   if (raw.allowEmpty !== undefined && typeof raw.allowEmpty !== 'boolean') throw fail('bad_request', 'allowEmpty must be true or false')
   const message = raw.message === undefined || raw.message === null ? null : textOr(raw.message, 'message') ?? null

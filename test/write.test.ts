@@ -2,11 +2,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { encodeTag, hashObject } from 'ply'
+import { encodeTag, hashObject, ZERO_OID } from 'ply'
 import { MODE_BLOB } from '../src/write/constants.ts'
 import { parseTime, stamp, nowSeconds } from '../src/write/identity.ts'
 import { headFromListing } from '../src/write/head.ts'
-import { isZeroOid } from '../src/write/oid.ts'
 import { mapPickOutcome } from '../src/write/pick.ts'
 import { asBody, parseBase, parseEdit, refOrCommit } from '../src/write/request.ts'
 import { unifyPly, writeResult } from '../src/write/result.ts'
@@ -27,7 +26,7 @@ test('parseBase rejects the zero oid and accepts a commit id or a branch', () =>
   const zero = code(() => parseBase('0'.repeat(40)))
   assert.equal(zero?.code, 'bad_request')
   assert.match(zero?.message ?? '', /omit base to create a root commit/)
-  assert.equal(isZeroOid('0'.repeat(40)), true)
+  assert.equal(ZERO_OID, '0'.repeat(40))
 })
 
 test('parseEdit: empty find creates, delete and rename, changes xor path', () => {
@@ -106,7 +105,7 @@ test('refOrCommit accepts a branch or a 40-hex commit and rejects zero', () => {
   assert.equal(code(() => refOrCommit('', 'from'))?.code, 'bad_request')
 })
 
-test('cherry-pick outcomes map exhaustively: empty, ok, and nothing else', () => {
+test('cherry-pick outcomes map exhaustively: empty, ok, kept_empty, and nothing else', () => {
   const ref = 'refs/heads/main'
   const oid = 'c'.repeat(40)
   const onto = 'd'.repeat(40)
@@ -114,9 +113,15 @@ test('cherry-pick outcomes map exhaustively: empty, ok, and nothing else', () =>
   assert.deepEqual(mapPickOutcome({ outcome: 'ok', ref, oid, tree: 't', onto, pushBytes: 12 }, false), {
     kind: 'applied', name: 'cherry_pick', ref, oid, oldOid: onto, tree: 't', pushBytes: 12,
   })
-  const reverted = mapPickOutcome({ outcome: 'ok', ref, oid }, true)
+  assert.deepEqual(mapPickOutcome({ outcome: 'kept_empty', ref, oid, tree: 't', onto, pushBytes: 12 }, false), {
+    kind: 'applied', name: 'cherry_pick', ref, oid, oldOid: onto, tree: 't', pushBytes: 12,
+  })
+  const reverted = mapPickOutcome({ outcome: 'kept_empty', ref, oid, tree: 't', onto, pushBytes: 12 }, true)
   assert.equal(reverted.kind, 'applied')
-  if (reverted.kind === 'applied') assert.equal(reverted.name, 'revert')
+  if (reverted.kind === 'applied') {
+    assert.equal(reverted.name, 'revert')
+    assert.equal(reverted.oldOid, onto)
+  }
   assert.equal(code(() => mapPickOutcome({ outcome: 'applied', ref, oid }, false))?.code, 'internal')
 })
 

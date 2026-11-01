@@ -6,9 +6,8 @@
 // discover result already in hand does not fetch the advertisement again. A later HEAD read on that origin is one
 // ls-refs. The first is discover + ls-refs. Sending `unborn` without that check would be this module speaking the
 // protocol, which is the code this adapter replaced.
-import { discover, KIND, lsRefs, type Span } from 'ply';
+import { discover, KIND, lsRefs, parseOid, type Oid, type Span } from 'ply';
 import { type GitTransport } from './call.ts';
-import { asOid, type Oid } from './oid.ts';
 
 export type HeadState =
   | { readonly kind: 'born'; readonly ref: string; readonly oid: Oid }
@@ -57,11 +56,17 @@ async function lsRefsUnbornOf(t: GitTransport): Promise<{ readonly advertised: b
  * unborn wins (an empty repository). A listed HEAD with a symref target is born. A listed HEAD with no target is
  * detached. Anything else is absent, including a server that does not advertise `ls-refs=unborn`.
  */
+function oidOf(value: string): Oid {
+  const parsed = parseOid(value);
+  if (!parsed.ok) throw parsed.error;
+  return parsed.value;
+}
+
 export function headFromListing(listed: HeadListing): HeadState {
   if (listed.unborn) return { kind: 'unborn', ref: listed.unborn.target };
   const rec = listed.refs.get(HEAD_NAME);
-  if (rec && listed.head !== null) return { kind: 'born', ref: listed.head, oid: asOid(rec.oid) };
-  if (rec) return { kind: 'detached', oid: asOid(rec.oid) };
+  if (rec && listed.head !== null) return { kind: 'born', ref: listed.head, oid: oidOf(rec.oid) };
+  if (rec) return { kind: 'detached', oid: oidOf(rec.oid) };
   return { kind: 'absent' };
 }
 

@@ -1,10 +1,9 @@
 // Lightweight tags point the ref at a commit. Annotated tags add a tag object and point the ref at that.
 // Delete uses the same compare-and-swap as a branch delete.
-import { encodeTag, fail, fetchObject, hashObject, ident, lsRefs, operation, push, resolveCommit, TYPE, ZERO_OID } from 'ply'
+import { encodeTag, fail, fetchCommit, hashObject, ident, lsRefs, operation, parseCommitId, parseOid, push, resolveCommit, TYPE, ZERO_OID } from 'ply'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
 import { refExists } from './errors.ts'
 import { nowSeconds, stamp, type Stamp } from './identity.ts'
-import { isOid, parseCommitOid } from './oid.ts'
 import { asBody, parseDeleteOid, tagRef } from './request.ts'
 import { writeResult } from './result.ts'
 import { deleteRef } from './branch.ts'
@@ -18,16 +17,26 @@ function messageBody(message: string): string {
 }
 
 async function commitOf(t: Transport, target: string): Promise<string> {
-  if (isOid(target)) {
-    parseCommitOid(target, 'target')
-    try {
-      await fetchObject(t, { oid: target, filter: 'tree:0', deepen: 1, expectType: TYPE.COMMIT })
-    } catch (e) {
-      const code = (e as { code?: string })?.code
-      if (code === 'pack_corrupt' || code === 'remote_error' || code === 'not_found') throw fail('not_found', `commit ${target} not found`)
-      throw e
+  if (parseOid(target).ok) {
+    const parsed = parseCommitId(target)
+    if (!parsed.ok) throw parsed.error
+    const fetched = await fetchCommit(t, parsed.value)
+    if (!fetched.ok) {
+      const error = fetched.error
+      if (error.code === 'not_found' && error.miss) {
+        switch (error.miss.kind) {
+          case 'absent':
+          case 'not_commit':
+            throw error
+          default: {
+            const unreachable: never = error.miss
+            throw unreachable
+          }
+        }
+      }
+      throw error
     }
-    return target
+    return parsed.value
   }
   return (await resolveCommit(t, target) as { commit: string }).commit
 }
@@ -37,7 +46,10 @@ export async function createTag(remote: string, body: unknown, opts: CallOpts): 
   const ref = tagRef(raw.name)
   const target = raw.target
   if (typeof target !== 'string' || target === '') throw fail('bad_request', 'target is required')
-  if (isOid(target)) parseCommitOid(target, 'target')
+  if (parseOid(target).ok) {
+    const parsed = parseCommitId(target)
+    if (!parsed.ok) throw parsed.error
+  }
   const annotated = raw.annotated === true || raw.message !== undefined || raw.tagger !== undefined
   const tagger: Stamp | null = annotated ? stamp(raw.tagger, 'tagger', nowSeconds()) : null
   const message = typeof raw.message === 'string' ? raw.message : null
