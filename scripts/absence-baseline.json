@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 95,
-    "optional": 257,
-    "chain": 285,
-    "nullish": 287,
-    "total": 924
+    "word": 83,
+    "optional": 227,
+    "chain": 257,
+    "nullish": 277,
+    "total": 844
   },
   "files": {
     "cloudflare.config.ts": {
@@ -267,41 +267,6 @@
       "nullish": 0,
       "total": 3
     },
-    "src/flags/client.ts": {
-      "word": 3,
-      "optional": 9,
-      "chain": 3,
-      "nullish": 2,
-      "total": 17
-    },
-    "src/flags/entry.ts": {
-      "word": 1,
-      "optional": 11,
-      "chain": 6,
-      "nullish": 0,
-      "total": 18
-    },
-    "src/flags/http.ts": {
-      "word": 0,
-      "optional": 3,
-      "chain": 2,
-      "nullish": 3,
-      "total": 8
-    },
-    "src/flags/operator.ts": {
-      "word": 7,
-      "optional": 2,
-      "chain": 14,
-      "nullish": 3,
-      "total": 26
-    },
-    "src/flags/store.ts": {
-      "word": 1,
-      "optional": 5,
-      "chain": 1,
-      "nullish": 1,
-      "total": 8
-    },
     "src/rays.ts": {
       "word": 1,
       "optional": 7,
@@ -466,9 +431,9 @@
     "test/flags/store.test.ts": {
       "word": 0,
       "optional": 1,
-      "chain": 9,
-      "nullish": 1,
-      "total": 11
+      "chain": 7,
+      "nullish": 0,
+      "total": 8
     },
     "test/gitcache.test.ts": {
       "word": 0,

@@ -60,8 +60,8 @@ describe('compare-and-swap', () => {
         return { etag, httpEtag: `"${etag}"`, text: async () => body };
       },
       async put(key, value, options) {
-        puts.push({ key, onlyIf: options?.onlyIf ?? new Headers() });
-        const onlyIf = options?.onlyIf;
+        puts.push({ key, onlyIf: options.onlyIf });
+        const onlyIf = options.onlyIf;
         if (onlyIf instanceof Headers) {
           if (onlyIf.get('if-none-match') === '*' && body) return null;
         } else if (!onlyIf || onlyIf.etagMatches !== etag) return null;

@@ -4,6 +4,7 @@ import { loadRuleset, type FlagCacheEnv, type FlagsCacheBinding } from './cache.
 import { elapsed, type Clock } from './clock.ts';
 import { parseUnit, type AttributeInput } from './document.ts';
 import { evaluateDocument } from './eval.ts';
+import { chainGet, dig, fromNullable } from '../absent.ts';
 import { some } from '../option.ts';
 import { emitEval, endSpan, openSpan, resolutionSample, type TracingLike } from './telemetry.ts';
 import { USAGE_NOTE_FLAG, USAGE_NOTE_LINE } from './ttl.ts';
@@ -16,8 +17,17 @@ export type FlagRuntime = {
   tracing: TracingLike | null;
 };
 
-function runtimeOf(env: FlagCacheEnv, ctx: { exports?: { FlagsCache?: FlagsCacheBinding }; tracing?: TracingLike | null } | undefined): FlagRuntime {
-  return { env, cache: ctx?.exports?.FlagsCache ?? null, tracing: ctx?.tracing ?? null };
+/** A missing context, export, cache, or tracer is null. A present value stays, including a falsy one. */
+export function flagRuntime(env: FlagCacheEnv, ctx: unknown): FlagRuntime {
+  const host = fromNullable(ctx);
+  if (host.tag === 'none') return { env, cache: null, tracing: null };
+  const cache = dig(host.value, ['exports', 'FlagsCache']);
+  const tracing = chainGet(host.value, 'tracing');
+  return {
+    env,
+    cache: cache.tag === 'some' ? cache.value as FlagsCacheBinding : null,
+    tracing: tracing.tag === 'some' ? tracing.value as TracingLike : null,
+  };
 }
 
 export type ResolveResult =
@@ -51,19 +61,19 @@ export async function resolveFlags(runtime: FlagRuntime, unit: Unit, keys: FlagS
   }
 }
 
-export async function isEnabled(env: FlagCacheEnv, ctx: { exports?: { FlagsCache?: FlagsCacheBinding }; tracing?: TracingLike | null } | undefined, key: string, unit: { readonly id: string; readonly attributes: AttributeInput }): Promise<boolean> {
+export async function isEnabled(env: FlagCacheEnv, ctx: unknown, key: string, unit: { readonly id: string; readonly attributes: AttributeInput }): Promise<boolean> {
   if (!env.FLAGS) return false;
   const parsedKey = parseFlagKey(key);
   if (parsedKey.kind !== 'key') return false;
   const parsed = parseUnit(unit.id, unit.attributes);
   if (parsed.kind === 'invalid') return false;
-  const resolved = await resolveFlags(runtimeOf(env, ctx), { id: parsed.id, attributes: parsed.attributes }, { kind: 'listed', keys: [parsedKey.value] });
+  const resolved = await resolveFlags(flagRuntime(env, ctx), { id: parsed.id, attributes: parsed.attributes }, { kind: 'listed', keys: [parsedKey.value] });
   if (resolved.kind === 'unavailable') return false;
   const evaluation = resolved.evaluations[0];
   return evaluation ? isEnabledVariant(evaluation.variant) : false;
 }
 
-export async function usageNote(env: FlagCacheEnv, ctx: { exports?: { FlagsCache?: FlagsCacheBinding }; tracing?: TracingLike | null } | undefined, unitHeader: HeaderField): Promise<string | null> {
+export async function usageNote(env: FlagCacheEnv, ctx: unknown, unitHeader: HeaderField): Promise<string | null> {
   const id = unitHeader.kind === 'present' && unitHeader.value.length > 0 ? unitHeader.value : 'anonymous';
   const on = await isEnabled(env, ctx, USAGE_NOTE_FLAG, { id, attributes: { kind: 'absent' } });
   return on ? USAGE_NOTE_LINE : null;

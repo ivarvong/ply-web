@@ -1,6 +1,7 @@
 // Authenticated caller of FlagControl. ply's /v1/flags stays read-only.
 // This module is the operator Worker's fetch handler and the CLI's command parser.
 // It does not read the token file and it does not deploy.
+import { atIndex, chainGet, fromNullable } from '../absent.ts';
 import { headerNumber, parseBearer, readHeader } from '../http/inbound.ts';
 import { err, isUnexpected, ok, runRequest, type Result, type UnexpectedFailure } from '../http/machine.ts';
 import { roundMs, type Clock } from './clock.ts';
@@ -71,8 +72,8 @@ export type FlagControlBinding = {
 };
 
 export type OperatorEnv = {
-  FLAG_OPERATOR_TOKEN?: string;
-  FLAG_CONTROL?: FlagControlBinding;
+  FLAG_OPERATOR_TOKEN: string | null;
+  FLAG_CONTROL: FlagControlBinding | null;
 };
 
 export type OperatorDeps = {
@@ -129,7 +130,7 @@ function timingSafeEqual(left: ArrayBuffer, right: ArrayBuffer): boolean {
   const b = new Uint8Array(right);
   if (a.length !== b.length) return false;
   let diff = 0;
-  for (let i = 0; i < a.length; i += 1) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+  for (let i = 0; i < a.length; i += 1) diff |= a[i] ^ b[i];
   return diff === 0;
 }
 
@@ -169,7 +170,7 @@ function reject(
 ): Outcome {
   const body = result === 'unauthorized'
     ? { kind: 'unauthorized' as const }
-    : { kind: result, reason: reason ?? 'rejected' };
+    : { kind: result, reason: reason === null ? 'rejected' : reason };
   return { status, body, sample: sample(op, result, flag, expected, null, null) };
 }
 
@@ -307,7 +308,7 @@ function unexpectedOutcome(): Outcome {
   };
 }
 
-async function postRollout(request: Request, control: FlagControlBinding | undefined): Promise<Outcome> {
+async function postRollout(request: Request, control: FlagControlBinding | null): Promise<Outcome> {
   const body = await readJson(request);
   if (body.kind === 'invalid') return reject(HTTP_BAD_REQUEST, 'bad_request', body.reason, 'setRollout', null, null);
   if (!exactKeys(body.value, ['flag', 'basisPoints', 'expected'])) {
@@ -328,7 +329,7 @@ async function postRollout(request: Request, control: FlagControlBinding | undef
   return fromWrite('setRollout', flag, expected, await control.setRollout(flag, basisPoints, rpcRevision(expected)));
 }
 
-async function postTargeting(request: Request, control: FlagControlBinding | undefined): Promise<Outcome> {
+async function postTargeting(request: Request, control: FlagControlBinding | null): Promise<Outcome> {
   const body = await readJson(request);
   if (body.kind === 'invalid') return reject(HTTP_BAD_REQUEST, 'bad_request', body.reason, 'setTargeting', null, null);
   if (!exactKeys(body.value, ['flag', 'targeting', 'expected'])) {
@@ -359,14 +360,24 @@ function operatorLog(entry: OperatorSample): string {
   });
 }
 
+/** A null span or a null method skips. A present method keeps the span as receiver and may throw. */
+function setAttribute(span: SpanLike | null, key: string, value: string | number | boolean): void {
+  const host = fromNullable(span);
+  if (host.tag === 'none') return;
+  const method = chainGet(host.value, 'setAttribute');
+  if (method.tag === 'none') return;
+  const fn = method.value as (name: string, attr: string | number | boolean) => unknown;
+  fn.apply(host.value, [key, value]);
+}
+
 function writeTelemetry(span: SpanLike | null, entry: OperatorSample, log: (line: string) => void): void {
-  span?.setAttribute?.('flags.op', entry.op);
-  span?.setAttribute?.('flags.result', entry.result);
-  span?.setAttribute?.('flags.operator_ms', entry.ms);
-  if (entry.flag !== null) span?.setAttribute?.('flags.key', entry.flag);
-  if (entry.expected !== null) span?.setAttribute?.('flags.expected', entry.expected);
-  if (entry.revision !== null) span?.setAttribute?.('flags.revision', entry.revision);
-  if (entry.invalidated !== null) span?.setAttribute?.('flags.invalidated', entry.invalidated);
+  setAttribute(span, 'flags.op', entry.op);
+  setAttribute(span, 'flags.result', entry.result);
+  setAttribute(span, 'flags.operator_ms', entry.ms);
+  if (entry.flag !== null) setAttribute(span, 'flags.key', entry.flag);
+  if (entry.expected !== null) setAttribute(span, 'flags.expected', entry.expected);
+  if (entry.revision !== null) setAttribute(span, 'flags.revision', entry.revision);
+  if (entry.invalidated !== null) setAttribute(span, 'flags.invalidated', entry.invalidated);
   log(operatorLog(entry));
 }
 
@@ -407,9 +418,9 @@ function isOption(arg: string): arg is typeof CLI_OPTIONS[number] {
 function option(argv: readonly string[], name: string): { readonly kind: 'missing' } | { readonly kind: 'ok'; readonly value: string } | { readonly kind: 'invalid' } {
   const index = argv.indexOf(name);
   if (index < 0) return { kind: 'missing' };
-  const value = argv[index + 1];
-  if (value === undefined || value.startsWith('--')) return { kind: 'invalid' };
-  return { kind: 'ok', value };
+  const value = atIndex(argv, index + 1);
+  if (value.tag === 'none' || value.value.startsWith('--')) return { kind: 'invalid' };
+  return { kind: 'ok', value: value.value };
 }
 
 function flagKey(value: string): string | null {
@@ -439,13 +450,13 @@ function unknownOption(argv: readonly string[]): string | null {
 function positionals(argv: readonly string[]): string[] {
   const out: string[] = [];
   for (let index = 0; index < argv.length; index++) {
-    const arg = argv[index];
-    if (arg === undefined) continue;
-    if (isOption(arg)) {
+    const arg = atIndex(argv, index);
+    if (arg.tag === 'none') continue;
+    if (isOption(arg.value)) {
       index += 1;
       continue;
     }
-    if (!arg.startsWith('--')) out.push(arg);
+    if (!arg.value.startsWith('--')) out.push(arg.value);
   }
   return out;
 }
@@ -511,23 +522,23 @@ export function parseFlagArgs(argv: readonly string[]): ParsedFlags {
     return { kind: 'command', url, command: { kind: 'getConfig' } };
   }
   if (name === 'rollout') {
-    const flag = rest[0];
-    const points = rest[1];
-    if (rest.length !== 2 || flag === undefined || points === undefined) {
+    const flag = atIndex(rest, 0);
+    const points = atIndex(rest, 1);
+    if (rest.length !== 2 || flag.tag === 'none' || points.tag === 'none') {
       return { kind: 'error', reason: 'rollout needs <flag> <basisPoints>' };
     }
-    if (!flagKey(flag)) return { kind: 'error', reason: 'flag key must match ^[a-z][a-z0-9._-]{0,63}$' };
-    const basisPoints = basisArg(points);
+    if (!flagKey(flag.value)) return { kind: 'error', reason: 'flag key must match ^[a-z][a-z0-9._-]{0,63}$' };
+    const basisPoints = basisArg(points.value);
     if (basisPoints === null) return { kind: 'error', reason: `basisPoints is an integer from 0 to ${BASIS_POINTS}` };
     const expected = expectedArg(argv);
     if (expected.kind === 'missing') return { kind: 'error', reason: '--expected is required (absent, or the revision from get)' };
     if (expected.kind === 'invalid') return { kind: 'error', reason: expected.reason };
-    return { kind: 'command', url, command: { kind: 'setRollout', flag, basisPoints, expected } };
+    return { kind: 'command', url, command: { kind: 'setRollout', flag: flag.value, basisPoints, expected } };
   }
   if (name === 'targeting') {
-    const flag = rest[0];
-    if (rest.length !== 1 || flag === undefined) return { kind: 'error', reason: 'targeting needs <flag>' };
-    if (!flagKey(flag)) return { kind: 'error', reason: 'flag key must match ^[a-z][a-z0-9._-]{0,63}$' };
+    const flag = atIndex(rest, 0);
+    if (rest.length !== 1 || flag.tag === 'none') return { kind: 'error', reason: 'targeting needs <flag>' };
+    if (!flagKey(flag.value)) return { kind: 'error', reason: 'flag key must match ^[a-z][a-z0-9._-]{0,63}$' };
     const expected = expectedArg(argv);
     if (expected.kind === 'missing') return { kind: 'error', reason: '--expected is required (absent, or the revision from get)' };
     if (expected.kind === 'invalid') return { kind: 'error', reason: expected.reason };
@@ -551,7 +562,7 @@ export function parseFlagArgs(argv: readonly string[]): ParsedFlags {
       rules,
     });
     if (isInvalidTargeting(targeting)) return { kind: 'error', reason: targeting.reason };
-    return { kind: 'command', url, command: { kind: 'setTargeting', flag, targeting, expected } };
+    return { kind: 'command', url, command: { kind: 'setTargeting', flag: flag.value, targeting, expected } };
   }
   return { kind: 'error', reason: 'usage: flags get | rollout <flag> <basisPoints> --expected absent|<revision> | targeting <flag> --expected absent|<revision>' };
 }
