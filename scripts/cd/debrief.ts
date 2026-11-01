@@ -43,6 +43,8 @@ function summarize(event: CdEvent): string {
     return `traffic → ${after || 'empty'}`
   }
   if (event.kind === 'request') return `${event.payload.method} ${event.payload.status} ${event.payload.version ?? '-'} ${event.payload.latencyMs}ms`
+  if (event.kind === 'annotation') return `${event.payload.note}: ${event.payload.reason}`
+  if (event.kind === 'policy') return `policy ${event.payload.sha256.slice(0, 12)}`
   return event.payload.message
 }
 
@@ -65,7 +67,7 @@ export function canarySplit(events: readonly CdEvent[]): { readonly percent: num
   const seenAt = new Map<number, number>()
   for (const step of rampSteps(events)) {
     const percent = num(step.percent)
-    const seen = num(step.observedPercent)
+    const seen = num(step.routedNewShare) ?? num(step.observedPercent)
     if (percent !== null && seen !== null) seenAt.set(percent, seen)
   }
   return changes.flatMap(event => {
@@ -76,6 +78,32 @@ export function canarySplit(events: readonly CdEvent[]): { readonly percent: num
     const percent = share?.percentage ?? 0
     return [{ percent, seen: seenAt.get(percent) ?? 0 }]
   })
+}
+
+function jsonObject(value: unknown): { readonly [key: string]: unknown } | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  return value as { readonly [key: string]: unknown }
+}
+
+function policyBurn(events: readonly CdEvent[]): number {
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]
+    if (!event || event.kind !== 'policy') continue
+    const burn = jsonObject(jsonObject(event.payload.body)?.burn)
+    const fast = burn?.fastBurn
+    if (typeof fast === 'number') return fast
+  }
+  return FAST_BURN
+}
+
+function latencyMode(events: readonly CdEvent[]): string | null {
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]
+    if (!event || event.kind !== 'policy') continue
+    const latency = jsonObject(jsonObject(jsonObject(event.payload.body)?.gates)?.latency)
+    return typeof latency?.mode === 'string' ? latency.mode : null
+  }
+  return null
 }
 
 function rampSteps(events: readonly CdEvent[]): Measurement[] {
@@ -102,6 +130,14 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
     lines.push('')
     lines.push(`Tools: node ${payload.tools.node}, ${payload.tools.cf}, ${payload.tools.git}.`)
     lines.push('')
+  }
+  const policies = events.filter(event => event.kind === 'policy')
+  if (policies.length > 0) {
+    lines.push('## Policy', '')
+    for (const event of policies) {
+      if (event.kind !== 'policy') continue
+      lines.push(`\`${event.payload.sha256}\``, '', event.payload.path, '', '```json', JSON.stringify(event.payload.body, null, 2), '```', '')
+    }
   }
   if (finished && finished.kind === 'lifecycle' && finished.payload.event === 'run_finished') {
     const payload = finished.payload
@@ -151,7 +187,7 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
     ]
     : [
       { name: 'cfg', rgb: [194, 65, 12], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.percent) ?? 0 })) },
-      { name: 'seen', rgb: [15, 118, 110], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.observedPercent) ?? 0 })) },
+      { name: 'seen', rgb: [15, 118, 110], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.routedNewShare) ?? num(step.observedPercent) ?? 0 })) },
     ]
   const latency: ChartSeries[] = [
     { name: 'new', rgb: [194, 65, 12], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.nextWallP99) ?? 0 })) },
@@ -169,15 +205,20 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
       y: burnsOf('burns' in step ? step.burns : undefined)[name] ?? 0,
     })),
   }))
+  const fastBurn = policyBurn(events)
+  const mode = latencyMode(events)
   await writeFile(join(outDir, 'split.png'), chartPng({ title: 'split percent', series: split }))
   await writeFile(join(outDir, 'latency.png'), chartPng({ title: 'wall p99 ms', series: latency }))
-  await writeFile(join(outDir, 'burn.png'), chartPng({ title: 'burn rate', series: burn, hLine: { y: FAST_BURN, rgb: [185, 28, 28] } }))
+  await writeFile(join(outDir, 'burn.png'), chartPng({ title: 'burn rate', series: burn, hLine: { y: fastBurn, rgb: [185, 28, 28] } }))
   lines.push('', '## Charts', '')
-  lines.push('Every state_change, including the 0% canary, against the share of requests the new version received at that percentage. Seen is 0 when that change was not a ramp step.', '')
-  lines.push('![Configured and observed split](split.png)', '')
-  lines.push('Wall-time p99, new version and old version. A carried old sample is the last step that still had one.', '')
+  lines.push('Every state_change, including the 0% canary, against `routedNewShare`: the percent of telemetry invocations the new version served. The band around that share is `toleranceLow`..`toleranceHigh` on the ramp observation. An older run stored `observedPercent` from pinned probes; that field is the fallback. Seen is 0 when that change was not a ramp step.', '')
+  lines.push('![Configured and routed split](split.png)', '')
+  const latencyCaption = mode
+    ? `Wall-time p99 and CPU p99 are recorded on each ramp observation. Latency mode for this run is ${mode}.`
+    : 'Wall-time p99, new version and old version. Informational unless a policy event sets latency to gate.'
+  lines.push(`${latencyCaption} A carried old sample is the last step that still had one.`, '')
   lines.push('![Latency by version](latency.png)', '')
-  lines.push(`Burn rate per SLO. The horizontal line is the fast-burn multiple ${FAST_BURN}. A null burn (no samples, or correctness on a ramp step) is drawn as 0.`, '')
+  lines.push(`Burn rate per SLO. The horizontal line is the fast-burn multiple ${fastBurn}. A null burn (no samples, or correctness on a ramp step) is drawn as 0.`, '')
   lines.push('![Burn rate per step](burn.png)', '')
   lines.push('## Raw files', '')
   lines.push(`- [events.jsonl](${link(outDir, join(runDir, 'events.jsonl'))})`)

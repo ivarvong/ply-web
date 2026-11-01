@@ -1,18 +1,21 @@
+import { spawnSync } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { PIN } from './bump-plan.ts'
 import { ROOT } from './cf.ts'
 import { loadConfig, publicConfig, type CdConfig } from './config.ts'
+import { splitPolicy } from './policy.ts'
 import { writeDebrief } from './debrief.ts'
 import { VERSION_ID } from './deploy-plan.ts'
-import { RunLog, withRun } from './log.ts'
+import { appendFalsePositive, RunLog, withRun } from './log.ts'
 import { runPipeline } from './pipeline.ts'
-import { checkNode } from './preflight.ts'
+import { binaryNodeVersion, checkNode, NODE_IMAGE_BIN, nodeSatisfies, pathWithNodeBin, selectNode } from './preflight.ts'
 import { errorMessage, run } from './proc.ts'
 import { unfinishedRunDir } from './reconcile.ts'
 import { reportLedger } from './report.ts'
-import { createRunDir, writeJson } from './run-dir.ts'
+import { createRunDir, RUN_ID, writeJson } from './run-dir.ts'
 import { stageBump } from './stage-bump.ts'
 import { stageDeploy } from './stage-deploy.ts'
 import { stageRamp } from './stage-ramp.ts'
@@ -32,6 +35,7 @@ export type Parsed =
   | { readonly kind: 'ramp'; readonly version: string; readonly previous: string | null; readonly verdict: string | null }
   | { readonly kind: 'rollback'; readonly to: string }
   | { readonly kind: 'report' }
+  | { readonly kind: 'annotate'; readonly runId: string; readonly reason: string }
   | { readonly kind: 'debrief'; readonly runDir: string }
   | { readonly kind: 'usage' }
   | { readonly kind: 'error'; readonly reason: string }
@@ -50,7 +54,13 @@ function uuid(value: string | null): string | null {
   return value
 }
 
-function parseCd(argv: readonly string[]): Parsed {
+/** `--no-bump` may name a sha only when that sha is already this checkout's ply pin. */
+export function noBumpSha(sha: string, pin: string | null): string | null {
+  if (sha === pin) return null
+  return '--no-bump deploys the checkout; --sha must equal the current pin'
+}
+
+function parseCd(argv: readonly string[], pin: string | null): Parsed {
   let sha: string | null = null
   let noBump = false
   for (let i = 0; i < argv.length; i++) {
@@ -70,15 +80,18 @@ function parseCd(argv: readonly string[]): Parsed {
     }
     return { kind: 'error', reason: arg.startsWith('--') ? `unknown option ${arg}` : `unknown command ${arg}` }
   }
-  if (noBump && sha) return { kind: 'error', reason: '--no-bump deploys the checkout; it does not take --sha' }
+  if (noBump && sha) {
+    const mismatch = noBumpSha(sha, pin)
+    if (mismatch) return { kind: 'error', reason: mismatch }
+  }
   return { kind: 'cd', sha, noBump }
 }
 
-export function parseArgs(argv: readonly string[]): Parsed {
+export function parseArgs(argv: readonly string[], pin: string | null = null): Parsed {
   const [command, ...rest] = argv
   if (command === 'help' || command === '--help' || command === '-h') return { kind: 'usage' }
   if (!command || command === 'cd' || command.startsWith('--')) {
-    return parseCd(command === 'cd' ? rest : argv)
+    return parseCd(command === 'cd' ? rest : argv, pin)
   }
   if (command === 'bump') {
     const sha = flag(rest, 'sha')
@@ -113,6 +126,15 @@ export function parseArgs(argv: readonly string[]): Parsed {
     return { kind: 'rollback', to }
   }
   if (command === 'report') return { kind: 'report' }
+  if (command === 'annotate') {
+    const runId = rest[0]
+    if (!runId || runId.startsWith('--')) return { kind: 'error', reason: 'annotate needs a run id' }
+    if (!RUN_ID.test(runId)) return { kind: 'error', reason: 'run id must look like 2026-11-01T00-10-02-620Z' }
+    const reason = flag(rest, 'false-positive')
+    if (reason === null) return { kind: 'error', reason: 'annotate needs --false-positive "reason"' }
+    if (!reason.trim() || /[\n\r]/.test(reason)) return { kind: 'error', reason: 'false-positive reason must be one line' }
+    return { kind: 'annotate', runId, reason: reason.trim() }
+  }
   if (command === 'debrief') {
     const runDir = rest[0]
     if (!runDir || runDir.startsWith('--')) return { kind: 'error', reason: 'debrief needs a run directory' }
@@ -123,7 +145,7 @@ export function parseArgs(argv: readonly string[]): Parsed {
 
 export function usageText(): string {
   return [
-    'usage: npm run cd -- [command]',
+    'usage: npm run cd -- [--policy <path>] [command]',
     '  cd [--sha <40 hex>] [--no-bump]',
     '  [--sha <40 hex>] [--no-bump]',
     '  bump [--sha <40 hex>]',
@@ -133,6 +155,7 @@ export function usageText(): string {
     '  ramp --version <id> [--previous <id>] [--verdict telemetry.json]',
     '  rollback --to <id>',
     '  report',
+    '  annotate <run-id> --false-positive "reason"',
     '  debrief <run-dir>',
   ].join('\n')
 }
@@ -166,21 +189,58 @@ async function identity(config: CdConfig) {
   }
 }
 
+async function checkoutPlyPin(): Promise<string | null> {
+  try {
+    const pkg = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8')) as { dependencies?: { ply?: string } }
+    return PIN.exec(pkg.dependencies?.ply ?? '')?.[1] ?? null
+  } catch {
+    return null
+  }
+}
+
+/** Leave the process on a Node that satisfies `package.json` engines when this one does not. */
+function reexecNode(): number | null {
+  if (process.env.PLY_CD_NODE_REEXEC === '1' || nodeSatisfies(process.version)) return null
+  const candidates = []
+  const preferred = process.env.PLY_NODE
+  if (preferred) candidates.push({ bin: preferred, version: binaryNodeVersion(preferred) })
+  candidates.push({ bin: NODE_IMAGE_BIN, version: binaryNodeVersion(NODE_IMAGE_BIN) })
+  const better = selectNode(process.version, candidates)
+  if (!better) return null
+  const child = spawnSync(better, [...process.execArgv, ...process.argv.slice(1)], {
+    stdio: 'inherit',
+    env: { ...process.env, PLY_CD_NODE_REEXEC: '1', PATH: pathWithNodeBin(better, process.env.PATH) },
+  })
+  return child.status === null ? 1 : child.status
+}
+
 export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: (line: string) => void = console.log): Promise<number> {
+  const switched = reexecNode()
+  if (switched !== null) return switched
   const nodeError = checkNode(process.version)
   if (nodeError) return finish(log, 1, `cd: harness_fault preflight: ${nodeError}`)
-  const parsed = parseArgs(argv)
+  const split = splitPolicy(argv)
+  if ('error' in split) return finish(log, 2, split.error)
+  const parsed = parseArgs(split.argv, await checkoutPlyPin())
   if (parsed.kind === 'usage') return finish(log, 2, usageText())
   if (parsed.kind === 'error') return finish(log, 2, parsed.reason)
   let config: CdConfig
   try {
-    config = loadConfig(env)
+    config = loadConfig(env, split.policyPath ?? undefined)
   } catch (error) {
     return finish(log, 2, errorMessage(error))
   }
   if (parsed.kind === 'report') {
     log(await reportLedger(config.ledgerPath))
     return 0
+  }
+  if (parsed.kind === 'annotate') {
+    try {
+      await appendFalsePositive(config.ledgerPath, parsed.runId, parsed.reason)
+      return finish(log, 0, `annotated ${parsed.runId} as a false positive`)
+    } catch (error) {
+      return finish(log, 1, `cd: FAIL annotate: ${errorMessage(error)}`)
+    }
   }
   if (parsed.kind === 'debrief') {
     try {
@@ -193,7 +253,6 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
   const needsToken = parsed.kind === 'cd' || parsed.kind === 'smoke' || parsed.kind === 'ramp'
   let token = ''
   if (needsToken) {
-    if (!config.tokenFile) return finish(log, 1, 'cd: harness_fault preflight: PLY_TOKEN_FILE is not set')
     try {
       token = await readTokenFile(config.tokenFile)
     } catch (error) {
@@ -220,6 +279,7 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
         const recorded = resumeSha ? { ...started, config: { ...started.config, sha: resumeSha } } : started
         await runLog.started(recorded)
       }
+      await runLog.recordPolicy({ sha256: config.policySha256, path: config.policyPath, body: config.policyBody })
       const outcome = await dispatch(parsed, config, token, runDir, runLog, log)
       code = outcome.code
       reason = outcome.reason
@@ -240,7 +300,7 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
 type Outcome = { readonly code: number; readonly reason: string | null }
 
 async function dispatch(
-  parsed: Exclude<Parsed, { kind: 'usage' | 'error' | 'report' | 'debrief' }>,
+  parsed: Exclude<Parsed, { kind: 'usage' | 'error' | 'report' | 'debrief' | 'annotate' }>,
   config: CdConfig,
   token: string,
   runDir: string,
@@ -305,7 +365,7 @@ async function dispatch(
     }
     const result = await stageTelemetry(config, { version: parsed.version, since, reportPath: parsed.report, runDir, live: false })
     if (result.kind === 'fail') {
-      const line = `cd: FAIL telemetry: ${result.reason}`
+      const line = `cd: ${result.fault === 'worker' ? 'FAIL' : result.fault} telemetry: ${result.reason}`
       log(line)
       return { code: 1, reason: line }
     }
@@ -323,7 +383,7 @@ async function dispatch(
       log,
     })
     if (result.kind === 'fail') {
-      const line = `cd: FAIL ramp: ${result.reason}`
+      const line = `cd: ${result.fault === 'worker' ? 'FAIL' : result.fault} ramp: ${result.reason}`
       log(line)
       return { code: 1, reason: line }
     }

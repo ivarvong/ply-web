@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { classifyCall, EXPIRED_TOKEN, type CallEvidence } from '../scripts/cd/classify.ts'
+import { classifyCall, EXPIRED_TOKEN, openingRevokeResult, type CallEvidence } from '../scripts/cd/classify.ts'
 
 function evidence(over: Partial<CallEvidence> = {}): CallEvidence {
   return { status: 500, body: '', timedOut: false, mintedToken: false, ...over }
@@ -18,6 +18,15 @@ test('a 403 on a token minted this stage is a harness fault', () => {
     mintedToken: true,
     body: `{"detail":"${EXPIRED_TOKEN}"}`,
   })), 'harness_fault')
+})
+
+test('the repo-create token is confirmed only after a 403', () => {
+  assert.deepEqual(openingRevokeResult({ hadToken: true, listed: 1, revoked: true, confirmed: true }), { ok: true })
+  assert.equal(openingRevokeResult({ hadToken: false, listed: 1, revoked: true, confirmed: true }).ok, false)
+  assert.equal(openingRevokeResult({ hadToken: true, listed: 0, revoked: false, confirmed: false }).ok, false)
+  const refused = openingRevokeResult({ hadToken: true, listed: 1, revoked: true, confirmed: false })
+  assert.equal(refused.ok, false)
+  if (!refused.ok) assert.match(refused.reason, /not revoked/)
 })
 
 test('a worker answer stays a worker fault', () => {

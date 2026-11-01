@@ -58,26 +58,72 @@ function stamp(value: string | null): number | null {
   return Number.isFinite(parsed) ? parsed : null
 }
 
+type Aside = 'aborted' | 'held' | 'harness_fault'
+
+export type FalsePositive = {
+  readonly runId: string
+  readonly reason: string
+}
+
+/** The latest false-positive note for each run. An annotation does not delete the run_finished line. */
+export function falsePositives(events: readonly CdEvent[]): FalsePositive[] {
+  const notes = new Map<string, string>()
+  for (const event of events) {
+    if (event.kind !== 'annotation' || event.payload.note !== 'false_positive') continue
+    notes.set(event.run_id, event.payload.reason)
+  }
+  return [...notes].map(([runId, reason]) => ({ runId, reason }))
+}
+
+/** A deploy reached 100% and was not a harness fault. Aborted, held, and harness_fault runs are not deploys. */
+function isDeploy(run: FinishedRun): boolean {
+  return run.liveAt !== null && run.fault !== 'harness_fault'
+}
+
+function asideOf(run: FinishedRun): Aside {
+  if (run.fault === 'harness_fault') return 'harness_fault'
+  if (run.fault === 'state_conflict' || (run.verdict === 'fail' && !run.rolledBack)) return 'held'
+  return 'aborted'
+}
+
 /**
  * DORA figures from run_finished events.
+ * A deploy reached 100% (`liveAt`) and is not a harness_fault. Aborted, held, and
+ * harness_fault runs are counted separately and are not deploys.
  * Frequency is deploys / days between the first and last deploy. One timestamp has no rate.
  * Lead time is plyMergedAt → liveAt on a passing deploy.
- * Change failure is rollbacks / deploys, excluding a harness_fault. That is a script,
- * cf, parse, or preflight error, not a bad version.
- * Time to restore is failedAt → restoredAt.
+ * Change failure is rollbacks / deploys. A run annotated as a false positive is in neither number.
+ * Time to restore is failedAt → restoredAt on a rolled-back deploy.
  */
 export function doraText(events: readonly CdEvent[]): string {
+  const notes = falsePositives(events)
+  const annotated = new Set(notes.map(note => note.runId))
   const finished = finishedRuns(events)
-  if (finished.length === 0) return 'no run_finished events in the ledger\n'
-  const deploys = finished.filter(run => run.versionId !== null)
-  const lines = [`runs: ${finished.length}`, `deploys: ${deploys.length}`]
+  if (finished.length === 0 && notes.length === 0) return 'no run_finished events in the ledger\n'
+  const counted = finished.filter(run => !annotated.has(run.runId))
+  const fpRuns = finished.filter(run => annotated.has(run.runId))
+  const deploys = counted.filter(isDeploy)
+  const aside = counted.filter(run => !isDeploy(run))
+  const asideCount = (kind: Aside) => aside.filter(run => asideOf(run) === kind).length
+  const lines = [
+    `runs: ${finished.length}`,
+    `deploys: ${deploys.length}`,
+    `excluded from deploys: ${aside.length + fpRuns.length}`,
+    `  aborted: ${asideCount('aborted')}`,
+    `  held: ${asideCount('held')}`,
+    `  harness_fault: ${asideCount('harness_fault')}`,
+    `  false_positive: ${fpRuns.length}`,
+    `false positives: ${notes.length}`,
+  ]
+  for (const note of notes) lines.push(`  ${note.runId}: ${note.reason}`)
+  if (notes.length > 0) lines.push('  excluded from deploys and from change failure rate')
   const times = deploys.map(run => stamp(run.at)).filter((value): value is number => value !== null).sort((a, b) => a - b)
   const first = times[0]
   const last = times[times.length - 1]
   if (deploys.length >= 2 && first !== undefined && last !== undefined && last > first) {
     const days = (last - first) / 86_400_000
     lines.push(`deployment frequency: ${(deploys.length / days).toFixed(3)} / day`)
-    lines.push(`  ${deploys.length} deploys / ${days.toFixed(2)} days between the first and last run_finished`)
+    lines.push(`  ${deploys.length} deploys / ${days.toFixed(2)} days between the first and last deploy that reached 100%`)
   } else {
     lines.push('deployment frequency: -')
     lines.push('  needs two deploys with different timestamps')
@@ -91,11 +137,10 @@ export function doraText(events: readonly CdEvent[]): string {
   })
   lines.push(`lead time p50: ${seconds(quantile(leads, 0.5))}  p90: ${seconds(quantile(leads, 0.9))}`)
   lines.push(`  ply merge → 100% live, ${leads.length} passing deploy${leads.length === 1 ? '' : 's'} with both timestamps`)
-  const counted = deploys.filter(run => run.fault !== 'harness_fault')
-  const failed = counted.filter(run => run.rolledBack).length
-  const rate = counted.length === 0 ? 0 : failed / counted.length
+  const failed = deploys.filter(run => run.rolledBack).length
+  const rate = deploys.length === 0 ? 0 : failed / deploys.length
   lines.push(`change failure rate: ${rate.toFixed(3)}`)
-  lines.push(`  ${failed} rollbacks / ${counted.length} deploys`)
+  lines.push(`  ${failed} rollbacks / ${deploys.length} deploys`)
   const restores = deploys.flatMap(run => {
     if (!run.rolledBack) return []
     const from = stamp(run.failedAt)

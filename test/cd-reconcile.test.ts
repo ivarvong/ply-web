@@ -5,12 +5,13 @@ import { basename, join } from 'node:path'
 import { test } from 'node:test'
 import { sameSplit, type VersionShare } from '../scripts/cd/deploy-plan.ts'
 import { readEvents, RunLog } from '../scripts/cd/log.ts'
+import { DEFAULT_POLICY_PATH, loadPolicy } from '../scripts/cd/policy.ts'
 import { liveSmokeAlreadyPassed, reconcile, unfinishedRunDir, type Reconcile } from '../scripts/cd/reconcile.ts'
 
 const SHA = '1274f2dd05b83d70f8d421cdcc79628692d848df'
 const NEXT = '8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e'
 const PREVIOUS = '1aa0bb11-2222-4333-8444-555566667777'
-const PERCENTS = [1, 5, 10, 25, 50, 75, 100]
+const PERCENTS = loadPolicy(DEFAULT_POLICY_PATH).policy.steps.map(step => step.percent)
 const REFUSAL = 'deployment is not a canary, a ramp step, or live for this sha'
 
 type Row = {

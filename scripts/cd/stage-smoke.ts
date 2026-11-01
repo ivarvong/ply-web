@@ -1,18 +1,19 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { REPO_PREFIX, SMOKE_HTTP_MS, STALE_REPO_MS, TOKEN_TTL_SECONDS } from './baseline.ts'
+import { REPO_PREFIX, REVOKE_ATTEMPTS, REVOKE_PROBE_MS, REVOKE_WAIT_MS, SMOKE_HTTP_MS, STALE_REPO_MS, TOKEN_TTL_SECONDS } from './baseline.ts'
 import { cfOk, runCf } from './cf.ts'
-import { classifyCall, type FailureClass } from './classify.ts'
+import { artifactsProbeUrl, classifyCall, openingRevokeResult, revokeConfirmed, type FailureClass } from './classify.ts'
 import { csvDocument, type CsvRow } from './csv.ts'
 import { asRecord, extractJson } from './json.ts'
 import { judgeCall, type Saved } from './judge.ts'
 import { expectedStatus, lifecycle, type HttpStep } from './lifecycle.ts'
 import { activeLog } from './log.ts'
 import { errorMessage, run } from './proc.ts'
-import { harvestSecrets, redact } from './redact.ts'
+import { createdTokenSecret, harvestSecrets, redact } from './redact.ts'
 import { judgeFsck, judgeRefs, parseShowRef, type ApiRefs } from './refs.ts'
 import { fail, pass, type StageResult } from './result.ts'
+import type { Secret } from './secret.ts'
 import { writeJson, writeText } from './run-dir.ts'
 import { CORRECTNESS } from './slo.ts'
 import type { SmokeRequest } from './telemetry.ts'
@@ -84,11 +85,47 @@ async function cfJson(args: readonly string[], secrets: readonly string[]): Prom
   return extractJson(stdout)
 }
 
+/** After revoke, the minted bearer must be refused. The token is sent and never recorded. */
+async function proveRevoked(remote: string, secret: Secret): Promise<boolean> {
+  const url = artifactsProbeUrl(remote)
+  const started = Date.now()
+  let status = 0
+  let cfRay: string | null = null
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { authorization: `Bearer ${secret.reveal()}` },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(REVOKE_PROBE_MS),
+    })
+    status = response.status
+    cfRay = header(response, 'cf-ray')
+    try {
+      await response.body?.cancel()
+    } catch {
+      // The status is what the check records. The body is not.
+    }
+  } catch {
+    status = 0
+  }
+  await activeLog()?.request({
+    method: 'GET',
+    url,
+    status,
+    version: null,
+    latencyMs: Date.now() - started,
+    cfRay,
+    requestId: null,
+    artifactsRay: null,
+  })
+  return revokeConfirmed(status)
+}
+
 async function revoke(config: CdConfig, id: string, secrets: readonly string[]): Promise<boolean> {
-  for (let attempt = 0; attempt < 5; attempt++) {
+  for (let attempt = 0; attempt < REVOKE_ATTEMPTS; attempt++) {
     const result = await runCf(['artifacts', 'namespaces', 'tokens', 'revoke', id, '--namespace', config.namespace, '--force'], secrets)
     if (result.code === 0) return true
-    await new Promise(resolve => setTimeout(resolve, 1_000))
+    await new Promise(resolve => setTimeout(resolve, REVOKE_WAIT_MS))
   }
   return false
 }
@@ -241,7 +278,7 @@ async function oneCall(
     judgementDetail: detail,
     ok: judgement.kind === 'ok',
     save: judgement.kind === 'ok' ? judgement.save : {},
-    request: requestId ? { id: requestId, version: seen, step: step.name, status: response.status, expected: [expectedStatus(step)] } : null,
+    request: requestId ? { id: requestId, version: seen, step: step.name, status: response.status, expected: [expectedStatus(step)], ray: header(response, 'cf-ray') } : null,
     refs,
     fault: judgement.kind === 'ok' ? null : classifyCall({
       status: response.status,
@@ -298,6 +335,7 @@ export async function stageSmoke(
   let gitToken = ''
   let remote = ''
   const minted: string[] = []
+  let mintedToken: { readonly id: string; readonly secret: Secret } | null = null
   let deleted = false
   const rows: CsvRow[] = []
   const requests: SmokeRequest[] = []
@@ -311,43 +349,62 @@ export async function stageSmoke(
       'artifacts', 'namespaces', 'repos', 'create', config.namespace,
       '--name', name, '--default-branch', 'main', '--description', 'ply-web operator smoke (deleted after a pass)',
     ], secrets)
-    remember(created, secrets)
+    const found = remember(created, secrets)
+    const auto = createdTokenSecret(created, found)
     remote = findRemote(created) ?? ''
     if (!REMOTE.test(remote)) throw new Error('cf did not return an Artifacts remote')
-    for (const id of await listTokenIds(config, name, secrets)) {
-      await revoke(config, id, secrets)
+    const opening = await listTokenIds(config, name, secrets)
+    let revoked = opening.length > 0
+    for (const id of opening) {
+      if (!(await revoke(config, id, secrets))) revoked = false
     }
-    const mintedJson = await cfJson([
-      'artifacts', 'namespaces', 'tokens', 'create', config.namespace,
-      '--repo', name, '--scope', 'write', '--ttl', String(TOKEN_TTL_SECONDS),
-    ], secrets)
-    const found = remember(mintedJson, secrets)
-    const rec = asRecord(mintedJson)
-    if (typeof rec?.id === 'string') minted.push(rec.id)
-    const plain = typeof rec?.plaintext === 'string' ? rec.plaintext : ''
-    const writeToken = found.find(secret => secret.reveal() === plain)
-    if (!writeToken) throw new Error('cf returned no write token')
-    gitToken = writeToken.reveal()
-    for (const step of lifecycle()) {
-      const result = await oneCall(config, step, saved, remote, opts.token, gitToken, opts.version, opts.pin)
-      rows.push(result.row)
-      if (result.request) requests.push(result.request)
-      if (!result.ok) {
-        detail = `${step.name}: ${result.judgementDetail}`
-        harness = result.fault === 'harness_fault'
-        break
+    let confirmed = false
+    if (auto && revoked) confirmed = await proveRevoked(remote, auto)
+    const openingResult = openingRevokeResult({
+      hadToken: auto !== null,
+      listed: opening.length,
+      revoked,
+      confirmed,
+    })
+    if (!openingResult.ok) {
+      detail = `${openingResult.reason} for ${name}`
+      harness = true
+    } else {
+      const mintedJson = await cfJson([
+        'artifacts', 'namespaces', 'tokens', 'create', config.namespace,
+        '--repo', name, '--scope', 'write', '--ttl', String(TOKEN_TTL_SECONDS),
+      ], secrets)
+      const mintedSecrets = remember(mintedJson, secrets)
+      const rec = asRecord(mintedJson)
+      const plain = typeof rec?.plaintext === 'string' ? rec.plaintext : ''
+      const writeToken = mintedSecrets.find(secret => secret.reveal() === plain)
+      if (!writeToken) throw new Error('cf returned no write token')
+      gitToken = writeToken.reveal()
+      if (typeof rec?.id === 'string') {
+        minted.push(rec.id)
+        mintedToken = { id: rec.id, secret: writeToken }
       }
-      saved = { ...saved, ...result.save }
-      if (result.refs) refs = result.refs
-    }
-    if (detail === 'ok') {
-      if (!refs) detail = 'refs-final did not return a ref map'
-      else {
-        const gitDetail = await judgeMirror(remote, gitToken, refs)
-        if (gitDetail) detail = gitDetail
+      for (const step of lifecycle()) {
+        const result = await oneCall(config, step, saved, remote, opts.token, gitToken, opts.version, opts.pin)
+        rows.push(result.row)
+        if (result.request) requests.push(result.request)
+        if (!result.ok) {
+          detail = `${step.name}: ${result.judgementDetail}`
+          harness = result.fault === 'harness_fault'
+          break
+        }
+        saved = { ...saved, ...result.save }
+        if (result.refs) refs = result.refs
       }
+      if (detail === 'ok') {
+        if (!refs) detail = 'refs-final did not return a ref map'
+        else {
+          const gitDetail = await judgeMirror(remote, gitToken, refs)
+          if (gitDetail) detail = gitDetail
+        }
+      }
+      passed = detail === 'ok'
     }
-    passed = detail === 'ok'
   } catch (error) {
     detail = redact(errorMessage(error), secrets)
     harness = true
@@ -356,7 +413,13 @@ export async function stageSmoke(
     const pending = [...new Set([...minted, ...await listTokenIds(config, name, secrets)])]
     const stuck = []
     for (const id of pending) {
-      if (!(await revoke(config, id, secrets))) stuck.push(id)
+      if (!(await revoke(config, id, secrets))) {
+        stuck.push(id)
+        continue
+      }
+      if (mintedToken && mintedToken.id === id && REMOTE.test(remote) && !(await proveRevoked(remote, mintedToken.secret))) {
+        stuck.push(id)
+      }
     }
     if (passed && stuck.length > 0) {
       detail = `smoke passed but a token for ${name} was not revoked`
@@ -389,13 +452,15 @@ export async function stageSmoke(
       to: Date.now(),
       raw: JSON.stringify({ detail, requests: requests.length, repo: name, deleted }),
     })
+    const informationalSmoke = !passed && !harness && config.policy.gates.smoke === 'informational'
     await runLog.decision({
       inputs: [ref],
       rules: [{ name: 'correctness.target', value: CORRECTNESS.target }],
-      outcome: passed ? 'advance' : harness ? 'harness_fault' : 'stop',
-      reason: detail,
+      outcome: passed || informationalSmoke ? 'advance' : harness ? 'harness_fault' : 'stop',
+      reason: informationalSmoke ? `informational: ${detail}` : detail,
     })
   }
-  if (!passed) return fail('smoke', `${detail}; repo ${deleted ? 'deleted' : name}`, false, harness ? 'harness_fault' : 'worker')
+  const smokeHard = config.policy.gates.smoke === 'hard'
+  if (!passed && (harness || smokeHard)) return fail('smoke', `${detail}; repo ${deleted ? 'deleted' : name}`, false, harness ? 'harness_fault' : 'worker')
   return pass('smoke', report)
 }

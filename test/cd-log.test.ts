@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -8,8 +8,8 @@ import { chartPng } from '../scripts/cd/charts.ts'
 import { cfWorkdir } from '../scripts/cd/cf.ts'
 import { canarySplit, writeDebrief } from '../scripts/cd/debrief.ts'
 import { fullSplit, isTrafficSplit, trafficSplit } from '../scripts/cd/deploy-plan.ts'
-import { parseEvent, readEvents, RunLog, validateRun, type CdEvent } from '../scripts/cd/log.ts'
-import { harvestSecrets } from '../scripts/cd/redact.ts'
+import { appendFalsePositive, parseEvent, readEvents, RunLog, validateRun, type CdEvent } from '../scripts/cd/log.ts'
+import { createdTokenSecret, harvestSecrets } from '../scripts/cd/redact.ts'
 import { checkNode } from '../scripts/cd/preflight.ts'
 import { doraText } from '../scripts/cd/report.ts'
 import { Secret } from '../scripts/cd/secret.ts'
@@ -30,12 +30,14 @@ test('cf runs from the repo directory', () => {
   assert.equal(existsSync(join(cwd, 'scripts', 'cd', 'cf.ts')), true)
 })
 
-test('node preflight names 22.18', () => {
-  assert.equal(checkNode('v22.18.0'), null)
+test('node preflight follows package.json engines', () => {
+  assert.equal(checkNode('v22.23.0'), null)
   assert.equal(checkNode('v22.23.4'), null)
-  assert.equal(checkNode('v24.0.0'), null)
-  assert.match(checkNode('v22.17.9') ?? '', /older than 22\.18/)
-  assert.match(checkNode('v20.11.0') ?? '', /cd|22\.18|older/)
+  assert.equal(checkNode('v24.22.1'), null)
+  assert.equal(checkNode('v26.12.0'), null)
+  assert.match(checkNode('v22.14.0') ?? '', /does not satisfy package.json engines/)
+  assert.match(checkNode('v22.14.0') ?? '', /node-v24\.22\.1/)
+  assert.match(checkNode('v24.0.0') ?? '', /engines/)
 })
 
 test('an empty or unbalanced split cannot be built', () => {
@@ -110,7 +112,11 @@ test('plaintext is a Secret and does not require a token prefix', () => {
   const token = 'art_v2_plaintext_token_value'
   const found = harvestSecrets({ id: 'tok', plaintext: token, nested: { plaintext: 'art_v2_also_a_secret_value' } })
   assert.deepEqual(found.map(secret => secret.reveal()), [token, 'art_v2_also_a_secret_value'])
-  assert.equal(harvestSecrets({ token: 'art_v1_not_a_plaintext_field' }).length, 0)
+  const created = 'art_v1_not_a_plaintext_field'
+  const harvested = harvestSecrets({ token: created, id: 'tok' })
+  assert.deepEqual(harvested.map(secret => secret.reveal()), [created])
+  assert.equal(createdTokenSecret({ result: { token: created } }, harvested)?.reveal(), created)
+  assert.equal(harvestSecrets({ token: 'short' }).length, 0)
   assert.equal(harvestSecrets({ plaintext: '' }).length, 0)
 })
 
@@ -205,6 +211,7 @@ test('debrief cites the decision, its rule, and writes charts', async () => {
   const markdownPath = await writeDebrief(runDir)
   const markdown = await readFile(markdownPath, 'utf8')
   assert.match(markdown, /insufficient_data/)
+  assert.match(markdown, /Informational unless a policy event sets latency to gate/)
   assert.match(markdown, /fast_burn/)
   assert.match(markdown, /14\.4/)
   assert.match(markdown, /raw\/2\.json/)
@@ -241,18 +248,31 @@ test('dora metrics use run_finished', () => {
       ...over,
     },
   })
+  const rollback = { ...finished({ rolledBack: true, verdict: 'fail', failedAt: '2026-10-31T22:00:00Z', restoredAt: '2026-10-31T22:01:30Z', liveAt: '2026-11-01T20:50:00Z', plyMergedAt: null }), run_id: 's', ts: '2026-11-01T21:00:00.000+00:00' }
   const text = doraText([
     finished({}),
-    { ...finished({ rolledBack: true, verdict: 'fail', failedAt: '2026-10-31T22:00:00Z', restoredAt: '2026-10-31T22:01:30Z', liveAt: null, plyMergedAt: null }), run_id: 's', ts: '2026-11-01T21:00:00.000+00:00' },
+    rollback,
+    { ...finished({ verdict: 'fail', liveAt: null, rolledBack: false, fault: 'worker', plyMergedAt: null }), run_id: 'held', ts: '2026-11-03T21:00:00.000+00:00' },
+    { ...finished({ fault: 'harness_fault', verdict: 'fail', liveAt: null, rolledBack: false, plyMergedAt: null }), run_id: 'h', ts: '2026-11-04T21:00:00.000+00:00' },
+    { ...finished({ verdict: 'fail', liveAt: null, rolledBack: true, fault: 'worker', failedAt: '2026-11-05T21:00:00Z', restoredAt: '2026-11-05T21:10:00Z', plyMergedAt: null }), run_id: 'aborted', ts: '2026-11-05T21:00:00.000+00:00' },
   ])
+  assert.match(text, /runs: 5/)
+  assert.match(text, /deploys: 2/)
+  assert.match(text, /excluded from deploys: 3/)
+  assert.match(text, /aborted: 1/)
+  assert.match(text, /held: 1/)
+  assert.match(text, /harness_fault: 1/)
+  assert.match(text, /false_positive: 0/)
+  assert.match(text, /false positives: 0/)
   assert.match(text, /deployment frequency: 2\.000 \/ day/)
   assert.match(text, /lead time p50: 3600s/)
   assert.match(text, /change failure rate: 0\.500/)
   const withHarness = doraText([
     finished({}),
-    { ...finished({ rolledBack: true, verdict: 'fail', failedAt: '2026-10-31T22:00:00Z', restoredAt: '2026-10-31T22:01:30Z', liveAt: null, plyMergedAt: null }), run_id: 's', ts: '2026-11-01T21:00:00.000+00:00' },
+    rollback,
     { ...finished({ fault: 'harness_fault', rolledBack: true, verdict: 'fail' }), run_id: 'h', ts: '2026-11-02T21:00:00.000+00:00' },
   ])
+  assert.match(withHarness, /deploys: 2/)
   assert.match(withHarness, /change failure rate: 0\.500/)
   assert.match(text, /time to restore p50: 90s/)
   assert.match(text, /bump p50 2s/)
@@ -278,6 +298,84 @@ test('split.png includes the 0% canary', async () => {
   await log.seal()
   const markdown = await readFile(await writeDebrief(runDir), 'utf8')
   assert.match(markdown, /0% canary/)
+})
+
+test('a false-positive annotation is appended and leaves change failure', async () => {
+  const dir = await temp()
+  const ledger = join(dir, 'ledger.jsonl')
+  const runId = '2026-11-01T00-10-02-620Z'
+  const reason = '5% ramp Mann-Whitney flagged a sub-millisecond wall-time shift'
+  const rollback: CdEvent = {
+    seq: 1,
+    ts: '2026-11-01T00:13:40.000+00:00',
+    run_id: runId,
+    stage: 'run',
+    kind: 'lifecycle',
+    payload: {
+      event: 'run_finished',
+      verdict: 'fail',
+      reason: 'new version wall time is slower',
+      rolledBack: true,
+      rollbackReason: 'new version wall time is slower',
+      versionId: VERSION,
+      plySha: null,
+      plyMergedAt: null,
+      plyWebSha: 'b',
+      smoke: { passed: 1, failed: 0 },
+      stages: [],
+      steps: [],
+      liveAt: '2026-11-01T00:13:00Z',
+      failedAt: '2026-11-01T00:13:20Z',
+      restoredAt: '2026-11-01T00:13:40Z',
+      fault: 'worker',
+    },
+  }
+  const pass: CdEvent = {
+    seq: 1,
+    ts: '2026-11-02T00:00:00.000+00:00',
+    run_id: '2026-11-02T00-00-00-000Z',
+    stage: 'run',
+    kind: 'lifecycle',
+    payload: {
+      event: 'run_finished',
+      verdict: 'pass',
+      reason: null,
+      rolledBack: false,
+      rollbackReason: null,
+      versionId: VERSION,
+      plySha: null,
+      plyMergedAt: null,
+      plyWebSha: 'b',
+      smoke: { passed: 1, failed: 0 },
+      stages: [],
+      steps: [],
+      liveAt: '2026-11-02T00:00:00Z',
+      failedAt: null,
+      restoredAt: null,
+      fault: null,
+    },
+  }
+  const before = `${JSON.stringify(rollback)}\n`
+  await writeFile(ledger, before)
+  const noted = await appendFalsePositive(ledger, runId, `  ${reason}  `, new Date('2026-11-02T12:00:00Z'))
+  const after = await readFile(ledger, 'utf8')
+  assert.ok(after.startsWith(before))
+  assert.equal(after.split('\n').filter(line => line).length, 2)
+  assert.equal(noted.seq, 2)
+  assert.equal(noted.kind, 'annotation')
+  if (noted.kind === 'annotation') {
+    assert.equal(noted.payload.note, 'false_positive')
+    assert.equal(noted.payload.reason, reason)
+  }
+  const events = after.split('\n').filter(line => line).map(line => parseEvent(JSON.parse(line) as unknown))
+  const text = doraText([...events, pass])
+  assert.match(text, /deploys: 1/)
+  assert.match(text, /false_positive: 1/)
+  assert.match(text, new RegExp(runId))
+  assert.match(text, /change failure rate: 0\.000/)
+  assert.match(text, /0 rollbacks \/ 1 deploys/)
+  const blamed = doraText([rollback, pass])
+  assert.match(blamed, /change failure rate: 0\.500/)
 })
 
 test('chart png is a png', () => {

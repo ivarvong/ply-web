@@ -1,16 +1,28 @@
 import { lossAllowance, verdict, type CanaryVerdict } from '../canary-verdict.mjs'
-import { QUERY_SLACK_MS, TELEMETRY_PAGE, type LatencyCeiling } from './baseline.ts'
+import { CF_RAY_HEX_LENGTH, JOIN_MIN_LOGGED, JOIN_MIN_SHARE, QUERY_SLACK_MS, TELEMETRY_PAGE, type LatencyCeiling } from './baseline.ts'
 import { asRecord } from './json.ts'
+import type { RolloutGates } from './policy.ts'
 import type { V1Request } from './slo.ts'
 
-export type TelemetryFailure =
+/**
+ * An observed bad value. This union has no missing-sample or shape variant:
+ * a check the harness could not evaluate cannot be stored as a worker fault.
+ */
+export type ObservedFault =
   | { readonly kind: 'exception'; readonly detail: string }
   | { readonly kind: 'unexpected-status'; readonly id: string; readonly status: number }
   | { readonly kind: 'log-error'; readonly detail: string }
-  | { readonly kind: 'missing'; readonly detail: string }
+  | { readonly kind: 'fivexx'; readonly detail: string }
+  | { readonly kind: 'non-ok'; readonly detail: string }
   | { readonly kind: 'latency'; readonly metric: string; readonly p: 'p50' | 'p99'; readonly value: number; readonly ceiling: number }
   | { readonly kind: 'other-version'; readonly detail: string }
+
+/** Missing data, a query-shape mismatch, or zero samples where samples are required. Not a worker fault. */
+export type UnevaluableCheck =
+  | { readonly kind: 'missing'; readonly detail: string }
+  | { readonly kind: 'shape'; readonly detail: string }
   | { readonly kind: 'trace-count'; readonly detail: string }
+  | { readonly kind: 'join'; readonly detail: string }
 
 export type SmokeRequest = {
   readonly id: string
@@ -18,6 +30,15 @@ export type SmokeRequest = {
   readonly step: string
   readonly status: number
   readonly expected: readonly number[]
+  /** cf-ray of the smoke response. Span events join on this. Null when the response had none. */
+  readonly ray: string | null
+}
+
+/** A telemetry query that threw. The type has no worker variant: a query failure is the harness. */
+export type QueryFault = { readonly kind: 'harness_fault'; readonly reason: string }
+
+export function queryFault(reason: string): QueryFault {
+  return { kind: 'harness_fault', reason }
 }
 
 export type Filter = {
@@ -56,6 +77,11 @@ export function versionFilter(version: string): Filter {
   return { key: '$workers.scriptVersion.id', operation: 'eq', type: 'string', value: version }
 }
 
+/** Child spans. The traces view does not return them; this events filter does. */
+export function spanTypeFilter(): Filter {
+  return { key: '$metadata.type', operation: 'eq', type: 'string', value: 'span' }
+}
+
 /** Workers Observability wraps the page as events.events or traces.traces. */
 export function unwrapEvents(payload: unknown): unknown[] {
   const rec = asRecord(payload)
@@ -83,16 +109,92 @@ export function percentile(values: readonly number[], p: number): number | null 
   return sorted[Math.floor((sorted.length - 1) * p)] ?? null
 }
 
-/** Duration in milliseconds. The bare `duration` field is nanoseconds when it is above 1e6. */
+/** Duration in milliseconds. `durationMS` is already milliseconds. A bare `duration` above 1e6 is nanoseconds. */
 export function spanDurationMs(span: Record<string, unknown>): number | null {
+  const source = asRecord(span.source)
   const attrs = asRecord(span.attributes) ?? asRecord(span.attrs) ?? {}
-  const millis = [span.durationMs, span.duration_ms, attrs.duration_ms, attrs.durationMs]
+  const millis = [
+    span.durationMs, span.durationMS, span.duration_ms,
+    source?.durationMs, source?.durationMS, source?.duration_ms,
+    attrs.duration_ms, attrs.durationMs, attrs.durationMS,
+  ]
   for (const candidate of millis) {
     if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0) return candidate
   }
-  const raw = typeof span.duration === 'number' ? span.duration : attrs.duration
+  const raw = typeof span.duration === 'number' ? span.duration : source?.duration ?? attrs.duration
   if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return null
   return raw > 1_000_000 ? raw / 1_000_000 : raw
+}
+
+/** One traces-view row: a span count and a root name, and no child spans. */
+export function isTraceSummary(row: Record<string, unknown>): boolean {
+  return typeof row.spans === 'number' && typeof row.rootSpanName === 'string' && typeof row.traceId === 'string'
+}
+
+const ARTIFACTS_FETCH_SUFFIXES = ['/git-upload-pack', '/git-receive-pack', '/info/refs'] as const
+
+export function isArtifactsFetchPath(path: string): boolean {
+  return ARTIFACTS_FETCH_SUFFIXES.some(suffix => path.endsWith(suffix))
+}
+
+export type FetchSample = {
+  readonly durationMs: number
+  readonly path: string
+  readonly status: number | null
+  readonly version: string | null
+  readonly traceId: string | null
+  readonly rayId: string | null
+  readonly artifacts: boolean
+}
+
+function spanNameOf(event: Record<string, unknown>): string | null {
+  const source = asRecord(event.source)
+  const meta = asRecord(event.$metadata)
+  return stringField(source?.name) ?? stringField(meta?.spanName) ?? stringField(event.name)
+}
+
+function urlPathOf(event: Record<string, unknown>): string | null {
+  const source = asRecord(event.source)
+  const url = source?.url ?? event.url
+  if (typeof url === 'string' && url !== '') return url
+  const rec = asRecord(url)
+  return stringField(rec?.path) ?? stringField(rec?.full)
+}
+
+function httpStatusOf(event: Record<string, unknown>): number | null {
+  const source = asRecord(event.source)
+  const http = asRecord(source?.http)
+  const response = asRecord(http?.response)
+  const status = response?.status_code ?? response?.statusCode
+  return typeof status === 'number' ? status : null
+}
+
+function scriptVersionOf(event: Record<string, unknown>): string | null {
+  const source = asRecord(event.source)
+  const cloudflare = asRecord(source?.cloudflare)
+  const script = asRecord(cloudflare?.script_version)
+  if (typeof script?.id === 'string' && script.id !== '') return script.id
+  const faas = asRecord(source?.faas)
+  return typeof faas?.version === 'string' && faas.version !== '' ? faas.version : null
+}
+
+/** An outbound `fetch` span. Trace summaries and root spans (GET, POST, DELETE) are not samples. */
+export function fetchSample(event: unknown): FetchSample | null {
+  const rec = asRecord(event)
+  if (!rec || isTraceSummary(rec)) return null
+  if (spanNameOf(rec) !== 'fetch') return null
+  const durationMs = spanDurationMs(rec)
+  if (durationMs === null) return null
+  const path = urlPathOf(rec) ?? ''
+  return {
+    durationMs,
+    path,
+    status: httpStatusOf(rec),
+    version: scriptVersionOf(rec),
+    traceId: traceIdOf(rec),
+    rayId: rayIdOf(rec),
+    artifacts: isArtifactsFetchPath(path),
+  }
 }
 
 function versionOf(event: Record<string, unknown>): string | null {
@@ -101,9 +203,129 @@ function versionOf(event: Record<string, unknown>): string | null {
   return typeof script?.id === 'string' ? script.id : null
 }
 
+/** `$workers.scriptVersion.id` on a telemetry event, or null. The ramp partitions one query with this. */
+export function scriptVersionId(event: unknown): string | null {
+  const rec = asRecord(event)
+  return rec ? versionOf(rec) : null
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === 'string' && value !== '' ? value : null
+}
+
 function requestIdOf(event: Record<string, unknown>): string | null {
   const meta = asRecord(event.$metadata)
-  return typeof meta?.requestId === 'string' ? meta.requestId : null
+  return stringField(meta?.requestId) ?? stringField(event.requestId)
+}
+
+function traceIdOf(event: Record<string, unknown>): string | null {
+  const meta = asRecord(event.$metadata)
+  return stringField(event.traceId) ?? stringField(event.trace_id) ?? stringField(meta?.traceId) ?? stringField(meta?.trace_id)
+}
+
+function rayIdOf(event: Record<string, unknown>): string | null {
+  const meta = asRecord(event.$metadata)
+  return stringField(event.rayId) ?? stringField(event.ray_id) ?? stringField(meta?.rayId) ?? stringField(meta?.ray_id)
+}
+
+type JoinKey = {
+  readonly requestId: string | null
+  readonly traceId: string | null
+  readonly rayId: string | null
+}
+
+function joinKeyOf(event: Record<string, unknown>): JoinKey {
+  return { requestId: requestIdOf(event), traceId: traceIdOf(event), rayId: rayIdOf(event) }
+}
+
+/** The 16-hex body of a cf-ray, or null when `ray` is not that shape. */
+function rayBody(ray: string): string | null {
+  const dash = ray.indexOf('-')
+  const body = dash === -1 ? ray : ray.slice(0, dash)
+  if (body.length !== CF_RAY_HEX_LENGTH || !/^[0-9a-f]+$/i.test(body)) return null
+  return body.toLowerCase()
+}
+
+function sameRay(left: string, right: string): boolean {
+  if (left === right) return true
+  const a = rayBody(left)
+  const b = rayBody(right)
+  return a !== null && a === b
+}
+
+type TraceMarks = {
+  readonly rays: readonly string[]
+  readonly traces: readonly string[]
+  readonly strings: ReadonlySet<string>
+}
+
+function traceMarks(trace: unknown): TraceMarks {
+  const rays: string[] = []
+  const traces: string[] = []
+  const strings = new Set<string>()
+  walk(trace, rec => {
+    const ray = rayIdOf(rec)
+    const traceId = traceIdOf(rec)
+    if (ray) rays.push(ray)
+    if (traceId) traces.push(traceId)
+    for (const value of Object.values(rec)) {
+      if (typeof value === 'string' && value !== '') strings.add(value)
+    }
+  }, new Set())
+  return { rays, traces, strings }
+}
+
+function rayHit(rays: readonly string[], want: string): boolean {
+  for (const ray of rays) if (sameRay(ray, want)) return true
+  return false
+}
+
+/**
+ * Span events carry `rayId` and `traceId`. `$metadata.requestId` is null on those events,
+ * so it is only a last resort for a span that still has one.
+ */
+function keysMatch(marks: TraceMarks, keys: readonly JoinKey[]): boolean {
+  for (const key of keys) if (key.rayId && rayHit(marks.rays, key.rayId)) return true
+  for (const key of keys) if (key.traceId && marks.traces.includes(key.traceId)) return true
+  for (const key of keys) if (key.requestId && marks.strings.has(key.requestId)) return true
+  return false
+}
+
+type SmokeKeys = {
+  rays: string[]
+  traces: string[]
+  requestIds: string[]
+}
+
+function smokeKeys(): SmokeKeys {
+  return { rays: [], traces: [], requestIds: [] }
+}
+
+function addKey(into: SmokeKeys, key: JoinKey): void {
+  const rayId = key.rayId
+  const traceId = key.traceId
+  const requestId = key.requestId
+  if (rayId && !into.rays.some(ray => sameRay(ray, rayId))) into.rays.push(rayId)
+  if (traceId && !into.traces.includes(traceId)) into.traces.push(traceId)
+  if (requestId && !into.requestIds.includes(requestId)) into.requestIds.push(requestId)
+}
+
+function smokeMatched(marks: TraceMarks, keysBySmoke: ReadonlyMap<string, SmokeKeys>, smokeIds: ReadonlySet<string>, platformToSmoke: ReadonlyMap<string, string>): Set<string> {
+  const matched = new Set<string>()
+  for (const [id, keys] of keysBySmoke) {
+    if (keys.rays.some(ray => rayHit(marks.rays, ray))) matched.add(id)
+  }
+  if (matched.size > 0) return matched
+  for (const [id, keys] of keysBySmoke) {
+    if (keys.traces.some(traceId => marks.traces.includes(traceId))) matched.add(id)
+  }
+  if (matched.size > 0) return matched
+  for (const value of marks.strings) {
+    if (smokeIds.has(value)) matched.add(value)
+    const smoke = platformToSmoke.get(value)
+    if (smoke) matched.add(smoke)
+  }
+  return matched
 }
 
 function isLog(event: Record<string, unknown>): boolean {
@@ -149,19 +371,14 @@ function walk(node: unknown, visit: (rec: Record<string, unknown>) => void, seen
   for (const value of Object.values(rec)) walk(value, visit, seen)
 }
 
-function collectStrings(node: unknown, into: Set<string>, seen: Set<object>): void {
-  walk(node, rec => {
-    for (const value of Object.values(rec)) {
-      if (typeof value === 'string') into.add(value)
-    }
-  }, seen)
-}
-
 export type VersionStats = {
   readonly requests: number
+  /** Fetch invocations only. `requests` falls back to log rows when this is 0. */
+  readonly invocations: number
   readonly exceptions: number
   readonly errors: number
   readonly fivexx: number
+  readonly errorLogs: number
   readonly wallMs: readonly number[]
   readonly cpuMs: readonly number[]
   readonly fetchMs: readonly number[]
@@ -219,43 +436,31 @@ function v1From(events: readonly unknown[]): V1Request[] {
   return out
 }
 
-/** Fetch spans have no script version. Attribute a span when its trace names a request id from `events`. */
-function fetchMsJoined(events: readonly unknown[], traces: readonly unknown[]): number[] {
-  const ids = new Set<string>()
+/** Fetch spans have no `$workers.scriptVersion.id`. Join on rayId, then traceId, then a request id the span still carries. */
+function fetchMsJoined(events: readonly unknown[], spans: readonly unknown[]): number[] {
+  const keys: JoinKey[] = []
   for (const item of events) {
     const event = asRecord(item)
     if (!event) continue
-    const id = requestIdOf(event)
-    if (id) ids.add(id)
+    const key = joinKeyOf(event)
+    if (key.requestId || key.traceId || key.rayId) keys.push(key)
   }
   const fetchMs: number[] = []
-  for (const trace of traces) {
-    const strings = new Set<string>()
-    collectStrings(trace, strings, new Set())
-    let hit = false
-    for (const id of ids) {
-      if (strings.has(id)) {
-        hit = true
-        break
-      }
-    }
-    if (!hit) continue
-    const seen = new Set<object>()
-    walk(trace, rec => {
-      if (rec.name !== 'fetch') return
-      const duration = spanDurationMs(rec)
-      if (duration !== null) fetchMs.push(duration)
-    }, seen)
+  for (const span of spans) {
+    if (!keysMatch(traceMarks(span), keys)) continue
+    const sample = fetchSample(span)
+    if (sample) fetchMs.push(sample.durationMs)
   }
   return fetchMs
 }
 
-/** All traffic on one version during a ramp step, not just the smoke ids. */
-export function statsFromEvents(events: readonly unknown[], traces: readonly unknown[]): VersionStats {
+/** All traffic on one version during a ramp step, not just the smoke ids. `spans` are child span events, not traces-view rows. */
+export function statsFromEvents(events: readonly unknown[], spans: readonly unknown[]): VersionStats {
   let requests = 0
   let exceptions = 0
   let errors = 0
   let fivexx = 0
+  let errorLogs = 0
   let logs = 0
   const wallMs: number[] = []
   const cpuMs: number[] = []
@@ -266,6 +471,8 @@ export function statsFromEvents(events: readonly unknown[], traces: readonly unk
       logs += 1
       const status = statusOf(event)
       if (status !== null && status >= 500) fivexx += 1
+      const meta = asRecord(event.$metadata)
+      if (meta?.level === 'error') errorLogs += 1
     }
     if (!isFetchInvocation(event)) continue
     requests += 1
@@ -277,12 +484,14 @@ export function statsFromEvents(events: readonly unknown[], traces: readonly unk
   }
   return {
     requests: requests > 0 ? requests : logs,
+    invocations: requests,
     exceptions,
     errors,
     fivexx,
+    errorLogs,
     wallMs,
     cpuMs,
-    fetchMs: fetchMsJoined(events, traces),
+    fetchMs: fetchMsJoined(events, spans),
     v1: v1From(events),
   }
 }
@@ -294,17 +503,46 @@ export type SmokeSummary = {
   readonly cpuMs: readonly number[]
   readonly fetchMs: readonly number[]
   readonly tracedIds: ReadonlySet<string>
+  /** Fetch invocations of this version in the window. The span join is compared with this. */
+  readonly invocations: number
+  /**
+   * `events` is a child-span query. `summaries` is the traces view (a count and a root name).
+   * `empty` means the span query returned nothing.
+   */
+  readonly spanShape: 'events' | 'summaries' | 'empty'
 }
 
-/** Reduce a version's events and traces to the smoke-id view the gate judges. */
-export function summarizeTelemetry(version: string, requests: readonly SmokeRequest[], events: readonly unknown[], traces: readonly unknown[]): SmokeSummary {
+/**
+ * Reduce a version's logs, traces-view rows, and child span events to the smoke-id view the gate judges.
+ * `spans` defaults to `traces` so a caller that already holds span events can pass them once.
+ * A traces-view row is not a child span: it cannot supply a fetch duration.
+ */
+export function summarizeTelemetry(
+  version: string,
+  requests: readonly SmokeRequest[],
+  events: readonly unknown[],
+  traces: readonly unknown[],
+  spans: readonly unknown[] = traces,
+): SmokeSummary {
   const want = new Set(requests.map(request => request.id))
   const loggedBy = new Map<string, Set<string>>()
   const platformToSmoke = new Map<string, string>()
+  const keysBySmoke = new Map<string, SmokeKeys>()
+  const keysFor = (id: string): SmokeKeys => {
+    const existing = keysBySmoke.get(id)
+    if (existing) return existing
+    const created = smokeKeys()
+    keysBySmoke.set(id, created)
+    return created
+  }
+  for (const request of requests) {
+    if (request.ray) keysFor(request.id).rays.push(request.ray)
+  }
   let fivexx = 0
   let errorLogs = 0
   let nonOk = 0
   let exceptions = 0
+  let invocations = 0
   const smokePlatform = new Set<string>()
   for (const item of events) {
     const event = asRecord(item)
@@ -316,6 +554,7 @@ export function summarizeTelemetry(version: string, requests: readonly SmokeRequ
         const versions = loggedBy.get(id) ?? new Set<string>()
         if (saw) versions.add(saw)
         loggedBy.set(id, versions)
+        addKey(keysFor(id), joinKeyOf(event))
         const platform = requestIdOf(event)
         if (platform && saw === version) {
           platformToSmoke.set(platform, id)
@@ -330,6 +569,7 @@ export function summarizeTelemetry(version: string, requests: readonly SmokeRequ
       }
     }
     if (saw !== version || !isFetchInvocation(event)) continue
+    invocations += 1
     if (exceptionCount(event) > 0) exceptions += 1
     const workers = asRecord(event.$workers)
     if (workers?.outcome !== undefined && workers.outcome !== 'ok') nonOk += 1
@@ -345,26 +585,48 @@ export function summarizeTelemetry(version: string, requests: readonly SmokeRequ
     if (typeof workers?.wallTimeMs === 'number') wallMs.push(workers.wallTimeMs)
     if (typeof workers?.cpuTimeMs === 'number') cpuMs.push(workers.cpuTimeMs)
   }
-  const tracedIds = new Set<string>()
-  const fetchMs: number[] = []
-  for (const trace of traces) {
-    const strings = new Set<string>()
-    collectStrings(trace, strings, new Set())
-    const matched = new Set<string>()
-    for (const value of strings) {
-      if (want.has(value)) matched.add(value)
-      const smoke = platformToSmoke.get(value)
-      if (smoke) matched.add(smoke)
+  for (const item of events) {
+    const event = asRecord(item)
+    if (!event) continue
+    const key = joinKeyOf(event)
+    const requestId = key.requestId
+    let smoke = requestId ? platformToSmoke.get(requestId) ?? null : null
+    const rayId = key.rayId
+    if (!smoke && rayId) {
+      for (const [id, keys] of keysBySmoke) {
+        if (keys.rays.some(ray => sameRay(ray, rayId))) {
+          smoke = id
+          break
+        }
+      }
     }
+    if (smoke) addKey(keysFor(smoke), key)
+  }
+  const tracedIds = new Set<string>()
+  for (const trace of traces) {
+    const matched = smokeMatched(traceMarks(trace), keysBySmoke, want, platformToSmoke)
+    for (const id of matched) tracedIds.add(id)
+  }
+  let summaries = 0
+  let spanEvents = 0
+  const fetchMs: number[] = []
+  for (const span of spans) {
+    const rec = asRecord(span)
+    if (!rec) continue
+    if (isTraceSummary(rec)) {
+      summaries += 1
+      const matched = smokeMatched(traceMarks(rec), keysBySmoke, want, platformToSmoke)
+      for (const id of matched) tracedIds.add(id)
+      continue
+    }
+    spanEvents += 1
+    const matched = smokeMatched(traceMarks(rec), keysBySmoke, want, platformToSmoke)
     if (matched.size === 0) continue
     for (const id of matched) tracedIds.add(id)
-    const seen = new Set<object>()
-    walk(trace, rec => {
-      if (rec.name !== 'fetch') return
-      const duration = spanDurationMs(rec)
-      if (duration !== null) fetchMs.push(duration)
-    }, seen)
+    const sample = fetchSample(rec)
+    if (sample) fetchMs.push(sample.durationMs)
   }
+  const spanShape = spanEvents > 0 ? 'events' as const : summaries > 0 ? 'summaries' as const : 'empty' as const
   return {
     loggedBy,
     health: { nonOk, fivexx, errorLogs, exceptions },
@@ -372,31 +634,113 @@ export function summarizeTelemetry(version: string, requests: readonly SmokeRequ
     cpuMs,
     fetchMs,
     tracedIds,
+    invocations,
+    spanShape,
   }
 }
 
-export type SmokeJudge = {
-  readonly pass: boolean
-  readonly failures: readonly TelemetryFailure[]
-  readonly line: string
-  readonly verdict: CanaryVerdict
+/**
+ * A join or query failure is `harness_fault` and has no worker label.
+ * A version that answered badly is `worker`. Those two cannot be confused.
+ */
+export type SmokeJudge =
+  | { readonly kind: 'pass'; readonly line: string; readonly failures: readonly []; readonly verdict: CanaryVerdict }
+  | { readonly kind: 'worker'; readonly line: string; readonly failures: readonly ObservedFault[]; readonly verdict: CanaryVerdict }
+  | { readonly kind: 'harness_fault'; readonly line: string; readonly reason: string; readonly checks: readonly UnevaluableCheck[]; readonly verdict: CanaryVerdict }
+
+function faultIsHard(fault: ObservedFault, gates: RolloutGates): boolean {
+  switch (fault.kind) {
+    case 'exception':
+      return gates.exceptions === 'hard'
+    case 'fivexx':
+      return gates.fivexx === 'hard'
+    case 'log-error':
+      return gates.errorLogs === 'hard'
+    case 'non-ok':
+      return gates.nonOk === 'hard'
+    case 'latency':
+      return gates.latency.mode === 'gate'
+    case 'unexpected-status':
+    case 'other-version':
+      return gates.smoke === 'hard'
+  }
 }
 
-function latencyFailures(
+function latencyGap(check: UnevaluableCheck): boolean {
+  return check.kind === 'missing' && /^(wall|cpu|fetch) has no samples$/.test(check.detail)
+}
+
+function faultText(fault: ObservedFault): string {
+  if (fault.kind === 'unexpected-status') return `unexpected-status ${fault.id} ${fault.status}`
+  if (fault.kind === 'latency') return `latency ${fault.metric} ${fault.p} ${fault.value} > ${fault.ceiling}`
+  return `${fault.kind}: ${fault.detail}`
+}
+
+/**
+ * Drop signals the policy does not treat as hard. A latency series with no samples
+ * is a harness fault only when latency mode is `gate`.
+ */
+export function applyGates(judge: SmokeJudge, gates: RolloutGates): SmokeJudge {
+  if (judge.kind === 'harness_fault') {
+    if (gates.latency.mode === 'gate') return judge
+    const checks = judge.checks.filter(check => !latencyGap(check))
+    if (checks.length === judge.checks.length) return judge
+    if (checks.length > 0) {
+      const reason = checks.map(check => `${check.kind}: ${check.detail}`).join('; ')
+      return { kind: 'harness_fault', line: `telemetry: harness_fault: ${reason}`, reason, checks, verdict: judge.verdict }
+    }
+    return { kind: 'pass', failures: [], line: `${judge.verdict.line} latency=${gates.latency.mode}`, verdict: judge.verdict }
+  }
+  if (judge.kind !== 'worker') return judge
+  const kept = judge.failures.filter(fault => faultIsHard(fault, gates))
+  const dropped = judge.failures.filter(fault => !faultIsHard(fault, gates))
+  if (dropped.length === 0) return judge
+  if (kept.length > 0) return { kind: 'worker', failures: kept, line: judge.line, verdict: judge.verdict }
+  return {
+    kind: 'pass',
+    failures: [],
+    line: `${judge.verdict.line} informational: ${dropped.map(faultText).join('; ')}`,
+    verdict: judge.verdict,
+  }
+}
+
+/** Below half of the invocations the worker logged, the span join is the harness, not the version. */
+export function implausibleJoin(input: { readonly smoke: number; readonly invocations: number; readonly joined: number }): boolean {
+  const compared = Math.min(input.invocations, input.smoke)
+  if (compared < JOIN_MIN_LOGGED) return false
+  return input.joined / compared < JOIN_MIN_SHARE
+}
+
+function latencyChecks(
   metric: string,
   values: readonly number[],
   ceiling: LatencyCeiling,
-): TelemetryFailure[] {
-  const failures: TelemetryFailure[] = []
+): readonly (ObservedFault | UnevaluableCheck)[] {
   const p50 = percentile(values, 0.5)
   const p99 = percentile(values, 0.99)
-  if (p50 === null || p99 === null) {
-    failures.push({ kind: 'missing', detail: `${metric} has no samples` })
-    return failures
-  }
+  if (p50 === null || p99 === null) return [{ kind: 'missing', detail: `${metric} has no samples` }]
+  const failures: ObservedFault[] = []
   if (p50 > ceiling.p50Ms) failures.push({ kind: 'latency', metric, p: 'p50', value: p50, ceiling: ceiling.p50Ms })
   if (p99 > ceiling.p99Ms) failures.push({ kind: 'latency', metric, p: 'p99', value: p99, ceiling: ceiling.p99Ms })
   return failures
+}
+
+function isObserved(check: ObservedFault | UnevaluableCheck): check is ObservedFault {
+  switch (check.kind) {
+    case 'exception':
+    case 'unexpected-status':
+    case 'log-error':
+    case 'fivexx':
+    case 'non-ok':
+    case 'latency':
+    case 'other-version':
+      return true
+    case 'missing':
+    case 'shape':
+    case 'trace-count':
+    case 'join':
+      return false
+  }
 }
 
 export function judgeSmokeTelemetry(input: {
@@ -412,37 +756,66 @@ export function judgeSmokeTelemetry(input: {
     loggedBy: summary.loggedBy,
     health: { nonOk: summary.health.nonOk, fivexx: summary.health.fivexx, errorLogs: summary.health.errorLogs },
   })
-  const failures: TelemetryFailure[] = []
+  const checks: (ObservedFault | UnevaluableCheck)[] = []
   for (const request of requests) {
     if (!request.expected.includes(request.status)) {
-      failures.push({ kind: 'unexpected-status', id: request.id, status: request.status })
+      checks.push({ kind: 'unexpected-status', id: request.id, status: request.status })
     }
   }
-  if (summary.health.exceptions > 0) {
-    failures.push({ kind: 'exception', detail: `${summary.health.exceptions} exceptions` })
-  }
-  if (summary.health.errorLogs > 0) failures.push({ kind: 'log-error', detail: `${summary.health.errorLogs} error logs` })
+  if (summary.health.exceptions > 0) checks.push({ kind: 'exception', detail: `${summary.health.exceptions} exceptions` })
+  if (summary.health.fivexx > 0) checks.push({ kind: 'fivexx', detail: `${summary.health.fivexx} 5xx logs` })
+  if (summary.health.nonOk > 0) checks.push({ kind: 'non-ok', detail: `${summary.health.nonOk} non-ok outcomes` })
+  if (summary.health.errorLogs > 0) checks.push({ kind: 'log-error', detail: `${summary.health.errorLogs} error logs` })
   if (decided.otherVersion.length > 0) {
-    failures.push({ kind: 'other-version', detail: `${decided.otherVersion.length} logged by another version` })
+    checks.push({ kind: 'other-version', detail: `${decided.otherVersion.length} logged by another version` })
   }
   if (requests.length === 0 || decided.matched === 0) {
-    failures.push({ kind: 'missing', detail: requests.length === 0 ? 'smoke recorded no requests' : 'zero invocations matched the smoke' })
+    checks.push({ kind: 'missing', detail: requests.length === 0 ? 'smoke recorded no requests' : 'zero invocations matched the smoke' })
   } else {
     const missingTraces = requests.filter(request => !summary.tracedIds.has(request.id)).length
     const allowance = lossAllowance(requests.length)
     if (missingTraces > allowance) {
-      failures.push({ kind: 'trace-count', detail: `${missingTraces} smoke requests have no trace, allowance ${allowance}` })
+      checks.push({ kind: 'trace-count', detail: `${missingTraces} smoke requests have no trace, allowance ${allowance}` })
     }
-    failures.push(...latencyFailures('wall', summary.wallMs, ceilings.wallMs))
-    failures.push(...latencyFailures('cpu', summary.cpuMs, ceilings.cpuMs))
-    failures.push(...latencyFailures('fetch', summary.fetchMs, ceilings.fetchMs))
+    checks.push(...latencyChecks('wall', summary.wallMs, ceilings.wallMs))
+    checks.push(...latencyChecks('cpu', summary.cpuMs, ceilings.cpuMs))
+    if (summary.spanShape === 'summaries') {
+      checks.push({ kind: 'shape', detail: 'span query returned trace summaries with no child spans' })
+    } else {
+      checks.push(...latencyChecks('fetch', summary.fetchMs, ceilings.fetchMs))
+    }
   }
   if (decided.unconfirmed.length > 0 || decided.lost.length > decided.allowance) {
-    failures.push({ kind: 'missing', detail: decided.reasons.join('; ') || 'smoke ids missing from telemetry' })
+    checks.push({ kind: 'missing', detail: decided.reasons.join('; ') || 'smoke ids missing from telemetry' })
   }
-  const pass = failures.length === 0 && decided.pass
-  const line = pass ? decided.line : `${decided.line}${failures.length ? `; ${failures.map(failure => failure.kind).join(', ')}` : ''}`
-  return { pass, failures, line, verdict: decided }
+  const observed = checks.filter(isObserved)
+  const unevaluable = checks.filter((check): check is UnevaluableCheck => !isObserved(check))
+  const line = checks.length === 0 && decided.pass
+    ? decided.line
+    : `${decided.line}${checks.length ? `; ${checks.map(check => check.kind).join(', ')}` : ''}`
+  let fromLogs = 0
+  for (const request of requests) {
+    if (summary.loggedBy.get(request.id)?.has(version)) fromLogs += 1
+  }
+  const joined = summary.tracedIds.size
+  const join = { smoke: requests.length, invocations: Math.max(summary.invocations, fromLogs), joined }
+  if (observed.length > 0) return { kind: 'worker', failures: observed, line, verdict: decided }
+  if (implausibleJoin(join)) {
+    const compared = Math.min(join.invocations, join.smoke)
+    const reason = `span join matched ${joined}/${compared} invocations the worker logged`
+    return {
+      kind: 'harness_fault',
+      line: `telemetry: harness_fault: ${reason}`,
+      reason,
+      checks: [{ kind: 'join', detail: reason }, ...unevaluable],
+      verdict: decided,
+    }
+  }
+  if (unevaluable.length > 0 || !decided.pass) {
+    const reason = unevaluable.map(check => `${check.kind}: ${check.detail}`).join('; ') || decided.line
+    return { kind: 'harness_fault', line: `telemetry: harness_fault: ${reason}`, reason, checks: unevaluable, verdict: decided }
+  }
+  return { kind: 'pass', failures: [], line, verdict: decided }
 }
 
 export function telemetryMarkdown(input: {
@@ -465,9 +838,11 @@ export function telemetryMarkdown(input: {
     `- wall p50/p99 ${percentile(summary.wallMs, 0.5) ?? '-'} / ${percentile(summary.wallMs, 0.99) ?? '-'} ms`,
     `- cpu p50/p99 ${percentile(summary.cpuMs, 0.5) ?? '-'} / ${percentile(summary.cpuMs, 0.99) ?? '-'} ms`,
     `- fetch p50/p99 ${percentile(summary.fetchMs, 0.5) ?? '-'} / ${percentile(summary.fetchMs, 0.99) ?? '-'} ms`,
-    `- traces for ${summary.tracedIds.size} smoke requests`,
+    `- traces for ${summary.tracedIds.size} smoke requests; ${summary.invocations} invocations logged by the worker`,
   ]
-  if (judge.failures.length) {
+  if (judge.kind === 'harness_fault') {
+    lines.push('', '## Harness fault', '', judge.reason)
+  } else if (judge.failures.length) {
     lines.push('', '## Failures', '')
     for (const failure of judge.failures) lines.push(`- ${failure.kind}: ${'detail' in failure ? failure.detail : JSON.stringify(failure)}`)
   }

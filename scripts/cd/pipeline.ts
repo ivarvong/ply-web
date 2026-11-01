@@ -79,7 +79,7 @@ async function readReconcile(config: CdConfig, sha: string, runLog: RunLog): Pro
   }
   const decision = error
     ? { stage: 'refuse' as const, reason: error }
-    : reconcile({ sha, versionId, split, liveSmokePassed, rampPercents: config.schedule.percents })
+    : reconcile({ sha, versionId, split, liveSmokePassed, rampPercents: config.policy.steps.map(step => step.percent) })
   runLog.useStage('reconcile')
   const ref = await runLog.observation({
     measurement: {

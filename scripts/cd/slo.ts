@@ -2,10 +2,16 @@
  * SLO definitions and the ramp's burn-rate math. Numbers live here, not at the call site.
  *
  * Burn rate is the observed bad fraction divided by the error-budget fraction (1 − target).
- * The ramp fails a step when that rate is above FAST_BURN and the window has MIN_SAMPLES,
- * or when the new version has any exception or 5xx. The multi-window table is the alerting
- * policy for later; the step window uses only the fast-burn multiple.
+ * The ramp fails a step when that rate is above the policy's fast burn and the window
+ * has the policy's sample floor, or when a version (or the whole worker) has any
+ * exception, 5xx, error log, or non-ok outcome. Which of those signals actually
+ * stops a step comes from the rollout policy. Wall time is a gate only when that
+ * policy says `latency.mode` is `gate`. The routed share is a separate check.
+ * The multi-window table is the alerting policy for later; the step window uses only
+ * the fast-burn multiple.
  */
+
+import type { RolloutPolicy } from './policy.ts'
 
 declare const ratioBrand: unique symbol
 /** A fraction strictly between 0 and 1. */
@@ -84,17 +90,19 @@ export const SLOS: readonly Slo[] = [AVAILABILITY, READ_LATENCY, WRITE_LATENCY, 
  */
 export const FAST_BURN = 14.4
 
-/** Below this, a burn rate is not judged. A short clean window is insufficient_data, not a pass of the SLO. */
-export const MIN_SAMPLES = 20
+/**
+ * Sample floor copied into the checked-in policy as `burn.minSamples`.
+ * A ramp reads the policy. This export is the chart fallback for a run that
+ * recorded no policy event, and the lock that the file did not drift.
+ */
+export const MIN_SAMPLES = 100
 
-/** Both sides at least this long, and at least one side under MIN_SAMPLES: compare p99 instead of Mann-Whitney. */
-export const QUANTILE_FLOOR = 5
-
-/** Initial. new/old wall p99 above this, on a short sample, rolls back. Equal to it advances. */
-export const QUANTILE_P99_RATIO = 2
-
-/** One-sided Mann-Whitney. Fail when the new version is slower and this tail probability is under alpha. */
-export const MANN_WHITNEY_ALPHA = 0.01
+/**
+ * At 100% the old version is no longer allocated. The wall and CPU numbers on
+ * that line use the last step whose old version had at least this many wall
+ * samples. This is display, not a gate.
+ */
+export const CARRY_WALL_SAMPLES = 5
 
 /**
  * Alerting policy for later. Not applied on a ramp step.
@@ -132,7 +140,7 @@ export type AppliedRule = {
 }
 
 export type StepVerdict = {
-  readonly outcome: 'advance' | 'insufficient_data' | 'rollback'
+  readonly outcome: 'advance' | 'rollback' | 'hold' | 'insufficient_data'
   readonly reason: string
   readonly rules: readonly [AppliedRule, ...AppliedRule[]]
   readonly burns: BurnMap
@@ -199,121 +207,45 @@ export function burnMap(requests: readonly V1Request[], correctness: SloCount | 
   }
 }
 
-export type RankTest = {
-  readonly rankSum: number
-  readonly z: number
-  readonly pGreater: number
-  /** True when the new sample is stochastically greater and the one-sided tail is under alpha. */
-  readonly slower: boolean
-}
-
-function erf(x: number): number {
-  const sign = x < 0 ? -1 : 1
-  const a = Math.abs(x)
-  const t = 1 / (1 + 0.3275911 * a)
-  const y = 1 - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t) * Math.exp(-a * a)
-  return sign * y
-}
-
-function normalCdf(z: number): number {
-  return 0.5 * (1 + erf(z / Math.SQRT2))
-}
-
-/**
- * One-sided Mann-Whitney: is `newer` stochastically greater than `older`?
- * Ranks are 1-based with the average rank on ties. Null when either side has fewer than 2 points.
- */
-export function mannWhitneyGreater(newer: readonly number[], older: readonly number[], alpha: number): RankTest | null {
-  const n1 = newer.length
-  const n2 = older.length
-  if (n1 < 2 || n2 < 2) return null
-  const tagged = [
-    ...newer.map(value => ({ value, side: 'new' as const })),
-    ...older.map(value => ({ value, side: 'old' as const })),
-  ].sort((a, b) => a.value - b.value)
-  const ranks = new Array<number>(tagged.length)
-  let tieTerm = 0
-  let index = 0
-  while (index < tagged.length) {
-    let end = index
-    while (end < tagged.length && tagged[end]?.value === tagged[index]?.value) end += 1
-    const width = end - index
-    const average = (index + 1 + end) / 2
-    for (let cursor = index; cursor < end; cursor++) ranks[cursor] = average
-    if (width > 1) tieTerm += width * width * width - width
-    index = end
-  }
-  let rankSum = 0
-  for (let cursor = 0; cursor < tagged.length; cursor++) {
-    if (tagged[cursor]?.side === 'new') rankSum += ranks[cursor] ?? 0
-  }
-  const n = n1 + n2
-  const mean = n1 * (n + 1) / 2
-  let variance = n1 * n2 * (n + 1) / 12
-  if (n > 1) variance -= n1 * n2 * tieTerm / (12 * n * (n - 1))
-  if (variance <= 0) return { rankSum, z: 0, pGreater: 0.5, slower: false }
-  const z = (rankSum - mean) / Math.sqrt(variance)
-  const pGreater = 1 - normalCdf(z)
-  return { rankSum, z, pGreater, slower: z > 0 && pGreater < alpha }
-}
-
-function p99(values: readonly number[]): number | null {
-  const sorted = values.filter(value => Number.isFinite(value)).slice().sort((a, b) => a - b)
-  if (sorted.length === 0) return null
-  return sorted[Math.floor((sorted.length - 1) * 0.99)] ?? null
-}
-
-export type LatencyCall =
-  | { readonly kind: 'insufficient_data'; readonly reason: string; readonly rule: AppliedRule }
-  | { readonly kind: 'not_slower'; readonly reason: string; readonly rule: AppliedRule }
-  | { readonly kind: 'slower'; readonly reason: string; readonly rule: AppliedRule }
-
-/** Mann-Whitney when both sides have MIN_SAMPLES. Quantile p99 when both have QUANTILE_FLOOR. Otherwise insufficient. */
-export function compareLatency(newer: readonly number[], older: readonly number[]): LatencyCall {
-  if (newer.length >= MIN_SAMPLES && older.length >= MIN_SAMPLES) {
-    const test = mannWhitneyGreater(newer, older, MANN_WHITNEY_ALPHA)
-    const rule = { name: 'mann_whitney_alpha', value: MANN_WHITNEY_ALPHA }
-    if (!test) return { kind: 'insufficient_data', reason: 'Mann-Whitney needs two samples on each side', rule }
-    if (test.slower) {
-      return {
-        kind: 'slower',
-        reason: `new version wall time is slower (Mann-Whitney p=${test.pGreater.toExponential(2)} < ${MANN_WHITNEY_ALPHA})`,
-        rule,
-      }
-    }
-    return { kind: 'not_slower', reason: `Mann-Whitney p=${test.pGreater.toExponential(2)}`, rule }
-  }
-  if (newer.length >= QUANTILE_FLOOR && older.length >= QUANTILE_FLOOR) {
-    const next = p99(newer)
-    const previous = p99(older)
-    const rule = { name: 'quantile_p99_ratio', value: QUANTILE_P99_RATIO }
-    if (next === null || previous === null) {
-      return { kind: 'insufficient_data', reason: 'wall p99 has no sample', rule }
-    }
-    if (previous === 0 && next === 0) return { kind: 'not_slower', reason: 'wall p99 is 0 on both versions', rule }
-    if (previous === 0 && next > 0) {
-      return { kind: 'slower', reason: `wall p99 was 0 on the old version and ${next} on the new`, rule }
-    }
-    const ratioValue = next / previous
-    if (ratioValue > QUANTILE_P99_RATIO) {
-      return { kind: 'slower', reason: `wall p99 ratio ${ratioValue.toFixed(3)} > ${QUANTILE_P99_RATIO}`, rule }
-    }
-    return { kind: 'not_slower', reason: `wall p99 ratio ${ratioValue.toFixed(3)}`, rule }
-  }
-  return {
-    kind: 'insufficient_data',
-    reason: `wall samples ${newer.length}/${older.length}; need ${MIN_SAMPLES} each for Mann-Whitney or ${QUANTILE_FLOOR} each for a quantile compare`,
-    rule: { name: 'min_samples', value: MIN_SAMPLES },
-  }
-}
-
 export type StepInput = {
   readonly requests: number
+  /** Fetch invocations. The routed share uses this, not `requests`, which falls back to logs. */
+  readonly invocations: number
   readonly exceptions: number
   readonly errors: number
   readonly fivexx: number
+  readonly errorLogs: number
   readonly wallMs: readonly number[]
   readonly v1: readonly V1Request[]
+}
+
+export type RoutedShare = {
+  readonly n: number
+  readonly newRequests: number
+  readonly share: number | null
+  readonly low: number | null
+  readonly high: number | null
+  readonly kind: 'untested' | 'match' | 'mismatch'
+}
+
+/**
+ * Binomial band around the target percent. Width is `z` standard errors at this n.
+ * `untested` is n = 0. `mismatch` is a share outside the band, or a new count that
+ * is not a fraction of the aggregate.
+ */
+export function routedShare(newRequests: number, total: number, targetPercent: number, z: number): RoutedShare {
+  if (!(total > 0) || newRequests < 0 || newRequests > total) {
+    const kind = total >= 0 && newRequests > total ? 'mismatch' : 'untested'
+    return { n: Math.max(0, total), newRequests, share: null, low: null, high: null, kind }
+  }
+  const p = targetPercent / 100
+  const se = Math.sqrt((p * (1 - p)) / total)
+  const margin = z * se
+  const low = Math.max(0, p - margin)
+  const high = Math.min(1, p + margin)
+  const share = newRequests / total
+  const kind = share < low || share > high ? 'mismatch' : 'match'
+  return { n: total, newRequests, share, low, high, kind }
 }
 
 function rulesOf(list: readonly AppliedRule[]): readonly [AppliedRule, ...AppliedRule[]] {
@@ -331,72 +263,124 @@ function verdict(
   return { outcome, reason, rules: rulesOf(rules), burns }
 }
 
+function percentile(values: readonly number[], p: number): number | null {
+  const sorted = values.filter(value => Number.isFinite(value)).slice().sort((a, b) => a - b)
+  if (sorted.length === 0) return null
+  return sorted[Math.floor((sorted.length - 1) * p)] ?? null
+}
+
+type Breach = { readonly reason: string; readonly rule: AppliedRule }
+
+/** Hard breaches stop the step. Informational ones are named on the advance reason. */
+function consider(mode: 'hard' | 'informational', breach: Breach | null, hard: Breach[], notes: string[]): void {
+  if (!breach) return
+  if (mode === 'hard') hard.push(breach)
+  else notes.push(breach.reason)
+}
+
+function countBreach(count: number, noun: string, rule: string, scope: string): Breach | null {
+  if (count <= 0) return null
+  const word = count === 1 ? noun : `${noun}s`
+  return { reason: `${count} ${word} ${scope}`, rule: { name: rule, value: 0 } }
+}
+
+function points(fraction: number): string {
+  return (fraction * 100).toFixed(2)
+}
+
 /**
- * One ramp step for the new version. Any exception, 5xx, non-ok outcome, or failed probe
- * rolls back before the sample floor. Burn is judged only at MIN_SAMPLES. Latency against
- * the old version is Mann-Whitney, or a p99 ratio when the sample is shorter.
+ * Version-vs-version wall p99. Fires only for `latency.mode = gate`, and only
+ * once both sides have the policy's minSamples. A short sample does not roll back.
+ */
+function latencyBreach(newer: readonly number[], older: readonly number[], policy: RolloutPolicy): Breach | null {
+  const latency = policy.gates.latency
+  if (latency.mode !== 'gate') return null
+  if (newer.length < latency.minSamples || older.length < latency.minSamples) return null
+  const next = percentile(newer, 0.99)
+  const previous = percentile(older, 0.99)
+  if (next === null || previous === null) return null
+  const delta = next - previous
+  const floor = { name: 'latency.effectFloorMs', value: latency.effectFloorMs }
+  if (previous <= 0) {
+    if (delta <= latency.effectFloorMs) return null
+    return { reason: `wall p99 was ${previous} on the old version and ${next} on the new`, rule: floor }
+  }
+  const ratio = next / previous
+  if (ratio > latency.p99Ratio && delta > latency.effectFloorMs) {
+    return {
+      reason: `wall p99 ratio ${ratio.toFixed(3)} > ${latency.p99Ratio} and +${delta}ms > ${latency.effectFloorMs}ms`,
+      rule: { name: 'latency.p99Ratio', value: latency.p99Ratio },
+    }
+  }
+  return null
+}
+
+const SCOPES = [
+  { id: 'new', scope: 'on the new version', pick: (input: { readonly next: StepInput }) => input.next },
+  { id: 'old', scope: 'on the old version', pick: (input: { readonly previous: StepInput }) => input.previous },
+  { id: 'aggregate', scope: 'across the worker', pick: (input: { readonly aggregate: StepInput }) => input.aggregate },
+] as const
+
+/**
+ * One ramp step. Correctness and burn are judged per version and across the worker.
+ * The routed share uses telemetry invocation counts. Too few new-version requests is
+ * `insufficient_data` or an advance, per the policy. A share outside the binomial
+ * band holds or rolls back, per the policy. Latency rolls back only in `gate` mode.
  */
 export function judgeStep(input: {
   readonly next: StepInput
   readonly previous: StepInput
-  readonly probeFailures: number
-  readonly unavailable?: string
+  readonly aggregate: StepInput
+  readonly targetPercent: number
+  readonly policy: RolloutPolicy
 }): StepVerdict {
   const burns = burnMap(input.next.v1)
-  if (input.unavailable) {
-    return verdict('rollback', input.unavailable, [{ name: 'telemetry_required', value: 1 }], burns)
-  }
-  if (input.probeFailures > 0) {
-    return verdict(
-      'rollback',
-      `${input.probeFailures} probe responses from the new version were not 2xx`,
-      [{ name: 'probe_contract', value: 0 }],
-      burns,
-    )
-  }
-  if (input.next.exceptions > 0) {
-    const noun = input.next.exceptions === 1 ? 'exception' : 'exceptions'
-    return verdict(
-      'rollback',
-      `${input.next.exceptions} ${noun} on the new version`,
-      [{ name: 'max_new_exceptions', value: 0 }],
-      burns,
-    )
-  }
-  if (input.next.fivexx > 0) {
-    return verdict(
-      'rollback',
-      `${input.next.fivexx} 5xx responses on the new version`,
-      [{ name: 'max_new_5xx', value: 0 }],
-      burns,
-    )
-  }
-  if (input.next.errors > 0) {
-    return verdict(
-      'rollback',
-      `${input.next.errors} non-ok outcomes on the new version`,
-      [{ name: 'max_new_errors', value: 0 }],
-      burns,
-    )
-  }
-  for (const slo of [AVAILABILITY, READ_LATENCY, WRITE_LATENCY]) {
-    const count = countSlo(slo, input.next.v1)
-    if (count.total >= MIN_SAMPLES && count.burn !== null && count.burn > FAST_BURN) {
-      return verdict(
-        'rollback',
-        `${slo.id} burn ${count.burn.toFixed(2)} > ${FAST_BURN}`,
-        [{ name: 'fast_burn', value: FAST_BURN }, { name: `${slo.id}.target`, value: slo.target }],
-        burns,
+  const hard: Breach[] = []
+  const notes: string[] = []
+  const gates = input.policy.gates
+  for (const scope of SCOPES) {
+    const side = scope.pick(input)
+    consider(gates.exceptions, countBreach(side.exceptions, 'exception', `max_${scope.id}_exceptions`, scope.scope), hard, notes)
+    consider(gates.fivexx, countBreach(side.fivexx, '5xx response', `max_${scope.id}_5xx`, scope.scope), hard, notes)
+    consider(gates.errorLogs, countBreach(side.errorLogs, 'error log', `max_${scope.id}_error_logs`, scope.scope), hard, notes)
+    consider(gates.nonOk, countBreach(side.errors, 'non-ok outcome', `max_${scope.id}_errors`, scope.scope), hard, notes)
+    if (gates.burn !== 'hard' && gates.burn !== 'informational') continue
+    for (const slo of [AVAILABILITY, READ_LATENCY, WRITE_LATENCY]) {
+      const count = countSlo(slo, side.v1)
+      if (count.total < input.policy.burn.minSamples || count.burn === null || count.burn <= input.policy.burn.fastBurn) continue
+      consider(
+        gates.burn,
+        {
+          reason: `${slo.id} burn ${count.burn.toFixed(2)} > ${input.policy.burn.fastBurn} ${scope.scope}`,
+          rule: { name: 'fast_burn', value: input.policy.burn.fastBurn },
+        },
+        hard,
+        notes,
       )
     }
   }
-  const latency = compareLatency(input.next.wallMs, input.previous.wallMs)
-  if (latency.kind === 'slower') return verdict('rollback', latency.reason, [latency.rule], burns)
-  if (latency.kind === 'insufficient_data') return verdict('insufficient_data', latency.reason, [latency.rule], burns)
-  return verdict(
-    'advance',
-    `within burn ${FAST_BURN} and latency is not slower`,
-    [{ name: 'fast_burn', value: FAST_BURN }, latency.rule],
-    burns,
-  )
+  consider(gates.latency.mode === 'gate' ? 'hard' : 'informational', latencyBreach(input.next.wallMs, input.previous.wallMs, input.policy), hard, notes)
+  const first = hard[0]
+  if (first) return verdict('rollback', first.reason, [first.rule], burns)
+  const noted = notes.length === 0 ? '' : `; informational: ${notes.join('; ')}`
+  const routed = routedShare(input.next.invocations, input.aggregate.invocations, input.targetPercent, input.policy.split.z)
+  if (routed.kind === 'mismatch') {
+    const where = routed.share === null
+      ? 'new-version requests are not a fraction of the aggregate'
+      : `routed share ${points(routed.share)}% is outside ${points(routed.low ?? 0)}..${points(routed.high ?? 0)} of target ${input.targetPercent}% (n=${routed.n})`
+    const outcome = input.policy.split.onMismatch === 'rollback' ? 'rollback' : 'hold'
+    return verdict(outcome, where, [{ name: 'routed_share', value: input.policy.split.z }], burns)
+  }
+  if (routed.kind === 'untested' || routed.newRequests < input.policy.split.minNewRequests) {
+    const reason = routed.kind === 'untested'
+      ? `insufficient evidence: 0 requests in the window${noted}`
+      : `insufficient evidence: ${routed.newRequests} new-version requests < ${input.policy.split.minNewRequests}${noted}`
+    const rule = { name: 'min_new_requests', value: input.policy.split.minNewRequests }
+    if (input.policy.split.onInsufficient === 'hold') return verdict('insufficient_data', reason, [rule], burns)
+    return verdict('advance', reason, [rule], burns)
+  }
+  const reason = notes.length === 0
+    ? `within burn ${input.policy.burn.fastBurn}`
+    : `within burn ${input.policy.burn.fastBurn}${noted}`
+  return verdict('advance', reason, [{ name: 'fast_burn', value: input.policy.burn.fastBurn }], burns)
 }
