@@ -82,7 +82,7 @@ test('span events join on rayId when requestId is null', () => {
   const summary = summarizeTelemetry(VERSION, [smoke(SMOKE_ID, RAY)], [logEvent(SMOKE_ID, PLATFORM, LOG_TRACE), invocation(SMOKE_ID, PLATFORM, LOG_TRACE)], spans)
   assert.equal(summary.tracedIds.has(SMOKE_ID), true)
   assert.deepEqual(summary.fetchMs, [20])
-  const judge = judgeSmokeTelemetry({ version: VERSION, requests: [smoke(SMOKE_ID, RAY)], summary, ceilings: SMOKE_LATENCY })
+  const judge = judgeSmokeTelemetry({ version: VERSION, requests: [smoke(SMOKE_ID, RAY)], summary, ceilings: SMOKE_LATENCY, maxLossRate: null })
   assert.equal(judge.kind, 'pass')
 })
 
@@ -119,7 +119,7 @@ test('a join that misses the invocations the worker logged is a harness fault', 
   assert.equal(summary.tracedIds.size, 0)
   assert.equal(summary.invocations, JOIN_MIN_LOGGED)
   assert.equal(implausibleJoin({ smoke: requests.length, invocations: summary.invocations, joined: summary.tracedIds.size }), true)
-  const judge = judgeSmokeTelemetry({ version: VERSION, requests, summary, ceilings: SMOKE_LATENCY })
+  const judge = judgeSmokeTelemetry({ version: VERSION, requests, summary, ceilings: SMOKE_LATENCY, maxLossRate: null })
   assert.equal(judge.kind, 'harness_fault')
   if (judge.kind === 'harness_fault') assert.match(judge.reason, /span join matched 0\//)
 })
@@ -137,7 +137,7 @@ test('a 5xx stays a worker fault when the span join also misses', () => {
     traces.push(spanEvent('fetch', 20, OTHER_RAY, LOG_TRACE))
   }
   const summary = summarizeTelemetry(VERSION, requests, events, traces)
-  const judge = judgeSmokeTelemetry({ version: VERSION, requests, summary, ceilings: SMOKE_LATENCY })
+  const judge = judgeSmokeTelemetry({ version: VERSION, requests, summary, ceilings: SMOKE_LATENCY, maxLossRate: null })
   assert.equal(judge.kind, 'worker')
 })
 
@@ -185,7 +185,7 @@ test('trace summaries with a full join are a harness fault, not a worker fault',
   assert.equal(summary.spanShape, 'summaries')
   assert.equal(summary.tracedIds.has(SMOKE_ID), true)
   assert.deepEqual([...summary.fetchMs], [])
-  const judge = judgeSmokeTelemetry({ version: VERSION, requests: [smoke(SMOKE_ID, RAY)], summary, ceilings: SMOKE_LATENCY })
+  const judge = judgeSmokeTelemetry({ version: VERSION, requests: [smoke(SMOKE_ID, RAY)], summary, ceilings: SMOKE_LATENCY, maxLossRate: null })
   assert.equal(judge.kind, 'harness_fault')
   if (judge.kind === 'harness_fault') {
     assert.match(judge.reason, /trace summaries/)
@@ -212,7 +212,7 @@ test('an observed fetch duration over the ceiling is a worker fault', () => {
     [logEvent(SMOKE_ID, PLATFORM, LOG_TRACE), invocation(SMOKE_ID, PLATFORM, LOG_TRACE)],
     [slow],
   )
-  const judge = judgeSmokeTelemetry({ version: VERSION, requests: [smoke(SMOKE_ID, RAY)], summary, ceilings: SMOKE_LATENCY })
+  const judge = judgeSmokeTelemetry({ version: VERSION, requests: [smoke(SMOKE_ID, RAY)], summary, ceilings: SMOKE_LATENCY, maxLossRate: null })
   assert.equal(judge.kind, 'worker')
   if (judge.kind === 'worker') assert.equal(judge.failures.some(failure => failure.kind === 'latency'), true)
 })
@@ -268,7 +268,7 @@ test('recorded query responses exercise every telemetry evaluator', () => {
   assert.equal(blinded.spanShape, 'summaries')
   assert.equal(blinded.fetchMs.length, 0)
   assert.equal(blinded.tracedIds.size, requests.length)
-  const blindedJudge = judgeSmokeTelemetry({ version: CANARY, requests, summary: blinded, ceilings: SMOKE_LATENCY })
+  const blindedJudge = judgeSmokeTelemetry({ version: CANARY, requests, summary: blinded, ceilings: SMOKE_LATENCY, maxLossRate: null })
   assert.equal(blindedJudge.kind, 'harness_fault')
   if (blindedJudge.kind === 'harness_fault') assert.match(blindedJudge.reason, /no child spans/)
 
@@ -276,7 +276,7 @@ test('recorded query responses exercise every telemetry evaluator', () => {
   assert.equal(seen.spanShape, 'events')
   assert.equal(seen.fetchMs.length, 200)
   assert.ok((percentile(seen.fetchMs, 0.99) ?? 0) < SMOKE_LATENCY.fetchMs.p99Ms)
-  const judge = judgeSmokeTelemetry({ version: CANARY, requests, summary: seen, ceilings: SMOKE_LATENCY })
+  const judge = judgeSmokeTelemetry({ version: CANARY, requests, summary: seen, ceilings: SMOKE_LATENCY, maxLossRate: null })
   assert.equal(judge.kind, 'pass')
   const versionStats = statsFromEvents(events, recordedSpans)
   assert.equal(versionStats.fetchMs.length, 200)

@@ -1,8 +1,42 @@
+import { atIndex, chainGet, fromNullable, mapGet, recordGet } from '../../src/absent.ts'
+import { orElse, unwrapOr } from '../../src/option.ts'
 import { verdict, type CanaryVerdict } from '../canary-verdict.mjs'
 import { CF_RAY_HEX_LENGTH, JOIN_MIN_LOGGED, JOIN_MIN_SHARE, QUERY_SLACK_MS, TELEMETRY_PAGE, type LatencyCeiling } from './baseline.ts'
 import { asRecord } from './json.ts'
 import { DEFAULT_MAX_LOSS_RATE, type RolloutGates } from './policy.ts'
 import type { V1Request } from './slo.ts'
+
+/** One property. A null receiver, a missing key, and a null property are null. */
+function field(value: unknown, key: string): unknown {
+  return unwrapOr(chainGet(value, key), null)
+}
+
+/** Preferred value, or the fallback when preferred is null. 0 and '' stay. */
+function coalesce(preferred: ReturnType<typeof chainGet>, fallback: unknown): unknown {
+  return unwrapOr(orElse(preferred, fromNullable(fallback)), null)
+}
+
+/** First record that is present. Both absent is an empty record. */
+function recordOrEmpty(first: Record<string, unknown> | null, second: Record<string, unknown> | null): Record<string, unknown> {
+  if (first !== null) return first
+  if (second !== null) return second
+  return {}
+}
+
+/** First non-empty string. Null and '' fall through. */
+function firstString(...values: readonly unknown[]): string | null {
+  for (const value of values) {
+    const text = stringField(value)
+    if (text !== null) return text
+  }
+  return null
+}
+
+/** A stored outcome other than ok, including a present null. A missing outcome is not a fault. */
+function outcomeFailed(workers: Record<string, unknown> | null): boolean {
+  const outcome = recordGet(workers, 'outcome')
+  return outcome.tag === 'some' && outcome.value !== 'ok'
+}
 
 /**
  * An observed bad value. This union has no missing-sample or shape variant:
@@ -53,7 +87,7 @@ export function telemetryQuery(
   from: number,
   to: number,
   filters: readonly Filter[],
-  offset?: string,
+  offset: string | null,
 ) {
   return {
     queryId: 'ply-cd',
@@ -97,31 +131,38 @@ export function unwrapEvents(payload: unknown): unknown[] {
 }
 
 export function pageCursor(page: readonly unknown[]): string | null {
-  const last = asRecord(page[page.length - 1])
-  const meta = asRecord(last?.$metadata)
-  return typeof meta?.id === 'string' && meta.id !== '' ? meta.id : null
+  const last = asRecord(unwrapOr(atIndex(page, page.length - 1), null))
+  const meta = asRecord(field(last, '$metadata'))
+  const id = field(meta, 'id')
+  return typeof id === 'string' && id !== '' ? id : null
 }
 
 /** Same percentile as scripts/canary-o11y.mjs: sorted[floor((n - 1) * p)], null when empty. */
 export function percentile(values: readonly number[], p: number): number | null {
   const sorted = values.filter(value => Number.isFinite(value)).sort((a, b) => a - b)
   if (sorted.length === 0) return null
-  return sorted[Math.floor((sorted.length - 1) * p)] ?? null
+  return unwrapOr(atIndex(sorted, Math.floor((sorted.length - 1) * p)), null)
+}
+
+/** Percentile text. An empty series prints `-`; 0 prints `0`. */
+function percentileLabel(values: readonly number[], p: number): string {
+  const value = percentile(values, p)
+  return value === null ? '-' : `${value}`
 }
 
 /** Duration in milliseconds. `durationMS` is already milliseconds. A bare `duration` above 1e6 is nanoseconds. */
 export function spanDurationMs(span: Record<string, unknown>): number | null {
   const source = asRecord(span.source)
-  const attrs = asRecord(span.attributes) ?? asRecord(span.attrs) ?? {}
+  const attrs = recordOrEmpty(asRecord(span.attributes), asRecord(span.attrs))
   const millis = [
     span.durationMs, span.durationMS, span.duration_ms,
-    source?.durationMs, source?.durationMS, source?.duration_ms,
+    field(source, 'durationMs'), field(source, 'durationMS'), field(source, 'duration_ms'),
     attrs.duration_ms, attrs.durationMs, attrs.durationMS,
   ]
   for (const candidate of millis) {
     if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0) return candidate
   }
-  const raw = typeof span.duration === 'number' ? span.duration : source?.duration ?? attrs.duration
+  const raw = typeof span.duration === 'number' ? span.duration : coalesce(chainGet(source, 'duration'), attrs.duration)
   if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return null
   return raw > 1_000_000 ? raw / 1_000_000 : raw
 }
@@ -150,32 +191,34 @@ export type FetchSample = {
 function spanNameOf(event: Record<string, unknown>): string | null {
   const source = asRecord(event.source)
   const meta = asRecord(event.$metadata)
-  return stringField(source?.name) ?? stringField(meta?.spanName) ?? stringField(event.name)
+  return firstString(field(source, 'name'), field(meta, 'spanName'), event.name)
 }
 
 function urlPathOf(event: Record<string, unknown>): string | null {
   const source = asRecord(event.source)
-  const url = source?.url ?? event.url
+  const url = coalesce(chainGet(source, 'url'), event.url)
   if (typeof url === 'string' && url !== '') return url
   const rec = asRecord(url)
-  return stringField(rec?.path) ?? stringField(rec?.full)
+  return firstString(field(rec, 'path'), field(rec, 'full'))
 }
 
 function httpStatusOf(event: Record<string, unknown>): number | null {
   const source = asRecord(event.source)
-  const http = asRecord(source?.http)
-  const response = asRecord(http?.response)
-  const status = response?.status_code ?? response?.statusCode
+  const http = asRecord(field(source, 'http'))
+  const response = asRecord(field(http, 'response'))
+  const status = coalesce(chainGet(response, 'status_code'), field(response, 'statusCode'))
   return typeof status === 'number' ? status : null
 }
 
 function scriptVersionOf(event: Record<string, unknown>): string | null {
   const source = asRecord(event.source)
-  const cloudflare = asRecord(source?.cloudflare)
-  const script = asRecord(cloudflare?.script_version)
-  if (typeof script?.id === 'string' && script.id !== '') return script.id
-  const faas = asRecord(source?.faas)
-  return typeof faas?.version === 'string' && faas.version !== '' ? faas.version : null
+  const cloudflare = asRecord(field(source, 'cloudflare'))
+  const script = asRecord(field(cloudflare, 'script_version'))
+  const id = field(script, 'id')
+  if (typeof id === 'string' && id !== '') return id
+  const faas = asRecord(field(source, 'faas'))
+  const version = field(faas, 'version')
+  return typeof version === 'string' && version !== '' ? version : null
 }
 
 /** An outbound `fetch` span. Trace summaries and root spans (GET, POST, DELETE) are not samples. */
@@ -185,7 +228,8 @@ export function fetchSample(event: unknown): FetchSample | null {
   if (spanNameOf(rec) !== 'fetch') return null
   const durationMs = spanDurationMs(rec)
   if (durationMs === null) return null
-  const path = urlPathOf(rec) ?? ''
+  const found = urlPathOf(rec)
+  const path = found === null ? '' : found
   return {
     durationMs,
     path,
@@ -199,8 +243,9 @@ export function fetchSample(event: unknown): FetchSample | null {
 
 function versionOf(event: Record<string, unknown>): string | null {
   const workers = asRecord(event.$workers)
-  const script = asRecord(workers?.scriptVersion)
-  return typeof script?.id === 'string' ? script.id : null
+  const script = asRecord(field(workers, 'scriptVersion'))
+  const id = field(script, 'id')
+  return typeof id === 'string' ? id : null
 }
 
 /** `$workers.scriptVersion.id` on a telemetry event, or null. The ramp partitions one query with this. */
@@ -215,17 +260,17 @@ function stringField(value: unknown): string | null {
 
 function requestIdOf(event: Record<string, unknown>): string | null {
   const meta = asRecord(event.$metadata)
-  return stringField(meta?.requestId) ?? stringField(event.requestId)
+  return firstString(field(meta, 'requestId'), event.requestId)
 }
 
 function traceIdOf(event: Record<string, unknown>): string | null {
   const meta = asRecord(event.$metadata)
-  return stringField(event.traceId) ?? stringField(event.trace_id) ?? stringField(meta?.traceId) ?? stringField(meta?.trace_id)
+  return firstString(event.traceId, event.trace_id, field(meta, 'traceId'), field(meta, 'trace_id'))
 }
 
 function rayIdOf(event: Record<string, unknown>): string | null {
   const meta = asRecord(event.$metadata)
-  return stringField(event.rayId) ?? stringField(event.ray_id) ?? stringField(meta?.rayId) ?? stringField(meta?.ray_id)
+  return firstString(event.rayId, event.ray_id, field(meta, 'rayId'), field(meta, 'ray_id'))
 }
 
 type JoinKey = {
@@ -330,18 +375,19 @@ function smokeMatched(marks: TraceMarks, keysBySmoke: ReadonlyMap<string, SmokeK
 
 function isLog(event: Record<string, unknown>): boolean {
   const source = asRecord(event.source)
-  return source?.msg === 'ply.request' || event.msg === 'ply.request'
+  return field(source, 'msg') === 'ply.request' || event.msg === 'ply.request'
 }
 
 function smokeIdOf(event: Record<string, unknown>): string | null {
   const source = asRecord(event.source)
-  if (typeof source?.id === 'string') return source.id
+  const id = field(source, 'id')
+  if (typeof id === 'string') return id
   return typeof event.id === 'string' ? event.id : null
 }
 
 function statusOf(event: Record<string, unknown>): number | null {
   const source = asRecord(event.source)
-  const status = source?.status ?? event.status
+  const status = coalesce(chainGet(source, 'status'), event.status)
   return typeof status === 'number' ? status : null
 }
 
@@ -365,7 +411,7 @@ export type FetchInvocation =
 export function fetchInvocation(event: Record<string, unknown>): FetchInvocation | null {
   const meta = asRecord(event.$metadata)
   const workers = asRecord(event.$workers)
-  if (meta?.type !== FETCH_EVENT || workers?.eventType !== FETCH_TYPE) return null
+  if (workers === null || field(meta, 'type') !== FETCH_EVENT || field(workers, 'eventType') !== FETCH_TYPE) return null
   const entrypoint = workers.entrypoint
   if (typeof entrypoint !== 'string' || entrypoint === '' || entrypoint === DEFAULT_ENTRYPOINT) {
     return { [fetchBrand]: 'FetchInvocation', kind: 'external' }
@@ -374,13 +420,15 @@ export function fetchInvocation(event: Record<string, unknown>): FetchInvocation
 }
 
 function isExternalFetch(event: Record<string, unknown>): boolean {
-  return fetchInvocation(event)?.kind === 'external'
+  const invocation = fetchInvocation(event)
+  return invocation !== null && invocation.kind === 'external'
 }
 
 function exceptionCount(event: Record<string, unknown>): number {
   const workers = asRecord(event.$workers)
-  if (Array.isArray(workers?.exceptions) && workers.exceptions.length > 0) return workers.exceptions.length
-  if (workers?.outcome === 'exception') return 1
+  const exceptions = field(workers, 'exceptions')
+  if (Array.isArray(exceptions) && exceptions.length > 0) return exceptions.length
+  if (field(workers, 'outcome') === 'exception') return 1
   return 0
 }
 
@@ -426,14 +474,14 @@ function internalCounts(counts: ReadonlyMap<string, number>): InternalEntrypoint
 
 function methodOf(event: Record<string, unknown>): V1Request['method'] {
   const source = asRecord(event.source)
-  const method = source?.method ?? event.method
+  const method = coalesce(chainGet(source, 'method'), event.method)
   if (method === 'GET' || method === 'POST') return method
   return 'OTHER'
 }
 
 function pathOf(event: Record<string, unknown>): string | null {
   const source = asRecord(event.source)
-  const path = source?.path ?? event.path
+  const path = coalesce(chainGet(source, 'path'), event.path)
   if (typeof path !== 'string' || path === '') return null
   const bare = path.split('?')[0]
   return bare || null
@@ -447,8 +495,9 @@ function v1From(events: readonly unknown[]): V1Request[] {
     const id = requestIdOf(event)
     if (!id) continue
     const workers = asRecord(event.$workers)
+    const wallTime = field(workers, 'wallTimeMs')
     invocations.set(id, {
-      wall: typeof workers?.wallTimeMs === 'number' ? workers.wallTimeMs : null,
+      wall: typeof wallTime === 'number' ? wallTime : null,
       exception: exceptionCount(event) > 0,
     })
   }
@@ -458,17 +507,19 @@ function v1From(events: readonly unknown[]): V1Request[] {
     if (!event || !isLog(event)) continue
     const path = pathOf(event)
     if (!path || (path !== '/v1' && !path.startsWith('/v1/'))) continue
-    const status = statusOf(event) ?? 0
+    const loggedStatus = statusOf(event)
+    const status = loggedStatus === null ? 0 : loggedStatus
     const id = requestIdOf(event)
-    const linked = id ? invocations.get(id) : undefined
+    const linked = id ? unwrapOr(mapGet(invocations, id), null) : null
     const source = asRecord(event.source)
-    const loggedMs = typeof source?.ms === 'number' ? source.ms : null
+    const logged = field(source, 'ms')
+    const loggedMs = typeof logged === 'number' ? logged : null
     out.push({
       method: methodOf(event),
       path,
       status,
-      exception: linked?.exception ?? false,
-      wallMs: linked?.wall ?? loggedMs,
+      exception: linked === null ? false : linked.exception,
+      wallMs: linked !== null && linked.wall !== null ? linked.wall : loggedMs,
       expected4xx: status >= 400 && status < 500,
     })
   }
@@ -481,7 +532,8 @@ function fetchMsJoined(events: readonly unknown[], spans: readonly unknown[]): n
   for (const item of events) {
     const event = asRecord(item)
     if (!event) continue
-    if (fetchInvocation(event)?.kind === 'internal') continue
+    const invocation = fetchInvocation(event)
+    if (invocation !== null && invocation.kind === 'internal') continue
     const key = joinKeyOf(event)
     if (key.requestId || key.traceId || key.rayId) keys.push(key)
   }
@@ -513,20 +565,22 @@ export function statsFromEvents(events: readonly unknown[], spans: readonly unkn
       const status = statusOf(event)
       if (status !== null && status >= 500) fivexx += 1
       const meta = asRecord(event.$metadata)
-      if (meta?.level === 'error') errorLogs += 1
+      if (field(meta, 'level') === 'error') errorLogs += 1
     }
     const fetch = fetchInvocation(event)
     if (!fetch) continue
     if (fetch.kind === 'internal') {
-      internal.set(fetch.entrypoint, (internal.get(fetch.entrypoint) ?? 0) + 1)
+      internal.set(fetch.entrypoint, unwrapOr(mapGet(internal, fetch.entrypoint), 0) + 1)
       continue
     }
     requests += 1
     exceptions += exceptionCount(event)
     const workers = asRecord(event.$workers)
-    if (workers?.outcome !== undefined && workers.outcome !== 'ok') errors += 1
-    if (typeof workers?.wallTimeMs === 'number') wallMs.push(workers.wallTimeMs)
-    if (typeof workers?.cpuTimeMs === 'number') cpuMs.push(workers.cpuTimeMs)
+    if (outcomeFailed(workers)) errors += 1
+    const wall = field(workers, 'wallTimeMs')
+    if (typeof wall === 'number') wallMs.push(wall)
+    const cpu = field(workers, 'cpuTimeMs')
+    if (typeof cpu === 'number') cpuMs.push(cpu)
   }
   return {
     requests: requests > 0 ? requests : logs,
@@ -598,7 +652,7 @@ export function summarizeTelemetry(
     if (isLog(event)) {
       const id = smokeIdOf(event)
       if (id && want.has(id)) {
-        const versions = loggedBy.get(id) ?? new Set<string>()
+        const versions = unwrapOr(mapGet(loggedBy, id), new Set<string>())
         if (saw) versions.add(saw)
         loggedBy.set(id, versions)
         addKey(keysFor(id), joinKeyOf(event))
@@ -612,14 +666,14 @@ export function summarizeTelemetry(
         const status = statusOf(event)
         if (status !== null && status >= 500) fivexx += 1
         const meta = asRecord(event.$metadata)
-        if (meta?.level === 'error') errorLogs += 1
+        if (field(meta, 'level') === 'error') errorLogs += 1
       }
     }
     if (saw !== version || !isExternalFetch(event)) continue
     invocations += 1
     if (exceptionCount(event) > 0) exceptions += 1
     const workers = asRecord(event.$workers)
-    if (workers?.outcome !== undefined && workers.outcome !== 'ok') nonOk += 1
+    if (outcomeFailed(workers)) nonOk += 1
   }
   const wallMs: number[] = []
   const cpuMs: number[] = []
@@ -629,15 +683,17 @@ export function summarizeTelemetry(
     const platform = requestIdOf(event)
     if (!platform || !smokePlatform.has(platform)) continue
     const workers = asRecord(event.$workers)
-    if (typeof workers?.wallTimeMs === 'number') wallMs.push(workers.wallTimeMs)
-    if (typeof workers?.cpuTimeMs === 'number') cpuMs.push(workers.cpuTimeMs)
+    const wall = field(workers, 'wallTimeMs')
+    if (typeof wall === 'number') wallMs.push(wall)
+    const cpu = field(workers, 'cpuTimeMs')
+    if (typeof cpu === 'number') cpuMs.push(cpu)
   }
   for (const item of events) {
     const event = asRecord(item)
     if (!event) continue
     const key = joinKeyOf(event)
     const requestId = key.requestId
-    let smoke = requestId ? platformToSmoke.get(requestId) ?? null : null
+    let smoke = requestId ? unwrapOr(mapGet(platformToSmoke, requestId), null) : null
     const rayId = key.rayId
     if (!smoke && rayId) {
       for (const [id, keys] of keysBySmoke) {
@@ -817,7 +873,8 @@ export function telemetryLoss(
   for (const request of requests) {
     if (counted.has(request.id)) continue
     counted.add(request.id)
-    const log = (summary.loggedBy.get(request.id)?.size ?? 0) === 0
+    const logged = mapGet(summary.loggedBy, request.id)
+    const log = (logged.tag === 'some' ? logged.value.size : 0) === 0
     const trace = !summary.tracedIds.has(request.id)
     if (log || trace) ids.push({ id: request.id, step: request.step, log, trace })
   }
@@ -835,11 +892,12 @@ export function judgeSmokeTelemetry(input: {
   readonly requests: readonly SmokeRequest[]
   readonly summary: SmokeSummary
   readonly ceilings: { readonly cpuMs: LatencyCeiling; readonly wallMs: LatencyCeiling; readonly fetchMs: LatencyCeiling }
-  /** Policy `telemetry.maxLossRate`. Loss at or below it is informational. */
-  readonly maxLossRate?: number
+  /** Policy `telemetry.maxLossRate`. Null uses the default. Loss at or below it is informational. */
+  readonly maxLossRate: number | null
 }): SmokeJudge {
   const { version, requests, summary, ceilings } = input
-  const loss = telemetryLoss(requests, summary, input.maxLossRate ?? DEFAULT_MAX_LOSS_RATE)
+  const maxLossRate = input.maxLossRate === null ? DEFAULT_MAX_LOSS_RATE : input.maxLossRate
+  const loss = telemetryLoss(requests, summary, maxLossRate)
   const decided = verdict({
     version,
     requests: requests.map(request => ({ id: request.id, version: request.version, step: request.step })),
@@ -882,7 +940,8 @@ export function judgeSmokeTelemetry(input: {
     : `${decided.line}${checks.length ? `; ${checks.map(check => check.kind).join(', ')}` : ''}`
   let fromLogs = 0
   for (const request of requests) {
-    if (summary.loggedBy.get(request.id)?.has(version)) fromLogs += 1
+    const logged = mapGet(summary.loggedBy, request.id)
+    if (logged.tag === 'some' && logged.value.has(version)) fromLogs += 1
   }
   const joined = summary.tracedIds.size
   const join = { smoke: requests.length, invocations: Math.max(summary.invocations, fromLogs), joined }
@@ -926,9 +985,9 @@ export function telemetryMarkdown(input: {
     `- invocations matched: ${judge.verdict.matched}/${judge.verdict.total}`,
     `- ${lossLine(loss)}${loss.exceeded ? ' EXCEEDED' : ' informational'}`,
     `- non-ok ${summary.health.nonOk}, 5xx ${summary.health.fivexx}, error logs ${summary.health.errorLogs}, exceptions ${summary.health.exceptions}`,
-    `- wall p50/p99 ${percentile(summary.wallMs, 0.5) ?? '-'} / ${percentile(summary.wallMs, 0.99) ?? '-'} ms`,
-    `- cpu p50/p99 ${percentile(summary.cpuMs, 0.5) ?? '-'} / ${percentile(summary.cpuMs, 0.99) ?? '-'} ms`,
-    `- fetch p50/p99 ${percentile(summary.fetchMs, 0.5) ?? '-'} / ${percentile(summary.fetchMs, 0.99) ?? '-'} ms`,
+    `- wall p50/p99 ${percentileLabel(summary.wallMs, 0.5)} / ${percentileLabel(summary.wallMs, 0.99)} ms`,
+    `- cpu p50/p99 ${percentileLabel(summary.cpuMs, 0.5)} / ${percentileLabel(summary.cpuMs, 0.99)} ms`,
+    `- fetch p50/p99 ${percentileLabel(summary.fetchMs, 0.5)} / ${percentileLabel(summary.fetchMs, 0.99)} ms`,
     `- traces for ${summary.tracedIds.size} smoke requests; ${summary.invocations} invocations logged by the worker`,
   ]
   if (loss.count > 0) {
