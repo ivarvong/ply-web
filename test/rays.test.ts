@@ -6,7 +6,19 @@ import {
   exposeRayHeaders, observeUpstream, parseCfRay, phaseOf, stampUpstreamSpans, type RayReport,
 } from '../src/rays.ts';
 
-const HEADER = /^(?:(?:ls-refs|fetch|receive-pack)=(?:[0-9a-f]{16}-[A-Za-z]{3}|-|no-response);dur=\d+)(?:, (?:(?:ls-refs|fetch|receive-pack)=(?:[0-9a-f]{16}-[A-Za-z]{3}|-|no-response);dur=\d+))*(?:, overflow=\d+)?$/;
+/** Null and a missing value take the fallback. An empty string and 0 stay. */
+function fill<T>(value: unknown, fallback: T): T {
+  return value === null || value === void 0 ? fallback : value as T;
+}
+
+/** One property. A null receiver and a missing key are holes. A stored null stays null. */
+function slot(receiver: unknown, key: string): unknown {
+  if (receiver === null || receiver === void 0) return void 0;
+  if (typeof receiver !== 'object' && typeof receiver !== 'function') return void 0;
+  return (receiver as Record<string, unknown>)[key];
+}
+
+const HEADER = /^((ls-refs|fetch|receive-pack)=([0-9a-f]{16}-[A-Za-z]{3}|-|no-response);dur=\d+)(, ((ls-refs|fetch|receive-pack)=([0-9a-f]{16}-[A-Za-z]{3}|-|no-response);dur=\d+))*(, overflow=\d+)?$/;
 
 function pkt(payload: string): Uint8Array<ArrayBuffer> {
   const raw = new TextEncoder().encode(`${(payload.length + 4).toString(16).padStart(4, '0')}${payload}`);
@@ -74,14 +86,14 @@ test('observeUpstream records a ray, a missing ray, a redirect, and a failure be
   await assert.rejects(() => call(() => { throw new Error('timeout'); }, upload, { method: 'POST', body: pkt('command=fetch\n') }));
   const report = log.report();
   const parts = encodeRayHeader(report).split(', ');
-  assert.match(parts[0] ?? '', /^ls-refs=aaaaaaaaaaaaaaaa-IAD;dur=\d+$/);
-  assert.match(parts[1] ?? '', /^fetch=bbbbbbbbbbbbbbbb-IAD;dur=\d+$/);
-  assert.match(parts[2] ?? '', /^receive-pack=-;dur=\d+$/);
-  assert.match(parts[3] ?? '', /^fetch=no-response;dur=\d+$/);
+  assert.match(fill(parts[0], ''), /^ls-refs=aaaaaaaaaaaaaaaa-IAD;dur=\d+$/);
+  assert.match(fill(parts[1], ''), /^fetch=bbbbbbbbbbbbbbbb-IAD;dur=\d+$/);
+  assert.match(fill(parts[2], ''), /^receive-pack=-;dur=\d+$/);
+  assert.match(fill(parts[3], ''), /^fetch=no-response;dur=\d+$/);
   assert.equal(parts.length, 4);
   assert.match(encodeRayHeader(report), HEADER);
-  assert.equal(report.entries[1]?.delivered, false, 'a redirect hop is listed and not the hop ply read');
-  assert.equal(report.entries[3]?.ray.kind, 'no_response');
+  assert.equal(slot(report.entries[1], 'delivered'), false, 'a redirect hop is listed and not the hop ply read');
+  assert.equal(report.entries[3] == null ? void 0 : report.entries[3].ray.kind, 'no_response');
 });
 
 test('headers and spans use the same tokens, and CORS exposure is opt-in', () => {
@@ -109,11 +121,12 @@ test('headers and spans use the same tokens, and CORS exposure is opt-in', () =>
     { name: 'git.upload-pack fetch', startTimeUnixNano: '10', attributes: [] },
   ] }] }] };
   stampUpstreamSpans([line], report);
-  const spans = line.resourceSpans[0]?.scopeSpans[0]?.spans ?? [];
+  const scope = slot(line.resourceSpans[0], 'scopeSpans');
+  const spans = fill(slot(slot(scope, '0'), 'spans'), [] as { name: string; attributes: { length: number } }[]);
   const tree = spans.find(span => span.name === 'git.ls_tree');
   const fetchSpan = spans.find(span => span.name === 'git.upload-pack fetch');
-  assert.equal(tree?.attributes.length, 1, 'a non-exchange span is left alone');
-  assert.deepEqual(fetchSpan?.attributes, [
+  assert.equal(tree == null ? void 0 : tree.attributes.length, 1, 'a non-exchange span is left alone');
+  assert.deepEqual(fetchSpan == null ? void 0 : fetchSpan.attributes, [
     { key: 'git.upstream.cf_ray', value: { stringValue: 'dddddddddddddddd-IAD' } },
     { key: 'git.upstream.phase', value: { stringValue: 'fetch' } },
     { key: 'git.upstream.dur_ms', value: { intValue: '9' } },

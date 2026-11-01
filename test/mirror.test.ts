@@ -9,6 +9,18 @@ import { git, makeBareRepo, startGitServer, tmpRoot, commitFiles } from './serve
 import { syncMirror, WRITE_TTL_S, type Mirror } from '../src/mirror.ts';
 import type { ArtifactsNamespace, TokenSource } from '../src/public.ts';
 
+/** Null and a missing value take the fallback. An empty string and 0 stay. */
+function fill<T>(value: unknown, fallback: T): T {
+  return value === null || value === void 0 ? fallback : value as T;
+}
+
+/** One property. A null receiver and a missing key are holes. A stored null stays null. */
+function slot(receiver: unknown, key: string): unknown {
+  if (receiver === null || receiver === void 0) return void 0;
+  if (typeof receiver !== 'object' && typeof receiver !== 'function') return void 0;
+  return (receiver as Record<string, unknown>)[key];
+}
+
 const READ = `art_v1_${'re4d'.repeat(10)}?expires=4102444800`;
 const WRITE = `art_v1_${'wr17'.repeat(10)}?expires=4102444800`;
 
@@ -34,8 +46,8 @@ test('syncMirror: first sync, in-sync, incremental, rewritten upstream; a 60 s w
     const tokens: TokenSource = { readToken: async () => READ, secrets: () => [READ] };
     const auths: string[] = [];
     // github.com/ivarvong/ply.git → the local source repo; the mirror origin is the local server itself
-    const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
-      auths.push(new Headers(init?.headers).get('authorization') ?? '');
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      auths.push(fill(new Headers(slot(init, 'headers') as HeadersInit).get('authorization'), ''));
       const u = String(input).replace('https://github.com/ivarvong/ply.git', `${srv.url}/src.git`);
       return fetch(u, init);
     };
