@@ -1,7 +1,7 @@
 import { asRecord } from './json.ts'
 import type { ObservationRef } from './log.ts'
 import { percentile, type VersionStats } from './telemetry.ts'
-import { judgeStep, QUANTILE_FLOOR, type StepVerdict } from './slo.ts'
+import { burnMap, judgeStep, QUANTILE_FLOOR, type StepVerdict } from './slo.ts'
 import type { RampSchedule } from './baseline.ts'
 
 export type { VersionStats } from './telemetry.ts'
@@ -10,7 +10,15 @@ export type Observation =
   | { readonly kind: 'unavailable'; readonly reason: string; readonly ref?: ObservationRef }
   | { readonly kind: 'sample'; readonly next: VersionStats; readonly previous: VersionStats; readonly ref?: ObservationRef }
 
-export type RampDecision = StepVerdict
+/** A query the ramp could not run. This is not a rollback: no observed burn or error was seen. */
+export type HarnessRamp = {
+  readonly outcome: 'harness_fault'
+  readonly reason: string
+  readonly rules: StepVerdict['rules']
+  readonly burns: StepVerdict['burns']
+}
+
+export type RampDecision = StepVerdict | HarnessRamp
 
 export type HeldWrite = { readonly kind: 'state_conflict'; readonly reason: string }
 
@@ -24,26 +32,23 @@ export function rampStart(): RampState {
   return { kind: 'ramping', step: 0 }
 }
 
-/** One ramp step. Unavailable telemetry rolls back. A short clean sample is insufficient_data, which still advances. */
+/** One ramp step. Unavailable telemetry is a harness fault and does not roll back. A short clean sample is insufficient_data, which still advances. */
 export function decideRampStep(obs: Observation, probeFailures = 0): RampDecision {
   if (obs.kind === 'unavailable') {
-    return judgeStep({
-      next: emptyStats(),
-      previous: emptyStats(),
-      probeFailures,
-      unavailable: obs.reason,
-    })
+    return {
+      outcome: 'harness_fault',
+      reason: obs.reason,
+      rules: [{ name: 'telemetry_required', value: 1 }],
+      burns: burnMap([]),
+    }
   }
   return judgeStep({ next: obs.next, previous: obs.previous, probeFailures })
 }
 
-function emptyStats(): VersionStats {
-  return { requests: 0, exceptions: 0, errors: 0, fivexx: 0, wallMs: [], cpuMs: [], fetchMs: [], v1: [] }
-}
-
-/** Advance on a clean step, including insufficient_data. A terminal state stays terminal. */
+/** Advance on a clean step, including insufficient_data. A terminal state stays terminal. A harness fault stops without rolling back. */
 export function applyRamp(state: RampState, decision: RampDecision, stepCount: number): RampState {
   if (state.kind !== 'ramping') return state
+  if (decision.outcome === 'harness_fault') return { kind: 'stopped', reason: decision.reason, fault: 'harness_fault' }
   if (decision.outcome === 'rollback') return { kind: 'rolled-back', reason: decision.reason }
   const next = state.step + 1
   if (next >= stepCount) return { kind: 'complete' }

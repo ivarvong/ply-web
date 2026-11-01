@@ -6,8 +6,9 @@ export const WORKER_DEFAULT = 'ply'
 export const BASE_URL_DEFAULT = 'https://ply.ivar.workers.dev'
 export const NAMESPACE_DEFAULT = 'ply-loadgen'
 export const BUMP_BRANCH_DEFAULT = 'bump-ply'
-export const RUN_ROOT_DEFAULT = 'cd-runs'
 export const REPO_PREFIX = 'ply-web-cd-'
+/** How long a candidate Node binary may take to print its version during preflight. */
+export const NODE_PROBE_MS = 5_000
 
 /** Write-token lifetime for the scratch repo. The smoke must finish inside this window. */
 export const TOKEN_TTL_SECONDS = 600

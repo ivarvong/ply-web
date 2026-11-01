@@ -13,6 +13,7 @@ import {
   queryFault,
   queryTo,
   serviceFilter,
+  spanTypeFilter,
   summarizeTelemetry,
   telemetryMarkdown,
   telemetryQuery,
@@ -120,8 +121,10 @@ export async function stageTelemetry(
     const to = queryTo(Date.now())
     const scoped = [serviceFilter(config.worker), versionFilter(opts.version)]
     const health = await queryAll('events', from, to, scoped)
-    // Span events have no script version and a null request id. Query traces by service, then join on rayId.
-    const traces = await queryAll('traces', from, to, [serviceFilter(config.worker)])
+    const service = serviceFilter(config.worker)
+    // The traces view is one summary row per trace and has no child spans. Fetch durations come from span events.
+    const traces = await queryAll('traces', from, to, [service])
+    const spans = await queryAll('events', from, to, [service, spanTypeFilter()])
     const seen = new Set<string>()
     const combined = []
     for (const event of [...events, ...health]) {
@@ -132,7 +135,7 @@ export async function stageTelemetry(
       }
       combined.push(event)
     }
-    const summary = summarizeTelemetry(opts.version, requests, combined, traces)
+    const summary = summarizeTelemetry(opts.version, requests, combined, traces, spans)
     const judge = judgeSmokeTelemetry({ version: opts.version, requests, summary, ceilings: SMOKE_LATENCY })
     const markdown = telemetryMarkdown({ version: opts.version, from, to, judge, summary })
     const stem = opts.live ? 'live-telemetry' : 'telemetry'
@@ -158,14 +161,22 @@ export async function stageTelemetry(
     if (log) {
       const ref = await log.observation({
         measurement: { source: 'smoke-telemetry', pass: judge.kind === 'pass', line: judge.line },
-        query: telemetryQuery('traces', from, to, [serviceFilter(config.worker)]),
+        query: {
+          traces: telemetryQuery('traces', from, to, [serviceFilter(config.worker)]),
+          spans: telemetryQuery('events', from, to, [serviceFilter(config.worker), spanTypeFilter()]),
+        },
         from,
         to,
         raw: JSON.stringify({ line: judge.line, failures }),
       })
       await log.decision({
         inputs: [ref],
-        rules: [{ name: judge.kind === 'harness_fault' ? 'span_join' : 'smoke_telemetry', value: judge.kind === 'pass' ? 'pass' : judge.kind }],
+        rules: [{
+          name: judge.kind === 'harness_fault'
+            ? (judge.checks.some(check => check.kind === 'join') ? 'span_join' : 'telemetry_evaluable')
+            : 'smoke_telemetry',
+          value: judge.kind === 'pass' ? 'pass' : judge.kind,
+        }],
         outcome: judge.kind === 'pass' ? 'advance' : judge.kind === 'harness_fault' ? 'harness_fault' : opts.live ? 'rollback' : 'stop',
         reason: judge.line,
       })

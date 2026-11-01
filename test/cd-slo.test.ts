@@ -125,10 +125,7 @@ test('quantile comparison is used below the Mann-Whitney floor', () => {
   assert.equal(short.kind, 'insufficient_data')
 })
 
-test('missing telemetry rolls back and a clean compared sample advances', () => {
-  const down = judgeStep({ next: side(), previous: side(), probeFailures: 0, unavailable: 'telemetry unavailable: cf o11y down' })
-  assert.equal(down.outcome, 'rollback')
-  assert.equal(down.rules[0]?.name, 'telemetry_required')
+test('a clean compared sample advances', () => {
   const ok = judgeStep({
     next: side({ requests: 6, wallMs: walls(6, 90), v1: walls(6, 90).map(wallMs => request({ wallMs })) }),
     previous: side({ requests: 6, wallMs: walls(6, 80) }),

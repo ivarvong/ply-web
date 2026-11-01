@@ -14,6 +14,26 @@ export function revokeConfirmed(status: number): boolean {
   return status === REVOKED_STATUS
 }
 
+export type OpeningRevoke =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: string }
+
+/**
+ * The token Artifacts returns from repo create is revoked before the smoke mints its own.
+ * The check is unevaluable without that token, a listed id, a successful revoke, and a 403.
+ */
+export function openingRevokeResult(input: {
+  readonly hadToken: boolean
+  readonly listed: number
+  readonly revoked: boolean
+  readonly confirmed: boolean
+}): OpeningRevoke {
+  if (!input.hadToken) return { ok: false, reason: 'repo create returned no token' }
+  if (input.listed === 0) return { ok: false, reason: 'repo create token was not listed' }
+  if (!input.revoked || !input.confirmed) return { ok: false, reason: 'repo create token was not revoked' }
+  return { ok: true }
+}
+
 export type FailureClass = 'harness_fault' | 'worker'
 
 export type CallEvidence = {

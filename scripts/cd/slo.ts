@@ -340,12 +340,8 @@ export function judgeStep(input: {
   readonly next: StepInput
   readonly previous: StepInput
   readonly probeFailures: number
-  readonly unavailable?: string
 }): StepVerdict {
   const burns = burnMap(input.next.v1)
-  if (input.unavailable) {
-    return verdict('rollback', input.unavailable, [{ name: 'telemetry_required', value: 1 }], burns)
-  }
   if (input.probeFailures > 0) {
     return verdict(
       'rollback',

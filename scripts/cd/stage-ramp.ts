@@ -10,7 +10,7 @@ import { activeLog } from './log.ts'
 import { readPassVerdict, runRamp, type Observation } from './ramp.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import { writeJson } from './run-dir.ts'
-import { percentile, queryTo, serviceFilter, statsFromEvents, versionFilter } from './telemetry.ts'
+import { percentile, queryTo, serviceFilter, spanTypeFilter, statsFromEvents, versionFilter } from './telemetry.ts'
 import { applySplit, readShares, rollbackTo } from './traffic.ts'
 
 export type RampValue = {
@@ -23,13 +23,14 @@ async function observe(config: CdConfig, version: string, previous: string, from
   const service = serviceFilter(config.worker)
   const nextQuery = { view: 'events' as const, filters: [service, versionFilter(version)] }
   try {
-    const [nextEvents, previousEvents, traces] = await Promise.all([
+    const spansQuery = [service, spanTypeFilter()]
+    const [nextEvents, previousEvents, spans] = await Promise.all([
       queryCaptured('events', from, to, [service, versionFilter(version)]),
       queryCaptured('events', from, to, [service, versionFilter(previous)]),
-      queryCaptured('traces', from, to, [service]),
+      queryCaptured('events', from, to, spansQuery),
     ])
-    const next = statsFromEvents(nextEvents.events, traces.events)
-    const prior = statsFromEvents(previousEvents.events, traces.events)
+    const next = statsFromEvents(nextEvents.events, spans.events)
+    const prior = statsFromEvents(previousEvents.events, spans.events)
     const ref = await activeLog()?.observation({
       measurement: {
         source: 'ramp-step',
@@ -41,10 +42,10 @@ async function observe(config: CdConfig, version: string, previous: string, from
         nextWallP99: percentile(next.wallMs, 0.99),
         previousWallP99: percentile(prior.wallMs, 0.99),
       },
-      query: { next: nextEvents.query, previous: previousEvents.query, traces: traces.query },
+      query: { next: nextEvents.query, previous: previousEvents.query, spans: spans.query },
       from,
       to,
-      raw: JSON.stringify({ next: nextEvents.raw, previous: previousEvents.raw, traces: traces.raw }),
+      raw: JSON.stringify({ next: nextEvents.raw, previous: previousEvents.raw, spans: spans.raw }),
     })
     return { kind: 'sample', next, previous: prior, ...(ref ? { ref } : {}) }
   } catch (error) {

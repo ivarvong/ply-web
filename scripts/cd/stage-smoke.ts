@@ -3,14 +3,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { REPO_PREFIX, REVOKE_ATTEMPTS, REVOKE_PROBE_MS, REVOKE_WAIT_MS, SMOKE_HTTP_MS, STALE_REPO_MS, TOKEN_TTL_SECONDS } from './baseline.ts'
 import { cfOk, runCf } from './cf.ts'
-import { artifactsProbeUrl, classifyCall, revokeConfirmed, type FailureClass } from './classify.ts'
+import { artifactsProbeUrl, classifyCall, openingRevokeResult, revokeConfirmed, type FailureClass } from './classify.ts'
 import { csvDocument, type CsvRow } from './csv.ts'
 import { asRecord, extractJson } from './json.ts'
 import { judgeCall, type Saved } from './judge.ts'
 import { expectedStatus, lifecycle, type HttpStep } from './lifecycle.ts'
 import { activeLog } from './log.ts'
 import { errorMessage, run } from './proc.ts'
-import { harvestSecrets, redact } from './redact.ts'
+import { createdTokenSecret, harvestSecrets, redact } from './redact.ts'
 import { judgeFsck, judgeRefs, parseShowRef, type ApiRefs } from './refs.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import type { Secret } from './secret.ts'
@@ -349,46 +349,62 @@ export async function stageSmoke(
       'artifacts', 'namespaces', 'repos', 'create', config.namespace,
       '--name', name, '--default-branch', 'main', '--description', 'ply-web operator smoke (deleted after a pass)',
     ], secrets)
-    remember(created, secrets)
+    const found = remember(created, secrets)
+    const auto = createdTokenSecret(created, found)
     remote = findRemote(created) ?? ''
     if (!REMOTE.test(remote)) throw new Error('cf did not return an Artifacts remote')
-    for (const id of await listTokenIds(config, name, secrets)) {
-      await revoke(config, id, secrets)
+    const opening = await listTokenIds(config, name, secrets)
+    let revoked = opening.length > 0
+    for (const id of opening) {
+      if (!(await revoke(config, id, secrets))) revoked = false
     }
-    const mintedJson = await cfJson([
-      'artifacts', 'namespaces', 'tokens', 'create', config.namespace,
-      '--repo', name, '--scope', 'write', '--ttl', String(TOKEN_TTL_SECONDS),
-    ], secrets)
-    const found = remember(mintedJson, secrets)
-    const rec = asRecord(mintedJson)
-    const plain = typeof rec?.plaintext === 'string' ? rec.plaintext : ''
-    const writeToken = found.find(secret => secret.reveal() === plain)
-    if (!writeToken) throw new Error('cf returned no write token')
-    gitToken = writeToken.reveal()
-    if (typeof rec?.id === 'string') {
-      minted.push(rec.id)
-      mintedToken = { id: rec.id, secret: writeToken }
-    }
-    for (const step of lifecycle()) {
-      const result = await oneCall(config, step, saved, remote, opts.token, gitToken, opts.version, opts.pin)
-      rows.push(result.row)
-      if (result.request) requests.push(result.request)
-      if (!result.ok) {
-        detail = `${step.name}: ${result.judgementDetail}`
-        harness = result.fault === 'harness_fault'
-        break
+    let confirmed = false
+    if (auto && revoked) confirmed = await proveRevoked(remote, auto)
+    const openingResult = openingRevokeResult({
+      hadToken: auto !== null,
+      listed: opening.length,
+      revoked,
+      confirmed,
+    })
+    if (!openingResult.ok) {
+      detail = `${openingResult.reason} for ${name}`
+      harness = true
+    } else {
+      const mintedJson = await cfJson([
+        'artifacts', 'namespaces', 'tokens', 'create', config.namespace,
+        '--repo', name, '--scope', 'write', '--ttl', String(TOKEN_TTL_SECONDS),
+      ], secrets)
+      const mintedSecrets = remember(mintedJson, secrets)
+      const rec = asRecord(mintedJson)
+      const plain = typeof rec?.plaintext === 'string' ? rec.plaintext : ''
+      const writeToken = mintedSecrets.find(secret => secret.reveal() === plain)
+      if (!writeToken) throw new Error('cf returned no write token')
+      gitToken = writeToken.reveal()
+      if (typeof rec?.id === 'string') {
+        minted.push(rec.id)
+        mintedToken = { id: rec.id, secret: writeToken }
       }
-      saved = { ...saved, ...result.save }
-      if (result.refs) refs = result.refs
-    }
-    if (detail === 'ok') {
-      if (!refs) detail = 'refs-final did not return a ref map'
-      else {
-        const gitDetail = await judgeMirror(remote, gitToken, refs)
-        if (gitDetail) detail = gitDetail
+      for (const step of lifecycle()) {
+        const result = await oneCall(config, step, saved, remote, opts.token, gitToken, opts.version, opts.pin)
+        rows.push(result.row)
+        if (result.request) requests.push(result.request)
+        if (!result.ok) {
+          detail = `${step.name}: ${result.judgementDetail}`
+          harness = result.fault === 'harness_fault'
+          break
+        }
+        saved = { ...saved, ...result.save }
+        if (result.refs) refs = result.refs
       }
+      if (detail === 'ok') {
+        if (!refs) detail = 'refs-final did not return a ref map'
+        else {
+          const gitDetail = await judgeMirror(remote, gitToken, refs)
+          if (gitDetail) detail = gitDetail
+        }
+      }
+      passed = detail === 'ok'
     }
-    passed = detail === 'ok'
   } catch (error) {
     detail = redact(errorMessage(error), secrets)
     harness = true
