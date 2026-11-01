@@ -192,7 +192,7 @@ export function createTokenSource(binding: ArtifactsNamespace, now: () => number
       catch (e) {
         if ((e as { code?: string })?.code === 'upstream_5xx') throw e;
         // binding.get throws when the repo does not exist (developers.cloudflare.com/artifacts/api/workers-binding/#getname).
-        if (/not.?found|does not exist|no such/i.test(String((e as { message?: string })?.message ?? e))) throw fail('not_found', `no repository ${repo} in the public namespace`);
+        if (/not.?found|does not exist|no such/i.test(String((e as { message?: string })?.message ?? e))) throw fail('not_found', `no repository ${repo} in the public namespace`, { miss: { kind: 'repository' } });
         throw fail('upstream_5xx', 'could not mint a read token for the public namespace');
       }
     },

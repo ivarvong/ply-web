@@ -338,9 +338,9 @@ test('empty repo lifecycle: first commit through history, with no git seeding', 
   const emptyBody = await emptyRes.json();
   const { trace: coldTrace, ...empty } = emptyBody;
   assert.deepEqual(empty, { empty: true, ref: 'refs/heads/main', oid: null, tree: null, parents: [], author: null, committer: null, message: null, signed: false });
-  // Cold HEAD read: ply discovers `ls-refs=unborn` (one GET) before the unborn ls-refs. The readCommit miss is another ls-refs.
+  // ply's readCommit resolves an unborn HEAD itself: one discover, then the unborn ls-refs. No git.head span (that is the Worker's own HEAD read).
   assert.equal(coldTrace.filter(s => s.name === 'git.upload-pack discover').length, 1, JSON.stringify(coldTrace.map(s => s.name)));
-  assert.equal(coldTrace.find(s => s.name === 'git.head')?.attrs['git.head.discover'], 'discover');
+  assert.equal(coldTrace.some(s => s.name === 'git.head'), false);
   const coldLs = (emptyRes.headers.get('x-artifacts-ray') ?? '').split(', ').filter(part => part.startsWith('ls-refs=')).length;
   assert.match(emptyRes.headers.get('x-ply-request-id') ?? '', /\S/);
   assert.match(emptyRes.headers.get('x-ply-build') ?? '', /^ply=[0-9a-f]{40} ply-web=[0-9a-f]{40}$/);
@@ -350,11 +350,11 @@ test('empty repo lifecycle: first commit through history, with no git seeding', 
   const warmBody = await warmRes.json();
   const { trace: warmTrace, ...warm } = warmBody;
   assert.deepEqual(warm, empty);
-  // The advertisement is remembered for the origin. This HEAD read is ls-refs only.
-  assert.equal(warmTrace.filter(s => s.name === 'git.upload-pack discover').length, 0, JSON.stringify(warmTrace.map(s => s.name)));
-  assert.equal(warmTrace.find(s => s.name === 'git.head')?.attrs['git.head.discover'], 'cached');
+  // ply does not share the Worker's advertisement cache, so this read discovers again. The Worker records the bit for later HEAD reads.
+  assert.equal(warmTrace.filter(s => s.name === 'git.upload-pack discover').length, 1, JSON.stringify(warmTrace.map(s => s.name)));
+  assert.equal(warmTrace.some(s => s.name === 'git.head'), false);
   const warmLs = (warmRes.headers.get('x-artifacts-ray') ?? '').split(', ').filter(part => part.startsWith('ls-refs=')).length;
-  assert.equal(coldLs, warmLs + 1, `cold ${emptyRes.headers.get('x-artifacts-ray')} warm ${warmRes.headers.get('x-artifacts-ray')}`);
+  assert.equal(coldLs, warmLs, `cold ${emptyRes.headers.get('x-artifacts-ray')} warm ${warmRes.headers.get('x-artifacts-ray')}`);
   assert.notEqual(warmRes.headers.get('x-ply-request-id'), emptyRes.headers.get('x-ply-request-id'));
   assert.match(warmRes.headers.get('server-timing') ?? '', /total;dur=\d+/);
   assert.equal((await W(`/v1/commit?${qs({ remote, ref: 'nope' })}`)).status, 404);

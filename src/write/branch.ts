@@ -3,7 +3,7 @@
 // the oid the ref actually points at.
 import { fail, fetchCommit, lsRefs, operation, parseOid, push, resolveCommit, ZERO_OID } from 'ply'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
-import { refExists, staleExpected } from './errors.ts'
+import { assertNever, refExists, staleExpected } from './errors.ts'
 import { readHead } from './head.ts'
 import { branchRef } from './request.ts'
 import { writeResult } from './result.ts'
@@ -18,14 +18,20 @@ async function tipOf(t: Transport, from: string): Promise<string> {
     if (!fetched.ok) {
       const error = fetched.error
       if (error.code === 'not_found' && error.miss) {
+        // fetchCommit's not_found is a commit miss. Every kind stays that error: not_found is 404, message unchanged.
         switch (error.miss.kind) {
-          case 'absent':
-          case 'not_commit':
+          case 'commit':
+          case 'head_absent':
+          case 'head_unborn':
+          case 'is_directory':
+          case 'not_directory':
+          case 'path':
+          case 'ref':
+          case 'repository':
+          case 'submodule':
             throw error
-          default: {
-            const unreachable: never = error.miss
-            throw unreachable
-          }
+          default:
+            return assertNever(error.miss)
         }
       }
       throw error
@@ -70,7 +76,7 @@ export async function createBranch(remote: string, refName: unknown, from: unkno
 export async function deleteRef(remote: string, ref: string, expected: string | null, opts: CallOpts, op: 'branch_delete' | 'tag_delete'): Promise<Record<string, unknown>> {
   return operation(op, remote, { ...opts, attrs: { [`git.${op}.ref`]: ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
     const current = (await lsRefs(t, [ref])).refs.get(ref)?.oid as string | undefined
-    if (!current) throw fail('not_found', `ref ${ref} not found`)
+    if (!current) throw fail('not_found', `ref ${ref} not found`, { miss: { kind: 'ref', ref, candidates: [ref] } })
     if (expected && expected !== current) throw staleExpected(ref, expected, current)
     root.set({ [`git.${op}.oid`]: current, [`git.${op}.cas_from_caller`]: expected !== null })
     try {
