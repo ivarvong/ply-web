@@ -1,0 +1,936 @@
+{
+  "boundary": "src/absent.ts",
+  "counts": {
+    "word": 212,
+    "optional": 381,
+    "chain": 555,
+    "nullish": 628,
+    "total": 1776
+  },
+  "files": {
+    "cloudflare.config.ts": {
+      "word": 1,
+      "optional": 1,
+      "chain": 0,
+      "nullish": 0,
+      "total": 2
+    },
+    "scripts/canary-o11y.mjs": {
+      "word": 1,
+      "optional": 0,
+      "chain": 21,
+      "nullish": 12,
+      "total": 34
+    },
+    "scripts/canary-verdict.mjs": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 3,
+      "total": 3
+    },
+    "scripts/cd/bump-plan.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 1,
+      "total": 1
+    },
+    "scripts/cd/cf.ts": {
+      "word": 1,
+      "optional": 1,
+      "chain": 0,
+      "nullish": 2,
+      "total": 4
+    },
+    "scripts/cd/charts.ts": {
+      "word": 0,
+      "optional": 1,
+      "chain": 1,
+      "nullish": 4,
+      "total": 6
+    },
+    "scripts/cd/config.ts": {
+      "word": 1,
+      "optional": 1,
+      "chain": 0,
+      "nullish": 0,
+      "total": 2
+    },
+    "scripts/cd/csv.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 3,
+      "total": 3
+    },
+    "scripts/cd/debrief.ts": {
+      "word": 1,
+      "optional": 0,
+      "chain": 10,
+      "nullish": 26,
+      "total": 37
+    },
+    "scripts/cd/deploy-plan.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 2,
+      "nullish": 5,
+      "total": 7
+    },
+    "scripts/cd/flags-smoke.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 2,
+      "total": 2
+    },
+    "scripts/cd/judge.ts": {
+      "word": 4,
+      "optional": 11,
+      "chain": 2,
+      "nullish": 12,
+      "total": 29
+    },
+    "scripts/cd/lifecycle.ts": {
+      "word": 0,
+      "optional": 8,
+      "chain": 0,
+      "nullish": 0,
+      "total": 8
+    },
+    "scripts/cd/log.ts": {
+      "word": 7,
+      "optional": 4,
+      "chain": 1,
+      "nullish": 4,
+      "total": 16
+    },
+    "scripts/cd/main.ts": {
+      "word": 1,
+      "optional": 2,
+      "chain": 2,
+      "nullish": 9,
+      "total": 14
+    },
+    "scripts/cd/o11y.ts": {
+      "word": 1,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 0,
+      "total": 1
+    },
+    "scripts/cd/pipeline.ts": {
+      "word": 2,
+      "optional": 3,
+      "chain": 7,
+      "nullish": 5,
+      "total": 17
+    },
+    "scripts/cd/policy.ts": {
+      "word": 6,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 1,
+      "total": 7
+    },
+    "scripts/cd/preflight.ts": {
+      "word": 1,
+      "optional": 2,
+      "chain": 1,
+      "nullish": 0,
+      "total": 4
+    },
+    "scripts/cd/proc.ts": {
+      "word": 1,
+      "optional": 5,
+      "chain": 0,
+      "nullish": 5,
+      "total": 11
+    },
+    "scripts/cd/ramp.ts": {
+      "word": 2,
+      "optional": 3,
+      "chain": 10,
+      "nullish": 5,
+      "total": 20
+    },
+    "scripts/cd/reconcile.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 3,
+      "nullish": 2,
+      "total": 5
+    },
+    "scripts/cd/redact.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 2,
+      "nullish": 2,
+      "total": 4
+    },
+    "scripts/cd/refs.ts": {
+      "word": 1,
+      "optional": 1,
+      "chain": 3,
+      "nullish": 6,
+      "total": 11
+    },
+    "scripts/cd/release.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 2,
+      "total": 2
+    },
+    "scripts/cd/report.ts": {
+      "word": 2,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 2,
+      "total": 4
+    },
+    "scripts/cd/slo.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 1,
+      "nullish": 4,
+      "total": 5
+    },
+    "scripts/cd/stage-bump.ts": {
+      "word": 0,
+      "optional": 7,
+      "chain": 5,
+      "nullish": 5,
+      "total": 17
+    },
+    "scripts/cd/stage-deploy.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 1,
+      "nullish": 0,
+      "total": 1
+    },
+    "scripts/cd/stage-ramp.ts": {
+      "word": 4,
+      "optional": 2,
+      "chain": 4,
+      "nullish": 0,
+      "total": 10
+    },
+    "scripts/cd/stage-rollback.ts": {
+      "word": 0,
+      "optional": 1,
+      "chain": 0,
+      "nullish": 1,
+      "total": 2
+    },
+    "scripts/cd/stage-smoke.ts": {
+      "word": 1,
+      "optional": 0,
+      "chain": 12,
+      "nullish": 10,
+      "total": 23
+    },
+    "scripts/cd/stage-telemetry.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 8,
+      "nullish": 2,
+      "total": 10
+    },
+    "scripts/cd/telemetry.ts": {
+      "word": 3,
+      "optional": 2,
+      "chain": 52,
+      "nullish": 34,
+      "total": 91
+    },
+    "scripts/cd/traffic.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 3,
+      "nullish": 0,
+      "total": 3
+    },
+    "scripts/flags-cli.ts": {
+      "word": 3,
+      "optional": 1,
+      "chain": 0,
+      "nullish": 2,
+      "total": 6
+    },
+    "scripts/flags-o11y.ts": {
+      "word": 1,
+      "optional": 4,
+      "chain": 2,
+      "nullish": 5,
+      "total": 12
+    },
+    "scripts/flags-propagation.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 2,
+      "total": 2
+    },
+    "scripts/publish.mjs": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 1,
+      "total": 1
+    },
+    "scripts/visual-smoke.mjs": {
+      "word": 0,
+      "optional": 1,
+      "chain": 2,
+      "nullish": 10,
+      "total": 13
+    },
+    "scripts/worker-deploy.mjs": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 1,
+      "total": 1
+    },
+    "src/abbrev.ts": {
+      "word": 0,
+      "optional": 1,
+      "chain": 1,
+      "nullish": 0,
+      "total": 2
+    },
+    "src/flags/cache.ts": {
+      "word": 0,
+      "optional": 3,
+      "chain": 2,
+      "nullish": 2,
+      "total": 7
+    },
+    "src/flags/client.ts": {
+      "word": 4,
+      "optional": 10,
+      "chain": 3,
+      "nullish": 2,
+      "total": 19
+    },
+    "src/flags/document.ts": {
+      "word": 1,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 2,
+      "total": 3
+    },
+    "src/flags/entry.ts": {
+      "word": 1,
+      "optional": 11,
+      "chain": 6,
+      "nullish": 0,
+      "total": 18
+    },
+    "src/flags/eval.ts": {
+      "word": 1,
+      "optional": 0,
+      "chain": 2,
+      "nullish": 4,
+      "total": 7
+    },
+    "src/flags/http.ts": {
+      "word": 3,
+      "optional": 3,
+      "chain": 2,
+      "nullish": 4,
+      "total": 12
+    },
+    "src/flags/operator-entry.ts": {
+      "word": 0,
+      "optional": 1,
+      "chain": 0,
+      "nullish": 1,
+      "total": 2
+    },
+    "src/flags/operator-names.ts": {
+      "word": 1,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 0,
+      "total": 1
+    },
+    "src/flags/operator.ts": {
+      "word": 7,
+      "optional": 2,
+      "chain": 15,
+      "nullish": 6,
+      "total": 30
+    },
+    "src/flags/propagation.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 2,
+      "nullish": 2,
+      "total": 4
+    },
+    "src/flags/report.ts": {
+      "word": 0,
+      "optional": 1,
+      "chain": 1,
+      "nullish": 26,
+      "total": 28
+    },
+    "src/flags/store.ts": {
+      "word": 1,
+      "optional": 5,
+      "chain": 1,
+      "nullish": 1,
+      "total": 8
+    },
+    "src/flags/telemetry.ts": {
+      "word": 3,
+      "optional": 1,
+      "chain": 32,
+      "nullish": 2,
+      "total": 38
+    },
+    "src/flags/ttl.ts": {
+      "word": 2,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 0,
+      "total": 2
+    },
+    "src/gitcache-entry.ts": {
+      "word": 1,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 0,
+      "total": 1
+    },
+    "src/gitcache.ts": {
+      "word": 4,
+      "optional": 8,
+      "chain": 16,
+      "nullish": 13,
+      "total": 41
+    },
+    "src/index.js": {
+      "word": 1,
+      "optional": 0,
+      "chain": 27,
+      "nullish": 19,
+      "total": 47
+    },
+    "src/mirror.ts": {
+      "word": 0,
+      "optional": 15,
+      "chain": 6,
+      "nullish": 8,
+      "total": 29
+    },
+    "src/pathguard.ts": {
+      "word": 0,
+      "optional": 2,
+      "chain": 0,
+      "nullish": 1,
+      "total": 3
+    },
+    "src/pinned.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 1,
+      "nullish": 1,
+      "total": 2
+    },
+    "src/public.ts": {
+      "word": 5,
+      "optional": 10,
+      "chain": 14,
+      "nullish": 8,
+      "total": 37
+    },
+    "src/rays.ts": {
+      "word": 1,
+      "optional": 7,
+      "chain": 2,
+      "nullish": 7,
+      "total": 17
+    },
+    "src/read-status.ts": {
+      "word": 1,
+      "optional": 2,
+      "chain": 1,
+      "nullish": 0,
+      "total": 4
+    },
+    "src/remote.ts": {
+      "word": 2,
+      "optional": 13,
+      "chain": 7,
+      "nullish": 6,
+      "total": 28
+    },
+    "src/status.ts": {
+      "word": 1,
+      "optional": 2,
+      "chain": 2,
+      "nullish": 0,
+      "total": 5
+    },
+    "src/viewer/app.tsx": {
+      "word": 1,
+      "optional": 6,
+      "chain": 12,
+      "nullish": 4,
+      "total": 23
+    },
+    "src/viewer/budget.ts": {
+      "word": 0,
+      "optional": 1,
+      "chain": 0,
+      "nullish": 0,
+      "total": 1
+    },
+    "src/viewer/call.ts": {
+      "word": 1,
+      "optional": 14,
+      "chain": 0,
+      "nullish": 0,
+      "total": 15
+    },
+    "src/viewer/cloudflare-workers.d.ts": {
+      "word": 1,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 0,
+      "total": 1
+    },
+    "src/viewer/escape.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 1,
+      "total": 1
+    },
+    "src/viewer/failure.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 4,
+      "nullish": 0,
+      "total": 4
+    },
+    "src/viewer/fetchguard.ts": {
+      "word": 3,
+      "optional": 4,
+      "chain": 5,
+      "nullish": 5,
+      "total": 17
+    },
+    "src/viewer/format.ts": {
+      "word": 0,
+      "optional": 4,
+      "chain": 3,
+      "nullish": 5,
+      "total": 12
+    },
+    "src/viewer/handle.ts": {
+      "word": 0,
+      "optional": 2,
+      "chain": 2,
+      "nullish": 3,
+      "total": 7
+    },
+    "src/viewer/hint.ts": {
+      "word": 0,
+      "optional": 5,
+      "chain": 1,
+      "nullish": 0,
+      "total": 6
+    },
+    "src/viewer/identity.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 4,
+      "total": 4
+    },
+    "src/viewer/limits.ts": {
+      "word": 2,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 0,
+      "total": 2
+    },
+    "src/viewer/markdown.ts": {
+      "word": 10,
+      "optional": 10,
+      "chain": 10,
+      "nullish": 54,
+      "total": 84
+    },
+    "src/viewer/model.ts": {
+      "word": 0,
+      "optional": 7,
+      "chain": 0,
+      "nullish": 0,
+      "total": 7
+    },
+    "src/viewer/packmap.ts": {
+      "word": 2,
+      "optional": 4,
+      "chain": 6,
+      "nullish": 12,
+      "total": 24
+    },
+    "src/viewer/pages.tsx": {
+      "word": 6,
+      "optional": 1,
+      "chain": 14,
+      "nullish": 21,
+      "total": 42
+    },
+    "src/viewer/paste.ts": {
+      "word": 2,
+      "optional": 4,
+      "chain": 1,
+      "nullish": 3,
+      "total": 10
+    },
+    "src/viewer/ply.ts": {
+      "word": 0,
+      "optional": 15,
+      "chain": 0,
+      "nullish": 0,
+      "total": 15
+    },
+    "src/viewer/rate.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 1,
+      "total": 1
+    },
+    "src/viewer/route.ts": {
+      "word": 10,
+      "optional": 1,
+      "chain": 4,
+      "nullish": 4,
+      "total": 19
+    },
+    "src/viewer/safehtml.ts": {
+      "word": 0,
+      "optional": 1,
+      "chain": 0,
+      "nullish": 0,
+      "total": 1
+    },
+    "src/viewer/session.ts": {
+      "word": 0,
+      "optional": 8,
+      "chain": 5,
+      "nullish": 19,
+      "total": 32
+    },
+    "src/viewer/styles.ts": {
+      "word": 0,
+      "optional": 1,
+      "chain": 0,
+      "nullish": 1,
+      "total": 2
+    },
+    "src/viewer/tags.ts": {
+      "word": 4,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 0,
+      "total": 4
+    },
+    "src/viewer/traceview.ts": {
+      "word": 4,
+      "optional": 5,
+      "chain": 3,
+      "nullish": 9,
+      "total": 21
+    },
+    "src/viewer/ui.tsx": {
+      "word": 3,
+      "optional": 17,
+      "chain": 6,
+      "nullish": 11,
+      "total": 37
+    },
+    "src/viewer/url.ts": {
+      "word": 4,
+      "optional": 5,
+      "chain": 0,
+      "nullish": 2,
+      "total": 11
+    },
+    "src/write/branch.ts": {
+      "word": 5,
+      "optional": 2,
+      "chain": 6,
+      "nullish": 3,
+      "total": 16
+    },
+    "src/write/commit.ts": {
+      "word": 3,
+      "optional": 2,
+      "chain": 6,
+      "nullish": 7,
+      "total": 18
+    },
+    "src/write/handle.ts": {
+      "word": 13,
+      "optional": 4,
+      "chain": 3,
+      "nullish": 4,
+      "total": 24
+    },
+    "src/write/head.ts": {
+      "word": 1,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 0,
+      "total": 1
+    },
+    "src/write/identity.ts": {
+      "word": 1,
+      "optional": 4,
+      "chain": 0,
+      "nullish": 0,
+      "total": 5
+    },
+    "src/write/pick.ts": {
+      "word": 0,
+      "optional": 3,
+      "chain": 0,
+      "nullish": 3,
+      "total": 6
+    },
+    "src/write/request.ts": {
+      "word": 21,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 0,
+      "total": 21
+    },
+    "src/write/result.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 12,
+      "total": 12
+    },
+    "src/write/tag.ts": {
+      "word": 6,
+      "optional": 1,
+      "chain": 3,
+      "nullish": 2,
+      "total": 12
+    },
+    "src/write/tree.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 1,
+      "total": 1
+    },
+    "test/cd-flags-smoke.test.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 9,
+      "nullish": 0,
+      "total": 9
+    },
+    "test/cd-log.test.ts": {
+      "word": 1,
+      "optional": 0,
+      "chain": 2,
+      "nullish": 4,
+      "total": 7
+    },
+    "test/cd-policy.test.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 1,
+      "nullish": 1,
+      "total": 2
+    },
+    "test/cd-preflight.test.ts": {
+      "word": 1,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 0,
+      "total": 1
+    },
+    "test/cd-ramp.test.ts": {
+      "word": 0,
+      "optional": 1,
+      "chain": 2,
+      "nullish": 5,
+      "total": 8
+    },
+    "test/cd-reconcile.test.ts": {
+      "word": 0,
+      "optional": 2,
+      "chain": 1,
+      "nullish": 2,
+      "total": 5
+    },
+    "test/cd-slo.test.ts": {
+      "word": 0,
+      "optional": 2,
+      "chain": 5,
+      "nullish": 8,
+      "total": 15
+    },
+    "test/cd-telemetry.test.ts": {
+      "word": 1,
+      "optional": 0,
+      "chain": 15,
+      "nullish": 2,
+      "total": 18
+    },
+    "test/cf-bundle.js": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 1,
+      "total": 1
+    },
+    "test/flags/cache.test.ts": {
+      "word": 2,
+      "optional": 5,
+      "chain": 2,
+      "nullish": 0,
+      "total": 9
+    },
+    "test/flags/operator.test.ts": {
+      "word": 1,
+      "optional": 13,
+      "chain": 2,
+      "nullish": 4,
+      "total": 20
+    },
+    "test/flags/report.test.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 11,
+      "nullish": 0,
+      "total": 11
+    },
+    "test/flags/store.test.ts": {
+      "word": 0,
+      "optional": 1,
+      "chain": 9,
+      "nullish": 1,
+      "total": 11
+    },
+    "test/gitcache.test.ts": {
+      "word": 0,
+      "optional": 7,
+      "chain": 3,
+      "nullish": 10,
+      "total": 20
+    },
+    "test/hold-last.test.ts": {
+      "word": 0,
+      "optional": 1,
+      "chain": 0,
+      "nullish": 0,
+      "total": 1
+    },
+    "test/mirror.test.ts": {
+      "word": 0,
+      "optional": 1,
+      "chain": 1,
+      "nullish": 1,
+      "total": 3
+    },
+    "test/pinned.test.ts": {
+      "word": 0,
+      "optional": 0,
+      "chain": 0,
+      "nullish": 2,
+      "total": 2
+    },
+    "test/proxy.js": {
+      "word": 0,
+      "optional": 0,
+      "chain": 1,
+      "nullish": 11,
+      "total": 12
+    },
+    "test/public-worker.test.js": {
+      "word": 1,
+      "optional": 0,
+      "chain": 9,
+      "nullish": 6,
+      "total": 16
+    },
+    "test/public.test.ts": {
+      "word": 0,
+      "optional": 4,
+      "chain": 3,
+      "nullish": 3,
+      "total": 10
+    },
+    "test/rays.test.ts": {
+      "word": 0,
+      "optional": 8,
+      "chain": 6,
+      "nullish": 5,
+      "total": 19
+    },
+    "test/security.test.ts": {
+      "word": 1,
+      "optional": 4,
+      "chain": 2,
+      "nullish": 11,
+      "total": 18
+    },
+    "test/server.js": {
+      "word": 0,
+      "optional": 0,
+      "chain": 1,
+      "nullish": 3,
+      "total": 4
+    },
+    "test/viewer.test.ts": {
+      "word": 2,
+      "optional": 28,
+      "chain": 38,
+      "nullish": 31,
+      "total": 99
+    },
+    "test/worker-entrypoints.test.ts": {
+      "word": 6,
+      "optional": 11,
+      "chain": 18,
+      "nullish": 2,
+      "total": 37
+    },
+    "test/worker.test.js": {
+      "word": 7,
+      "optional": 0,
+      "chain": 7,
+      "nullish": 17,
+      "total": 31
+    },
+    "test/write.test.ts": {
+      "word": 1,
+      "optional": 2,
+      "chain": 14,
+      "nullish": 1,
+      "total": 18
+    },
+    "vite.config.ts": {
+      "word": 0,
+      "optional": 2,
+      "chain": 1,
+      "nullish": 1,
+      "total": 4
+    }
+  }
+}
