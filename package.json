@@ -23,7 +23,7 @@
     "worker:test": "node --test test/worker.test.js",
     "test:viewer": "node --experimental-strip-types --import ./test/register-tsx.mjs --test test/viewer.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json && cf workers types && tsc --noEmit -p tsconfig.cloudflare.json",
-    "lint": "oxlint"
+    "lint": "oxlint && oxlint --type-aware -A all -D typescript/switch-exhaustiveness-check src scripts"
   },
   "dependencies": {
     "@cloudflare/kumo": "^2.15.0",
@@ -36,6 +36,7 @@
     "cf": "1.0.0-beta.23",
     "esbuild": "^0.28.2",
     "oxlint": "^1.22.0",
+    "oxlint-tsgolint": "^7.0.2005",
     "parse5": "^7.3.0",
     "typescript": "^7.0.2",
     "vite": "^8.3.5",
