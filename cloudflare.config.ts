@@ -1,6 +1,7 @@
 // The ply Worker: the /v1 git API and the public /view repository viewer, served at ply.ivar.workers.dev.
 // `cf build`, `cf dev`, `cf deploy` and `cf workers types` read this file. vite.config.ts holds build settings only.
 import { bindings, defineConfig, exports, triggers } from "cf/config";
+import { FLAGS_MAX_AGE_S, FLAGS_SWR_S } from "./src/flags/ttl.ts";
 import { PUBLIC_NAMESPACE } from "./src/public-namespace.ts";
 
 const MILLISECONDS_PER_SECOND = 1_000;
@@ -31,6 +32,10 @@ const entrypoints = {
 	GitCache: exports.worker({ cache: { enabled: true } }),
 	// Whole responses pinned to a commit oid (src/pinned.ts): /v1 tree/read/commit and viewer raw files.
 	Pinned: exports.worker({ cache: { enabled: true } }),
+	// The one flag ruleset (src/flags/cache.ts). Caching stays off on the default entrypoint, which always runs.
+	FlagsCache: exports.worker({ cache: { enabled: true } }),
+	// RPC writes (src/flags/entry.ts). Not cached: setRollout and setTargeting are not idempotent GETs.
+	FlagControl: exports.worker({ cache: { enabled: false } }),
 } as const;
 
 // A binding can only name a class declared live above. src/index.js re-exports it from src/viewer/rate.ts.
@@ -76,6 +81,16 @@ export default defineConfig({
 			// The running version's id, sent as x-ply-version on every front-door response so a deploy can prove which
 			// version answered a request pinned with Cloudflare-Workers-Version-Overrides (`npm run cd`).
 			VERSION: bindings.versionMetadata(),
+			// R2 is the flag source of truth: one object, flags/config.json, ETag = revision.
+			// The bucket is not created here. It must already exist before a deploy that uploads this binding.
+			// `cf deploy` can provision a missing R2 bucket; create `ply-flags` first so that path is not taken.
+			FLAGS: bindings.r2({ name: "ply-flags" }),
+			FLAGS_MAX_AGE_S: bindings.text(String(FLAGS_MAX_AGE_S)),
+			FLAGS_SWR_S: bindings.text(String(FLAGS_SWR_S)),
+			// Callers (the CD follow-up) use a service binding to FlagControl. This one is that binding,
+			// aimed at this Worker, so the RPC methods are the write API. Reads of the ruleset go through
+			// ctx.exports.FlagsCache, which is the cached entrypoint.
+			FLAG_CONTROL: bindings.worker({ worker: WORKER_NAME, exportName: "FlagControl" }),
 		},
 		exports: { ...durableObjects, ...entrypoints },
 	},
