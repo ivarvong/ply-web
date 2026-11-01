@@ -1,4 +1,18 @@
 // Named TTLs for the one cached ruleset. cloudflare.config.ts publishes the same numbers as text bindings.
+import { parseFlagKey, parseFlagSalt, type FlagKey, type FlagSalt } from './brand.ts';
+
+function knownFlagKey(raw: string): FlagKey {
+  const parsed = parseFlagKey(raw);
+  if (parsed.kind === 'key') return parsed.value;
+  throw new Error(parsed.reason);
+}
+
+function knownFlagSalt(raw: string): FlagSalt {
+  const parsed = parseFlagSalt(raw);
+  if (parsed.kind === 'salt') return parsed.value;
+  throw new Error(parsed.reason);
+}
+
 // max-age is the fresh window. stale-while-revalidate is how long a failed revalidation may still be served.
 // Neither value is an s-maxage, and the response must not say must-revalidate: those directives
 // disable stale-while-revalidate. An absent ruleset uses this same header. no-store is a bypass.
@@ -18,13 +32,13 @@ export const BUCKETS = 10_000;
 export const BASIS_POINTS = BUCKETS;
 
 /** Salt assigned when setRollout creates a flag. Changing it would rebucket everyone, so it stays put. */
-export const DEFAULT_SALT = 'v1';
+export const DEFAULT_SALT: FlagSalt = knownFlagSalt('v1');
 
 /**
  * The example gate on GET /. Off unless this flag's variant is boolean true.
  * Missing config, a missing flag, and percent 0 all leave the usage text unchanged.
  */
-export const USAGE_NOTE_FLAG = 'ply.usage.note';
+export const USAGE_NOTE_FLAG: FlagKey = knownFlagKey('ply.usage.note');
 
 /** The one line GET / appends when ply.usage.note resolves to boolean true. Off leaves GET / unchanged. */
 export const USAGE_NOTE_LINE = 'ply.usage.note is on for this unit.';

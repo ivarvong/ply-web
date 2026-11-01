@@ -1,9 +1,11 @@
 // Authenticated caller of FlagControl. ply's /v1/flags stays read-only.
 // This module is the operator Worker's fetch handler and the CLI's command parser.
 // It does not read the token file and it does not deploy.
+import { headerNumber, parseBearer, readHeader } from '../http/inbound.ts';
 import { err, isUnexpected, ok, runRequest, type Result, type UnexpectedFailure } from '../http/machine.ts';
 import { roundMs, type Clock } from './clock.ts';
-import { applyBasisPoints, applyRollout, parseTargeting } from './document.ts';
+import { parseFlagKey } from './brand.ts';
+import { applyBasisPoints, parseTargeting } from './document.ts';
 import { endSpan, openSpan, type SpanLike, type TracingLike } from './telemetry.ts';
 import {
   OPERATOR_CONFIG_PATH,
@@ -13,7 +15,7 @@ import {
   OPERATOR_TARGETING_PATH,
 } from './operator-names.ts';
 import { ABSENT_REVISION, BASIS_POINTS, MAX_DOCUMENT_BYTES } from './ttl.ts';
-import { EMPTY_DOCUMENT, type ReadResult, type Targeting, type WriteResult } from './types.ts';
+import type { ReadResult, Targeting, WriteResult } from './types.ts';
 
 const HTTP_OK = 200;
 const HTTP_BAD_REQUEST = 400;
@@ -141,8 +143,9 @@ async function tokenEqual(presented: string, secret: string): Promise<boolean> {
 }
 
 function bearer(request: Request): string | null {
-  const match = BEARER.exec(request.headers.get('authorization') ?? '');
-  return match?.[1] ?? null;
+  const parsed = parseBearer(readHeader(request.headers, 'authorization'), BEARER);
+  if (parsed.kind !== 'bearer') return null;
+  return parsed.token;
 }
 
 function sample(
@@ -229,7 +232,7 @@ function bindingMissing(op: 'getConfig' | 'setRollout' | 'setTargeting', flag: s
 }
 
 async function readJson(request: Request): Promise<{ readonly kind: 'ok'; readonly value: Obj } | { readonly kind: 'invalid'; readonly reason: string }> {
-  const length = Number(request.headers.get('content-length') ?? 0);
+  const length = headerNumber(readHeader(request.headers, 'content-length'));
   if (Number.isFinite(length) && length > MAX_DOCUMENT_BYTES) {
     return { kind: 'invalid', reason: `operator body is over ${MAX_DOCUMENT_BYTES} bytes` };
   }
@@ -315,8 +318,10 @@ async function postRollout(request: Request, control: FlagControlBinding | undef
   if (typeof flag !== 'string' || typeof basisPoints !== 'number') {
     return reject(HTTP_BAD_REQUEST, 'bad_request', 'flag is a string and basisPoints is a number', 'setRollout', null, null);
   }
-  const checked = applyRollout(EMPTY_DOCUMENT, flag, basisPoints);
-  if (checked.kind === 'invalid') return reject(HTTP_BAD_REQUEST, 'bad_request', checked.reason, 'setRollout', flag, null);
+  const key = parseFlagKey(flag);
+  if (key.kind !== 'key') return reject(HTTP_BAD_REQUEST, 'bad_request', key.reason, 'setRollout', flag, null);
+  const points = applyBasisPoints(basisPoints);
+  if (points.kind === 'invalid') return reject(HTTP_BAD_REQUEST, 'bad_request', points.reason, 'setRollout', flag, null);
   const expected = parseExpectedValue(body.value.expected);
   if (expected.kind === 'invalid') return reject(HTTP_BAD_REQUEST, 'bad_request', expected.reason, 'setRollout', flag, null);
   if (!control) return bindingMissing('setRollout', flag, expectedKind(expected));
@@ -331,8 +336,8 @@ async function postTargeting(request: Request, control: FlagControlBinding | und
   }
   const flag = body.value.flag;
   if (typeof flag !== 'string') return reject(HTTP_BAD_REQUEST, 'bad_request', 'flag is a string', 'setTargeting', null, null);
-  const key = applyRollout(EMPTY_DOCUMENT, flag, 0);
-  if (key.kind === 'invalid') return reject(HTTP_BAD_REQUEST, 'bad_request', key.reason, 'setTargeting', flag, null);
+  const key = parseFlagKey(flag);
+  if (key.kind !== 'key') return reject(HTTP_BAD_REQUEST, 'bad_request', key.reason, 'setTargeting', flag, null);
   const targeting = parseTargeting(body.value.targeting);
   if (isInvalidTargeting(targeting)) return reject(HTTP_BAD_REQUEST, 'bad_request', targeting.reason, 'setTargeting', flag, null);
   const expected = parseExpectedValue(body.value.expected);
@@ -408,8 +413,8 @@ function option(argv: readonly string[], name: string): { readonly kind: 'missin
 }
 
 function flagKey(value: string): string | null {
-  const checked = applyRollout(EMPTY_DOCUMENT, value, 0);
-  return checked.kind === 'ok' ? value : null;
+  const parsed = parseFlagKey(value);
+  return parsed.kind === 'key' ? parsed.value : null;
 }
 
 function basisArg(value: string): number | null {

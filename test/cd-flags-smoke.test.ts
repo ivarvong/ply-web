@@ -3,16 +3,27 @@ import { test } from 'node:test'
 import { judgeCall, type CallHeaders, type Expect, type Saved } from '../scripts/cd/judge.ts'
 import { expectedStatuses, lifecycle } from '../scripts/cd/lifecycle.ts'
 import { FLAGS_RULES_SAVE, HTTP_NOT_FOUND, HTTP_OK, SMOKE_FLAG_KEY, SMOKE_UNIT_ID, USAGE_MARK } from '../scripts/cd/flags-smoke.ts'
+import { parseUnit } from '../src/flags/document.ts'
 import { evaluateDocument } from '../src/flags/eval.ts'
-import { USAGE_NOTE_LINE } from '../src/flags/ttl.ts'
-import { EMPTY_DOCUMENT, variantKind, variantValue, type Flag } from '../src/flags/types.ts'
+import { DEFAULT_SALT, USAGE_NOTE_FLAG, USAGE_NOTE_LINE } from '../src/flags/ttl.ts'
+import { EMPTY_DOCUMENT, variantKind, variantValue, type Flag, type FlagSelection, type Unit } from '../src/flags/types.ts'
 
 const BUILD = `ply=${'a'.repeat(40)} ply-web=${'b'.repeat(40)}`
 const REQUEST_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
 
+function smokeUnit(): Unit {
+  const parsed = parseUnit(SMOKE_UNIT_ID, { kind: 'absent' })
+  if (parsed.kind !== 'ok') throw new Error(parsed.reason)
+  return { id: parsed.id, attributes: parsed.attributes }
+}
+
+function smokeKeys(): FlagSelection {
+  return { kind: 'listed', keys: [USAGE_NOTE_FLAG] }
+}
+
 const note: Flag = {
   key: SMOKE_FLAG_KEY,
-  salt: 'v1',
+  salt: DEFAULT_SALT,
   rollout: { kind: 'rolled-back', reason: 'basis points 0' },
   on: { kind: 'boolean', value: true },
   off: { kind: 'boolean', value: false },
@@ -74,7 +85,7 @@ test('a missing ruleset is 404 and eval matches the empty rollout', () => {
   assert.equal(rules.kind, 'ok')
   if (rules.kind !== 'ok') return
   assert.equal(rules.save[FLAGS_RULES_SAVE], JSON.stringify({ kind: 'absent' }))
-  const evaluation = evaluateDocument(EMPTY_DOCUMENT, { id: SMOKE_UNIT_ID, attributes: {} }, [SMOKE_FLAG_KEY])[0]!
+  const evaluation = evaluateDocument(EMPTY_DOCUMENT, smokeUnit(), smokeKeys())[0]!
   const evald = judge({ kind: 'flags-eval' }, HTTP_OK, {
     revision: null,
     cache: 'MISS',
@@ -112,7 +123,7 @@ test('a present ruleset keeps revision, cache status, and the rollout value', ()
   })
   assert.equal(listed.kind, 'ok')
   if (listed.kind !== 'ok') return
-  const evaluation = evaluateDocument({ environment: 'production', flags: [note] }, { id: SMOKE_UNIT_ID, attributes: {} }, [SMOKE_FLAG_KEY])[0]!
+  const evaluation = evaluateDocument({ environment: 'production', flags: [note] }, smokeUnit(), smokeKeys())[0]!
   assert.equal(evaluation.variant.kind === 'boolean' && evaluation.variant.value, false)
   const evald = judge({ kind: 'flags-eval' }, HTTP_OK, {
     revision: '"rev"',

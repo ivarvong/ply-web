@@ -1,4 +1,16 @@
 // Parse, validate, and edit the one ruleset. Edits are pure: the caller compare-and-swaps the encoded bytes.
+// Flag keys, unit ids, attribute tokens, and salts are branded once, in brand.ts.
+import {
+  parseAttributeName,
+  parseAttributeValue,
+  parseFlagKey,
+  parseFlagSalt,
+  parseUnitId,
+  type AttributeName,
+  type AttributeValue,
+  type FlagKey,
+  type UnitId,
+} from './brand.ts';
 import { BASIS_POINTS, DEFAULT_SALT, MAX_ATTRIBUTES, MAX_DOCUMENT_BYTES, MAX_FLAGS, MAX_RULES, MAX_UNITS } from './ttl.ts';
 import {
   EMPTY_DOCUMENT,
@@ -12,11 +24,6 @@ import {
   type Variant,
 } from './types.ts';
 
-const FLAG_KEY = /^[a-z][a-z0-9._-]{0,63}$/;
-const UNIT_ID = /^[A-Za-z0-9._:@+/-]{1,128}$/;
-const ATTR_NAME = /^[a-z][a-z0-9._-]{0,63}$/;
-const ATTR_VALUE = /^[A-Za-z0-9._:@+/-]{1,128}$/;
-const SALT = /^[A-Za-z0-9._:-]{1,64}$/;
 const ROLLBACK_REASON = /^[\x20-\x7e]{1,200}$/;
 
 type Obj = Record<string, unknown>;
@@ -45,8 +52,10 @@ function parseVariant(value: unknown): Variant | Invalid {
     return { kind: 'boolean', value: value.value };
   }
   if (value.kind === 'string') {
-    if (!exactKeys(value, ['kind', 'value']) || typeof value.value !== 'string' || !ATTR_VALUE.test(value.value)) return invalid('string variant is a short printable token');
-    return { kind: 'string', value: value.value };
+    if (!exactKeys(value, ['kind', 'value']) || typeof value.value !== 'string') return invalid('string variant is a short printable token');
+    const parsed = parseAttributeValue(value.value);
+    if (parsed.kind !== 'value') return invalid('string variant is a short printable token');
+    return { kind: 'string', value: parsed.value };
   }
   if (value.kind === 'number') {
     if (!exactKeys(value, ['kind', 'value']) || typeof value.value !== 'number' || !Number.isFinite(value.value)) return invalid('number variant must be finite');
@@ -55,34 +64,46 @@ function parseVariant(value: unknown): Variant | Invalid {
   return invalid('variant kind must be boolean, string, or number');
 }
 
-function parseStringList(value: unknown, label: string): readonly string[] | Invalid {
+function parseStringList(value: unknown, label: string): readonly UnitId[] | Invalid {
   if (!Array.isArray(value)) return invalid(`${label} must be an array`);
   if (value.length > MAX_UNITS) return invalid(`${label} is longer than ${MAX_UNITS}`);
-  const seen = new Set<string>();
+  const seen = new Set<UnitId>();
+  const ids: UnitId[] = [];
   for (const item of value) {
-    if (typeof item !== 'string' || !UNIT_ID.test(item)) return invalid(`${label} entries are unit ids`);
-    if (seen.has(item)) return invalid(`${label} contains a duplicate`);
-    seen.add(item);
+    if (typeof item !== 'string') return invalid(`${label} entries are unit ids`);
+    const parsed = parseUnitId(item);
+    if (parsed.kind !== 'id') return invalid(`${label} entries are unit ids`);
+    if (seen.has(parsed.value)) return invalid(`${label} contains a duplicate`);
+    seen.add(parsed.value);
+    ids.push(parsed.value);
   }
-  return value;
+  return ids;
 }
 
 function parseRule(value: unknown): AttributeRule | Invalid {
   if (!isObj(value)) return invalid('a rule must be an object');
   if (!exactKeys(value, ['attribute', 'op', 'value', 'variant'])) return invalid('a rule is {attribute, op, value, variant}');
-  if (typeof value.attribute !== 'string' || !ATTR_NAME.test(value.attribute)) return invalid('rule attribute is a short name');
+  if (typeof value.attribute !== 'string') return invalid('rule attribute is a short name');
+  const attribute = parseAttributeName(value.attribute);
+  if (attribute.kind !== 'name') return invalid('rule attribute is a short name');
   if (value.op !== 'eq' && value.op !== 'neq' && value.op !== 'in') return invalid('rule op must be eq, neq, or in');
   const variant = parseVariant(value.variant);
   if ('kind' in variant && variant.kind === 'invalid') return variant;
   if (value.op === 'in') {
     if (!Array.isArray(value.value) || value.value.length < 1 || value.value.length > 32) return invalid('in rules need a value list');
+    const items: AttributeValue[] = [];
     for (const item of value.value) {
-      if (typeof item !== 'string' || !ATTR_VALUE.test(item)) return invalid('in-rule values are short tokens');
+      if (typeof item !== 'string') return invalid('in-rule values are short tokens');
+      const parsed = parseAttributeValue(item);
+      if (parsed.kind !== 'value') return invalid('in-rule values are short tokens');
+      items.push(parsed.value);
     }
-    return { attribute: value.attribute, op: 'in', value: value.value.slice(), variant: variant as Variant };
+    return { attribute: attribute.value, op: 'in', value: items, variant: variant as Variant };
   }
-  if (typeof value.value !== 'string' || !ATTR_VALUE.test(value.value)) return invalid('eq and neq compare one token');
-  return { attribute: value.attribute, op: value.op, value: value.value, variant: variant as Variant };
+  if (typeof value.value !== 'string') return invalid('eq and neq compare one token');
+  const compared = parseAttributeValue(value.value);
+  if (compared.kind !== 'value') return invalid('eq and neq compare one token');
+  return { attribute: attribute.value, op: value.op, value: compared.value, variant: variant as Variant };
 }
 
 function basisPoint(value: unknown): number | Invalid {
@@ -113,8 +134,12 @@ function parseRollout(value: unknown): Rollout | Invalid {
 function parseFlag(value: unknown): Flag | Invalid {
   if (!isObj(value)) return invalid('a flag must be an object');
   if (!exactKeys(value, ['key', 'salt', 'rollout', 'on', 'off', 'allow', 'deny', 'rules'])) return invalid('a flag has key, salt, rollout, on, off, allow, deny, rules');
-  if (typeof value.key !== 'string' || !FLAG_KEY.test(value.key)) return invalid('flag key must match ^[a-z][a-z0-9._-]{0,63}$');
-  if (typeof value.salt !== 'string' || !SALT.test(value.salt)) return invalid('flag salt is a short token');
+  if (typeof value.key !== 'string') return invalid('flag key must match ^[a-z][a-z0-9._-]{0,63}$');
+  const key = parseFlagKey(value.key);
+  if (key.kind !== 'key') return key;
+  if (typeof value.salt !== 'string') return invalid('flag salt is a short token');
+  const salt = parseFlagSalt(value.salt);
+  if (salt.kind !== 'salt') return invalid('flag salt is a short token');
   const rollout = parseRollout(value.rollout);
   if (isInvalid(rollout)) return rollout;
   const on = parseVariant(value.on);
@@ -133,7 +158,7 @@ function parseFlag(value: unknown): Flag | Invalid {
     if (isInvalid(parsed)) return parsed;
     rules.push(parsed);
   }
-  return { key: value.key, salt: value.salt, rollout, on, off, allow, deny, rules };
+  return { key: key.value, salt: salt.value, rollout, on, off, allow, deny, rules };
 }
 
 export type ParsedDocument = { readonly kind: 'ok'; readonly document: FlagDocument } | Invalid;
@@ -181,22 +206,37 @@ export function encodeDocument(document: FlagDocument): string {
   return stableStringify(document);
 }
 
-export function parseUnit(id: string, attributes: Readonly<Record<string, string>> | undefined): { readonly kind: 'ok'; readonly id: string; readonly attributes: Readonly<Record<string, string>> } | Invalid {
-  if (!UNIT_ID.test(id)) return invalid('unit id must be a short token');
-  const source = attributes ?? {};
+export type AttributeInput =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'present'; readonly value: Readonly<Record<string, unknown>> };
+
+export function parseUnit(id: string, attributes: AttributeInput): { readonly kind: 'ok'; readonly id: UnitId; readonly attributes: Readonly<Record<AttributeName, AttributeValue>> } | Invalid {
+  const parsedId = parseUnitId(id);
+  if (parsedId.kind !== 'id') return invalid(parsedId.reason);
+  const source = attributes.kind === 'present' ? attributes.value : {};
   const names = Object.keys(source);
   if (names.length > MAX_ATTRIBUTES) return invalid(`at most ${MAX_ATTRIBUTES} attributes`);
-  const clean: Record<string, string> = {};
+  const clean: Record<AttributeName, AttributeValue> = {};
   for (const name of names) {
-    if (!ATTR_NAME.test(name)) return invalid('attribute names are short tokens');
+    const parsedName = parseAttributeName(name);
+    if (parsedName.kind !== 'name') return invalid('attribute names are short tokens');
     const attr = source[name];
-    if (typeof attr !== 'string' || !ATTR_VALUE.test(attr)) return invalid('attribute values are short tokens');
-    clean[name] = attr;
+    if (typeof attr !== 'string') return invalid('attribute values are short tokens');
+    const parsedValue = parseAttributeValue(attr);
+    if (parsedValue.kind !== 'value') return invalid('attribute values are short tokens');
+    clean[parsedName.value] = parsedValue.value;
   }
-  return { kind: 'ok', id, attributes: clean };
+  return { kind: 'ok', id: parsedId.value, attributes: clean };
 }
 
-export function freshFlag(key: string): Flag {
+function findFlag(document: FlagDocument, key: FlagKey): Flag | null {
+  for (const flag of document.flags) {
+    if (flag.key === key) return flag;
+  }
+  return null;
+}
+
+export function freshFlag(key: FlagKey): Flag {
   return {
     key,
     salt: DEFAULT_SALT,
@@ -218,10 +258,9 @@ export function applyBasisPoints(basisPoints: number): { readonly kind: 'ok'; re
 
 export type Changed = { readonly kind: 'ok'; readonly document: FlagDocument } | Invalid;
 
-export function applyRollout(document: FlagDocument, key: string, basisPoints: number): Changed {
-  if (!FLAG_KEY.test(key)) return invalid('flag key must match ^[a-z][a-z0-9._-]{0,63}$');
-  const existing = document.flags.find(flag => flag.key === key);
-  const base = existing ?? freshFlag(key);
+export function applyRollout(document: FlagDocument, key: FlagKey, basisPoints: number): Changed {
+  const existing = findFlag(document, key);
+  const base = existing === null ? freshFlag(key) : existing;
   const applied = applyBasisPoints(basisPoints);
   if (applied.kind === 'invalid') return applied;
   const next: Flag = { ...base, rollout: applied.rollout };
@@ -247,13 +286,10 @@ export function parseTargeting(value: unknown): Targeting | Invalid {
   return { allow, deny, rules };
 }
 
-export function applyTargeting(document: FlagDocument, key: string, targeting: Targeting): Changed {
-  if (!FLAG_KEY.test(key)) return invalid('flag key must match ^[a-z][a-z0-9._-]{0,63}$');
-  const existing = document.flags.find(flag => flag.key === key);
-  if (!existing) return invalid(`unknown flag ${key}`);
-  const parsed = parseTargeting(targeting);
-  if (isInvalid(parsed)) return parsed;
-  const next: Flag = { ...existing, allow: parsed.allow, deny: parsed.deny, rules: parsed.rules };
+export function applyTargeting(document: FlagDocument, key: FlagKey, targeting: Targeting): Changed {
+  const existing = findFlag(document, key);
+  if (existing === null) return invalid(`unknown flag ${key}`);
+  const next: Flag = { ...existing, allow: targeting.allow, deny: targeting.deny, rules: targeting.rules };
   return { kind: 'ok', document: { environment: document.environment, flags: document.flags.map(flag => flag.key === key ? next : flag) } };
 }
 

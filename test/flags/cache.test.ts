@@ -5,8 +5,20 @@ import { setRollout } from '../../src/flags/api.ts';
 import { ABSENT_REVISION, FLAGS_CACHE_URL, FLAGS_MAX_AGE_S, FLAGS_SWR_S, cacheControl } from '../../src/flags/ttl.ts';
 import { handleFlagHttp } from '../../src/flags/http.ts';
 import { isEnabled, resolveFlags, usageNote } from '../../src/flags/client.ts';
+import { parseFlagKey } from '../../src/flags/brand.ts';
+import { parseUnit } from '../../src/flags/document.ts';
+import type { FlagSelection, Unit } from '../../src/flags/types.ts';
 
 const env = { FLAGS: { present: true }, FLAGS_MAX_AGE_S: String(FLAGS_MAX_AGE_S), FLAGS_SWR_S: String(FLAGS_SWR_S) };
+const ABSENT_UNIT = { kind: 'absent' } as const;
+
+function resolvedUnit(id: string): { unit: Unit; keys: FlagSelection } {
+  const parsed = parseUnit(id, ABSENT_UNIT);
+  if (parsed.kind !== 'ok') throw new Error(parsed.reason);
+  const flag = parseFlagKey('ply.usage.note');
+  if (flag.kind !== 'key') throw new Error(flag.reason);
+  return { unit: { id: parsed.id, attributes: parsed.attributes }, keys: { kind: 'listed', keys: [flag.value] } };
+}
 
 async function seeded() {
   const store = memoryStore();
@@ -59,11 +71,12 @@ describe('ruleset cache', () => {
           },
         };
         const unit = status === 'HIT' ? 'user-a' : 'user-b';
-        await usageNote(env, { exports: { FlagsCache: cache }, tracing: null }, unit);
+        await usageNote(env, { exports: { FlagsCache: cache }, tracing: null }, { kind: 'present', value: unit });
+        const asked = resolvedUnit(unit);
         const resolved = await resolveFlags(
           { env, cache, tracing: null },
-          { id: unit, attributes: {} },
-          ['ply.usage.note'],
+          asked.unit,
+          asked.keys,
         );
         expect(resolved.kind).toBe('ok');
         if (resolved.kind === 'ok') expect(resolved.cache).toBe(status);
@@ -107,8 +120,8 @@ describe('ruleset cache', () => {
 
 describe('in-worker gate', () => {
   it('stays off when the binding is missing, and on for an allow-listed unit', async () => {
-    expect(await isEnabled({}, undefined, 'ply.usage.note', { id: 'anonymous' })).toBe(false);
-    expect(await usageNote({}, undefined, null)).toBeNull();
+    expect(await isEnabled({}, undefined, 'ply.usage.note', { id: 'anonymous', attributes: ABSENT_UNIT })).toBe(false);
+    expect(await usageNote({}, undefined, { kind: 'absent' })).toBeNull();
     const store = memoryStore();
     const created = await setRollout(store, { invalidate: async () => ({ kind: 'ok' }) }, 'ply.usage.note', 0, ABSENT_REVISION);
     if (created.kind !== 'ok') throw new Error(created.kind);
@@ -122,9 +135,9 @@ describe('in-worker gate', () => {
         return response;
       },
     };
-    const on = await isEnabled(env, { exports: { FlagsCache: cache } }, 'ply.usage.note', { id: 'anonymous' });
+    const on = await isEnabled(env, { exports: { FlagsCache: cache } }, 'ply.usage.note', { id: 'anonymous', attributes: ABSENT_UNIT });
     expect(on).toBe(true);
-    const note = await usageNote(env, { exports: { FlagsCache: cache } }, null);
+    const note = await usageNote(env, { exports: { FlagsCache: cache } }, { kind: 'absent' });
     expect(note).toBe('ply.usage.note is on for this unit.');
     const loaded = await loadRuleset(env, cache);
     expect(loaded.kind).toBe('ready');
@@ -157,10 +170,11 @@ describe('resolve timing', () => {
     const lines: string[] = [];
     const spy = vi.spyOn(console, 'log').mockImplementation(line => { lines.push(String(line)); });
     try {
+      const asked = resolvedUnit('user:smoke');
       const resolved = await resolveFlags(
         { env, cache, tracing },
-        { id: 'user:smoke', attributes: {} },
-        ['ply.usage.note'],
+        asked.unit,
+        asked.keys,
         clock,
       );
       expect(resolved.kind).toBe('ok');

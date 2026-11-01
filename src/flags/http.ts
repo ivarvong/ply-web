@@ -2,10 +2,12 @@
 // parse, then authorize, then execute each return a Result. json() is the only status mapping.
 import { loadRuleset, type FlagCacheEnv, type FlagsCacheBinding } from './cache.ts';
 import { resolveFlags } from './client.ts';
-import { parseUnit } from './document.ts';
+import { parseUnit, type AttributeInput } from './document.ts';
+import { parseFlagKey, type AttributeName, type AttributeValue, type FlagKey, type UnitId } from './brand.ts';
+import { headerNumber, jsonField, jsonRecord, readHeader } from '../http/inbound.ts';
 import { err, isUnexpected, ok, runRequest, type Result, type UnexpectedFailure } from '../http/machine.ts';
 import type { TracingLike } from './telemetry.ts';
-import { variantKind, variantValue, type FlagEvaluation } from './types.ts';
+import { variantKind, variantValue, type FlagEvaluation, type FlagSelection } from './types.ts';
 
 const NO_STORE = 'no-store';
 const MAX_BODY = 64 * 1024;
@@ -28,15 +30,16 @@ function view(evaluation: FlagEvaluation) {
 }
 
 async function readBody(request: Request): Promise<{ readonly kind: 'ok'; readonly value: Record<string, unknown> } | { readonly kind: 'invalid'; readonly reason: string }> {
-  const length = Number(request.headers.get('content-length') ?? 0);
+  const length = headerNumber(readHeader(request.headers, 'content-length'));
   if (Number.isFinite(length) && length > MAX_BODY) return { kind: 'invalid', reason: 'flag eval body is over 64 KiB' };
   const text = await request.text();
   if (text.length > MAX_BODY) return { kind: 'invalid', reason: 'flag eval body is over 64 KiB' };
   if (!text.trim()) return { kind: 'invalid', reason: 'flag eval body is required' };
   try {
     const value = JSON.parse(text) as unknown;
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return { kind: 'invalid', reason: 'flag eval body must be an object' };
-    return { kind: 'ok', value: value as Record<string, unknown> };
+    const record = jsonRecord(value);
+    if (record.kind !== 'record') return { kind: 'invalid', reason: 'flag eval body must be an object' };
+    return { kind: 'ok', value: record.value };
   } catch {
     return { kind: 'invalid', reason: 'flag eval body must be JSON' };
   }
@@ -44,7 +47,7 @@ async function readBody(request: Request): Promise<{ readonly kind: 'ok'; readon
 
 type FlagRoute =
   | { readonly kind: 'rules' }
-  | { readonly kind: 'eval'; readonly id: string; readonly attributes: Readonly<Record<string, string>>; readonly keys: readonly string[] | null };
+  | { readonly kind: 'eval'; readonly id: UnitId; readonly attributes: Readonly<Record<AttributeName, AttributeValue>>; readonly keys: FlagSelection };
 
 type FlagBody = { readonly status: number; readonly body: unknown };
 
@@ -66,25 +69,32 @@ async function parseFlagRoute(request: Request): Promise<Result<FlagRoute, FlagF
   }
   const body = await readBody(request);
   if (body.kind === 'invalid') return flagFailure('bad_request', 400, body.reason, 'no');
-  const unit = body.value.unit;
-  if (typeof unit !== 'string') return flagFailure('bad_request', 400, 'unit is required', 'no');
-  const attributes = body.value.attributes;
-  if (attributes !== undefined && (!attributes || typeof attributes !== 'object' || Array.isArray(attributes))) {
-    return flagFailure('bad_request', 400, 'attributes must be an object', 'no');
+  const unitField = jsonField(body.value, 'unit');
+  if (unitField.kind !== 'present' || typeof unitField.value !== 'string') return flagFailure('bad_request', 400, 'unit is required', 'no');
+  const attributesField = jsonField(body.value, 'attributes');
+  let attributes: AttributeInput = { kind: 'absent' };
+  if (attributesField.kind === 'present') {
+    const record = jsonRecord(attributesField.value);
+    if (record.kind !== 'record') return flagFailure('bad_request', 400, 'attributes must be an object', 'no');
+    attributes = { kind: 'present', value: record.value };
   }
-  const parsed = parseUnit(unit, attributes as Readonly<Record<string, string>> | undefined);
+  const parsed = parseUnit(unitField.value, attributes);
   if (parsed.kind === 'invalid') return flagFailure('bad_request', 400, parsed.reason, 'no');
-  let keys: string[] | null = null;
-  if (body.value.keys !== undefined) {
-    if (!Array.isArray(body.value.keys) || body.value.keys.some(key => typeof key !== 'string')) {
+  const keysField = jsonField(body.value, 'keys');
+  let keys: FlagSelection = { kind: 'all' };
+  if (keysField.kind === 'present') {
+    const listed = keysField.value;
+    if (!Array.isArray(listed) || listed.some(item => typeof item !== 'string')) {
       return flagFailure('bad_request', 400, 'keys must be an array of flag names', 'no');
     }
-    keys = body.value.keys;
-  }
-  if (keys) {
-    for (const key of keys) {
-      if (!/^[a-z][a-z0-9._-]{0,63}$/.test(key)) return flagFailure('bad_request', 400, 'flag key is not valid', 'no');
+    const values: FlagKey[] = [];
+    for (const item of listed) {
+      if (typeof item !== 'string') return flagFailure('bad_request', 400, 'keys must be an array of flag names', 'no');
+      const key = parseFlagKey(item);
+      if (key.kind !== 'key') return flagFailure('bad_request', 400, 'flag key is not valid', 'no');
+      values.push(key.value);
     }
+    keys = { kind: 'listed', keys: values };
   }
   return ok({ kind: 'eval', id: parsed.id, attributes: parsed.attributes, keys });
 }
