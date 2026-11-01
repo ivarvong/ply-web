@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { chainGet, envBinding, fromAbsent } from '../absent.ts'
+import { chainGet, dig, envBinding, recordGet } from '../absent.ts'
 import { createBudget } from './budget.ts'
 import { viewerCalls, type ViewerCall } from './call.ts'
 import { safeFilename } from './escape.ts'
@@ -27,7 +27,8 @@ function callOf(req: Request): ViewerCall {
 }
 
 async function clientKey(req: Request): Promise<string> {
-  const ip = req.headers.get('cf-connecting-ip') ?? 'unknown'
+  const connecting = req.headers.get('cf-connecting-ip')
+  const ip = connecting === null ? 'unknown' : connecting
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`ply-viewer-rate/1\n${ip}`))
   let hex = ''
   for (const byte of new Uint8Array(digest)) hex += byte.toString(16).padStart(2, '0')
@@ -61,11 +62,30 @@ function traceOf(call: ViewerCall, bars: TraceModel['bars'] = []): TraceModel {
   return { bars, totalMs: 0, cfRay: call.cfRay, requestId: call.requestId }
 }
 
+function failureCode(err: unknown, fallback: string): string {
+  const found = chainGet(err, 'code')
+  return found.tag === 'some' && plyCode(found.value) ? String(found.value) : fallback
+}
+
+function failureMessage(err: unknown, code: string): string {
+  if (code === 'internal') return 'The viewer hit an internal error.'
+  const found = chainGet(err, 'message')
+  const text = found.tag === 'some' ? String(found.value) : String(err)
+  return text.slice(0, 500)
+}
+
+function notify(opts: unknown, extra: Record<string, string | number>): void {
+  const found = chainGet(opts, 'note')
+  if (found.tag === 'none') return
+  const note = found.value as (fields: Record<string, string | number>) => void
+  note(extra)
+}
+
 function routeError(call: ViewerCall, err: unknown): Response {
-  const code = plyCode((err as { code?: string })?.code) ? (err as { code: string }).code : 'bad_request'
-  const message = code === 'internal' ? 'The viewer hit an internal error.' : String((err as { message?: string })?.message ?? err).slice(0, 500)
+  const code = failureCode(err, 'bad_request')
+  const message = failureMessage(err, code)
   const status = statusOf({ code })
-  call.opts.note?.({ code, status })
+  notify(call.opts, { code, status })
   call.fields['http.status_code'] = status
   call.fields['error.type'] = code
   const trace = traceOf(call)
@@ -73,20 +93,21 @@ function routeError(call: ViewerCall, err: unknown): Response {
 }
 
 async function rateGate(req: Request, env: ViewerEnv, call: ViewerCall, route: Extract<ViewerRoute, { kind: 'repo' }> | { kind: 'home' } | { kind: 'redirect' } | { kind: 'namespace' }): Promise<Response | null> {
-  if (call.opts.skipRate) return null
+  const skipRate = chainGet(call.opts, 'skipRate')
+  if (skipRate.tag === 'some' && skipRate.value) return null
   const bucket: RateBucket = route.kind === 'repo' && route.pack ? 'pack' : 'page'
   const decision = await admitClient(req, env, bucket, call.now)
   if (decision === 'unconfigured' || decision === 'unavailable') {
     const trace = traceOf(call)
     const message = decision === 'unconfigured' ? 'The viewer rate limiter is not configured.' : 'The viewer rate limiter is unavailable.'
-    call.opts.note?.({ code: 'rate_unavailable', status: 503 })
+    notify(call.opts, { code: 'rate_unavailable', status: 503 })
     call.fields['http.status_code'] = 503
     return htmlResponse(503, renderError(503, 'unavailable', message, trace), trace, call.requestId)
   }
   if (!decision.ok) {
     const retry = String(Math.max(1, Math.ceil(decision.retryAfterMs / LAYOUT.msPerSecond)))
     const trace = traceOf(call)
-    call.opts.note?.({ code: 'rate_limited', status: 429 })
+    notify(call.opts, { code: 'rate_limited', status: 429 })
     call.fields['http.status_code'] = 429
     return htmlResponse(429, renderError(429, 'rate_limited', `Too many viewer requests. Retry after ${retry}s.`, trace), trace, call.requestId, { 'retry-after': retry })
   }
@@ -99,7 +120,7 @@ function cssResponse(call: ViewerCall, req: Request): Response {
   call.fields['http.status_code'] = 200
   call.fields['ply.viewer.route'] = 'css'
   const route = call.route
-  const exact = route?.kind === 'css' && route.hash === VIEWER_CSS_HASH
+  const exact = route !== null && route.kind === 'css' && route.hash === VIEWER_CSS_HASH
   const etag = `"${VIEWER_CSS_HASH}"`
   const headers = {
     'content-type': 'text/css; charset=utf-8',
@@ -125,18 +146,20 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
   // The public namespace's read token is attached below the guard: every hop is validated by createViewerFetch first,
   // then checked again by withPublicReadCredential, and the pack cache above never sees it in its key.
   // Public, credential-free exchanges go to the cache-enabled GitCache entrypoint (Workers Caching) under the guard.
-  const direct = withPublicReadCredential(call.opts.fetchImpl ?? globalThis.fetch, tokenSourceFor(env.PUBLIC_REPOS))
-  const provided = fromAbsent(call.opts.loopback)
+  const fetchField = chainGet(call.opts, 'fetchImpl')
+  const direct = withPublicReadCredential(fetchField.tag === 'some' ? fetchField.value as FetchLike : globalThis.fetch, tokenSourceFor(env.PUBLIC_REPOS))
+  const optsRecord = call.opts !== null && typeof call.opts === 'object' ? call.opts as Record<string, unknown> : null
+  const provided = recordGet(optsRecord, 'loopback')
   let loopback: (() => LoopbackBinding | null) | null
   if (provided.tag === 'none') {
     loopback = env.PACK_CACHE === 'off' ? null : () => {
-      const found = chainGet(call.ctx.exports, 'GitCache')
+      const found = dig(call.ctx, ['exports', 'GitCache'])
       return found.tag === 'some' ? found.value as LoopbackBinding : null
     }
   } else if (provided.value === null) {
     loopback = null
   } else {
-    const chosen = provided.value
+    const chosen = provided.value as () => LoopbackBinding | null
     loopback = () => {
       const binding = chosen()
       return isLoopback(binding) ? binding : null
@@ -162,7 +185,7 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
     }
     const loaded = await loadRepo(route, { tracer, fetchImpl, signal: pageSignal, budget })
     const trace = traced()
-    call.opts.note?.({ host: route.loc.host, rtt: trace.bars.length, bytes: budget.bytes, code: 'ok' })
+    notify(call.opts, { host: route.loc.host, rtt: trace.bars.length, bytes: budget.bytes, code: 'ok' })
     if (loaded.kind === 'raw') {
       const text = isText(loaded.bytes)
       const headers = new Headers({
@@ -189,12 +212,12 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
     call.fields['ply.viewer.upstream_spans'] = trace.bars.length
     return headless(req, attach(htmlResponse(200, renderLoaded(loaded, trace, call.now), trace, call.requestId)))
   } catch (err) {
-    const code = plyCode((err as { code?: string })?.code) ? (err as { code: string }).code : 'internal'
-    const upstream = code === 'internal' ? 500 : statusOf(err as { code?: string; status?: number })
-    const message = code === 'internal' ? 'The viewer hit an internal error.' : String((err as { message?: string })?.message ?? err).slice(0, 500)
+    const code = failureCode(err, 'internal')
+    const upstream = code === 'internal' ? 500 : statusOf(err)
+    const message = failureMessage(err, code)
     const view = describeFailure({ code, status: upstream, message, host: route.loc.host, repoPath: route.loc.repoPath, ref: route.ref, path: route.path })
     const trace = traced()
-    call.opts.note?.({ host: route.loc.host, code, status: view.status, rtt: trace.bars.length })
+    notify(call.opts, { host: route.loc.host, code, status: view.status, rtt: trace.bars.length })
     call.fields['http.status_code'] = view.status
     call.fields['error.type'] = code
     call.fields['server.address'] = route.loc.host
@@ -220,7 +243,7 @@ viewerApp.use('*', async (c, next) => {
 
 function serveCss(c: { req: { raw: Request } }): Response {
   const call = callOf(c.req.raw)
-  if (call.route?.kind !== 'css') return headless(c.req.raw, routeError(call, { code: 'bad_request', message: 'not a viewer route' }))
+  if (call.route === null || call.route.kind !== 'css') return headless(c.req.raw, routeError(call, { code: 'bad_request', message: 'not a viewer route' }))
   return cssResponse(call, c.req.raw)
 }
 

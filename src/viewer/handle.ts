@@ -1,8 +1,7 @@
 // Public viewer entry. No PLY_TOKEN, no git credential, no /v1 handler. Rate limit runs before any git fetch.
 // This module does not import rate.ts: node tests must not load cloudflare:workers. The Worker re-exports the class.
-import { fromNullable } from '../absent.ts'
-import { unwrapOr } from '../option.ts'
-import { openSpan } from '../flags/telemetry.ts'
+import { chainGet } from '../absent.ts'
+import { openSpan, type TracingLike } from '../flags/telemetry.ts'
 import { plyBuildValue, BUILD_HEADER } from '../version.ts'
 import { ok, runRequest, type Result, type UnexpectedFailure } from '../http/machine.ts'
 import { viewerApp } from './app.tsx'
@@ -15,7 +14,15 @@ export type { HandleOpts, ViewerCtx }
 
 const EMPTY: TraceModel = { bars: [], totalMs: 0, cfRay: '', requestId: '' }
 
-type EdgeSpan = { setAttribute?: (key: string, value: string | number | boolean) => void; end?: () => void }
+type EdgeSpan = { setAttribute?(key: string, value: string | number | boolean): void; end?(): void }
+
+/** A null receiver or a null method skips. A present method keeps its receiver and may throw. */
+function callMethod(receiver: unknown, key: string, args: readonly unknown[]): void {
+  const method = chainGet(receiver, key)
+  if (method.tag === 'none') return
+  const fn = method.value as (...params: unknown[]) => unknown
+  fn.apply(receiver, [...args])
+}
 
 type ViewerReady = { readonly requestId: string }
 
@@ -34,15 +41,19 @@ function viewerFailure(failure: UnexpectedFailure, call: ViewerCall): Response {
   return res
 }
 
-export async function handleViewer(req: Request, env: ViewerEnv, ctx: ViewerCtx = {}, opts: HandleOpts = {}): Promise<Response> {
-  const requestId = opts.requestId ?? crypto.randomUUID()
+export async function handleViewer(req: Request, env: ViewerEnv, ctx: unknown = null, opts: unknown = null): Promise<Response> {
+  const requestIdField = chainGet(opts, 'requestId')
+  const nowField = chainGet(opts, 'now')
+  const ray = req.headers.get('cf-ray')
+  const requestId = requestIdField.tag === 'none' ? crypto.randomUUID() : requestIdField.value as string
   const call: ViewerCall = {
     requestId,
-    now: opts.now ?? Date.now(),
-    cfRay: req.headers.get('cf-ray') ?? '',
+    now: nowField.tag === 'none' ? Date.now() : nowField.value as number,
+    cfRay: ray === null ? '' : ray,
     opts,
     ctx,
     fields: {},
+    route: null,
   }
   viewerCalls.set(req, call)
   let span: EdgeSpan | null = null
@@ -51,13 +62,14 @@ export async function handleViewer(req: Request, env: ViewerEnv, ctx: ViewerCtx 
     if (spanClosed) return
     spanClosed = true
     if (!span) return
-    for (const [key, value] of Object.entries(call.fields)) span.setAttribute?.(key, value)
-    span.end?.()
+    for (const [key, value] of Object.entries(call.fields)) callMethod(span, 'setAttribute', [key, value])
+    callMethod(span, 'end', [])
   }
   return runRequest(
     {
       parse: () => {
-        span = openSpan(unwrapOr(fromNullable(ctx.tracing), null), 'ply.viewer')
+        const tracing = chainGet(ctx, 'tracing')
+        span = openSpan(tracing.tag === 'some' ? tracing.value as TracingLike : null, 'ply.viewer')
         return ok({ requestId } satisfies ViewerReady)
       },
       authorize: (parsed: ViewerReady) => ok(parsed),

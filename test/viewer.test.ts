@@ -106,7 +106,7 @@ test('public repo URLs: exact allowlist, case, trailing dot, lookalikes, credent
   assert.equal(extra.some(host => host === 'github.com'), true);
   assert.equal(extra.some(host => host === 'acct.artifacts.cloudflare.net'), true);
   assert.equal(extra.some(host => host.includes('*') || host.includes('/') || host.includes(':')), false);
-  assert.equal(allowlistFromEnv(undefined).length, ALLOWED_HOSTS.length);
+  assert.equal(allowlistFromEnv(null).length, ALLOWED_HOSTS.length);
   assert.equal(allowlistFromEnv('').length, ALLOWED_HOSTS.length);
   assert.equal(allowlistFromEnv('*.artifacts.cloudflare.net').length, ALLOWED_HOSTS.length);
   const art = loc('https://acct.artifacts.cloudflare.net/git/ns/repo.git', extra);
