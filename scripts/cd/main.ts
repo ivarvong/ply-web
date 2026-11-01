@@ -20,7 +20,7 @@ import { readPlyPin, resolvePlySha, stageBump } from './stage-bump.ts'
 import { stageDeploy } from './stage-deploy.ts'
 import { stageRamp } from './stage-ramp.ts'
 import { stageRollback } from './stage-rollback.ts'
-import { stageSmoke } from './stage-smoke.ts'
+import { stageSmoke, stageSweep } from './stage-smoke.ts'
 import { stageTelemetry } from './stage-telemetry.ts'
 import { withCommandSink } from './trace.ts'
 import { readTokenFile } from './token.ts'
@@ -37,6 +37,7 @@ export type Parsed =
   | { readonly kind: 'report' }
   | { readonly kind: 'annotate'; readonly runId: string; readonly reason: string }
   | { readonly kind: 'debrief'; readonly runDir: string }
+  | { readonly kind: 'sweep' }
   | { readonly kind: 'usage' }
   | { readonly kind: 'error'; readonly reason: string }
 
@@ -140,6 +141,10 @@ export function parseArgs(argv: readonly string[], pin: string | null = null): P
     if (!runDir || runDir.startsWith('--')) return { kind: 'error', reason: 'debrief needs a run directory' }
     return { kind: 'debrief', runDir }
   }
+  if (command === 'sweep') {
+    if (rest.length > 0) return { kind: 'error', reason: 'sweep takes no arguments' }
+    return { kind: 'sweep' }
+  }
   return { kind: 'error', reason: `unknown command ${command}` }
 }
 
@@ -157,6 +162,7 @@ export function usageText(): string {
     '  report',
     '  annotate <run-id> --false-positive "reason"',
     '  debrief <run-dir>',
+    '  sweep',
   ].join('\n')
 }
 
@@ -395,6 +401,19 @@ async function dispatch(
     }
     log(result.value.line)
     log(`cd: PASS telemetry ${parsed.version}`)
+    return { code: 0, reason: null }
+  }
+  if (parsed.kind === 'sweep') {
+    const result = await stageSweep(config, runDir)
+    if (result.kind === 'unlistable') {
+      runLog.patch({ fault: 'harness_fault' })
+      const line = `cd: harness_fault sweep: ${result.detail}`
+      log(line)
+      return { code: 1, reason: line }
+    }
+    if (result.leaks.length > 0) log(`cleanup_leak: ${result.leaks.join(' ')}`)
+    const line = `cd: PASS sweep deleted ${result.deleted.length}`
+    log(line)
     return { code: 0, reason: null }
   }
   if (parsed.kind === 'ramp') {

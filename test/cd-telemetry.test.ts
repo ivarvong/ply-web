@@ -456,6 +456,7 @@ test('named entrypoints are not routed traffic', () => {
     share: counted,
     decision,
     latency: policy.gates.latency.mode,
+    probe: { kind: 'none' },
   })
   assert.match(line, new RegExp(`samples=${NEW_EXTERNAL}/${OLD_EXTERNAL}`))
   assert.match(line, /routed_share=10.27/)

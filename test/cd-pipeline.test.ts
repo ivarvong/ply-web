@@ -73,4 +73,6 @@ test('usage and a bad version exit as argument errors', () => {
   assert.equal(parseArgs(['annotate']).kind, 'error')
   assert.equal(parseArgs(['annotate', 'not-a-run', '--false-positive', 'reason']).kind, 'error')
   assert.equal(parseArgs(['annotate', runId]).kind, 'error')
+  assert.deepEqual(parseArgs(['sweep']), { kind: 'sweep' })
+  assert.equal(parseArgs(['sweep', '--force']).kind, 'error')
 })
