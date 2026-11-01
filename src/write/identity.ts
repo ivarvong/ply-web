@@ -2,6 +2,7 @@
 // brands the object ident() will accept. This module is the HTTP shape: {name, email, tz?, time?}.
 // The zone check lives in validateIdent; a bad tz is still 400 bad_request, with ply's message.
 import { fail, ident, validateIdent } from 'ply';
+import { recordGet } from '../absent.ts';
 
 declare const tzBrand: unique symbol;
 declare const timeBrand: unique symbol;
@@ -28,19 +29,25 @@ export function parseTime(value: unknown, field: string): UnixSeconds {
   return value as UnixSeconds;
 }
 
-type Raw = { name?: unknown; email?: unknown; tz?: unknown; time?: unknown };
-
-function rawOf(value: unknown, field: string): Raw {
+function rawOf(value: unknown, field: string): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw fail('bad_request', `${field} must be {name, email}`);
-  return value as Raw;
+  return value as Record<string, unknown>;
 }
 
-/** Stamp one identity. Omitted tz is UTC. Omitted time is `now` (unix seconds). */
+/** Stamp one identity. Omitted tz is UTC. Omitted time is `now` (unix seconds). A present null is rejected. */
 export function stamp(value: unknown, field: string, now: UnixSeconds): Stamp {
   const raw = rawOf(value, field);
-  const time = raw.time === undefined ? now : parseTime(raw.time, `${field}.time`);
+  const time = recordGet(raw, 'time');
+  const name = recordGet(raw, 'name');
+  const email = recordGet(raw, 'email');
+  const tz = recordGet(raw, 'tz');
   // Omitted tz is validateIdent's UTC. A present tz is checked there (sign, four digits, civil range).
-  const person = validateIdent({ name: raw.name, email: raw.email, time, tz: raw.tz });
+  const person = validateIdent({
+    ...(name.tag === 'some' ? { name: name.value } : {}),
+    ...(email.tag === 'some' ? { email: email.value } : {}),
+    time: time.tag === 'none' ? now : parseTime(time.value, `${field}.time`),
+    ...(tz.tag === 'some' ? { tz: tz.value } : {}),
+  });
   return { name: person.name, email: person.email, tz: person.tz as TzOffset, time: person.time as UnixSeconds, person, line: ident(person) };
 }
 

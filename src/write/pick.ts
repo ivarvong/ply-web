@@ -8,7 +8,7 @@
 import { cherryPick, fail, revertCommit } from 'ply'
 import { type CallOpts } from './call.ts'
 import { type Stamp } from './identity.ts'
-import { writeResult } from './result.ts'
+import { firstPresent, writeResult } from './result.ts'
 
 const OUTCOME_EMPTY = 'empty'
 const OUTCOME_OK = 'ok'
@@ -18,9 +18,7 @@ export type PlyPickResult = {
   readonly outcome: string
   readonly ref: string
   readonly oid: string
-  readonly tree?: string
-  readonly onto?: string
-  readonly pushBytes?: number
+  readonly [field: string]: unknown
 }
 
 export type MappedPick =
@@ -40,9 +38,9 @@ export function mapPickOutcome(result: PlyPickResult, revert: boolean): MappedPi
       name: revert ? 'revert' : 'cherry_pick',
       ref: result.ref,
       oid: result.oid,
-      oldOid: result.onto ?? null,
-      tree: result.tree ?? null,
-      pushBytes: result.pushBytes ?? 0,
+      oldOid: firstPresent(result, ['onto'], null) as string | null,
+      tree: firstPresent(result, ['tree'], null) as string | null,
+      pushBytes: firstPresent(result, ['pushBytes'], 0) as number,
     }
   }
   throw fail('internal', `unexpected ${revert ? 'revert' : 'cherry-pick'} outcome ${result.outcome}`)
