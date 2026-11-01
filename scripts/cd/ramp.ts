@@ -1,8 +1,8 @@
 import { asRecord } from './json.ts'
 import type { ObservationRef } from './log.ts'
+import type { RolloutPolicy } from './policy.ts'
 import { percentile, type VersionStats } from './telemetry.ts'
-import { burnMap, judgeStep, QUANTILE_FLOOR, type StepVerdict } from './slo.ts'
-import type { RampSchedule } from './baseline.ts'
+import { burnMap, CARRY_WALL_SAMPLES, judgeStep, type StepVerdict } from './slo.ts'
 
 export type { VersionStats } from './telemetry.ts'
 
@@ -32,8 +32,8 @@ export function rampStart(): RampState {
   return { kind: 'ramping', step: 0 }
 }
 
-/** One ramp step. Unavailable telemetry is a harness fault and does not roll back. A short clean sample is insufficient_data, which still advances. */
-export function decideRampStep(obs: Observation, probeFailures = 0): RampDecision {
+/** One ramp step. Unavailable telemetry is a harness fault and does not roll back. A clean step advances. */
+export function decideRampStep(obs: Observation, policy: RolloutPolicy, probeFailures = 0): RampDecision {
   if (obs.kind === 'unavailable') {
     return {
       outcome: 'harness_fault',
@@ -42,10 +42,15 @@ export function decideRampStep(obs: Observation, probeFailures = 0): RampDecisio
       burns: burnMap([]),
     }
   }
-  return judgeStep({ next: obs.next, previous: obs.previous, probeFailures })
+  return judgeStep({
+    next: obs.next,
+    previous: obs.previous,
+    probeFailures,
+    policy,
+  })
 }
 
-/** Advance on a clean step, including insufficient_data. A terminal state stays terminal. A harness fault stops without rolling back. */
+/** Advance on a clean step. A terminal state stays terminal. A harness fault stops without rolling back. */
 export function applyRamp(state: RampState, decision: RampDecision, stepCount: number): RampState {
   if (state.kind !== 'ramping') return state
   if (decision.outcome === 'harness_fault') return { kind: 'stopped', reason: decision.reason, fault: 'harness_fault' }
@@ -74,15 +79,19 @@ export function progressLine(input: {
   readonly next: VersionStats | null
   readonly previous: VersionStats | null
   readonly decision: RampDecision
+  readonly latency: RolloutPolicy['gates']['latency']['mode']
   readonly carried?: boolean
 }): string {
   const previousPercent = input.percent >= 100 ? 0 : 100 - input.percent
   const samples = `${input.next?.requests ?? '-'}/${input.previous?.requests ?? '-'}`
   const errors = `${input.next ? fixedRate(input.next.errors, input.next.requests) : '-'}/${input.previous ? fixedRate(input.previous.errors, input.previous.requests) : '-'}`
   const walls = `${p99(input.next?.wallMs)}/${p99(input.previous?.wallMs)}`
-  const head = `ramp step=${input.step}/${input.steps} percent=${input.percent} previous=${previousPercent} samples=${samples} error_rate=${errors} p99_wall_ms=${walls} decision=${input.decision.outcome}`
+  const cpu = `${p99(input.next?.cpuMs)}/${p99(input.previous?.cpuMs)}`
+  const latency = input.latency === 'off' ? '' : ` p99_wall_ms=${walls} p99_cpu_ms=${cpu} latency=${input.latency}`
+  const head = `ramp step=${input.step}/${input.steps} percent=${input.percent} previous=${previousPercent} samples=${samples} error_rate=${errors}${latency} decision=${input.decision.outcome}`
   const carried = input.carried ? ' previous_sample=carried' : ''
-  if (input.decision.outcome === 'advance') return head + carried
+  const informational = input.decision.outcome === 'advance' && input.decision.reason.includes('informational:')
+  if (input.decision.outcome === 'advance' && !informational) return head + carried
   const reason = input.decision.reason.replace(/[\n\r"]/g, "'")
   return `${head}${carried} reason="${reason}"`
 }
@@ -128,28 +137,29 @@ export type RampLoopResult = {
 }
 
 /**
- * Step the schedule. At 100% the previous version is no longer allocated, so the old side of
- * the latency compare is the last step whose old version had enough wall samples.
+ * Step the policy. At 100% the previous version is no longer allocated, so the old
+ * wall and CPU numbers are the last step whose old version had enough wall samples.
  */
 function asConflict(value: null | string | HeldWrite): HeldWrite | null {
   if (value && typeof value === 'object') return value
   return null
 }
 
-export async function runRamp(schedule: RampSchedule, io: RampIo): Promise<RampLoopResult> {
+export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLoopResult> {
   const lines: string[] = []
   const steps: RampStepRecord[] = []
   let state = rampStart()
   let carried: VersionStats | null = null
   let rollbackError: string | null = null
-  const cap = schedule.percents.length
+  const cap = policy.steps.length
   for (let guard = 0; guard < cap && state.kind === 'ramping'; guard++) {
     const index = state.step
-    const percent = schedule.percents[index]
-    if (percent === undefined) {
+    const step = policy.steps[index]
+    if (!step) {
       state = { kind: 'rolled-back', reason: `schedule has no step ${index}` }
       break
     }
+    const percent = step.percent
     const splitError = await io.applySplit(percent)
     const splitConflict = asConflict(splitError)
     if (splitConflict) {
@@ -167,36 +177,42 @@ export async function runRamp(schedule: RampSchedule, io: RampIo): Promise<RampL
       state = { kind: 'rolled-back', reason: splitError }
       break
     }
+    if (policy.warmupMs > 0) await io.sleep(policy.warmupMs)
     const from = io.now()
-    const probed = io.dwell ? await io.dwell(schedule.dwellMs) : (await io.sleep(schedule.dwellMs), { probeFailures: 0 })
+    const probed = io.dwell ? await io.dwell(step.dwellMs) : (await io.sleep(step.dwellMs), { probeFailures: 0 })
     if ((probed.harnessFaults ?? 0) > 0) {
       state = { kind: 'stopped', reason: 'harness fault during probes', fault: 'harness_fault' }
       break
     }
     const to = io.now()
+    // Wait for the dwell's own tail to land, then query that window. The next step
+    // has not started. The checked-in wait is above the 2026-11-01 gaps: 12640ms
+    // at 1% and 17313ms at 5% on run 2026-11-01T00-10-02-620Z.
+    await io.sleep(policy.ingestWaitMs)
     const observed = await io.observe(from, to, percent)
-    if (observed.kind === 'sample' && observed.previous.wallMs.length >= QUANTILE_FLOOR) carried = observed.previous
+    if (observed.kind === 'sample' && observed.previous.wallMs.length >= CARRY_WALL_SAMPLES) carried = observed.previous
     let used = observed
     let usedCarried = false
     if (
       observed.kind === 'sample'
       && percent === 100
-      && observed.previous.wallMs.length < QUANTILE_FLOOR
+      && observed.previous.wallMs.length < CARRY_WALL_SAMPLES
       && carried
-      && carried.wallMs.length >= QUANTILE_FLOOR
+      && carried.wallMs.length >= CARRY_WALL_SAMPLES
     ) {
       used = { kind: 'sample', next: observed.next, previous: carried, ref: observed.ref }
       usedCarried = true
     }
-    const decision = decideRampStep(used, probed.probeFailures)
+    const decision = decideRampStep(used, policy, probed.probeFailures)
     steps.push({ percent, burns: decision.burns, outcome: decision.outcome })
     const line = progressLine({
       step: index + 1,
-      steps: schedule.percents.length,
+      steps: policy.steps.length,
       percent,
       next: used.kind === 'sample' ? used.next : null,
       previous: used.kind === 'sample' ? used.previous : null,
       decision,
+      latency: policy.gates.latency.mode,
       carried: usedCarried,
     })
     lines.push(line)
@@ -204,7 +220,7 @@ export async function runRamp(schedule: RampSchedule, io: RampIo): Promise<RampL
       if (!used.ref) throw new Error('decision without an observation')
       await io.onDecision(used.ref, decision, percent)
     }
-    state = applyRamp(state, decision, schedule.percents.length)
+    state = applyRamp(state, decision, policy.steps.length)
     if (state.kind === 'rolled-back') {
       const rolled = await io.rollback()
       const rolledConflict = asConflict(rolled)

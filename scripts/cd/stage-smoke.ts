@@ -452,13 +452,15 @@ export async function stageSmoke(
       to: Date.now(),
       raw: JSON.stringify({ detail, requests: requests.length, repo: name, deleted }),
     })
+    const informationalSmoke = !passed && !harness && config.policy.gates.smoke === 'informational'
     await runLog.decision({
       inputs: [ref],
       rules: [{ name: 'correctness.target', value: CORRECTNESS.target }],
-      outcome: passed ? 'advance' : harness ? 'harness_fault' : 'stop',
-      reason: detail,
+      outcome: passed || informationalSmoke ? 'advance' : harness ? 'harness_fault' : 'stop',
+      reason: informationalSmoke ? `informational: ${detail}` : detail,
     })
   }
-  if (!passed) return fail('smoke', `${detail}; repo ${deleted ? 'deleted' : name}`, false, harness ? 'harness_fault' : 'worker')
+  const smokeHard = config.policy.gates.smoke === 'hard'
+  if (!passed && (harness || smokeHard)) return fail('smoke', `${detail}; repo ${deleted ? 'deleted' : name}`, false, harness ? 'harness_fault' : 'worker')
   return pass('smoke', report)
 }

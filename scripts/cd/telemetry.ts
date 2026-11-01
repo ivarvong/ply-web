@@ -1,6 +1,7 @@
 import { lossAllowance, verdict, type CanaryVerdict } from '../canary-verdict.mjs'
 import { CF_RAY_HEX_LENGTH, JOIN_MIN_LOGGED, JOIN_MIN_SHARE, QUERY_SLACK_MS, TELEMETRY_PAGE, type LatencyCeiling } from './baseline.ts'
 import { asRecord } from './json.ts'
+import type { RolloutGates } from './policy.ts'
 import type { V1Request } from './slo.ts'
 
 /**
@@ -369,6 +370,7 @@ export type VersionStats = {
   readonly exceptions: number
   readonly errors: number
   readonly fivexx: number
+  readonly errorLogs: number
   readonly wallMs: readonly number[]
   readonly cpuMs: readonly number[]
   readonly fetchMs: readonly number[]
@@ -450,6 +452,7 @@ export function statsFromEvents(events: readonly unknown[], spans: readonly unkn
   let exceptions = 0
   let errors = 0
   let fivexx = 0
+  let errorLogs = 0
   let logs = 0
   const wallMs: number[] = []
   const cpuMs: number[] = []
@@ -460,6 +463,8 @@ export function statsFromEvents(events: readonly unknown[], spans: readonly unkn
       logs += 1
       const status = statusOf(event)
       if (status !== null && status >= 500) fivexx += 1
+      const meta = asRecord(event.$metadata)
+      if (meta?.level === 'error') errorLogs += 1
     }
     if (!isFetchInvocation(event)) continue
     requests += 1
@@ -474,6 +479,7 @@ export function statsFromEvents(events: readonly unknown[], spans: readonly unkn
     exceptions,
     errors,
     fivexx,
+    errorLogs,
     wallMs,
     cpuMs,
     fetchMs: fetchMsJoined(events, spans),
@@ -632,6 +638,62 @@ export type SmokeJudge =
   | { readonly kind: 'pass'; readonly line: string; readonly failures: readonly []; readonly verdict: CanaryVerdict }
   | { readonly kind: 'worker'; readonly line: string; readonly failures: readonly ObservedFault[]; readonly verdict: CanaryVerdict }
   | { readonly kind: 'harness_fault'; readonly line: string; readonly reason: string; readonly checks: readonly UnevaluableCheck[]; readonly verdict: CanaryVerdict }
+
+function faultIsHard(fault: ObservedFault, gates: RolloutGates): boolean {
+  switch (fault.kind) {
+    case 'exception':
+      return gates.exceptions === 'hard'
+    case 'fivexx':
+      return gates.fivexx === 'hard'
+    case 'log-error':
+      return gates.errorLogs === 'hard'
+    case 'non-ok':
+      return gates.nonOk === 'hard'
+    case 'latency':
+      return gates.latency.mode === 'gate'
+    case 'unexpected-status':
+    case 'other-version':
+      return gates.smoke === 'hard'
+  }
+}
+
+function latencyGap(check: UnevaluableCheck): boolean {
+  return check.kind === 'missing' && /^(wall|cpu|fetch) has no samples$/.test(check.detail)
+}
+
+function faultText(fault: ObservedFault): string {
+  if (fault.kind === 'unexpected-status') return `unexpected-status ${fault.id} ${fault.status}`
+  if (fault.kind === 'latency') return `latency ${fault.metric} ${fault.p} ${fault.value} > ${fault.ceiling}`
+  return `${fault.kind}: ${fault.detail}`
+}
+
+/**
+ * Drop signals the policy does not treat as hard. A latency series with no samples
+ * is a harness fault only when latency mode is `gate`.
+ */
+export function applyGates(judge: SmokeJudge, gates: RolloutGates): SmokeJudge {
+  if (judge.kind === 'harness_fault') {
+    if (gates.latency.mode === 'gate') return judge
+    const checks = judge.checks.filter(check => !latencyGap(check))
+    if (checks.length === judge.checks.length) return judge
+    if (checks.length > 0) {
+      const reason = checks.map(check => `${check.kind}: ${check.detail}`).join('; ')
+      return { kind: 'harness_fault', line: `telemetry: harness_fault: ${reason}`, reason, checks, verdict: judge.verdict }
+    }
+    return { kind: 'pass', failures: [], line: `${judge.verdict.line} latency=${gates.latency.mode}`, verdict: judge.verdict }
+  }
+  if (judge.kind !== 'worker') return judge
+  const kept = judge.failures.filter(fault => faultIsHard(fault, gates))
+  const dropped = judge.failures.filter(fault => !faultIsHard(fault, gates))
+  if (dropped.length === 0) return judge
+  if (kept.length > 0) return { kind: 'worker', failures: kept, line: judge.line, verdict: judge.verdict }
+  return {
+    kind: 'pass',
+    failures: [],
+    line: `${judge.verdict.line} informational: ${dropped.map(faultText).join('; ')}`,
+    verdict: judge.verdict,
+  }
+}
 
 /** Below half of the invocations the worker logged, the span join is the harness, not the version. */
 export function implausibleJoin(input: { readonly smoke: number; readonly invocations: number; readonly joined: number }): boolean {

@@ -3,6 +3,8 @@
 # The default `node` on the operator image can be older than that range.
 # A matching build lives at /workspace/node-v24.22.1-linux-x64 when the image has it.
 # .nvmrc names 24.22.1. PLY_NODE overrides the search.
+# The chosen Node's bin directory is prepended to PATH. `cf` is a `#!/usr/bin/env node`
+# script, so a v20 `node` left on PATH makes `cf` exit and the run records harness_fault.
 set -eu
 cd "$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 
@@ -36,5 +38,8 @@ if [ -z "$chosen" ]; then
   exit 1
 fi
 
+node_dir=$(CDPATH= cd -- "$(dirname "$chosen")" && pwd)
+PATH="$node_dir${PATH:+:$PATH}"
+export PATH
 export PLY_CD_NODE_REEXEC=1
 exec "$chosen" --experimental-strip-types scripts/cd/main.ts "$@"

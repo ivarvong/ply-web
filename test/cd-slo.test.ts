@@ -1,17 +1,16 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
+import { parsePolicy, type RolloutPolicy } from '../scripts/cd/policy.ts'
 import {
   AVAILABILITY,
   burnRate,
-  compareLatency,
   countCorrectness,
   countSlo,
   errorBudget,
   FAST_BURN,
   judgeStep,
-  mannWhitneyGreater,
   MIN_SAMPLES,
-  QUANTILE_P99_RATIO,
   READ_LATENCY,
   type StepInput,
   type V1Request,
@@ -30,7 +29,13 @@ function request(over: Partial<V1Request> = {}): V1Request {
 }
 
 function side(over: Partial<StepInput> = {}): StepInput {
-  return { requests: 0, exceptions: 0, errors: 0, fivexx: 0, wallMs: [], v1: [], ...over }
+  return { requests: 0, exceptions: 0, errors: 0, fivexx: 0, errorLogs: 0, wallMs: [], v1: [], ...over }
+}
+
+function checkedPolicy(patch?: (raw: Record<string, unknown>) => void): RolloutPolicy {
+  const raw = JSON.parse(readFileSync(new URL('../scripts/cd/cd.policy.json', import.meta.url), 'utf8')) as Record<string, unknown>
+  patch?.(raw)
+  return parsePolicy(JSON.stringify(raw)).policy
 }
 
 function walls(n: number, value: number): number[] {
@@ -64,25 +69,16 @@ test('expected 4xx leave the availability denominator and a slow read is a laten
   assert.ok(Math.abs((correctness.burn ?? 0) - 1) < 1e-9)
 })
 
-test('Mann-Whitney rank sums match the textbook samples', () => {
-  const faster = mannWhitneyGreater([1, 2, 3], [4, 5, 6], 0.01)
-  assert.equal(faster?.rankSum, 6)
-  assert.equal(faster?.slower, false)
-  const slower = mannWhitneyGreater([4, 5, 6], [1, 2, 3], 0.01)
-  assert.equal(slower?.rankSum, 15)
-  assert.ok((slower?.z ?? 0) > 0)
-  const separated = mannWhitneyGreater(walls(MIN_SAMPLES, 500), walls(MIN_SAMPLES, 50), 0.01)
-  assert.equal(separated?.slower, true)
-})
-
-test('a short clean sample is insufficient_data and a fast burn rolls back', () => {
+test('a short clean sample advances and a fast burn rolls back', () => {
+  const policy = checkedPolicy()
   const quiet = judgeStep({
     next: side({ requests: 3, wallMs: walls(3, 80) }),
     previous: side({ requests: 4, wallMs: walls(4, 70) }),
     probeFailures: 0,
+    policy,
   })
-  assert.equal(quiet.outcome, 'insufficient_data')
-  assert.equal(quiet.rules[0]?.name, 'min_samples')
+  assert.equal(quiet.outcome, 'advance')
+  assert.equal(quiet.rules[0]?.name, 'fast_burn')
   const burned = judgeStep({
     next: side({
       requests: MIN_SAMPLES,
@@ -91,6 +87,7 @@ test('a short clean sample is insufficient_data and a fast burn rolls back', () 
     }),
     previous: side({ requests: MIN_SAMPLES, wallMs: walls(MIN_SAMPLES, 80) }),
     probeFailures: 0,
+    policy,
   })
   assert.equal(burned.outcome, 'rollback')
   assert.equal(burned.rules[0]?.name, 'fast_burn')
@@ -98,11 +95,13 @@ test('a short clean sample is insufficient_data and a fast burn rolls back', () 
   assert.match(burned.reason, /read_latency burn/)
 })
 
-test('any exception or 5xx on the new version rolls back before the sample floor', () => {
+test('any exception, 5xx, error log, or non-ok outcome rolls back before the sample floor', () => {
+  const policy = checkedPolicy()
   const exception = judgeStep({
     next: side({ requests: 1, exceptions: 1, errors: 1 }),
     previous: side({ requests: 40 }),
     probeFailures: 0,
+    policy,
   })
   assert.deepEqual(exception.outcome, 'rollback')
   assert.equal(exception.reason, '1 exception on the new version')
@@ -110,26 +109,96 @@ test('any exception or 5xx on the new version rolls back before the sample floor
     next: side({ requests: 1, fivexx: 1 }),
     previous: side({ requests: 1, fivexx: 9 }),
     probeFailures: 0,
+    policy,
   })
   assert.match(fivexx.reason, /5xx/)
   assert.equal(fivexx.outcome, 'rollback')
+  const logged = judgeStep({
+    next: side({ requests: 1, errorLogs: 1 }),
+    previous: side({ requests: 4 }),
+    probeFailures: 0,
+    policy,
+  })
+  assert.equal(logged.outcome, 'rollback')
+  assert.equal(logged.reason, '1 error log on the new version')
 })
 
-test('quantile comparison is used below the Mann-Whitney floor', () => {
-  const over = compareLatency(walls(6, 210), walls(6, 80))
-  assert.equal(over.kind, 'slower')
-  assert.equal(over.reason, `wall p99 ratio 2.625 > ${QUANTILE_P99_RATIO}`)
-  const atMax = compareLatency(walls(6, 160), walls(6, 80))
-  assert.equal(atMax.kind, 'not_slower')
-  const short = compareLatency(walls(4, 10), walls(4, 10))
-  assert.equal(short.kind, 'insufficient_data')
+test('the checked-in policy does not roll back on wall time', () => {
+  const policy = checkedPolicy()
+  const fixture = JSON.parse(readFileSync(new URL('./fixtures/cd/ramp-5pct-walls.json', import.meta.url), 'utf8')) as {
+    next: number[]
+    previous: number[]
+  }
+  const recorded = judgeStep({
+    next: side({ requests: fixture.next.length, wallMs: fixture.next }),
+    previous: side({ requests: fixture.previous.length, wallMs: fixture.previous }),
+    probeFailures: 0,
+    policy,
+  })
+  assert.equal(recorded.outcome, 'advance')
+  assert.equal(recorded.rules[0]?.name, 'fast_burn')
+  const wide = judgeStep({
+    next: side({ requests: 161, wallMs: walls(161, 27) }),
+    previous: side({ requests: 161, wallMs: walls(161, 12) }),
+    probeFailures: 0,
+    policy,
+  })
+  assert.equal(wide.outcome, 'advance')
+  const gross = judgeStep({
+    next: side({ requests: MIN_SAMPLES, wallMs: walls(MIN_SAMPLES, 210) }),
+    previous: side({ requests: MIN_SAMPLES, wallMs: walls(MIN_SAMPLES, 80) }),
+    probeFailures: 0,
+    policy,
+  })
+  assert.equal(gross.outcome, 'advance')
 })
 
-test('a clean compared sample advances', () => {
-  const ok = judgeStep({
-    next: side({ requests: 6, wallMs: walls(6, 90), v1: walls(6, 90).map(wallMs => request({ wallMs })) }),
+test('latency=gate rolls back only when the policy thresholds clear', () => {
+  const policy = checkedPolicy(raw => {
+    raw.gates = {
+      ...(raw.gates as Record<string, unknown>),
+      latency: { mode: 'gate', minSamples: MIN_SAMPLES, p99Ratio: 2, effectFloorMs: 10 },
+    }
+  })
+  const clear = judgeStep({
+    next: side({ requests: MIN_SAMPLES, wallMs: walls(MIN_SAMPLES, 80) }),
+    previous: side({ requests: MIN_SAMPLES, wallMs: walls(MIN_SAMPLES, 20) }),
+    probeFailures: 0,
+    policy,
+  })
+  assert.equal(clear.outcome, 'rollback')
+  assert.match(clear.reason, /wall p99 ratio 4.000 > 2/)
+  assert.match(clear.reason, /\+60ms > 10ms/)
+  const short = judgeStep({
+    next: side({ requests: 6, wallMs: walls(6, 210) }),
     previous: side({ requests: 6, wallMs: walls(6, 80) }),
     probeFailures: 0,
+    policy,
   })
-  assert.equal(ok.outcome, 'advance')
+  assert.equal(short.outcome, 'advance')
+  const fixture = JSON.parse(readFileSync(new URL('./fixtures/cd/ramp-5pct-walls.json', import.meta.url), 'utf8')) as {
+    next: number[]
+    previous: number[]
+  }
+  const recorded = judgeStep({
+    next: side({ requests: fixture.next.length, wallMs: fixture.next }),
+    previous: side({ requests: fixture.previous.length, wallMs: fixture.previous }),
+    probeFailures: 0,
+    policy,
+  })
+  assert.equal(recorded.outcome, 'advance')
+})
+
+test('an informational signal is recorded and does not roll back', () => {
+  const policy = checkedPolicy(raw => {
+    raw.gates = { ...(raw.gates as Record<string, unknown>), fivexx: 'informational' }
+  })
+  const step = judgeStep({
+    next: side({ requests: 2, fivexx: 1 }),
+    previous: side({ requests: 2 }),
+    probeFailures: 0,
+    policy,
+  })
+  assert.equal(step.outcome, 'advance')
+  assert.match(step.reason, /informational: 1 5xx response/)
 })
