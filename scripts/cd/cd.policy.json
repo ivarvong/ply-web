@@ -49,7 +49,22 @@
     "onInsufficient": "hold"
   },
   "telemetry": {
-    "maxLossRate": 0.5
+    "maxLossRate": 0.5,
+    "query": {
+      "attempts": 3,
+      "backoffMs": 1000,
+      "calibration": {
+        "source": "run 2026-11-01T19-17-18-170Z",
+        "date": "2026-11-01",
+        "window": "100% ramp step",
+        "n": 1,
+        "web": "07568e0",
+        "ply": "1743461",
+        "observed": "cf o11y telemetry query --body APIError timeout Envelope Error, exit 1",
+        "percentile": "one measured query, not a percentile",
+        "headroom": "attempts is 3, two past the single timeout that rolled the step back. backoffMs 1000 is PRIOR: the run did not retry."
+      }
+    }
   },
   "cleanup": {
     "attempts": 3,

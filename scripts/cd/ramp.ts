@@ -52,16 +52,48 @@ export function rampStart(): RampState {
   return { kind: 'ramping', step: 0 }
 }
 
-/** One ramp step. Unavailable telemetry is a harness fault and does not roll back. A clean step advances. */
-export function decideRampStep(obs: Observation, policy: RolloutPolicy, targetPercent: number): RampDecision {
-  if (obs.kind === 'unavailable') {
+/**
+ * A query that never returned. Probes that already answered are the correctness signal:
+ * a 5xx is a rollback when that gate is hard, and a clean probe window advances. The
+ * missing series is named on the reason and is not treated as zero errors. With no
+ * probe sample there is nothing to judge, so the step stays a harness fault.
+ */
+export function decideWithoutTelemetry(probes: ProbeLoss | null, policy: RolloutPolicy, reason: string): RampDecision {
+  if (probes === null || probes.total === 0) {
     return {
       outcome: 'harness_fault',
-      reason: obs.reason,
+      reason,
       rules: [{ name: 'telemetry_required', value: 1 }],
       burns: burnMap([]),
     }
   }
+  if (probes.serverErrors > 0 && policy.gates.fivexx === 'hard') {
+    return {
+      outcome: 'rollback',
+      reason: `${probes.serverErrors} 5xx on responded probes; telemetry query lost; ${reason}`,
+      rules: [{ name: 'max_new_5xx', value: 0 }],
+      burns: burnMap([]),
+    }
+  }
+  return {
+    outcome: 'advance',
+    reason: `informational: telemetry query lost; ${probes.responded} responded probes, ${probes.serverErrors} server errors; ${reason}`,
+    rules: [
+      { name: 'telemetry.query.attempts', value: policy.telemetry.query.attempts },
+      { name: 'probe_responded', value: probes.responded },
+    ],
+    burns: burnMap([]),
+  }
+}
+
+/** One ramp step. A returned sample is judged as usual. A lost query uses the probe statuses. */
+export function decideRampStep(
+  obs: Observation,
+  policy: RolloutPolicy,
+  targetPercent: number,
+  probes: ProbeLoss | null = null,
+): RampDecision {
+  if (obs.kind === 'unavailable') return decideWithoutTelemetry(probes, policy, obs.reason)
   return judgeStep({
     next: obs.next,
     previous: obs.previous,
@@ -338,7 +370,8 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
       && carried.wallMs.length >= CARRY_WALL_SAMPLES
       ? carried
       : null
-    const decision = withProbeRules(decideRampStep(observed, policy, percent), probeLoss)
+    const probes = io.dwell ? probeLoss : null
+    const decision = withProbeRules(decideRampStep(observed, policy, percent, probes), probeLoss)
     const liveShare = observed.kind === 'sample'
       ? routedShare(observed.next.invocations, observed.aggregate.invocations, percent, policy.split.z)
       : UNTESTED_SHARE

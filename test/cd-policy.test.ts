@@ -55,6 +55,16 @@ test('the checked-in policy is the correctness ramp', () => {
   assert.equal(loaded.policy.cleanup.calibration.window, 'post-ramp scratch repo delete')
   assert.equal(loaded.policy.cleanup.calibration.n, 1)
   assert.equal(loaded.policy.cleanup.calibration.latencyMs, 103_000)
+  assert.equal(loaded.policy.telemetry.query.attempts, 3)
+  assert.equal(loaded.policy.telemetry.query.backoffMs, 1_000)
+  assert.equal(loaded.policy.telemetry.query.calibration.source, 'run 2026-11-01T19-17-18-170Z')
+  assert.equal(loaded.policy.telemetry.query.calibration.date, '2026-11-01')
+  assert.equal(loaded.policy.telemetry.query.calibration.window, '100% ramp step')
+  assert.equal(loaded.policy.telemetry.query.calibration.n, 1)
+  assert.equal(loaded.policy.telemetry.query.calibration.web, '07568e0')
+  assert.equal(loaded.policy.telemetry.query.calibration.ply, '1743461')
+  assert.match(loaded.policy.telemetry.query.calibration.observed, /APIError timeout Envelope Error/)
+  assert.match(loaded.policy.telemetry.query.calibration.headroom, /PRIOR/)
   assert.equal(loaded.policy.cleanup.calibration.web, '9558b10')
   assert.equal(loaded.policy.cleanup.calibration.namespace, 'ply-loadgen')
   assert.match(loaded.policy.cleanup.calibration.observed, /404 \[10200\] Repository not found/)
@@ -177,9 +187,10 @@ test('telemetry.maxLossRate is validated and defaults when omitted', () => {
   const { telemetry: _omitted, ...without } = base
   assert.equal(parsePolicy(JSON.stringify(without)).policy.telemetry.maxLossRate, DEFAULT_MAX_LOSS_RATE)
   const tight = 0.1
-  assert.equal(parsePolicy(JSON.stringify({ ...base, telemetry: { maxLossRate: tight } })).policy.telemetry.maxLossRate, tight)
+  const query = (base.telemetry as { query: unknown }).query
+  assert.equal(parsePolicy(JSON.stringify({ ...base, telemetry: { maxLossRate: tight, query } })).policy.telemetry.maxLossRate, tight)
   for (const bad of [0, -0.1, 1.5, '0.5', null]) {
-    assert.throws(() => parsePolicy(JSON.stringify({ ...base, telemetry: { maxLossRate: bad } })), /telemetry.maxLossRate: must be a number in \(0, 1\]/)
+    assert.throws(() => parsePolicy(JSON.stringify({ ...base, telemetry: { maxLossRate: bad, query } })), /telemetry.maxLossRate: must be a number in \(0, 1\]/)
   }
   assert.throws(() => parsePolicy(JSON.stringify({ ...base, telemetry: { maxLoss: 1 } })), /telemetry.maxLoss: unknown field/)
 })

@@ -4,7 +4,7 @@ import { orNull } from '../../src/option.ts'
 import { SMOKE_HTTP_MS } from './baseline.ts'
 import type { CdConfig } from './config.ts'
 import { isTrafficSplit, sameSplit, trafficSplit, type VersionShare } from './deploy-plan.ts'
-import { queryCaptured } from './o11y.ts'
+import { queryCaptured, telemetryQueryRetry } from './o11y.ts'
 import { errorMessage } from './proc.ts'
 import { activeLog } from './log.ts'
 import { readPassVerdict, runRamp, type Observation } from './ramp.ts'
@@ -31,9 +31,10 @@ async function observe(config: CdConfig, version: string, previous: string, from
   const query = { view: 'events' as const, filters: [service] }
   try {
     const spansQuery = [service, spanTypeFilter()]
+    const retry = telemetryQueryRetry(config.policy)
     const [all, spans] = await Promise.all([
-      queryCaptured('events', from, to, [service]),
-      queryCaptured('events', from, to, spansQuery),
+      queryCaptured('events', from, to, [service], retry),
+      queryCaptured('events', from, to, spansQuery, retry),
     ])
     const next = statsFromEvents(eventsFor(all.events, version), spans.events)
     const prior = statsFromEvents(eventsFor(all.events, previous), spans.events)
