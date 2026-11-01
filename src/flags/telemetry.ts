@@ -44,19 +44,17 @@ export type TracingLike = {
 };
 
 export function openSpan(tracing: TracingLike | null | undefined, name: string): SpanLike | null {
-  try {
-    return tracing?.enterSpan?.(name) ?? null;
-  } catch {
-    return null;
-  }
+  // The one-argument form stays open until end(). A platform enterSpan that requires a callback
+  // (workerd: parameter 2 must be a Function) is not this form; skip it instead of failing the request.
+  if (!tracing) return null;
+  const enter = tracing.enterSpan;
+  if (typeof enter !== 'function' || enter.length !== 1) return null;
+  const span = enter(name);
+  return span ? span : null;
 }
 
 export function endSpan(span: SpanLike | null): void {
-  try {
-    span?.end?.();
-  } catch {
-    // Telemetry must not change the flag decision.
-  }
+  span?.end?.();
 }
 
 export function resolutionSample(evaluation: FlagEvaluation): ResolutionSample {
@@ -132,18 +130,14 @@ export function emitEval(
       }
     }
   };
+  if (parent !== undefined) {
+    write(parent);
+    return;
+  }
+  const span = openSpan(tracing, 'flags.eval');
   try {
-    if (parent !== undefined) {
-      write(parent);
-      return;
-    }
-    const span = openSpan(tracing, 'flags.eval');
-    try {
-      write(span);
-    } finally {
-      endSpan(span);
-    }
-  } catch {
-    // Telemetry must not change the flag decision.
+    write(span);
+  } finally {
+    endSpan(span);
   }
 }

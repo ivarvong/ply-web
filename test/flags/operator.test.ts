@@ -157,6 +157,8 @@ describe('operator http', () => {
     expect(text).toContain('flag operator failed');
     expect(text).not.toContain(TOKEN);
     expect(lines.join('\n')).not.toContain(TOKEN);
+    const line = lines.length > 0 ? lines[0] : '{}';
+    expect(JSON.parse(line)).toMatchObject({ result: 'unexpected', op: 'reject' });
   });
 
   it('rejects a bad expectation before calling FlagControl', async () => {

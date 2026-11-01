@@ -21,6 +21,7 @@
 // ply's retry after a corrupt cached pack sends `x-ply-cache: bust`; the loopback then purges that key (GitCache, which
 // owns it) and fetches again.
 import { CACHE_VERSION } from './cache-version.ts';
+import { err, httpReply, isUnexpected, ok, responseOf, runRequest, type HttpReply, type Result, type UnexpectedFailure } from './http/machine.ts';
 import { extractRequestPath, rawPathHasUnsafeSegment } from './pathguard.ts';
 import { parseCfRay } from './rays.ts';
 import { publicUploadPackRepo, scrubSecrets, type TokenSource, withPublicReadCredential, type FetchLike } from './public.ts';
@@ -186,8 +187,90 @@ export function createLoopbackFetch(direct: FetchLike, loopback: (() => Loopback
 export type GitCacheEnv = { PUBLIC_REPOS?: unknown };
 export type PurgeCtx = { cache?: { purge?: (opts: { pathPrefixes: string[] }) => Promise<unknown> } };
 
-function plain(status: number, text: string): Response {
-  return new Response(text, { status, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': NO_STORE } });
+function plain(status: number, text: string): HttpReply {
+  return httpReply(status, text, new Headers({ 'content-type': 'text/plain; charset=utf-8', 'cache-control': NO_STORE }));
+}
+
+type CacheRequest = {
+  readonly bust: boolean;
+  readonly cacheKind: CacheKind;
+  readonly hash: string;
+  readonly url: string;
+  readonly proto: string;
+  readonly body: Uint8Array | null;
+  readonly ua: string | null;
+};
+
+type GitCacheFailure =
+  | { readonly kind: 'method' }
+  | { readonly kind: 'not_key' }
+  | { readonly kind: 'bad_body' }
+  | { readonly kind: 'not_public' }
+  | { readonly kind: 'mismatch' }
+  | { readonly kind: 'upstream'; readonly status: number; readonly text: string };
+
+function decodeCacheBody(value: string): { readonly kind: 'text'; readonly value: Uint8Array } | { readonly kind: 'opaque' } {
+  try {
+    return { kind: 'text', value: fromBase64(value) };
+  } catch {
+    return { kind: 'opaque' };
+  }
+}
+
+function parseGitCache(req: Request): Result<CacheRequest, GitCacheFailure> {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return err({ kind: 'method' });
+  const path = new URL(req.url).pathname;
+  const match = /^\/v(\d+)\/(?:(bust)\/)?(pack|refs|discover)\/([0-9a-f]{64})$/.exec(path);
+  if (!match || Number(match[1]) !== CACHE_VERSION) return err({ kind: 'not_key' });
+  const encoded = req.headers.get(H_BODY);
+  let body: Uint8Array | null = null;
+  if (encoded !== null) {
+    const decoded = decodeCacheBody(encoded);
+    if (decoded.kind === 'opaque') return err({ kind: 'bad_body' });
+    body = decoded.value;
+  }
+  const cacheKind = match[3] as CacheKind;
+  return ok({
+    bust: match[2] === 'bust',
+    cacheKind,
+    hash: match[4] as string,
+    url: req.headers.get(H_URL) ?? '',
+    proto: req.headers.get(H_PROTO) ?? '',
+    body,
+    ua: req.headers.get(H_UA),
+  });
+}
+
+async function authorizeGitCache(parsed: CacheRequest): Promise<Result<CacheRequest, GitCacheFailure>> {
+  const method = parsed.cacheKind === 'discover' ? 'GET' : 'POST';
+  if (!cacheableUpstream(method, parsed.url) || classify(method, parsed.url, parsed.body) !== parsed.cacheKind) {
+    return err({ kind: 'not_public' });
+  }
+  if ((await keyHash(parsed.cacheKind, parsed.url, parsed.proto, parsed.body)) !== parsed.hash) return err({ kind: 'mismatch' });
+  return ok(parsed);
+}
+
+function gitCacheFailureReply(failure: GitCacheFailure): HttpReply {
+  switch (failure.kind) {
+    case 'method':
+      return plain(405, 'method not allowed');
+    case 'not_key':
+      return plain(404, 'not a cache key');
+    case 'bad_body':
+      return plain(400, 'bad body');
+    case 'not_public':
+      return plain(403, 'not a public upload-pack exchange');
+    case 'mismatch':
+      return plain(400, 'key does not match the request');
+    case 'upstream':
+      return plain(failure.status, failure.text);
+    default:
+      return assertGitCacheFailure(failure);
+  }
+}
+
+function assertGitCacheFailure(failure: never): never {
+  throw new Error(`unhandled git cache failure ${JSON.stringify(failure)}`);
 }
 
 /** A rebuilt response keeps the upstream ray only when it is a ray id. Anything else (a URL, a token) is dropped. */
@@ -201,27 +284,37 @@ function copyCfRay(from: Headers, to: Headers): void {
  * namespace's read token is attached here, by withPublicReadCredential), and label the answer.
  */
 export async function serveGitCache(req: Request, tokens: TokenSource | null, ctx: PurgeCtx, upstream: FetchLike = (i, n) => fetch(i, n)): Promise<Response> {
-  if (req.method !== 'GET' && req.method !== 'HEAD') return plain(405, 'method not allowed');
-  const path = new URL(req.url).pathname;
-  const m = /^\/v(\d+)\/(?:(bust)\/)?(pack|refs|discover)\/([0-9a-f]{64})$/.exec(path);
-  if (!m || Number(m[1]) !== CACHE_VERSION) return plain(404, 'not a cache key');
-  const bust = m[2] === 'bust';
-  const kind = m[3] as CacheKind;
-  const url = req.headers.get(H_URL) ?? '';
-  const proto = req.headers.get(H_PROTO) ?? '';
-  let body: Uint8Array | null = null;
-  const b64 = req.headers.get(H_BODY);
-  if (b64 !== null) { try { body = fromBase64(b64); } catch { return plain(400, 'bad body'); } }
-  const method = kind === 'discover' ? 'GET' : 'POST';
-  if (!cacheableUpstream(method, url) || classify(method, url, body) !== kind) return plain(403, 'not a public upload-pack exchange');
-  if ((await keyHash(kind, url, proto, body)) !== m[4]) return plain(400, 'key does not match the request');
-  if (bust) {
-    try { await ctx.cache?.purge?.({ pathPrefixes: [keyPath(kind, m[4] as string)] }); } catch { /* best effort */ }
-    return new Response(null, { status: 204, headers: { 'cache-control': NO_STORE } });
+  return runRequest(
+    {
+      parse: () => parseGitCache(req),
+      authorize: (parsed: CacheRequest) => authorizeGitCache(parsed),
+      execute: (parsed: CacheRequest) => executeGitCache(req, parsed, tokens, ctx, upstream),
+    },
+    (result: Result<HttpReply, GitCacheFailure | UnexpectedFailure>) => {
+      if (!result.ok) {
+        if (isUnexpected(result.error)) {
+          console.log(JSON.stringify({ msg: 'ply.gitcache', error_kind: result.error.kind, stage: result.error.stage, error_name: result.error.name }));
+          return new Response('unexpected\n', {
+            status: 500,
+            headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': NO_STORE, 'x-ply-error-kind': result.error.kind },
+          });
+        }
+        return responseOf(gitCacheFailureReply(result.error));
+      }
+      return responseOf(result.value);
+    },
+  );
+}
+
+async function executeGitCache(req: Request, parsed: CacheRequest, tokens: TokenSource | null, ctx: PurgeCtx, upstream: FetchLike): Promise<Result<HttpReply, GitCacheFailure>> {
+  const { cacheKind, url, proto, body, ua } = parsed;
+  if (parsed.bust) {
+    await ctx.cache?.purge?.({ pathPrefixes: [keyPath(cacheKind, parsed.hash)] });
+    return ok(httpReply(204, null, new Headers({ 'cache-control': NO_STORE })));
   }
+  const method = cacheKind === 'discover' ? 'GET' : 'POST';
   const headers = new Headers({ [VIA_HEADER]: 'gitcache' });
   if (proto) headers.set('git-protocol', proto);
-  const ua = req.headers.get(H_UA);
   if (ua) headers.set('user-agent', ua);
   if (body) { headers.set('content-type', 'application/x-git-upload-pack-request'); headers.set('accept', 'application/x-git-upload-pack-result'); }
   const fetchUp = withPublicReadCredential(upstream, tokens);
@@ -232,22 +325,22 @@ export async function serveGitCache(req: Request, tokens: TokenSource | null, ct
     // A failure before any upstream answer (the read-token mint: no such repo, binding down; the network). Answer with
     // the HTTP status ply maps back to the same code (http.js httpCode): 404 → not_found, else 502 → upstream_5xx.
     const code = (e as { code?: string })?.code;
-    return plain(code === 'not_found' ? 404 : 502, code === 'not_found' ? 'repository not found' : 'upstream unavailable');
+    return err({ kind: 'upstream', status: code === 'not_found' ? 404 : 502, text: code === 'not_found' ? 'repository not found' : 'upstream unavailable' });
   }
   const ct = res.headers.get('content-type') ?? '';
-  const out = new Headers({ 'content-type': ct || 'application/octet-stream', 'x-ply-gc-kind': kind, 'cache-tag': `ply-gc-v${CACHE_VERSION},ply-gc-${kind}` });
+  const out = new Headers({ 'content-type': ct || 'application/octet-stream', 'x-ply-gc-kind': cacheKind, 'cache-tag': `ply-gc-v${CACHE_VERSION},ply-gc-${cacheKind}` });
   copyCfRay(res.headers, out);
   const location = res.headers.get('location');
   if (location) out.set('location', location);
-  const ok = res.status === 200 && /^application\/x-git-upload-pack-(result|advertisement)/.test(ct) && res.body;
-  if (!ok) {
+  const answered = res.status === 200 && /^application\/x-git-upload-pack-(result|advertisement)/.test(ct) && res.body;
+  if (!answered) {
     // Not stored. An error body is small; scrub it with this isolate's tokens before it leaves (the caller scrubs too,
     // but may be another isolate that never saw this token).
     const text = res.body ? (await res.text()).slice(0, MAX_ERROR_BODY) : '';
-    out.set('cache-control', kind === 'pack' && res.status === 400 && FILTER_REFUSAL.test(text) ? REFUSAL_CACHE : NO_STORE);
-    return new Response(res.status >= 300 && res.status < 400 ? null : scrubSecrets(tokens?.secrets() ?? [])(text), { status: res.status, headers: out });
+    out.set('cache-control', cacheKind === 'pack' && res.status === 400 && FILTER_REFUSAL.test(text) ? REFUSAL_CACHE : NO_STORE);
+    return ok(httpReply(res.status, res.status >= 300 && res.status < 400 ? null : scrubSecrets(tokens?.secrets() ?? [])(text), out));
   }
-  if (kind === 'pack') {
+  if (cacheKind === 'pack') {
     // Buffer up to the cap, verify, and only then call it immutable. Over the cap, or unverified: passed on, not stored.
     const reader = (res.body as ReadableStream<Uint8Array>).getReader();
     const parts: Uint8Array[] = [];
@@ -265,20 +358,23 @@ export async function serveGitCache(req: Request, tokens: TokenSource | null, ct
           async pull(c) { const n = await reader.read(); if (n.done) c.close(); else c.enqueue(n.value); },
           cancel(r) { return reader.cancel(r); },
         });
-        return new Response(rest, { status: 200, headers: out });
+        return ok(httpReply(200, rest, out));
       }
     }
     const bytes = new Uint8Array(total);
-    let o = 0;
-    for (const p of parts) { bytes.set(p, o); o += p.byteLength; }
-    const v = await verifyPackResponse(url, body as Uint8Array, bytes, ct);
-    out.set('cache-control', v.ok ? IMMUTABLE : NO_STORE);
-    out.set('x-ply-gc-verified', v.ok ? `ok;objects=${v.objects}` : `failed;${v.reason.replace(/[^\x20-\x7e]/g, '?')}`);
-    return new Response(bytes, { status: 200, headers: out });
+    let offset = 0;
+    for (const part of parts) { bytes.set(part, offset); offset += part.byteLength; }
+    const verified = await verifyPackResponse(url, body as Uint8Array, bytes, ct);
+    out.set('cache-control', verified.ok ? IMMUTABLE : NO_STORE);
+    out.set('x-ply-gc-verified', verified.ok ? `ok;objects=${verified.objects}` : `failed;${verified.reason.replace(/[^\x20-\x7e]/g, '?')}`);
+    return ok(httpReply(200, bytes, out));
   }
-  if (kind === 'refs') { out.set('cache-control', REFS_CACHE); return new Response(res.body, { status: 200, headers: out }); }
+  if (cacheKind === 'refs') {
+    out.set('cache-control', REFS_CACHE);
+    return ok(httpReply(200, res.body, out));
+  }
   // discover: buffer the (small) advertisement to tell a v2 capability list from a v0 ref advertisement
   const bytes = new Uint8Array(await res.arrayBuffer());
   out.set('cache-control', /(^|[0-9a-f]{4})version 2\n/.test(latin1(bytes.subarray(0, 128))) ? DISCOVER_V2_CACHE : REFS_CACHE);
-  return new Response(bytes, { status: 200, headers: out });
+  return ok(httpReply(200, bytes, out));
 }
