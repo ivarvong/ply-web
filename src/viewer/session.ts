@@ -292,10 +292,11 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
     if (entries.length > VIEWER_GIT_LIMITS.maxTreeEntries) throw limitError('tree entries', entries.length, VIEWER_GIT_LIMITS.maxTreeEntries);
     const entry = entries.find((item: { name: string }) => item.name === name);
     const existingPath = comps.slice(0, depth).join('/');
-    if (!entry) throw withHint(fail('not_found', `path component ${name} not found`), { nearby: [], path: { missing: name, existingPath, notDirectory: false } });
+    if (!entry) throw withHint(fail('not_found', `path component ${name} not found`, { miss: { kind: 'path', missing: name, existingPath } }), { nearby: [], path: { missing: name, existingPath, notDirectory: false } });
     const last = depth === comps.length - 1;
     if (!last) {
-      if (entry.mode !== '40000') throw withHint(fail('not_found', `${name} is not a directory`), { nearby: [], path: { missing: name, existingPath, notDirectory: true } });
+      const walked = existingPath === '' ? name : `${existingPath}/${name}`;
+      if (entry.mode !== '40000') throw withHint(fail('not_found', `${name} is not a directory`, { miss: { kind: 'not_directory', path: walked, mode: entry.mode } }), { nearby: [], path: { missing: name, existingPath, notDirectory: true } });
       treeOid = entry.oid;
       continue;
     }
@@ -305,7 +306,7 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
   if (file) {
     const mode = treeMode(file.mode);
     if (file.mode === '160000') {
-      if (route.raw) throw fail('not_found', 'submodule has no blob in this repository');
+      if (route.raw) throw fail('not_found', 'submodule has no blob in this repository', { miss: { kind: 'submodule', path: route.path, commit: file.oid } });
       return { kind: 'file', header, path: route.path, ...catalog, mode, blob: file.oid, size: 0, note: 'submodule', text: null };
     }
     const blob = await readBlob(transport, tracer, file.oid);

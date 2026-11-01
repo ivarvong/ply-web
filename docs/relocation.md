@@ -18,7 +18,7 @@ ply [#126](https://github.com/ivarvong/ply/issues/126) orders ply's own work dif
 | `handle.ts` `sameStamp` on merge and rebase (one identity, one timestamp) | `author` and `committer` are separate `plyStamp`s. `from` and `onto` go through `refOrCommit` (branch name or 40-hex). |
 | `pick.ts` `writeEmpty`, `load`, `messageBody` | `allowEmpty` passes ply `empty: 'keep'`. `mapPickOutcome` maps `kept_empty` to an applied cherry-pick or revert. `empty` still writes nothing. |
 | `src/write/oid.ts` (`Oid`, `ZERO_OID`, `isOid`, `isZeroOid`, `asOid`, `parseCommitOid`) | ply `parseOid`, `parseCommitId`, `ZERO_OID`, and `Oid`. `request.ts` keeps its own `bad_request` text. Mode constants and the hex patterns in `abbrev.ts`, `pinned.ts`, and `version.ts` stay. |
-| `branch.ts` `tipOf`, `tag.ts` `commitOf`, `commit.ts` `commitOf` (regex and code maps) | `fetchCommit`, then a match on `miss` (`absent` or `not_commit`). `pack_corrupt` and every other code are thrown through. |
+| `branch.ts` `tipOf`, `tag.ts` `commitOf`, `commit.ts` `commitOf` (regex and code maps) | `fetchCommit`, then a match on `miss.kind`. A commit id is `commit` (nested `absent` or `not_commit`). Every other kind stays that `not_found`. `pack_corrupt` and every other code are thrown through. |
 
 `src/hold-last.ts` stays. ply [#111](https://github.com/ivarvong/ply/issues/111) is still open.
 
@@ -30,9 +30,9 @@ ply [#126](https://github.com/ivarvong/ply/issues/126) orders ply's own work dif
 
 Measured in `test/worker.test.js` on an origin the isolate has not seen (`raySrv`; `srv` is already warm from the missing-repo commit read earlier in the file):
 
-- Cold `GET /v1/commit` on an empty repo: exactly one span named `git.upload-pack discover`, and `git.head.discover` is `discover`. `x-artifacts-ray` has one more `ls-refs` entry than the warm read (`cold === warm + 1`). That entry is the info/refs GET. Server-Timing still has `ls-refs;dur` and `total;dur`.
-- Warm `GET /v1/commit?ref=main` on the same origin: zero discover spans, `git.head.discover` is `cached`.
-- The root commit that follows pays no second discover.
+- Cold `GET /v1/commit` on an empty repo: ply's `readCommit` returns the empty commit. Exactly one span named `git.upload-pack discover`. There is no `git.head` span; that span is the Worker's own HEAD read. Server-Timing still has `ls-refs;dur` and `total;dur`.
+- Warm `GET /v1/commit?ref=main` on the same origin: ply discovers again (it does not use the Worker's advertisement cache). The Worker records `ls-refs=unborn` for the origin, so the root commit that follows pays no second discover.
+- `x-artifacts-ray` has the same number of `ls-refs` entries on the cold and warm commit reads. The info/refs GET is inside ply's read, on both.
 
 `git.head` is a parent span (kind, ref, oid, whether discover was cached). It is not in `SPAN_PHASE`, so it does not take an `x-artifacts-ray` slot. The discover span and the ls-refs span each match one HTTP exchange.
 
