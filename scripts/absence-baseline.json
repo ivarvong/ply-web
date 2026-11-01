@@ -2,10 +2,10 @@
   "boundary": "src/absent.ts",
   "counts": {
     "word": 45,
-    "optional": 80,
-    "chain": 133,
+    "optional": 79,
+    "chain": 128,
     "nullish": 160,
-    "total": 418
+    "total": 412
   },
   "files": {
     "cloudflare.config.ts": {
@@ -192,10 +192,10 @@
     },
     "scripts/cd/stage-ramp.ts": {
       "word": 4,
-      "optional": 2,
-      "chain": 2,
+      "optional": 1,
+      "chain": 0,
       "nullish": 0,
-      "total": 8
+      "total": 5
     },
     "scripts/cd/stage-rollback.ts": {
       "word": 0,
@@ -217,13 +217,6 @@
       "chain": 8,
       "nullish": 2,
       "total": 10
-    },
-    "scripts/cd/traffic.ts": {
-      "word": 0,
-      "optional": 0,
-      "chain": 3,
-      "nullish": 0,
-      "total": 3
     },
     "scripts/flags-cli.ts": {
       "word": 3,

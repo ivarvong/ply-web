@@ -1,7 +1,6 @@
 import { readFile, appendFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { orNull } from '../../src/option.ts'
-import { SMOKE_HTTP_MS } from './baseline.ts'
+import { none, orNull, some, type Option } from '../../src/option.ts'
 import type { CdConfig } from './config.ts'
 import { isTrafficSplit, sameSplit, trafficSplit, type VersionShare } from './deploy-plan.ts'
 import { queryCaptured, telemetryQueryRetry } from './o11y.ts'
@@ -9,12 +8,14 @@ import { errorMessage } from './proc.ts'
 import { activeLog } from './log.ts'
 import { readPassVerdict, runRamp, type Observation } from './ramp.ts'
 import { fail, pass, type StageResult } from './result.ts'
-import type { ProbeCall } from './policy.ts'
+import type { RolloutPolicy } from './policy.ts'
 import { accountProbeLoss, classifyProbe, probeLossRecord, rayOf, type ProbeOutcome } from './probe.ts'
+import { runProbeSchedule } from './probe-schedule.ts'
 import { writeJson } from './run-dir.ts'
 import { routedShare } from './slo.ts'
 import { percentile, queryTo, scriptVersionId, serviceFilter, spanTypeFilter, statsFromEvents } from './telemetry.ts'
 import { applySplit, readShares, rollbackTo } from './traffic.ts'
+import { armStep, beginRamp, endRamp, HarnessFault, noteStepApplied } from './traffic-gate.ts'
 
 export type RampValue = {
   readonly version: string
@@ -40,7 +41,9 @@ async function observe(config: CdConfig, version: string, previous: string, from
     const prior = statsFromEvents(eventsFor(all.events, previous), spans.events)
     const aggregate = statsFromEvents(all.events, spans.events)
     const share = routedShare(next.invocations, aggregate.invocations, percent, config.policy.split.z)
-    const ref = await activeLog()?.observation({
+    const log = activeLog()
+    if (!log) throw new HarnessFault('ramp observation with no active log')
+    const ref = await log.observation({
       measurement: {
         source: 'ramp-step',
         available: true,
@@ -68,43 +71,52 @@ async function observe(config: CdConfig, version: string, previous: string, from
       to,
       raw: JSON.stringify({ events: all.raw, spans: spans.raw }),
     })
-    return { kind: 'sample', next, previous: prior, aggregate, ...(ref ? { ref } : {}) }
+    return { kind: 'sample', next, previous: prior, aggregate, ref }
   } catch (error) {
+    if (error instanceof HarnessFault) throw error
     const reason = `telemetry unavailable: ${errorMessage(error)}`
-    const ref = await activeLog()?.observation({
+    const log = activeLog()
+    if (!log) throw new HarnessFault('ramp observation with no active log')
+    const ref = await log.observation({
       measurement: { source: 'ramp-step', available: false, percent, targetPercent: percent, reason },
       query,
       from,
       to,
       raw: JSON.stringify({ error: reason }),
     })
-    return { kind: 'unavailable', reason, ...(ref ? { ref } : {}) }
+    return { kind: 'unavailable', reason, ref }
   }
 }
 
-/** Unpinned. A thrown fetch is a loss. A real status is a response, and only that response is logged. */
+function versionOf(header: string | null): Option<string> {
+  if (header === null || header.length === 0) return none()
+  return some(header)
+}
+
+/** Unpinned. A policy timeout is `timed_out`. Any other throw is a transport loss. */
 async function probeCall(
   id: string,
   method: string,
   url: string,
   headers: Record<string, string>,
+  timeoutMs: number,
+  parent: AbortSignal,
 ): Promise<ProbeOutcome> {
   const log = activeLog()
   const started = Date.now()
+  const signal = AbortSignal.any([AbortSignal.timeout(timeoutMs), parent])
   try {
-    const response = await fetch(url, {
-      method,
-      headers,
-      signal: AbortSignal.timeout(SMOKE_HTTP_MS),
-    })
-    const outcome = classifyProbe(id, { kind: 'response', status: response.status, ray: rayOf(response.headers.get('cf-ray')) })
+    const response = await fetch(url, { method, headers, signal })
+    const latencyMs = Date.now() - started
+    const version = versionOf(response.headers.get('x-ply-version'))
+    const outcome = classifyProbe(id, { kind: 'response', status: response.status, ray: rayOf(response.headers.get('cf-ray')), latencyMs, version })
     if (outcome.kind === 'responded' && log) {
       await log.request({
         method,
         url,
         status: outcome.status,
         version: response.headers.get('x-ply-version'),
-        latencyMs: Date.now() - started,
+        latencyMs,
         cfRay: orNull(outcome.ray),
         requestId: response.headers.get('x-ply-request-id'),
         artifactsRay: response.headers.get('x-artifacts-ray'),
@@ -113,70 +125,46 @@ async function probeCall(
     return outcome
   } catch (error) {
     const name = error instanceof Error ? error.name : 'Error'
+    if (name === 'TimeoutError') return classifyProbe(id, { kind: 'timeout' })
     const message = error instanceof Error ? error.message : 'probe failed'
     return classifyProbe(id, { kind: 'thrown', name, message })
   }
-}
-
-/** One tick of the unpinned mix. Cloudflare's split chooses the version. The call path includes its query. */
-async function probeOnce(
-  token: string,
-  baseUrl: string,
-  calls: readonly ProbeCall[],
-  identify: (method: string, url: string) => string,
-): Promise<ProbeOutcome[]> {
-  const pending: Promise<ProbeOutcome>[] = []
-  for (const call of calls) {
-    if (call.auth && !token) continue
-    const headers: Record<string, string> = call.auth ? { authorization: `Bearer ${token}` } : {}
-    const url = `${baseUrl}${call.path}`
-    pending.push(probeCall(identify(call.method, url), call.method, url, headers))
-  }
-  return Promise.all(pending)
-}
-
-/** How many ticks may be in flight: one second of the scheduled rate, at least one. */
-function maxInflight(rps: number): number {
-  return Math.max(1, Math.ceil(rps))
 }
 
 async function dwell(
   token: string,
   baseUrl: string,
   ms: number,
-  rps: number,
-  calls: readonly ProbeCall[],
-): Promise<ProbeOutcome[]> {
-  if (rps <= 0) {
+  probe: RolloutPolicy['probe'],
+): Promise<readonly ProbeOutcome[]> {
+  const live = probe.calls.filter(call => !call.auth || token.length > 0)
+  if (probe.rps <= 0 || live.length === 0) {
     await new Promise(resolve => setTimeout(resolve, ms))
     return []
   }
-  const deadline = Date.now() + ms
-  const period = 1000 / rps
-  const cap = maxInflight(rps)
-  const outcomes: ProbeOutcome[] = []
-  let issued = 0
-  const identify = (method: string, url: string) => {
-    issued += 1
-    return `${issued} ${method} ${url}`
-  }
-  const inflight = new Set<Promise<void>>()
-  while (Date.now() < deadline) {
-    const tick = Date.now()
-    const tracked: { promise?: Promise<void> } = {}
-    const promise = probeOnce(token, baseUrl, calls, identify).then(batch => {
-      for (const outcome of batch) outcomes.push(outcome)
-    }).finally(() => {
-      if (tracked.promise) inflight.delete(tracked.promise)
-    })
-    tracked.promise = promise
-    inflight.add(promise)
-    if (inflight.size >= cap) await Promise.race(inflight)
-    const remain = Math.min(period - (Date.now() - tick), deadline - Date.now())
-    if (remain > 0) await new Promise(resolve => setTimeout(resolve, remain))
-  }
-  await Promise.all(inflight)
-  return outcomes
+  const controller = new AbortController()
+  return runProbeSchedule({
+    clock: {
+      now: () => Date.now(),
+      sleep: wait => new Promise(resolve => setTimeout(resolve, wait)),
+    },
+    dwellMs: ms,
+    periodMs: 1000 / probe.rps,
+    maxInFlight: probe.maxInFlight,
+    batch: live.length,
+    issue: seq => {
+      const call = live[(seq - 1) % live.length]
+      if (!call) throw new Error('probe call missing')
+      const url = `${baseUrl}${call.path}`
+      const id = `${seq} ${call.method} ${url}`
+      const headers: Record<string, string> = call.auth ? { authorization: `Bearer ${token}` } : {}
+      return { id, promise: probeCall(id, call.method, url, headers, probe.timeoutMs, controller.signal) }
+    },
+    shed: seq => ({ kind: 'shed', id: `${seq} shed` }),
+    stop: () => {
+      controller.abort(new DOMException('probe dwell deadline', 'TimeoutError'))
+    },
+  })
 }
 
 export async function stageRamp(
@@ -246,14 +234,18 @@ export async function stageRamp(
   }
   const policy = { ...config.policy, steps }
   const logPath = join(opts.runDir, 'ramp.jsonl')
-  const result = await runRamp(policy, {
-    now: () => Date.now(),
-    sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
-    dwell: async (ms, percent) => {
-      const outcomes = await dwell(opts.token, config.baseUrl, ms, config.policy.probe.rps, config.policy.probe.calls)
-      const loss = accountProbeLoss(outcomes, config.policy.probe.maxLossRate)
-      const log = activeLog()
-      if (log) {
+  const first = steps[0]
+  if (!first) return fail('ramp', 'schedule has no step; traffic was not changed')
+  beginRamp(first.percent)
+  try {
+    const result = await runRamp(policy, {
+      now: () => Date.now(),
+      sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+      dwell: async (ms, percent) => {
+        const outcomes = await dwell(opts.token, config.baseUrl, ms, config.policy.probe)
+        const loss = accountProbeLoss(outcomes, config.policy.probe.maxLossRate)
+        const log = activeLog()
+        if (!log) throw new HarnessFault('probe-loss observation with no active log')
         const at = Date.now()
         await log.observation({
           measurement: {
@@ -264,6 +256,10 @@ export async function stageRamp(
             total: loss.total,
             responded: loss.responded,
             serverErrors: loss.serverErrors,
+            timedOut: loss.timedOut,
+            shed: loss.shed,
+            aborted: loss.aborted,
+            network: loss.network,
             maxLossRate: loss.maxLossRate,
             exceeded: loss.exceeded,
             ids: [...loss.ids],
@@ -273,70 +269,93 @@ export async function stageRamp(
           to: at,
           raw: JSON.stringify({ ids: loss.ids }),
         })
-      }
-      return { outcomes }
-    },
-    applySplit: async percent => {
-      const want = trafficSplit(percent, opts.version, target)
-      if (!isTrafficSplit(want)) return want.reason
-      if (percent === fromPercent && sameSplit(expected, want.versions)) return null
-      try {
-        const applied = await applySplit(config.worker, `ramp ${opts.version} ${percent}%`, want, expected)
-        if (applied.ok) expected = want.versions.map(share => ({ versionId: share.versionId, percentage: share.percentage }))
-        if (!applied.ok && applied.kind === 'state_conflict') return { kind: 'state_conflict', reason: applied.reason }
-        if (!applied.ok) return applied.reason
-        return null
-      } catch (error) {
-        return errorMessage(error)
-      }
-    },
-    observe: (from, to, percent) => observe(config, opts.version, target, from, queryTo(to), percent),
-    onDecision: async (ref, decision, percent) => {
-      const log = activeLog()
-      if (!log) return
-      log.addStep({ percent, burns: decision.burns })
-      await log.decision({
-        inputs: [ref],
-        rules: decision.rules,
-        outcome: decision.outcome,
-        reason: decision.reason,
-      })
-    },
-    rollback: async () => {
-      const applied = await rollbackTo(config.worker, target, expected)
-      if (applied.ok) return null
-      if (applied.kind === 'state_conflict') return { kind: 'state_conflict', reason: applied.reason }
-      return applied.reason
-    },
-  })
-  const probeLoss = result.steps.map(step => probeLossRecord(step.percent, step.probeLoss))
-  for (const step of result.steps) {
-    opts.log(step.line)
-    await appendFile(logPath, JSON.stringify({ line: step.line, probe_loss: probeLossRecord(step.percent, step.probeLoss) }) + '\n')
-  }
-  await writeJson(opts.runDir, 'ramp.json', {
-    state: result.state,
-    lines: result.lines,
-    steps: result.steps,
-    probeLoss,
-    rollbackError: result.rollbackError,
-    version: opts.version,
-    previous: target,
-  })
-  if (result.state.kind === 'complete') return pass('ramp', { version: opts.version, previous: target, lines: result.lines })
-  if (result.state.kind === 'held') {
-    if (result.state.outcome === 'insufficient_samples') return fail('ramp', result.state.reason, false, 'insufficient_samples')
-    return fail('ramp', result.state.reason, false)
-  }
-  if (result.state.kind === 'stopped') {
-    if (result.state.fault === 'harness_fault') {
-      const rolledBack = result.state.traffic === 'rolled_back' && result.rollbackError === null
-      const reason = result.rollbackError ? `${result.state.reason}; traffic change failed: ${result.rollbackError}` : result.state.reason
-      return fail('ramp', reason, rolledBack, 'harness_fault')
+        return { outcomes }
+      },
+      applySplit: async percent => {
+        const want = trafficSplit(percent, opts.version, target)
+        if (!isTrafficSplit(want)) return want.reason
+        if (sameSplit(expected, want.versions)) {
+          noteStepApplied(percent)
+          return null
+        }
+        try {
+          const applied = await applySplit(config.worker, `ramp ${opts.version} ${percent}%`, want, expected, { kind: 'step', percent })
+          if (applied.ok) {
+            expected = want.versions.map(share => ({ versionId: share.versionId, percentage: share.percentage }))
+            noteStepApplied(percent)
+          }
+          if (!applied.ok && applied.kind === 'state_conflict') return { kind: 'state_conflict', reason: applied.reason }
+          if (!applied.ok) return applied.reason
+          return null
+        } catch (error) {
+          if (error instanceof HarnessFault) throw error
+          return errorMessage(error)
+        }
+      },
+      observe: (from, to, percent) => observe(config, opts.version, target, from, queryTo(to), percent),
+      onDecision: async (ref, decision, percent) => {
+        const log = activeLog()
+        if (!log) throw new HarnessFault('ramp decision with no active log')
+        log.addStep({ percent, burns: decision.burns })
+        await log.decision({
+          inputs: [ref],
+          rules: decision.rules,
+          outcome: decision.outcome,
+          reason: decision.reason,
+        })
+        if (decision.outcome !== 'advance') return
+        const index = steps.findIndex(step => step.percent === percent)
+        const next = steps[index + 1]
+        if (next) armStep(next.percent)
+      },
+      rollback: async () => {
+        const applied = await rollbackTo(config.worker, target, expected)
+        if (applied.ok) return null
+        if (applied.kind === 'state_conflict') return { kind: 'state_conflict', reason: applied.reason }
+        return applied.reason
+      },
+    })
+    const probeLoss = result.steps.map(step => probeLossRecord(step.percent, step.probeLoss))
+    for (const step of result.steps) {
+      opts.log(step.line)
+      await appendFile(logPath, JSON.stringify({ line: step.line, probe_loss: probeLossRecord(step.percent, step.probeLoss) }) + '\n')
     }
-    return fail('ramp', result.state.reason, false, result.state.fault)
+    await writeJson(opts.runDir, 'ramp.json', {
+      state: result.state,
+      lines: result.lines,
+      steps: result.steps,
+      probeLoss,
+      rollbackError: result.rollbackError,
+      version: opts.version,
+      previous: target,
+    })
+    if (result.state.kind === 'complete') return pass('ramp', { version: opts.version, previous: target, lines: result.lines })
+    if (result.state.kind === 'held') {
+      if (result.state.outcome === 'insufficient_samples') return fail('ramp', result.state.reason, false, 'insufficient_samples')
+      return fail('ramp', result.state.reason, false)
+    }
+    if (result.state.kind === 'stopped') {
+      if (result.state.fault === 'harness_fault') {
+        const rolledBack = result.state.traffic === 'rolled_back' && result.rollbackError === null
+        const reason = result.rollbackError ? `${result.state.reason}; traffic change failed: ${result.rollbackError}` : result.state.reason
+        return fail('ramp', reason, rolledBack, 'harness_fault')
+      }
+      return fail('ramp', result.state.reason, false, result.state.fault)
+    }
+    const reason = result.state.kind === 'rolled-back' ? result.state.reason : 'ramp stopped'
+    if (result.rollbackError) return fail('ramp', `${reason}; rollback to ${target} failed: ${result.rollbackError}`)
+    return fail('ramp', reason, true)
+  } catch (error) {
+    if (!(error instanceof HarnessFault)) throw error
+    let rolled = false
+    try {
+      const applied = await rollbackTo(config.worker, target, expected)
+      rolled = applied.ok
+    } catch (rollbackError) {
+      return fail('ramp', `${error.message}; rollback failed: ${errorMessage(rollbackError)}`, false, 'harness_fault')
+    }
+    return fail('ramp', error.message, rolled, 'harness_fault')
+  } finally {
+    endRamp()
   }
-  const reason = result.state.kind === 'rolled-back' ? result.state.reason : 'ramp stopped'
-  if (result.rollbackError) return fail('ramp', `${reason}; rollback to ${target} failed: ${result.rollbackError}`)
-  return fail('ramp', reason, true)
 }
