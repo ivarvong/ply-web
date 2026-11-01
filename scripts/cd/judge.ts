@@ -1,3 +1,4 @@
+import { judgeFlagStep } from './flags-smoke.ts'
 import { asRecord } from './json.ts'
 
 export type Saved = Readonly<Record<string, string>>
@@ -28,12 +29,17 @@ export type Expect =
   | { readonly kind: 'born' }
   | { readonly kind: 'stamps'; readonly authorEmail: string; readonly committerEmail: string }
   | { readonly kind: 'refs-final'; readonly has: readonly string[]; readonly missing: readonly string[]; readonly head: string }
+  | { readonly kind: 'flags-rules' }
+  | { readonly kind: 'flags-eval' }
+  | { readonly kind: 'usage-off' }
 
 export type CallHeaders = {
   readonly requestId: string | null
   readonly build: string | null
   readonly version: string | null
   readonly ray: string | null
+  readonly cacheControl?: string | null
+  readonly contentType?: string | null
 }
 
 export type CallInput = {
@@ -108,8 +114,19 @@ function emptyCommit(body: Record<string, unknown>): boolean {
     && body.signed === false
 }
 
+function flagHeaders(input: CallInput) {
+  return {
+    cacheControl: input.headers.cacheControl ?? null,
+    contentType: input.headers.contentType ?? null,
+  }
+}
+
 function checkExpect(input: CallInput, body: Record<string, unknown> | null, saved: Saved): string | null {
   const expect = input.expect
+  if (expect.kind === 'flags-rules' || expect.kind === 'flags-eval' || expect.kind === 'usage-off') {
+    const judged = judgeFlagStep(expect.kind, input.status, input.bodyText, flagHeaders(input), saved)
+    return judged.kind === 'fail' ? judged.detail : null
+  }
   if (expect.kind === 'text') {
     if (input.status !== expect.status) return `status ${input.status}, wanted ${expect.status}`
     if (input.bodyText !== expect.text) return `body ${JSON.stringify(input.bodyText)}, wanted ${JSON.stringify(expect.text)}`
@@ -223,6 +240,8 @@ export function judgeCall(input: CallInput, saved: Saved): Judgement {
   const problem = checkExpect(input, body, saved)
   if (problem) return { kind: 'fail', detail: problem }
   const next: Record<string, string> = {}
+  const flag = judgeFlagStep(input.expect.kind, input.status, input.bodyText, flagHeaders(input), saved)
+  if (flag.kind === 'ok') Object.assign(next, flag.save)
   if (body) {
     for (const item of input.save ?? []) {
       const value = body[item.field]

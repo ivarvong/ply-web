@@ -94,6 +94,7 @@ describe('ruleset cache', () => {
     expect(put.status).toBe(405);
     const body = await put.json() as { message: string };
     expect(body.message).toContain('FlagControl');
+    expect(body.message).toContain('ply-flag-operator');
     const evalResponse = await handleFlagHttp(new Request('https://ply.ivar.workers.dev/v1/flags/eval', {
       method: 'POST',
       body: JSON.stringify({ unit: 'anonymous' }),
@@ -127,5 +128,51 @@ describe('in-worker gate', () => {
     expect(note).toBe('ply.usage.note is on for this unit.');
     const loaded = await loadRuleset(env, cache);
     expect(loaded.kind).toBe('ready');
+  });
+});
+
+describe('resolve timing', () => {
+  it('measures the cache await and leaves the pure eval at 0 when the clock only moves on I/O', async () => {
+    const { store } = await seeded();
+    let now = 0;
+    const clock = () => now;
+    const spans: string[] = [];
+    let spanOpenDuringFetch = false;
+    const cache = {
+      async fetch(request: Request) {
+        expect(request.method).toBe('GET');
+        spanOpenDuringFetch = spans.includes('flags.eval') && !spans.includes('flags.eval:end');
+        now += 12.5;
+        const response = await serveFlags(request, env, store);
+        response.headers.set('cf-cache-status', 'MISS');
+        return response;
+      },
+    };
+    const tracing = {
+      enterSpan(name: string) {
+        spans.push(name);
+        return { setAttribute() {}, end() { spans.push(`${name}:end`); } };
+      },
+    };
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation(line => { lines.push(String(line)); });
+    try {
+      const resolved = await resolveFlags(
+        { env, cache, tracing },
+        { id: 'user:smoke', attributes: {} },
+        ['ply.usage.note'],
+        clock,
+      );
+      expect(resolved.kind).toBe('ok');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(spanOpenDuringFetch).toBe(true);
+    expect(spans[0]).toBe('flags.eval');
+    const evalLine = lines.map(line => JSON.parse(line) as { msg?: string; resolve_ms?: number; eval_ms?: number }).find(row => row.msg === 'flags.eval');
+    expect(evalLine?.resolve_ms).toBe(12.5);
+    expect(evalLine?.eval_ms).toBe(0);
+    expect(spans.indexOf('flags.resolve')).toBeGreaterThan(spans.indexOf('flags.eval'));
+    expect(spans.indexOf('flags.resolve:end')).toBeLessThan(spans.indexOf('flags.eval:end'));
   });
 });

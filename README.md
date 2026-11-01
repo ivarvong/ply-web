@@ -52,7 +52,7 @@ Feature flags are one R2 object and a service binding ([Feature flags](docs/feat
 | GET | `/v1/flags` | | the cached flag ruleset `{revision, cache, environment, flags}`. Writes are not this route |
 | POST | `/v1/flags/eval` | `{unit, attributes?, keys?}` | `{revision, cache, flags:[{key, variant, reason, bucket}]}`. Per-unit; the response is `no-store` |
 
-Flag writes are `FlagControl` RPC (`setRollout`, `setTargeting`, `getConfig`) on the `FLAG_CONTROL` service binding, not HTTP. The design, the basis-point allocation, and the staleness bound are in [Feature flags](docs/feature-flags.md).
+Flag writes are not HTTP (`PUT`/`POST`/`PATCH`/`DELETE` `/v1/flags` are 405). Operators call `scripts/flags`, which talks to the `ply-flag-operator` Worker. That Worker checks `FLAG_OPERATOR_TOKEN` and calls `FlagControl` (`setRollout`, `setTargeting`, `getConfig`) over a service binding. The design, the basis-point allocation, and the staleness bound are in [Feature flags](docs/feature-flags.md).
 
 - `ref` defaults to the remote's HEAD branch. On an empty repository HEAD is an unborn symref (`refs/heads/main` on
   Artifacts and on `git init -b main`). `GET /v1/commit` reports that as `empty: true` and names the symref.

@@ -1,6 +1,13 @@
 // The ply Worker: the /v1 git API and the public /view repository viewer, served at ply.ivar.workers.dev.
 // `cf build`, `cf dev`, `cf deploy` and `cf workers types` read this file. vite.config.ts holds build settings only.
-import { bindings, defineConfig, exports, triggers } from "cf/config";
+import { bindings, defineConfig, exports, triggers, type ConfigContext } from "cf/config";
+import {
+	FLAG_OPERATOR_COMPATIBILITY_DATE,
+	FLAG_OPERATOR_MODE,
+	FLAG_OPERATOR_WORKER,
+	OPERATOR_CONTROL_BINDING,
+	OPERATOR_TOKEN_BINDING,
+} from "./src/flags/operator-names.ts";
 import { FLAGS_MAX_AGE_S, FLAGS_SWR_S } from "./src/flags/ttl.ts";
 import { PUBLIC_NAMESPACE } from "./src/public-namespace.ts";
 
@@ -51,7 +58,7 @@ export const entrypoints = {
 // A binding can only name a class declared live above. src/index.js re-exports it from src/viewer/rate.ts.
 const VIEWER_RATE_CLASS: keyof typeof durableObjects = "ViewerRateLimit";
 
-export default defineConfig({
+const plyWorker = {
 	worker: {
 		// The Worker already exists on the account. Renaming it here creates a second Worker.
 		name: WORKER_NAME,
@@ -97,11 +104,44 @@ export default defineConfig({
 			FLAGS: bindings.r2({ name: "ply-flags" }),
 			FLAGS_MAX_AGE_S: bindings.text(String(FLAGS_MAX_AGE_S)),
 			FLAGS_SWR_S: bindings.text(String(FLAGS_SWR_S)),
-			// Callers (the CD follow-up) use a service binding to FlagControl. This one is that binding,
-			// aimed at this Worker, so the RPC methods are the write API. Reads of the ruleset go through
-			// ctx.exports.FlagsCache, which is the cached entrypoint.
+			// ply's own service binding to FlagControl. Nothing outside this Worker can call it.
+			// The operator Worker (`cf deploy --mode flag-operator`) binds the same export and is the
+			// sanctioned write path. Reads of the ruleset go through ctx.exports.FlagsCache.
 			FLAG_CONTROL: bindings.worker({ worker: WORKER_NAME, exportName: "FlagControl" }),
 		},
 		exports: { ...durableObjects, ...entrypoints },
 	},
+};
+
+// A second Worker, selected only when `--mode` is exactly `flag-operator`.
+// `cf build`, `cf deploy`, and `cf workers types` pass production, development, or undefined, and stay on ply.
+// This Worker has no R2 binding, so a deploy does not provision ply-flags. It does not add a secret to ply.
+function flagOperatorWorker() {
+	return {
+		name: FLAG_OPERATOR_WORKER,
+		compatibilityDate: FLAG_OPERATOR_COMPATIBILITY_DATE,
+		entrypoint: "src/flags/operator-entry.ts",
+		workersDev: true,
+		previewUrls: false,
+		cache: { enabled: false as const },
+		observability: {
+			enabled: true,
+			headSamplingRate: SAMPLE_EVERY_REQUEST,
+			redactQueryString: true,
+			logs: { enabled: true, invocationLogs: true },
+			traces: { enabled: true, headSamplingRate: SAMPLE_EVERY_REQUEST },
+		},
+		env: {
+			// Bearer for this Worker only. Set it with
+			// `cf workers secrets update FLAG_OPERATOR_TOKEN --worker ply-flag-operator --type secret_text`
+			// (cf prompts for the value). ply does not gain this secret.
+			[OPERATOR_TOKEN_BINDING]: bindings.secret(),
+			[OPERATOR_CONTROL_BINDING]: bindings.worker({ worker: WORKER_NAME, exportName: "FlagControl" }),
+		},
+	};
+}
+
+export default defineConfig((ctx: ConfigContext) => {
+	if (ctx.mode === FLAG_OPERATOR_MODE) return { worker: flagOperatorWorker() };
+	return plyWorker;
 });

@@ -230,22 +230,30 @@ export function applyRollout(document: FlagDocument, key: string, basisPoints: n
   return { kind: 'ok', document: { environment: document.environment, flags } };
 }
 
-export function applyTargeting(document: FlagDocument, key: string, targeting: Targeting): Changed {
-  if (!FLAG_KEY.test(key)) return invalid('flag key must match ^[a-z][a-z0-9._-]{0,63}$');
-  const existing = document.flags.find(flag => flag.key === key);
-  if (!existing) return invalid(`unknown flag ${key}`);
-  const allow = parseStringList(targeting.allow, 'allow');
+export function parseTargeting(value: unknown): Targeting | Invalid {
+  if (!isObj(value) || !exactKeys(value, ['allow', 'deny', 'rules'])) return invalid('targeting is {allow, deny, rules}');
+  const allow = parseStringList(value.allow, 'allow');
   if (isInvalid(allow)) return allow;
-  const deny = parseStringList(targeting.deny, 'deny');
+  const deny = parseStringList(value.deny, 'deny');
   if (isInvalid(deny)) return deny;
-  if (targeting.rules.length > MAX_RULES) return invalid(`a flag has at most ${MAX_RULES} rules`);
+  if (!Array.isArray(value.rules)) return invalid('rules must be an array');
+  if (value.rules.length > MAX_RULES) return invalid(`a flag has at most ${MAX_RULES} rules`);
   const rules: AttributeRule[] = [];
-  for (const rule of targeting.rules) {
+  for (const rule of value.rules) {
     const parsed = parseRule(rule);
     if (isInvalid(parsed)) return parsed;
     rules.push(parsed);
   }
-  const next: Flag = { ...existing, allow, deny, rules };
+  return { allow, deny, rules };
+}
+
+export function applyTargeting(document: FlagDocument, key: string, targeting: Targeting): Changed {
+  if (!FLAG_KEY.test(key)) return invalid('flag key must match ^[a-z][a-z0-9._-]{0,63}$');
+  const existing = document.flags.find(flag => flag.key === key);
+  if (!existing) return invalid(`unknown flag ${key}`);
+  const parsed = parseTargeting(targeting);
+  if (isInvalid(parsed)) return parsed;
+  const next: Flag = { ...existing, allow: parsed.allow, deny: parsed.deny, rules: parsed.rules };
   return { kind: 'ok', document: { environment: document.environment, flags: document.flags.map(flag => flag.key === key ? next : flag) } };
 }
 
