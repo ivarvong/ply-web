@@ -1,13 +1,14 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { CdConfig } from './config.ts'
-import { cfOk } from './cf.ts'
-import { fullSplit, isTrafficSplit, versionByTag, type VersionShare } from './deploy-plan.ts'
+import { cfOk, ROOT } from './cf.ts'
+import { fullSplit, isTrafficSplit, versionsFromList, type VersionShare } from './deploy-plan.ts'
 import { asRecord, extractJson } from './json.ts'
 import { isoOffset, type RunLog } from './log.ts'
 import { nextPhase, pipelineStart, type PhaseOutcome, type PipelineState } from './pipeline-plan.ts'
 import { errorMessage } from './proc.ts'
 import { liveSmokeAlreadyPassed, reconcile, reconcileReason, type Reconcile } from './reconcile.ts'
+import { checkoutReason, readCheckout, releasePair, releaseTag, type ReleaseId } from './release.ts'
 import { fail, type Fail, type StageResult } from './result.ts'
 import { writeJson } from './run-dir.ts'
 import { stageBump } from './stage-bump.ts'
@@ -56,12 +57,15 @@ async function previousFromDeploy(runDir: string, version: string): Promise<stri
   }
 }
 
-async function readReconcile(config: CdConfig, sha: string, runLog: RunLog): Promise<Reconcile> {
+async function readReconcile(config: CdConfig, release: ReleaseId, runLog: RunLog): Promise<Reconcile> {
   const at = Date.now()
+  const pair = releasePair(release)
+  const tag = releaseTag(release)
   let versionId: string | null = null
   let split: VersionShare[] = []
   let liveSmokePassed = false
   let error: string | null = null
+  let versions: ReturnType<typeof versionsFromList> = []
   try {
     const listed = await cfOk(['workers', 'versions', 'list', '--worker-id', config.worker, '--page', '1', '--per-page', '100'])
     let payload: unknown = listed
@@ -70,8 +74,8 @@ async function readReconcile(config: CdConfig, sha: string, runLog: RunLog): Pro
     } catch {
       payload = listed
     }
-    const found = versionByTag(payload, sha)
-    versionId = found.ok ? found.versionId : null
+    versions = versionsFromList(payload)
+    versionId = versions.find(version => version.tag === tag)?.id ?? null
     split = (await readDeployment(config.worker)).versions.map(share => ({ versionId: share.versionId, percentage: share.percentage }))
     if (versionId) liveSmokePassed = await liveSmokeAlreadyPassed(config.runRoot, versionId)
   } catch (caught) {
@@ -79,21 +83,22 @@ async function readReconcile(config: CdConfig, sha: string, runLog: RunLog): Pro
   }
   const decision = error
     ? { stage: 'refuse' as const, reason: error }
-    : reconcile({ sha, versionId, split, liveSmokePassed, rampPercents: config.policy.steps.map(step => step.percent) })
+    : reconcile({ release, versions, split, liveSmokePassed, rampPercents: config.policy.steps.map(step => step.percent) })
   runLog.useStage('reconcile')
   const ref = await runLog.observation({
     measurement: {
       source: 'reconcile',
-      sha,
+      sha: release.ply,
+      release: pair,
       versionId,
       split,
       liveSmokePassed,
       ...(error ? { error } : {}),
     },
-    query: { source: 'cf workers deployments list', worker: config.worker, tag: sha },
+    query: { source: 'cf workers deployments list', worker: config.worker, tag },
     from: at,
     to: Date.now(),
-    raw: JSON.stringify({ sha, versionId, split, liveSmokePassed, error }),
+    raw: JSON.stringify({ release: pair, versionId, split, liveSmokePassed, error }),
   })
   await runLog.decision({
     inputs: [ref],
@@ -138,6 +143,7 @@ export async function runPipeline(
     readonly token: string
     readonly sha: string | null
     readonly noBump: boolean
+    readonly release: ReleaseId
     readonly log: (line: string) => void
     readonly runDir: string
     readonly runLog: RunLog
@@ -145,6 +151,7 @@ export async function runPipeline(
 ): Promise<PipelineExit> {
   const runDir = opts.runDir
   const runLog = opts.runLog
+  runLog.patch({ plySha: opts.release.ply, plyWebSha: opts.release.web, release: releasePair(opts.release) })
   opts.log(`run: ${runDir}`)
   let state = pipelineStart()
   let failure: Fail | null = null
@@ -186,6 +193,11 @@ export async function runPipeline(
       const result = await span(runLog, 'bump', () => stageBump(config, opts.sha))
       await writeJson(runDir, 'bump.json', result)
       await note(result)
+      if (result.kind === 'pass' && result.value.sha !== opts.release.ply) {
+        await note(fail('bump', 'bad-ply-sha: bump resolved a different ply sha than this release', false, 'harness_fault'))
+        state = { phase: 'halt', smoke: null }
+        continue
+      }
       if (result.kind === 'pass') {
         runLog.patch({ plySha: result.value.sha, plyMergedAt: await plyMergedAt(result.value.sha) })
       } else opts.log(`bump: ${result.reason}`)
@@ -193,9 +205,18 @@ export async function runPipeline(
       continue
     }
     if (state.phase === 'deploy-canary') {
-      if (opts.sha && !reconciled) {
+      if (!reconciled) {
         reconciled = true
-        const next = await readReconcile(config, opts.sha, runLog)
+        const checkout = await readCheckout(ROOT)
+        if (!checkout.ok || checkout.web !== opts.release.web) {
+          const reason = !checkout.ok
+            ? checkoutReason(checkout)
+            : `checkout-unavailable: HEAD ${checkout.web} is not the release ply-web sha`
+          await note(fail('deploy-canary', reason, false, 'harness_fault'))
+          state = { phase: 'halt', smoke: null }
+          continue
+        }
+        const next = await readReconcile(config, opts.release, runLog)
         opts.log(`reconcile: ${reconcileReason(next)}`)
         if (next.stage === 'refuse') {
           await note(fail('deploy-canary', next.reason, false, 'harness_fault'))
@@ -219,7 +240,7 @@ export async function runPipeline(
           continue
         }
       }
-      const result = await span(runLog, 'deploy-canary', () => stageDeploy(config, opts.sha ?? undefined))
+      const result = await span(runLog, 'deploy-canary', () => stageDeploy(config, opts.release))
       await writeJson(runDir, 'deploy.json', result, [opts.token])
       await note(result)
       if (result.kind === 'pass') {
@@ -310,6 +331,6 @@ export async function runPipeline(
     opts.log(`cd: ${label} ${failure.stage}: ${failure.reason}`)
     return { code: 1, reason: `${failure.stage}: ${failure.reason}` }
   }
-  opts.log(`cd: PASS ${version}`)
+  opts.log(`cd: PASS ${version} ply ${opts.release.ply} web ${opts.release.web}`)
   return { code: 0, reason: null }
 }

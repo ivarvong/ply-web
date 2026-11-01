@@ -126,7 +126,8 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
   const lines: string[] = [`# Debrief ${events[0]?.run_id ?? basename(runDir)}`, '']
   if (started && started.kind === 'lifecycle' && started.payload.event === 'run_started') {
     const payload = started.payload
-    lines.push(`${payload.host} ran ply \`${payload.plySha ?? '-'}\` on ply-web \`${payload.plyWebSha}\`.`)
+    const pair = payload.release ? ` Release \`${payload.release.ply}+${payload.release.web}\`.` : ''
+    lines.push(`${payload.host} ran ply \`${payload.plySha ?? '-'}\` on ply-web \`${payload.plyWebSha}\`.${pair}`)
     lines.push('')
     lines.push(`Tools: node ${payload.tools.node}, ${payload.tools.cf}, ${payload.tools.git}.`)
     lines.push('')
@@ -136,7 +137,10 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
     lines.push('## Policy', '')
     for (const event of policies) {
       if (event.kind !== 'policy') continue
-      lines.push(`\`${event.payload.sha256}\``, '', event.payload.path, '', '```json', JSON.stringify(event.payload.body, null, 2), '```', '')
+      const pair = event.payload.release
+        ? `ply \`${event.payload.release.ply}\` ply-web \`${event.payload.release.web}\``
+        : null
+      lines.push(`\`${event.payload.sha256}\``, '', event.payload.path, ...(pair ? ['', pair] : []), '', '```json', JSON.stringify(event.payload.body, null, 2), '```', '')
     }
   }
   if (finished && finished.kind === 'lifecycle' && finished.payload.event === 'run_finished') {
