@@ -27,7 +27,31 @@
     "calls": [
       { "method": "GET", "path": "/", "auth": false },
       { "method": "GET", "path": "/v1/discover?remote=https%3A%2F%2F5ad2236b39de4c8bd8f6270ea63f3ea9.artifacts.cloudflare.net%2Fgit%2Fpublic-v0%2Fply.git", "auth": true }
-    ]
+    ],
+    "timeoutMs": 2000,
+    "maxInFlight": 50,
+    "minSamples": 1000,
+    "stallLatencyMs": 1000,
+    "windowAttempts": 2,
+    "windowBackoffMs": 1000,
+    "schedule": {
+      "source": "run 2026-11-01T19-40-35-485Z",
+      "date": "2026-11-01",
+      "window": "50% ramp step",
+      "n": 128,
+      "responded": 118,
+      "lost": 10,
+      "healthyN": 1990,
+      "web": "22bfb79",
+      "oldVersion": "4f3d7acf",
+      "newVersion": "19ee3cab",
+      "healthyP50Ms": "41-101",
+      "observedStallMs": 69830,
+      "dwellMs": 40000,
+      "observedRate": "10/128",
+      "percentile": "healthy responses p50 41-101ms on both versions in the first seconds of the step (n=118); the stalled cohort latencyMs ~69830 on both versions; not a worker percentile",
+      "headroom": "timeoutMs 2000 is above 10× the healthy p50 upper bound (101ms → 1010ms) and below observedStallMs 69830, so a client stall is timed_out instead of holding the dwell. stallLatencyMs 1000 is PRIOR: a round threshold above that 101ms p50 and below timeoutMs. maxInFlight 50 is PRIOR: the previous cap was one second of ticks (ceil(rps)=25) times 2 calls; healthy in-flight at p50 101ms and 50 requests/s is about 5. The 50% step hit that cap and issuance stopped until 14:49:39 EST, about 3m14s after 14:46:25 instead of dwellMs 40000. minSamples 1000 is PRIOR: a round floor above the stalled denominator 128 and below the healthy 10/25 steps of about 1990, so the loss-rate gate cannot fail a window as small as this stall. windowAttempts 2 is the one stalled window plus one re-run; a further stall holds and does not roll back when server errors are 0. windowBackoffMs 1000 is PRIOR: the run did not wait between windows."
+    }
   },
   "gates": {
     "smoke": "hard",

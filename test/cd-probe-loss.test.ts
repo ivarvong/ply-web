@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
-import { some } from '../src/option.ts'
+import { none, some } from '../src/option.ts'
 import { parsePolicy, type RolloutPolicy } from '../scripts/cd/policy.ts'
-import { accountProbeLoss, classifyProbe, judgeProbeWindow, type ProbeOutcome } from '../scripts/cd/probe.ts'
+import { accountProbeLoss, classifyProbe, judgeProbeWindow, type ProbeJudge, type ProbeOutcome } from '../scripts/cd/probe.ts'
 import { runRamp, type Observation } from '../scripts/cd/ramp.ts'
 import type { VersionStats } from '../scripts/cd/telemetry.ts'
 
@@ -22,12 +22,16 @@ function policy(over: { readonly onHarnessFault: 'rollback' | 'hold'; readonly m
   return parsePolicy(JSON.stringify(raw)).policy
 }
 
+function judgeOf(maxLossRate: number, respondedMin: number, minSamples: number): ProbeJudge {
+  return { maxLossRate, respondedMin, minSamples, stallLatencyMs: 1_000, fivexxHard: true }
+}
+
 function responded(id: string, status = 200): ProbeOutcome {
-  return classifyProbe(id, { kind: 'response', status, ray: some('ray') })
+  return classifyProbe(id, { kind: 'response', status, ray: some('ray'), latencyMs: 50, version: none() })
 }
 
 function aborted(id: string): ProbeOutcome {
-  return classifyProbe(id, { kind: 'thrown', name: 'TimeoutError', message: 'The operation was aborted due to timeout' })
+  return classifyProbe(id, { kind: 'thrown', name: 'AbortError', message: 'The operation was aborted' })
 }
 
 function fill(count: number, status = 200): ProbeOutcome[] {
@@ -67,11 +71,15 @@ test('a client abort with no status and no ray is a loss, and a 500 is a respond
   const lost = aborted('1 GET https://ply.ivar.workers.dev/')
   assert.equal(lost.kind, 'lost')
   if (lost.kind === 'lost') assert.equal(lost.reason, 'aborted')
+  const timed = classifyProbe('timed', { kind: 'timeout' })
+  assert.deepEqual(timed, { kind: 'lost', id: 'timed', reason: 'timed_out' })
+  const named = classifyProbe('named', { kind: 'thrown', name: 'TimeoutError', message: 'The operation was aborted due to timeout' })
+  assert.deepEqual(named, { kind: 'lost', id: 'named', reason: 'timed_out' })
   const network = classifyProbe('net', { kind: 'thrown', name: 'TypeError', message: 'fetch failed' })
   assert.deepEqual(network, { kind: 'lost', id: 'net', reason: 'network' })
-  const empty = classifyProbe('empty', { kind: 'response', status: 0, ray: some('ray') })
+  const empty = classifyProbe('empty', { kind: 'response', status: 0, ray: some('ray'), latencyMs: 50, version: none() })
   assert.equal(empty.kind, 'lost')
-  const server = classifyProbe('srv', { kind: 'response', status: 500, ray: some('ray') })
+  const server = classifyProbe('srv', { kind: 'response', status: 500, ray: some('ray'), latencyMs: 50, version: none() })
   assert.equal(server.kind, 'responded')
   const loss = accountProbeLoss([lost, server, ...fill(1)], 1 / 790)
   assert.equal(loss.count, 1)
@@ -90,13 +98,15 @@ test('the measured 1/790 abort is under the checked-in rate and is not a server 
   assert.equal(loss.exceeded, false)
   assert.equal(loss.responded, 789)
   assert.equal(loss.serverErrors, 0)
-  const window = judgeProbeWindow(outcomes, 1 / 790, 100)
+  const window = judgeProbeWindow(outcomes, judgeOf(1 / 790, 100, 1_000))
   assert.equal(window.kind, 'ok')
 })
 
-test('one more loss than the measured rate is a harness fault', () => {
-  const outcomes = [...fill(788), aborted('a'), aborted('b')]
-  const window = judgeProbeWindow(outcomes, 1 / 790, 100)
+test('one more loss than the measured rate is a harness fault once the denominator is large enough', () => {
+  const under = judgeProbeWindow([...fill(788), aborted('a'), aborted('b')], judgeOf(1 / 790, 100, 1_000))
+  assert.notEqual(under.kind, 'harness_fault')
+  const outcomes = [...fill(998), aborted('a'), aborted('b')]
+  const window = judgeProbeWindow(outcomes, judgeOf(1 / 790, 100, 1_000))
   assert.equal(window.kind, 'harness_fault')
   if (window.kind === 'harness_fault') {
     assert.equal(window.loss.count, 2)
@@ -107,7 +117,7 @@ test('one more loss than the measured rate is a harness fault', () => {
 
 test('losses that leave fewer responded probes than the minimum are insufficient samples, not a pass', () => {
   const outcomes = [...fill(40), aborted('lost')]
-  const window = judgeProbeWindow(outcomes, 0.5, 100)
+  const window = judgeProbeWindow(outcomes, judgeOf(0.5, 100, 1_000))
   assert.equal(window.kind, 'insufficient_samples')
   if (window.kind === 'insufficient_samples') {
     assert.equal(window.loss.responded, 40)
@@ -123,7 +133,7 @@ test('a loss above the rate at 100% rolls back to previous and does not judge th
     now: () => 0,
     sleep: async () => {},
     dwell: async (_ms, percent) => ({
-      outcomes: percent === 100 ? [...fill(788), aborted('a'), aborted('b')] : fill(200),
+      outcomes: percent === 100 ? [...fill(998), aborted('a'), aborted('b')] : fill(200),
     }),
     applySplit: async percent => {
       splits.push(percent)
@@ -152,7 +162,7 @@ test('hold keeps the last fully passed split instead of rolling back to previous
     now: () => 0,
     sleep: async () => {},
     dwell: async (_ms, percent) => ({
-      outcomes: percent === 100 ? [...fill(10), aborted('a')] : fill(200),
+      outcomes: percent === 100 ? [...fill(998), aborted('a'), aborted('b')] : fill(200),
     }),
     applySplit: async percent => {
       splits.push(percent)

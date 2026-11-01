@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { redact } from './redact.ts'
+import { assertDeploymentCreate, withTrafficLock } from './traffic-gate.ts'
 import { traceCommand } from './trace.ts'
 
 export const ROOT = fileURLToPath(new URL('../..', import.meta.url))
@@ -18,9 +19,34 @@ export function cfWorkdir(): string {
   return ROOT
 }
 
+export type CfRunner = (args: readonly string[], secrets: readonly string[]) => Promise<CfResult>
+
+let installed: CfRunner | null = null
+
+/** Tests install a runner. Production leaves this unset and execs `cf`. */
+export function useCfRunner(next: CfRunner | null): void {
+  installed = next
+}
+
+function isDeploymentCreate(args: readonly string[]): boolean {
+  return args[0] === 'workers' && args[1] === 'deployments' && args[2] === 'create'
+}
+
 /** cf with --quiet. Stdout is raw so a token can be parsed; callers must not log it. The log copy is redacted. */
 export function runCf(args: readonly string[], secrets: readonly string[] = []): Promise<CfResult> {
+  if (!isDeploymentCreate(args)) return execCf(args, secrets)
+  return withTrafficLock(async () => {
+    assertDeploymentCreate()
+    return execCf(args, secrets)
+  })
+}
+
+function execCf(args: readonly string[], secrets: readonly string[]): Promise<CfResult> {
   const started = Date.now()
+  const runner = installed
+  if (runner) {
+    return runner(args, secrets).then(result => traced(args, secrets, started, result))
+  }
   return new Promise(resolve => {
     execFile(CF, ['--quiet', ...args], {
       cwd: cfWorkdir(),
@@ -32,18 +58,21 @@ export function runCf(args: readonly string[], secrets: readonly string[] = []):
       const code = typeof coded === 'number' ? coded : err ? 1 : 0
       const rawOut = stdout ?? ''
       const safeErr = redact(stderr ?? '', secrets)
-      void traceCommand({
-        argv: [CF, '--quiet', ...args],
-        cwd: cfWorkdir(),
-        exitCode: code,
-        durationMs: Date.now() - started,
-        stdout: redact(rawOut, secrets),
-        stderr: safeErr,
-      }).finally(() => {
-        resolve({ code, stdout: rawOut, stderr: safeErr })
-      })
+      const result = { code, stdout: rawOut, stderr: safeErr }
+      void traced(args, secrets, started, result).then(resolve, () => resolve(result))
     })
   })
+}
+
+function traced(args: readonly string[], secrets: readonly string[], started: number, result: CfResult): Promise<CfResult> {
+  return traceCommand({
+    argv: [CF, '--quiet', ...args],
+    cwd: cfWorkdir(),
+    exitCode: result.code,
+    durationMs: Date.now() - started,
+    stdout: redact(result.stdout, secrets),
+    stderr: redact(result.stderr, secrets),
+  }).then(() => result)
 }
 
 export async function cfOk(args: readonly string[], secrets: readonly string[] = []): Promise<string> {
