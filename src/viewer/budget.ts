@@ -8,7 +8,7 @@ export type Budget = {
   subrequests: number;
   addBytes(n: number): void;
   countSubrequest(): void;
-  canSpend(extra?: number): boolean;
+  canSpend(extra: number): boolean;
 };
 
 export function createBudget(maxBytes: number = VIEWER_CAPS.maxUpstreamBytes, maxSubrequests: number = VIEWER_CAPS.maxSubrequests): Budget {
@@ -26,7 +26,7 @@ export function createBudget(maxBytes: number = VIEWER_CAPS.maxUpstreamBytes, ma
       budget.subrequests += 1;
       if (budget.subrequests > maxSubrequests) throw limitError('upstream requests', budget.subrequests, maxSubrequests);
     },
-    canSpend(extra = 1) {
+    canSpend(extra: number) {
       return budget.subrequests + extra <= maxSubrequests && budget.bytes <= maxBytes;
     },
   };
