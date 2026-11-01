@@ -93,7 +93,7 @@ cd: PASS 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e ply 1274f2dd05b83d70f8d421cdcc7962
 | --- | --- | --- |
 | `cd: PASS <version id> ply <ply sha> web <ply-web sha>` | 0 | The new version is at 100%, and the live smoke and telemetry passed. |
 | `cd: FAIL <stage>: <reason>` | 1 | That stage stopped the run. If the line is from ramp or from the live checks, traffic is already back on `previous` unless the line says the rollback itself failed. |
-| `cd: harness_fault <stage>: <reason>` | 1 | A probe loss above `probe.maxLossRate`, a revoked Artifacts token that did not get 403, or a check that could not be evaluated (the telemetry query, a span-query shape mismatch, zero samples where samples are required, an implausible span join, a preflight miss). A ramp step above 0% then follows `probe.onHarnessFault`. Any other stage leaves the split unchanged. This is not a change failure. |
+| `cd: harness_fault <stage>: <reason>` | 1 | A probe loss above `probe.maxLossRate`, a revoked Artifacts token that did not get 403, or a check that could not be evaluated (a telemetry query with no probe sample to stand on, a span-query shape mismatch, zero samples where samples are required, an implausible span join, a preflight miss). A ramp step above 0% then follows `probe.onHarnessFault`. A ramp query that never returns after a clean probe window is not this row: the step advances and names the loss. Any other stage leaves the split unchanged. This is not a change failure. |
 | `cd: state_conflict <stage>: <reason>` | 1 | The deployment was not the expected prior split, so the write was skipped. The split is unchanged. |
 | a usage line, no `cd: PASS` / `cd: FAIL` | 2 | The arguments were wrong. Traffic was not touched. |
 
@@ -276,13 +276,13 @@ The step decision is the policy. A signal set to `hard` rolls back. The same sig
 
 | Signal | Checked-in mode | What happens |
 | --- | --- | --- |
-| Smoke | `hard` | The 0% lifecycle only. A ramp probe's HTTP status is not a gate |
+| Smoke | `hard` | The 0% lifecycle only. While the ramp query returns, a probe's HTTP status is not a gate. When that query is lost, a 5xx on a responded probe is the correctness signal |
 | Exception, 5xx, error log, non-ok outcome | `hard` | Any, on the new version, on the old version, or across the worker. One request is enough |
 | SLO burn | `hard` | The same three scopes. `bad/total` divided by the error budget is above `burn.fastBurn` (**14.4**), and that SLO saw at least `burn.minSamples` (**100**) requests |
 | Routed share | `rollback` | `routedNewShare` outside the binomial band. `split.onMismatch` may instead be `hold`, which leaves the split |
 | Thin evidence | `hold` | Fewer than `split.minNewRequests` (**100**) new-version invocations, or no invocations at all. Outcome `insufficient_data`. `onInsufficient: advance` moves on and still says so |
 | Latency | `informational` | Never, under this file. Wall p99 and CPU p99 are on the line and on the ramp observation. `off` omits them from the line. `gate` needs `minSamples`, `p99Ratio` (> 1), and `effectFloorMs`, and rolls back only when both sides have that many wall samples and p99 clears both thresholds |
-| Query failed | always | `harness_fault`. Above 0% the split follows `probe.onHarnessFault` (checked-in: roll back to `previous`). A missing query is not zero errors |
+| Query failed | retry, then probes | Each `cf o11y telemetry query` is retried up to `telemetry.query.attempts` (3). The wait before retry n is `telemetry.query.backoffMs * 2^(n-1)`. A later success is a normal sample. If every attempt fails and the probe window already passed, the step uses those status codes: a 5xx rolls back, and a clean window advances. The lost series is `informational` on the reason and a `telemetry-query` observation per attempt. It is not stored as zero errors, and it is not a `harness_fault`. With no probe sample the step is still `harness_fault`, and above 0% the split follows `probe.onHarnessFault` |
 
 ### How many requests that is
 
@@ -368,12 +368,13 @@ A 10% step whose telemetry shows about half the traffic on the new version:
 ramp step=1/5 percent=10 previous=90 samples=1000/1000 error_rate=0.0000/0.0000 routed_share=50.00 target=10 tolerance=7.99..12.01 agg=2000 p99_wall_ms=80/80 p99_cpu_ms=12/12 latency=informational decision=rollback reason="routed share 50.00% is outside 7.99..12.01 of target 10% (n=2000)"
 ```
 
-`cf o11y` down stops the ramp as `harness_fault`. It does not roll back and it does not wait:
+A ramp query that times out is retried. Run `2026-11-01T19-17-18-170Z` (web `07568e0`) lost one `cf o11y telemetry query --body` at 100% to `APIError "timeout" Envelope Error` after every probe had returned, and that single miss rolled the release back. A retry that returns a page is not a fault. If the bound is exhausted and the probes were a full clean sample, the step advances and names the loss:
 
 ```text
-ramp step=1/5 percent=10 previous=90 samples=-/- error_rate=-/- routed_share=- target=10 tolerance=- agg=0 p99_wall_ms=-/- p99_cpu_ms=-/- latency=informational decision=harness_fault reason="telemetry unavailable: …"
-cd: harness_fault ramp: telemetry unavailable: …
+ramp step=5/5 percent=100 previous=0 samples=-/- error_rate=-/- routed_share=- target=100 tolerance=- agg=0 p99_wall_ms=-/- p99_cpu_ms=-/- latency=informational probe_loss=0/790 decision=advance reason="informational: telemetry query lost; 790 responded probes, 0 server errors; …"
 ```
+
+A 5xx on one of those probes still rolls back, because that status was observed. Routed share, burn, exceptions, and error logs from the missing query are not filled in as zero. With no probe sample at all, the step is `harness_fault` and above 0% follows `probe.onHarnessFault` (checked-in: roll back to `previous`).
 
 If the rollback request itself does not stick, the last line says so and names the version that should be at 100%. Do not treat that run as rolled back. Put it back yourself with the command in the next section.
 
@@ -438,7 +439,7 @@ cd: FAIL rollback: rollback to 1aa0bb11-… failed: …
 | A ramp line with `decision=rollback`, then `cd: FAIL ramp:` | Previous at 100% | Relay the line. The new version is off traffic. |
 | `cd: FAIL ramp:` and the text says rollback failed | **Not** safe | Run `npm run cd -- rollback --to <previous>` and read the deployment list. The id to restore is the one in that sentence. |
 | `cd: FAIL smoke:` or `cd: FAIL telemetry:` after ramp lines that reached `percent=100` | Previous at 100% if rollback landed | Same as a ramp rollback. The live check is what rejected it. |
-| `cd: harness_fault` | On a ramp step above 0%, `previous` at 100% when `probe.onHarnessFault` is `rollback`, or the last fully passed split when it is `hold`. Elsewhere, the split where the run stopped | The version was not blamed. A probe loss above `probe.maxLossRate`, a 403 on the token this stage minted, or a telemetry query or span join. The verdict kind is `harness_fault`, not a correctness fail. |
+| `cd: harness_fault` | On a ramp step above 0%, `previous` at 100% when `probe.onHarnessFault` is `rollback`, or the last fully passed split when it is `hold`. Elsewhere, the split where the run stopped | The version was not blamed. A probe loss above `probe.maxLossRate`, a 403 on the token this stage minted, or a telemetry query that had no probe sample, or a span join. A lost ramp query after a clean probe window stays on the advance line. The verdict kind is `harness_fault`, not a correctness fail. |
 | `cd: state_conflict` | The split that was already there | Something else changed the deployment. Do not apply the step again until you have read `cf workers deployments list`. |
 
 ## Metrics

@@ -98,10 +98,33 @@ export type SplitPolicy = {
 /**
  * Workers Observability drops whole invocations in bursts. A smoke id with no log line or no trace is
  * telemetry loss: recorded with a count, rate and id list, and only fails the run above `maxLossRate`.
+ *
+ * `query` bounds retries of `cf o11y telemetry query`. The citation is run 2026-11-01T19-17-18-170Z:
+ * one timeout at the 100% step. A recovered query is a normal sample. A query that never returns
+ * does not invent zeroes for the series it did not fetch.
  */
+export type QueryCalibration = {
+  readonly source: string
+  readonly date: string
+  readonly window: string
+  readonly n: number
+  readonly web: string
+  readonly ply: string
+  readonly observed: string
+  readonly percentile: string
+  readonly headroom: string
+}
+
+export type TelemetryQueryPolicy = {
+  readonly attempts: number
+  readonly backoffMs: number
+  readonly calibration: QueryCalibration
+}
+
 export type TelemetryPolicy = {
   /** Fraction of smoke ids in (0, 1] that may be missing from telemetry before the run fails. */
   readonly maxLossRate: number
+  readonly query: TelemetryQueryPolicy
 }
 
 /** Default when the policy omits `telemetry`: fail only when more than half of the smoke is missing. */
@@ -321,11 +344,62 @@ function cleanupOf(value: unknown): CleanupPolicy {
   }
 }
 
+function queryCalibrationOf(value: unknown): QueryCalibration {
+  const rec = record(value, 'telemetry.query.calibration')
+  exactKeys(rec, 'telemetry.query.calibration', ['source', 'date', 'window', 'n', 'web', 'ply', 'observed', 'percentile', 'headroom'])
+  return {
+    source: textOf(rec.source, 'telemetry.query.calibration.source'),
+    date: textOf(rec.date, 'telemetry.query.calibration.date'),
+    window: textOf(rec.window, 'telemetry.query.calibration.window'),
+    n: integer(rec.n, 'telemetry.query.calibration.n', 1),
+    web: textOf(rec.web, 'telemetry.query.calibration.web'),
+    ply: textOf(rec.ply, 'telemetry.query.calibration.ply'),
+    observed: textOf(rec.observed, 'telemetry.query.calibration.observed'),
+    percentile: textOf(rec.percentile, 'telemetry.query.calibration.percentile'),
+    headroom: textOf(rec.headroom, 'telemetry.query.calibration.headroom'),
+  }
+}
+
+function queryPolicyOf(value: unknown): TelemetryQueryPolicy {
+  const rec = record(value, 'telemetry.query')
+  exactKeys(rec, 'telemetry.query', ['attempts', 'backoffMs', 'calibration'])
+  return {
+    attempts: integer(rec.attempts, 'telemetry.query.attempts', 1),
+    backoffMs: integer(rec.backoffMs, 'telemetry.query.backoffMs', 0),
+    calibration: queryCalibrationOf(rec.calibration),
+  }
+}
+
+/** Used only when the policy file omits `telemetry`. The numbers match the checked-in block. */
+function defaultTelemetry(): TelemetryPolicy {
+  return {
+    maxLossRate: DEFAULT_MAX_LOSS_RATE,
+    query: {
+      attempts: 3,
+      backoffMs: 1000,
+      calibration: {
+        source: 'run 2026-11-01T19-17-18-170Z',
+        date: '2026-11-01',
+        window: '100% ramp step',
+        n: 1,
+        web: '07568e0',
+        ply: '1743461',
+        observed: 'cf o11y telemetry query --body APIError timeout Envelope Error, exit 1',
+        percentile: 'one measured query, not a percentile',
+        headroom: 'default for an omitted telemetry block. attempts is 3. backoffMs 1000 is PRIOR: the run did not retry.',
+      },
+    },
+  }
+}
+
 function telemetryOf(value: unknown): TelemetryPolicy {
-  if (value === undefined) return { maxLossRate: DEFAULT_MAX_LOSS_RATE }
+  if (value === undefined) return defaultTelemetry()
   const rec = record(value, 'telemetry')
-  exactKeys(rec, 'telemetry', [], ['maxLossRate'])
-  return { maxLossRate: rec.maxLossRate === undefined ? DEFAULT_MAX_LOSS_RATE : rate(rec.maxLossRate, 'telemetry.maxLossRate') }
+  exactKeys(rec, 'telemetry', ['query'], ['maxLossRate'])
+  return {
+    maxLossRate: rec.maxLossRate === undefined ? DEFAULT_MAX_LOSS_RATE : rate(rec.maxLossRate, 'telemetry.maxLossRate'),
+    query: queryPolicyOf(rec.query),
+  }
 }
 
 function validate(value: unknown): RolloutPolicy {
@@ -409,7 +483,24 @@ function policyBody(policy: RolloutPolicy): Json {
       onMismatch: policy.split.onMismatch,
       onInsufficient: policy.split.onInsufficient,
     },
-    telemetry: { maxLossRate: policy.telemetry.maxLossRate },
+    telemetry: {
+      maxLossRate: policy.telemetry.maxLossRate,
+      query: {
+        attempts: policy.telemetry.query.attempts,
+        backoffMs: policy.telemetry.query.backoffMs,
+        calibration: {
+          source: policy.telemetry.query.calibration.source,
+          date: policy.telemetry.query.calibration.date,
+          window: policy.telemetry.query.calibration.window,
+          n: policy.telemetry.query.calibration.n,
+          web: policy.telemetry.query.calibration.web,
+          ply: policy.telemetry.query.calibration.ply,
+          observed: policy.telemetry.query.calibration.observed,
+          percentile: policy.telemetry.query.calibration.percentile,
+          headroom: policy.telemetry.query.calibration.headroom,
+        },
+      },
+    },
     cleanup: {
       attempts: policy.cleanup.attempts,
       backoffMs: policy.cleanup.backoffMs,
