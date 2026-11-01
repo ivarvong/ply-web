@@ -5,6 +5,7 @@
 // Host policy is an exact allowlist. There is no suffix match, no wildcard, and no IP-literal
 // folding: a hostname is accepted only when it is one of the allowed hosts, character for character.
 import { fail } from 'ply';
+import { chainGet } from '../absent.ts';
 import { extractRequestPath, rawPathHasUnsafeSegment } from '../pathguard.ts';
 import { publicRepoShortName } from '../public.ts';
 import { authorityHasTrailingDot } from '../remote.ts';
@@ -32,8 +33,8 @@ export type BuiltinAllowedHost = (typeof ALLOWED_HOSTS)[number];
 export type AllowedHost = BuiltinAllowedHost | (string & { readonly [allowedHost]: 'AllowedHost' });
 
 export type ValidateOpts = {
-  allowedHosts?: readonly AllowedHost[];
-  maxLength?: number;
+  allowedHosts: readonly AllowedHost[] | null;
+  maxLength: number | null;
 };
 
 export type RepoLocation = {
@@ -45,7 +46,7 @@ export type RepoLocation = {
   allowedHosts: readonly AllowedHost[];
 };
 
-const EXTRA_HOST = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+const EXTRA_HOST = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/;
 
 function brand(url: string): ValidatedPublicRepoUrl {
   return url as ValidatedPublicRepoUrl;
@@ -60,8 +61,8 @@ function brandExtra(host: string): AllowedHost {
  * Tokens with a scheme, port, userinfo, wildcard, or trailing dot are skipped — they are not
  * turned into suffix rules. Artifacts stays off until the operator names that exact host.
  */
-export function allowlistFromEnv(raw: string | undefined): readonly AllowedHost[] {
-  if (raw === undefined || raw.trim() === '') return ALLOWED_HOSTS;
+export function allowlistFromEnv(raw: string | null): readonly AllowedHost[] {
+  if (raw === null || raw.trim() === '') return ALLOWED_HOSTS;
   const extras: AllowedHost[] = [];
   const seen = new Set<string>(ALLOWED_HOSTS);
   for (const part of raw.split(',')) {
@@ -121,9 +122,11 @@ function checkPath(pathname: string, allowed: readonly AllowedHost[]): string {
  * Validate a user-supplied git remote. https, no userinfo, default port, and a hostname that
  * exactly matches the allowlist. Anything else is rejected before a fetch, with the supported hosts.
  */
-export function validatePublicRepoUrl(raw: string, opts: ValidateOpts = {}): RepoLocation {
-  const allowed = opts.allowedHosts ?? ALLOWED_HOSTS;
-  const maxLength = opts.maxLength ?? 2048;
+export function validatePublicRepoUrl(raw: string, opts: unknown = null): RepoLocation {
+  const allowedField = chainGet(opts, 'allowedHosts');
+  const maxField = chainGet(opts, 'maxLength');
+  const allowed = allowedField.tag === 'some' ? allowedField.value as readonly AllowedHost[] : ALLOWED_HOSTS;
+  const maxLength = maxField.tag === 'some' ? maxField.value as number : 2048;
   if (typeof raw !== 'string' || !raw.trim()) reject(allowed, 'remote is required.');
   if (raw.length > maxLength) reject(allowed, 'remote is too long.');
   // oxlint-disable-next-line no-control-regex -- a remote with controls is not a URL
@@ -172,7 +175,7 @@ export function assertUpstreamUrl(raw: string, repo: ValidatedPublicRepoUrl, all
   return brand(u.toString());
 }
 
-export function viewerHref(host: string, repoPath: string, query: Record<string, string | undefined> = {}): string {
+export function viewerHref(host: string, repoPath: string, query: Record<string, string | null> = {}): string {
   const short = publicRepoShortName(host, repoPath);
   const path = short
     ? `/r/${encodeURIComponent(short)}`
@@ -184,6 +187,6 @@ export function viewerHref(host: string, repoPath: string, query: Record<string,
   return tail ? `${path}?${tail}` : path;
 }
 
-export function viewerPathFor(loc: RepoLocation, query: Record<string, string | undefined> = {}): string {
+export function viewerPathFor(loc: RepoLocation, query: Record<string, string | null> = {}): string {
   return viewerHref(loc.host, loc.repoPath, query);
 }

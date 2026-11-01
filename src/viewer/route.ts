@@ -1,4 +1,6 @@
 import { fail } from 'ply';
+import { atIndex, captureGroup, chainGet } from '../absent.ts';
+import { unwrapOr } from '../option.ts';
 import { validatePath } from 'ply';
 import { VIEWER_CAPS, VIEWER_GIT_LIMITS } from './limits.ts';
 import type { FilterName } from './model.ts';
@@ -32,8 +34,10 @@ function bad(message: string): never {
   throw fail('bad_request', message);
 }
 
-export function routeOptsFromEnv(env: { VIEWER_EXTRA_HOSTS?: string }): RouteOpts {
-  return { allowedHosts: allowlistFromEnv(env.VIEWER_EXTRA_HOSTS) };
+export function routeOptsFromEnv(env: unknown): RouteOpts {
+  const extra = chainGet(env, 'VIEWER_EXTRA_HOSTS');
+  const raw = extra.tag === 'some' && typeof extra.value === 'string' ? extra.value : null;
+  return { allowedHosts: allowlistFromEnv(raw) };
 }
 
 function chosenRef(url: URL, fallback: string | null = null): string | null {
@@ -52,14 +56,14 @@ function canonicalLocation(url: URL, loc: RepoLocation, ref: string | null, path
   const short = publicRepoShortName(loc.host, loc.repoPath)
   const onShort = short !== null && url.pathname === `/r/${encodeURIComponent(short)}`
   if (!alias && (short === null || onShort)) return null
-  const query: Record<string, string | undefined> = {
-    ref: ref ?? undefined,
-    path: path || undefined,
-    raw: raw ? '1' : undefined,
-    trace: url.searchParams.get('trace') === '1' ? '1' : undefined,
-    want: pack?.want,
-    filter: pack ? pack.filter : undefined,
-    offset: pack?.offset !== null && pack?.offset !== undefined ? String(pack.offset) : undefined,
+  const query: Record<string, string | null> = {
+    ref,
+    path: path.length > 0 ? path : null,
+    raw: raw ? '1' : null,
+    trace: url.searchParams.get('trace') === '1' ? '1' : null,
+    want: pack === null ? null : pack.want,
+    filter: pack === null ? null : pack.filter,
+    offset: pack !== null && pack.offset !== null ? String(pack.offset) : null,
   }
   return viewerPathFor(loc, query)
 }
@@ -130,14 +134,15 @@ export function parseViewerRoute(url: URL, opts: RouteOpts): ViewerRoute {
   for (const key of url.searchParams.keys()) if (SECRET_QUERY.test(key)) bad('query must not carry credentials');
   if (url.pathname === '/view.css') return { kind: 'css', hash: null };
   const hashed = /^\/view\.([0-9a-f]{12})\.css$/.exec(url.pathname);
-  if (hashed?.[1]) return { kind: 'css', hash: hashed[1] };
+  const hash = captureGroup(hashed, 1);
+  if (hash.tag === 'some' && hash.value) return { kind: 'css', hash: hash.value };
   if (url.pathname === '/view' || url.pathname === '/view/') {
     const remote = url.searchParams.get('remote');
     if (!remote) return { kind: 'home' };
     const pasted = interpretRemote(remote);
     const loc = validateLocation(pasted.remote, opts);
-    const ref = chosenRef(url, pasted.ref ?? null);
-    return { kind: 'redirect', location: viewerPathFor(loc, { ref: ref ?? undefined, path: pasted.path || undefined }) };
+    const ref = chosenRef(url, pasted.ref);
+    return { kind: 'redirect', location: viewerPathFor(loc, { ref, path: pasted.path }) };
   }
   if (url.pathname === '/r' || url.pathname === '/r/') return { kind: 'namespace' };
   let loc: RepoLocation;
@@ -157,7 +162,7 @@ export function parseViewerRoute(url: URL, opts: RouteOpts): ViewerRoute {
     }
     const parts = decoded.split('/').filter(part => part.length > 0);
     if (parts.length < 2) bad('remote path is not allowed');
-    const host = parts[0] ?? '';
+    const host = unwrapOr(atIndex(parts, 0), '');
     const repoPath = parts.slice(1).join('/');
     loc = locate(host, repoPath, opts);
   }
