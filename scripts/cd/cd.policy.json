@@ -12,7 +12,7 @@
     "rps": 25,
     "calls": [
       { "method": "GET", "path": "/", "auth": false },
-      { "method": "GET", "path": "/v1/discover", "auth": true }
+      { "method": "GET", "path": "/v1/discover?remote=https%3A%2F%2F5ad2236b39de4c8bd8f6270ea63f3ea9.artifacts.cloudflare.net%2Fgit%2Fpublic-v0%2Fply.git", "auth": true }
     ]
   },
   "gates": {
