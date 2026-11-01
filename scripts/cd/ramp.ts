@@ -92,7 +92,21 @@ function tolerance(share: RoutedShare): string {
   return `${points(share.low)}..${points(share.high)}`
 }
 
-/** One line an operator can paste. `step` is 1-based. Sample counts are this window. Carried p99 is display only. */
+function entrypointList(rows: VersionStats['internal'] | undefined): string {
+  if (!rows || rows.length === 0) return ''
+  return rows.map(row => `${row.entrypoint}:${row.count}`).join(',')
+}
+
+/** Named-entrypoint fetches, display only. Empty when this window had none. */
+function internalNote(next: VersionStats | null, previous: VersionStats | null): string {
+  const newer = entrypointList(next?.internal)
+  const older = entrypointList(previous?.internal)
+  const nextField = newer === '' ? '' : ` internal_next=${newer}`
+  const previousField = older === '' ? '' : ` internal_previous=${older}`
+  return `${nextField}${previousField}`
+}
+
+/** One line an operator can paste. `step` is 1-based. Sample counts are external fetches in this window. Carried p99 is display only. */
 export function progressLine(input: {
   readonly step: number
   readonly steps: number
@@ -113,7 +127,8 @@ export function progressLine(input: {
   const cpu = `${p99(input.next?.cpuMs)}/${p99(oldCpu)}`
   const latency = input.latency === 'off' ? '' : ` p99_wall_ms=${walls} p99_cpu_ms=${cpu} latency=${input.latency}`
   const routed = `routed_share=${points(input.share.share)} target=${input.percent} tolerance=${tolerance(input.share)} agg=${input.share.n}`
-  const head = `ramp step=${input.step}/${input.steps} percent=${input.percent} previous=${previousPercent} samples=${samples} error_rate=${errors} ${routed}${latency} decision=${input.decision.outcome}`
+  const internal = internalNote(input.next, input.previous)
+  const head = `ramp step=${input.step}/${input.steps} percent=${input.percent} previous=${previousPercent} samples=${samples} error_rate=${errors} ${routed}${internal}${latency} decision=${input.decision.outcome}`
   const carried = input.carriedPrevious ? ' previous_sample=carried' : ''
   const informational = input.decision.outcome === 'advance' && input.decision.reason.includes('informational:')
   if (input.decision.outcome === 'advance' && !informational) return head + carried

@@ -28,6 +28,7 @@ function stats(over: Partial<VersionStats> = {}): VersionStats {
     cpuMs: [10, 12, 14],
     fetchMs: [40, 50, 60],
     v1: [],
+    internal: [],
     ...over,
   }
   return { ...row, invocations: over.invocations ?? row.requests }

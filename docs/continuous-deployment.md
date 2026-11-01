@@ -307,11 +307,11 @@ The checked-in probe schedules `25 × 2 × 40s = 2000` requests a step. The smal
 
 A step with fewer than 100 new-version invocations does not advance. That floor is the 2.95% row. A normal 10% step sees about 200 and can catch a 1.5% regression on the new version. The aggregate, which is what users feel, can catch 0.15% in the same window. Per-version is what keeps a regression on the small arm from being diluted into the aggregate.
 
-The share check is the same `n`. For target proportion `p` and `z = 3`, the band is `p ± z √(p(1−p)/n)`. At 10% and `n = 2000` that is 7.99%..12.01%. At 100%, `p(1−p)` is 0, so the share has to be 100%. Counts come from telemetry fetch invocations, not from the probe's own bookkeeping. `test/fixtures/cd/routed-share.json` is a synthetic 10% window of this shape: 200 of 2000 advances, 1000 of 2000 rolls back, 40 of 400 is `insufficient_data`.
+The share check is the same `n`. For target proportion `p` and `z = 3`, the band is `p ± z √(p(1−p)/n)`. At 10% and `n = 2000` that is 7.99%..12.01%. At 100%, `p(1−p)` is 0, so the share has to be 100%. Counts come from external fetch invocations, not from the probe's own bookkeeping and not from named entrypoints. `test/fixtures/cd/routed-share.json` is a synthetic 10% window of this shape: 200 of 2000 advances, 1000 of 2000 rolls back, 40 of 400 is `insufficient_data`.
 
 This probe is a scaled model of production. At about 800 requests per second, a 40s dwell already holds 32000 requests and the 10% arm holds 3200, which can see about a 0.09% error rate. Retune `probe.rps`, `burn.minSamples`, and `split.minNewRequests` in the policy. When real traffic is the load, `probe.rps` can go to 0 and the same gates read whoever called the worker. That is a config change.
 
-`samples=` on a ramp line counts fetch invocations (`$metadata.type` `cf-worker-event`, `$workers.eventType` `fetch`), new / old, in this window. `agg=` is the unfiltered count, the share denominator. Each request also writes a `ply.request` log, so the event page is about twice the sample count. The query asks for `limit` 1000 and follows the cursor. On the 2026-11-01 run a page came back short because the index held about 28s of the 40s dwell, not because of a 1000-row cap. The window's `to` is the dwell end plus `60000` ms so the tail is inside the query. The ingest wait is what keeps the next step's probes out of this step's judged window.
+`samples=` on a ramp line counts external fetch invocations, new / old, in this window. An external fetch is `$metadata.type` `cf-worker-event`, `$workers.eventType` `fetch`, and `$workers.entrypoint` absent or `default`. A named entrypoint (`FlagsCache`, `GitCache`) is an internal `ctx.exports` call. It has its own ray and request id, so dropping duplicate ids does not remove it. Those counts are `internal_next` / `internal_previous` on the ramp line and `internalInvocations` on the ramp observation. They are not part of `samples`, `agg`, error rates, latency samples, or the share. `agg=` is the external count, the share denominator. Each external request also writes a `ply.request` log, so the event page is larger than the sample count. The query asks for `limit` 1000 and follows the cursor. On the 2026-11-01 run a page came back short because the index held about 28s of the 40s dwell, not because of a 1000-row cap. The window's `to` is the dwell end plus `60000` ms so the tail is inside the query. The ingest wait is what keeps the next step's probes out of this step's judged window.
 
 At 100% the old version is dropped, so its wall and CPU numbers are the last step whose old version had at least 5 wall samples. That line includes `previous_sample=carried`. If no earlier step had them, 100% still advances when the new version is clean.
 
@@ -336,12 +336,12 @@ How to read a line:
 | --- | --- |
 | `step=2/5` | Second percentage. 1-based. The count is the policy's step list. |
 | `percent=25` `previous=75` | Configured new-version share, and what is left on the old one. At the last step `previous=0`. |
-| `samples=500/1500` | Fetch invocations in this step's window, new / old. |
+| `samples=500/1500` | External fetch invocations in this step's window, new / old. Named entrypoints are not included. |
 | `error_rate=0.0000/0.0000` | Non-ok rate, new / old, four decimal places. |
 | `routed_share=25.00` | `100 × new / agg`. Null (`-`) when `agg` is 0. |
 | `target=25` | The step's percent. The same number as `percent`. |
 | `tolerance=22.10..27.90` | The binomial band in percent, `z` standard errors at this `agg`. `-` when `agg` is 0. |
-| `agg=2000` | Fetch invocations in the window, every version. |
+| `agg=2000` | External fetch invocations in the window, every version. |
 | `p99_wall_ms=90/76` | Wall-time p99 in milliseconds, new / old. `-` means that side had no sample. Omitted when latency mode is `off`. |
 | `p99_cpu_ms=12/11` | CPU p99, new / old. Informational under the checked-in policy, same as wall. |
 | `latency=informational` | The percentiles are recorded. They do not roll back. `gate` would. |
@@ -350,6 +350,7 @@ How to read a line:
 | `decision=insufficient_data` | The new version had fewer than `minNewRequests` invocations (or the window had none) and `onInsufficient` is `hold`. The split stays. |
 | `decision=hold` | The share is outside the band and `onMismatch` is `hold`. The split stays. The checked-in file rolls back instead. |
 | `reason="…"` | Present on rollback, hold, insufficient evidence, `harness_fault`, and an advance that names an informational signal. Relay it with the line. |
+| `internal_next=FlagsCache:92` | Named-entrypoint fetches on that version, `name:count` separated by commas. Omitted when there were none. Not a gate. |
 | `previous_sample=carried` | The old-version p99 is from the last step that had at least 5 wall samples. The sample counts on that line are still this window. |
 
 A large wall shift advances. The 2026-11-01 5% walls (`test/fixtures/cd/ramp-5pct-walls.json`, run `2026-11-01T00-10-02-620Z`) do not roll back on latency. So does a step whose p99 is 27ms against 12ms. `insufficient_data` now means the new version was not seen enough times. It is not the old latency compare. Relay it: nothing was rolled back, and the split did not advance.

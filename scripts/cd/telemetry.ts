@@ -345,10 +345,36 @@ function statusOf(event: Record<string, unknown>): number | null {
   return typeof status === 'number' ? status : null
 }
 
-function isFetchInvocation(event: Record<string, unknown>): boolean {
+/** Workers names the internet-facing fetch handler this. A missing entrypoint is that handler. */
+export const DEFAULT_ENTRYPOINT = 'default'
+
+const FETCH_EVENT = 'cf-worker-event'
+const FETCH_TYPE = 'fetch'
+const fetchBrand = Symbol('FetchInvocation')
+
+/**
+ * A fetch handler invocation. `external` is the default entrypoint, the traffic
+ * the ramp routes. `internal` is a named entrypoint (`FlagsCache`, `GitCache`):
+ * `ctx.exports` calls it, and it carries its own ray and request id.
+ */
+export type FetchInvocation =
+  | { readonly [fetchBrand]: 'FetchInvocation'; readonly kind: 'external' }
+  | { readonly [fetchBrand]: 'FetchInvocation'; readonly kind: 'internal'; readonly entrypoint: string }
+
+/** Null when the event is not a fetch invocation. */
+export function fetchInvocation(event: Record<string, unknown>): FetchInvocation | null {
   const meta = asRecord(event.$metadata)
   const workers = asRecord(event.$workers)
-  return meta?.type === 'cf-worker-event' && workers?.eventType === 'fetch'
+  if (meta?.type !== FETCH_EVENT || workers?.eventType !== FETCH_TYPE) return null
+  const entrypoint = workers.entrypoint
+  if (typeof entrypoint !== 'string' || entrypoint === '' || entrypoint === DEFAULT_ENTRYPOINT) {
+    return { [fetchBrand]: 'FetchInvocation', kind: 'external' }
+  }
+  return { [fetchBrand]: 'FetchInvocation', kind: 'internal', entrypoint }
+}
+
+function isExternalFetch(event: Record<string, unknown>): boolean {
+  return fetchInvocation(event)?.kind === 'external'
 }
 
 function exceptionCount(event: Record<string, unknown>): number {
@@ -371,9 +397,15 @@ function walk(node: unknown, visit: (rec: Record<string, unknown>) => void, seen
   for (const value of Object.values(rec)) walk(value, visit, seen)
 }
 
+/** Named-entrypoint fetches on one version. Recorded, never gated. */
+export type InternalEntrypoint = {
+  readonly entrypoint: string
+  readonly count: number
+}
+
 export type VersionStats = {
   readonly requests: number
-  /** Fetch invocations only. `requests` falls back to log rows when this is 0. */
+  /** External fetch invocations. `requests` falls back to log rows when this is 0. Named entrypoints are `internal`. */
   readonly invocations: number
   readonly exceptions: number
   readonly errors: number
@@ -383,6 +415,13 @@ export type VersionStats = {
   readonly cpuMs: readonly number[]
   readonly fetchMs: readonly number[]
   readonly v1: readonly V1Request[]
+  readonly internal: readonly InternalEntrypoint[]
+}
+
+function internalCounts(counts: ReadonlyMap<string, number>): InternalEntrypoint[] {
+  return [...counts.entries()]
+    .sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0))
+    .map(([entrypoint, count]) => ({ entrypoint, count }))
 }
 
 function methodOf(event: Record<string, unknown>): V1Request['method'] {
@@ -404,7 +443,7 @@ function v1From(events: readonly unknown[]): V1Request[] {
   const invocations = new Map<string, { wall: number | null; exception: boolean }>()
   for (const item of events) {
     const event = asRecord(item)
-    if (!event || !isFetchInvocation(event)) continue
+    if (!event || !isExternalFetch(event)) continue
     const id = requestIdOf(event)
     if (!id) continue
     const workers = asRecord(event.$workers)
@@ -442,6 +481,7 @@ function fetchMsJoined(events: readonly unknown[], spans: readonly unknown[]): n
   for (const item of events) {
     const event = asRecord(item)
     if (!event) continue
+    if (fetchInvocation(event)?.kind === 'internal') continue
     const key = joinKeyOf(event)
     if (key.requestId || key.traceId || key.rayId) keys.push(key)
   }
@@ -464,6 +504,7 @@ export function statsFromEvents(events: readonly unknown[], spans: readonly unkn
   let logs = 0
   const wallMs: number[] = []
   const cpuMs: number[] = []
+  const internal = new Map<string, number>()
   for (const item of events) {
     const event = asRecord(item)
     if (!event) continue
@@ -474,7 +515,12 @@ export function statsFromEvents(events: readonly unknown[], spans: readonly unkn
       const meta = asRecord(event.$metadata)
       if (meta?.level === 'error') errorLogs += 1
     }
-    if (!isFetchInvocation(event)) continue
+    const fetch = fetchInvocation(event)
+    if (!fetch) continue
+    if (fetch.kind === 'internal') {
+      internal.set(fetch.entrypoint, (internal.get(fetch.entrypoint) ?? 0) + 1)
+      continue
+    }
     requests += 1
     exceptions += exceptionCount(event)
     const workers = asRecord(event.$workers)
@@ -493,6 +539,7 @@ export function statsFromEvents(events: readonly unknown[], spans: readonly unkn
     cpuMs,
     fetchMs: fetchMsJoined(events, spans),
     v1: v1From(events),
+    internal: internalCounts(internal),
   }
 }
 
@@ -503,7 +550,7 @@ export type SmokeSummary = {
   readonly cpuMs: readonly number[]
   readonly fetchMs: readonly number[]
   readonly tracedIds: ReadonlySet<string>
-  /** Fetch invocations of this version in the window. The span join is compared with this. */
+  /** External fetch invocations of this version in the window. The span join is compared with this. */
   readonly invocations: number
   /**
    * `events` is a child-span query. `summaries` is the traces view (a count and a root name).
@@ -568,7 +615,7 @@ export function summarizeTelemetry(
         if (meta?.level === 'error') errorLogs += 1
       }
     }
-    if (saw !== version || !isFetchInvocation(event)) continue
+    if (saw !== version || !isExternalFetch(event)) continue
     invocations += 1
     if (exceptionCount(event) > 0) exceptions += 1
     const workers = asRecord(event.$workers)
@@ -578,7 +625,7 @@ export function summarizeTelemetry(
   const cpuMs: number[] = []
   for (const item of events) {
     const event = asRecord(item)
-    if (!event || versionOf(event) !== version || !isFetchInvocation(event)) continue
+    if (!event || versionOf(event) !== version || !isExternalFetch(event)) continue
     const platform = requestIdOf(event)
     if (!platform || !smokePlatform.has(platform)) continue
     const workers = asRecord(event.$workers)
