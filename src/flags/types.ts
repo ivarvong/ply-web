@@ -1,13 +1,14 @@
 // Flag config is one document. A rollout is an allocation in basis points, not a step list.
 // Stepped ramps live in scripts/cd/cd.policy.json. This module does not import that file.
 
+import type { AttributeName, AttributeValue, FlagKey, FlagSalt, UnitId } from './brand.ts';
 import { BASIS_POINTS } from './ttl.ts';
 
 export type EnvironmentName = 'production';
 
 export type Variant =
   | { readonly kind: 'boolean'; readonly value: boolean }
-  | { readonly kind: 'string'; readonly value: string }
+  | { readonly kind: 'string'; readonly value: AttributeValue }
   | { readonly kind: 'number'; readonly value: number };
 
 export type Reason = 'override' | 'rule' | 'bucket' | 'default';
@@ -15,9 +16,9 @@ export type Reason = 'override' | 'rule' | 'bucket' | 'default';
 export type AttributeOp = 'eq' | 'neq' | 'in';
 
 export type AttributeRule = {
-  readonly attribute: string;
+  readonly attribute: AttributeName;
   readonly op: AttributeOp;
-  readonly value: string | readonly string[];
+  readonly value: AttributeValue | readonly AttributeValue[];
   readonly variant: Variant;
 };
 
@@ -31,13 +32,13 @@ export type Rollout =
   | { readonly kind: 'rolled-back'; readonly reason: string };
 
 export type Flag = {
-  readonly key: string;
-  readonly salt: string;
+  readonly key: FlagKey;
+  readonly salt: FlagSalt;
   readonly rollout: Rollout;
   readonly on: Variant;
   readonly off: Variant;
-  readonly allow: readonly string[];
-  readonly deny: readonly string[];
+  readonly allow: readonly UnitId[];
+  readonly deny: readonly UnitId[];
   readonly rules: readonly AttributeRule[];
 };
 
@@ -49,22 +50,27 @@ export type FlagDocument = {
 export const EMPTY_DOCUMENT: FlagDocument = { environment: 'production', flags: [] };
 
 export type Targeting = {
-  readonly allow: readonly string[];
-  readonly deny: readonly string[];
+  readonly allow: readonly UnitId[];
+  readonly deny: readonly UnitId[];
   readonly rules: readonly AttributeRule[];
 };
 
 export type FlagEvaluation = {
-  readonly key: string;
+  readonly key: FlagKey;
   readonly variant: Variant;
   readonly reason: Reason;
   readonly bucket: number;
 };
 
 export type Unit = {
-  readonly id: string;
-  readonly attributes: Readonly<Record<string, string>>;
+  readonly id: UnitId;
+  readonly attributes: Readonly<Record<AttributeName, AttributeValue>>;
 };
+
+/** Which flags an evaluation walks. Omitted keys at the HTTP boundary become `all`. */
+export type FlagSelection =
+  | { readonly kind: 'all' }
+  | { readonly kind: 'listed'; readonly keys: readonly FlagKey[] };
 
 /**
  * `CF-Cache-Status` tokens documented by the Cache API.

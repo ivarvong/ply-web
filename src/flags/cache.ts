@@ -1,6 +1,7 @@
 // Workers Cache sits in front of FlagsCache.fetch. The default entrypoint stays uncached and calls this
 // over ctx.exports, so a ruleset hit does not run the Worker. Per-user evaluations are not cached.
 import { envBinding } from '../absent.ts';
+import { parseIfNoneMatch, readHeader, type IfNoneMatch } from '../http/inbound.ts';
 import { err, httpReply, isUnexpected, ok, responseOf, runRequest, type HttpReply, type Result, type UnexpectedFailure } from '../http/machine.ts';
 import { parseDocumentText } from './document.ts';
 import {
@@ -143,17 +144,21 @@ function rulesetHeaders(env: FlagCacheEnv, r2ReadMs: number, etag: string | null
   return headers;
 }
 
-function noneMatch(header: string | null, etag: string): boolean {
-  if (!header) return false;
-  return header.split(',').some(part => {
-    const token = part.trim();
-    return token === '*' || token === etag || token === etag.replace(/^"|"$/g, '');
-  });
+function noneMatch(header: IfNoneMatch, etag: string): boolean {
+  if (header.kind === 'absent') return false;
+  const bare = etag.replace(/^"|"$/g, '');
+  for (const token of header.tokens) {
+    if (token.kind === 'any') return true;
+    if (token.value === etag || token.value === bare) return true;
+  }
+  return false;
 }
 
 type RulesetMethod = 'GET' | 'HEAD';
 
-type RulesetRead = { readonly method: RulesetMethod; readonly store: ReadableStore };
+type ParsedRuleset = { readonly method: RulesetMethod; readonly ifNoneMatch: IfNoneMatch };
+
+type RulesetRead = ParsedRuleset & { readonly store: ReadableStore };
 
 type RulesetFailure =
   | { readonly kind: 'method' }
@@ -191,16 +196,16 @@ function thrownName(error: unknown): string {
 export async function serveFlags(request: Request, env: FlagCacheEnv, store: ReadableStore | null): Promise<Response> {
   return runRequest(
     {
-      parse: (): Result<RulesetMethod, RulesetFailure> => {
+      parse: (): Result<ParsedRuleset, RulesetFailure> => {
         if (request.method !== 'GET' && request.method !== 'HEAD') return err({ kind: 'method' });
         if (new URL(request.url).pathname !== FLAGS_CACHE_PATH) return err({ kind: 'path' });
-        return ok(request.method);
+        return ok({ method: request.method, ifNoneMatch: parseIfNoneMatch(readHeader(request.headers, 'if-none-match')) });
       },
-      authorize: (method: RulesetMethod): Result<RulesetRead, RulesetFailure> => {
+      authorize: (parsed: ParsedRuleset): Result<RulesetRead, RulesetFailure> => {
         if (!store) return err({ kind: 'unconfigured' });
-        return ok({ method, store });
+        return ok({ method: parsed.method, ifNoneMatch: parsed.ifNoneMatch, store });
       },
-      execute: (read: RulesetRead) => readRuleset(request, env, read),
+      execute: (read: RulesetRead) => readRuleset(env, read),
     },
     (result: Result<HttpReply, RulesetFailure | UnexpectedFailure>) => {
       if (!result.ok) {
@@ -221,7 +226,7 @@ export async function serveFlags(request: Request, env: FlagCacheEnv, store: Rea
   );
 }
 
-async function readRuleset(request: Request, env: FlagCacheEnv, read: RulesetRead): Promise<Result<HttpReply, RulesetFailure>> {
+async function readRuleset(env: FlagCacheEnv, read: RulesetRead): Promise<Result<HttpReply, RulesetFailure>> {
   const started = performance.now();
   let object: { etag: string; body: string } | null;
   try {
@@ -239,7 +244,7 @@ async function readRuleset(request: Request, env: FlagCacheEnv, read: RulesetRea
     return ok(plainReply(500, 'flag config is invalid\n', new Headers({ 'cache-control': 'no-store', [R2_HEADER]: String(r2ReadMs) })));
   }
   const headers = rulesetHeaders(env, r2ReadMs, object.etag);
-  if (noneMatch(request.headers.get('if-none-match'), object.etag)) return ok(httpReply(304, null, headers));
+  if (noneMatch(read.ifNoneMatch, object.etag)) return ok(httpReply(304, null, headers));
   headers.set('content-type', 'application/json; charset=utf-8');
   return ok(httpReply(200, read.method === 'HEAD' ? null : object.body, headers));
 }
@@ -273,7 +278,8 @@ export async function loadRuleset(env: FlagCacheEnv, fetchRuleset: FlagsCacheBin
   const text = await response.text();
   const parsed = parseDocumentText(text);
   if (parsed.kind === 'invalid') return { kind: 'unavailable', reason: parsed.reason };
-  const revision = response.headers.get('etag') ?? '';
-  if (!revision) return { kind: 'unavailable', reason: 'flag cache response has no etag' };
+  const etag = readHeader(response.headers, 'etag');
+  if (etag.kind === 'absent' || etag.value.length === 0) return { kind: 'unavailable', reason: 'flag cache response has no etag' };
+  const revision = etag.value;
   return { kind: 'ready', revision, cache, r2ReadMs: readMs, document: parsed.document };
 }

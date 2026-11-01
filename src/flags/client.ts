@@ -1,11 +1,13 @@
 // In-Worker reads. isEnabled is false when the flag is missing, the store is down, or the variant is not boolean true.
+import { parseFlagKey } from './brand.ts';
 import { loadRuleset, type FlagCacheEnv, type FlagsCacheBinding } from './cache.ts';
 import { elapsed, type Clock } from './clock.ts';
-import { parseUnit } from './document.ts';
+import { parseUnit, type AttributeInput } from './document.ts';
 import { evaluateDocument } from './eval.ts';
 import { emitEval, endSpan, openSpan, resolutionSample, type TracingLike } from './telemetry.ts';
 import { USAGE_NOTE_FLAG, USAGE_NOTE_LINE } from './ttl.ts';
-import { EMPTY_DOCUMENT, isEnabledVariant, type CacheStatus, type FlagEvaluation, type Unit } from './types.ts';
+import { EMPTY_DOCUMENT, isEnabledVariant, type CacheStatus, type FlagEvaluation, type FlagSelection, type Unit } from './types.ts';
+import type { HeaderField } from '../http/inbound.ts';
 
 export type FlagRuntime = {
   env: FlagCacheEnv;
@@ -21,7 +23,7 @@ export type ResolveResult =
   | { readonly kind: 'ok'; readonly evaluations: readonly FlagEvaluation[]; readonly revision: string | null; readonly cache: CacheStatus }
   | { readonly kind: 'unavailable'; readonly reason: string };
 
-export async function resolveFlags(runtime: FlagRuntime, unit: Unit, keys: readonly string[] | null, clock: Clock = () => performance.now()): Promise<ResolveResult> {
+export async function resolveFlags(runtime: FlagRuntime, unit: Unit, keys: FlagSelection, clock: Clock = () => performance.now()): Promise<ResolveResult> {
   // Open the span before the await so its platform duration includes the cache/R2 yield.
   // The hash itself does not move the Workers clock; resolve_ms is this await, not the hash.
   const span = openSpan(runtime.tracing, 'flags.eval');
@@ -48,18 +50,20 @@ export async function resolveFlags(runtime: FlagRuntime, unit: Unit, keys: reado
   }
 }
 
-export async function isEnabled(env: FlagCacheEnv, ctx: { exports?: { FlagsCache?: FlagsCacheBinding }; tracing?: TracingLike | null } | undefined, key: string, unit: { readonly id: string; readonly attributes?: Readonly<Record<string, string>> }): Promise<boolean> {
+export async function isEnabled(env: FlagCacheEnv, ctx: { exports?: { FlagsCache?: FlagsCacheBinding }; tracing?: TracingLike | null } | undefined, key: string, unit: { readonly id: string; readonly attributes: AttributeInput }): Promise<boolean> {
   if (!env.FLAGS) return false;
+  const parsedKey = parseFlagKey(key);
+  if (parsedKey.kind !== 'key') return false;
   const parsed = parseUnit(unit.id, unit.attributes);
   if (parsed.kind === 'invalid') return false;
-  const resolved = await resolveFlags(runtimeOf(env, ctx), { id: parsed.id, attributes: parsed.attributes }, [key]);
+  const resolved = await resolveFlags(runtimeOf(env, ctx), { id: parsed.id, attributes: parsed.attributes }, { kind: 'listed', keys: [parsedKey.value] });
   if (resolved.kind === 'unavailable') return false;
   const evaluation = resolved.evaluations[0];
   return evaluation ? isEnabledVariant(evaluation.variant) : false;
 }
 
-export async function usageNote(env: FlagCacheEnv, ctx: { exports?: { FlagsCache?: FlagsCacheBinding }; tracing?: TracingLike | null } | undefined, unitHeader: string | null): Promise<string | null> {
-  const id = unitHeader && unitHeader.length > 0 ? unitHeader : 'anonymous';
-  const on = await isEnabled(env, ctx, USAGE_NOTE_FLAG, { id });
+export async function usageNote(env: FlagCacheEnv, ctx: { exports?: { FlagsCache?: FlagsCacheBinding }; tracing?: TracingLike | null } | undefined, unitHeader: HeaderField): Promise<string | null> {
+  const id = unitHeader.kind === 'present' && unitHeader.value.length > 0 ? unitHeader.value : 'anonymous';
+  const on = await isEnabled(env, ctx, USAGE_NOTE_FLAG, { id, attributes: { kind: 'absent' } });
   return on ? USAGE_NOTE_LINE : null;
 }

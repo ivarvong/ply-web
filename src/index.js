@@ -40,6 +40,7 @@ import { holdLastChunk } from './hold-last.ts';
 import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from './rays.ts';
 import { usageNote } from './flags/client.ts';
 import { handleFlagHttp } from './flags/http.ts';
+import { headerNumber, parseBearer, readHeader } from './http/inbound.ts';
 import { err, ok, runRequest } from './http/machine.ts';
 
 export { FlagsCache, FlagControl } from './flags/entry.ts';
@@ -271,7 +272,7 @@ async function timingSafeTokenEqual(a, b) {
 }
 
 async function readJson(req) {
-  const len = Number(req.headers.get('content-length') ?? 0);
+  const len = headerNumber(readHeader(req.headers, 'content-length'));
   if (len > MAX_BODY) throw fail('limit_exceeded', `request body over ${MAX_BODY} bytes`);
   if (!req.body) return {};
   const parts = []; let n = 0;
@@ -455,15 +456,15 @@ const worker = {
         }
         const token = env.PLY_TOKEN;
         if (!token) return err(jsonOut(500, { code: 'internal', message: 'PLY_TOKEN is not configured', retry: 'no' }));
-        const presented = /^Bearer\s+(.+)$/i.exec(req.headers.get('authorization') ?? '')?.[1] ?? '';
-        if (!presented || !(await timingSafeTokenEqual(presented, token))) return err(jsonOut(401, { code: 'unauthorized', message: 'Authorization: Bearer <PLY_TOKEN> required', retry: 'no' }, { 'www-authenticate': 'Bearer realm="ply"' }));
+        const presented = parseBearer(readHeader(req.headers, 'authorization'), /^Bearer\s+(.+)$/i);
+        if (presented.kind !== 'bearer' || !(await timingSafeTokenEqual(presented.token, token))) return err(jsonOut(401, { code: 'unauthorized', message: 'Authorization: Bearer <PLY_TOKEN> required', retry: 'no' }, { 'www-authenticate': 'Bearer realm="ply"' }));
         return ok(parsed);
       },
       execute: async parsed => {
         if (parsed.kind === 'usage') {
           // ply.usage.note is off unless the flag ruleset says otherwise. A missing binding leaves this text unchanged.
           let body = USAGE;
-          const note = await usageNote(env, ctx, req.headers.get('x-ply-unit'));
+          const note = await usageNote(env, ctx, readHeader(req.headers, 'x-ply-unit'));
           if (note) body = `${USAGE}\n${note}\n`;
           return ok(rawOut(200, body, new Headers({ 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })));
         }

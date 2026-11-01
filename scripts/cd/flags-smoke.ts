@@ -1,12 +1,29 @@
 // Judges the flag smoke steps. No import of judge.ts or lifecycle.ts: those import this file.
-import { parseDocument } from '../../src/flags/document.ts'
+import { parseUnitId, type UnitId } from '../../src/flags/brand.ts'
+import { parseDocument, parseUnit } from '../../src/flags/document.ts'
 import { evaluateDocument } from '../../src/flags/eval.ts'
 import { BUCKETS, USAGE_NOTE_FLAG, USAGE_NOTE_LINE } from '../../src/flags/ttl.ts'
-import { EMPTY_DOCUMENT, parseCacheStatus, variantKind, variantValue, type CacheStatus, type FlagDocument, type Variant } from '../../src/flags/types.ts'
+import { EMPTY_DOCUMENT, parseCacheStatus, variantKind, variantValue, type CacheStatus, type FlagDocument, type FlagSelection, type Unit, type Variant } from '../../src/flags/types.ts'
 import { assertNever } from '../../src/never.ts'
 
+function knownUnit(raw: string): UnitId {
+  const parsed = parseUnitId(raw)
+  if (parsed.kind !== 'id') throw new Error(parsed.reason)
+  return parsed.value
+}
+
 /** Unit the eval smoke sends. GET / uses anonymous and is checked separately. */
-export const SMOKE_UNIT_ID = 'user:smoke'
+export const SMOKE_UNIT_ID = knownUnit('user:smoke')
+
+function smokeUnit(): Unit {
+  const parsed = parseUnit(SMOKE_UNIT_ID, { kind: 'absent' })
+  if (parsed.kind !== 'ok') throw new Error(parsed.reason)
+  return { id: parsed.id, attributes: parsed.attributes }
+}
+
+function smokeKeys(): FlagSelection {
+  return { kind: 'listed', keys: [USAGE_NOTE_FLAG] }
+}
 
 /** Flag the eval smoke asks for, and the line GET / must not contain while that flag is off. */
 export const SMOKE_FLAG_KEY = USAGE_NOTE_FLAG
@@ -175,7 +192,7 @@ function judgeEval(status: number, bodyText: string, headers: FlagHeaders, saved
   const row = parsed.flags.find(item => isObj(item) && item.key === SMOKE_FLAG_KEY)
   if (!isObj(row)) return fail(`eval is missing ${SMOKE_FLAG_KEY}`)
   const document = snapshot.kind === 'present' ? snapshot.document : EMPTY_DOCUMENT
-  const expected = evaluateDocument(document, { id: SMOKE_UNIT_ID, attributes: {} }, [SMOKE_FLAG_KEY])[0]
+  const expected = evaluateDocument(document, smokeUnit(), smokeKeys())[0]
   if (!expected) return fail(`no evaluation for ${SMOKE_FLAG_KEY}`)
   if (expected.variant.kind !== 'boolean') return fail('rollout variant is not boolean')
   if (!sameVariant(row.variant, expected.variant)) return fail(`variant ${JSON.stringify(row.variant)} does not match the rollout`)
