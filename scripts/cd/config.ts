@@ -10,7 +10,7 @@ import {
   WORKER_DEFAULT,
   type RampSchedule,
 } from './baseline.ts'
-import { FAST_BURN, MIN_SAMPLES, QUANTILE_FLOOR, QUANTILE_P99_RATIO, SLOS } from './slo.ts'
+import { FAST_BURN, LATENCY_EFFECT_FLOOR_MS, LATENCY_EFFECT_FRACTION, MIN_SAMPLES, QUANTILE_FLOOR, QUANTILE_P99_RATIO, SLOS } from './slo.ts'
 
 export type CdConfig = {
   readonly worker: string
@@ -98,6 +98,8 @@ export function publicConfig(config: CdConfig) {
     minSamples: MIN_SAMPLES,
     quantileFloor: QUANTILE_FLOOR,
     quantileP99Ratio: QUANTILE_P99_RATIO,
+    latencyEffectFloorMs: LATENCY_EFFECT_FLOOR_MS,
+    latencyEffectFraction: LATENCY_EFFECT_FRACTION,
     slos: SLOS.map(slo => ({
       id: slo.id,
       statement: slo.statement,

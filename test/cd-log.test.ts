@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -8,7 +8,7 @@ import { chartPng } from '../scripts/cd/charts.ts'
 import { cfWorkdir } from '../scripts/cd/cf.ts'
 import { canarySplit, writeDebrief } from '../scripts/cd/debrief.ts'
 import { fullSplit, isTrafficSplit, trafficSplit } from '../scripts/cd/deploy-plan.ts'
-import { parseEvent, readEvents, RunLog, validateRun, type CdEvent } from '../scripts/cd/log.ts'
+import { appendFalsePositive, parseEvent, readEvents, RunLog, validateRun, type CdEvent } from '../scripts/cd/log.ts'
 import { createdTokenSecret, harvestSecrets } from '../scripts/cd/redact.ts'
 import { checkNode } from '../scripts/cd/preflight.ts'
 import { doraText } from '../scripts/cd/report.ts'
@@ -261,6 +261,8 @@ test('dora metrics use run_finished', () => {
   assert.match(text, /aborted: 1/)
   assert.match(text, /held: 1/)
   assert.match(text, /harness_fault: 1/)
+  assert.match(text, /false_positive: 0/)
+  assert.match(text, /false positives: 0/)
   assert.match(text, /deployment frequency: 2\.000 \/ day/)
   assert.match(text, /lead time p50: 3600s/)
   assert.match(text, /change failure rate: 0\.500/)
@@ -295,6 +297,84 @@ test('split.png includes the 0% canary', async () => {
   await log.seal()
   const markdown = await readFile(await writeDebrief(runDir), 'utf8')
   assert.match(markdown, /0% canary/)
+})
+
+test('a false-positive annotation is appended and leaves change failure', async () => {
+  const dir = await temp()
+  const ledger = join(dir, 'ledger.jsonl')
+  const runId = '2026-11-01T00-10-02-620Z'
+  const reason = '5% ramp Mann-Whitney flagged a sub-millisecond wall-time shift'
+  const rollback: CdEvent = {
+    seq: 1,
+    ts: '2026-11-01T00:13:40.000+00:00',
+    run_id: runId,
+    stage: 'run',
+    kind: 'lifecycle',
+    payload: {
+      event: 'run_finished',
+      verdict: 'fail',
+      reason: 'new version wall time is slower',
+      rolledBack: true,
+      rollbackReason: 'new version wall time is slower',
+      versionId: VERSION,
+      plySha: null,
+      plyMergedAt: null,
+      plyWebSha: 'b',
+      smoke: { passed: 1, failed: 0 },
+      stages: [],
+      steps: [],
+      liveAt: '2026-11-01T00:13:00Z',
+      failedAt: '2026-11-01T00:13:20Z',
+      restoredAt: '2026-11-01T00:13:40Z',
+      fault: 'worker',
+    },
+  }
+  const pass: CdEvent = {
+    seq: 1,
+    ts: '2026-11-02T00:00:00.000+00:00',
+    run_id: '2026-11-02T00-00-00-000Z',
+    stage: 'run',
+    kind: 'lifecycle',
+    payload: {
+      event: 'run_finished',
+      verdict: 'pass',
+      reason: null,
+      rolledBack: false,
+      rollbackReason: null,
+      versionId: VERSION,
+      plySha: null,
+      plyMergedAt: null,
+      plyWebSha: 'b',
+      smoke: { passed: 1, failed: 0 },
+      stages: [],
+      steps: [],
+      liveAt: '2026-11-02T00:00:00Z',
+      failedAt: null,
+      restoredAt: null,
+      fault: null,
+    },
+  }
+  const before = `${JSON.stringify(rollback)}\n`
+  await writeFile(ledger, before)
+  const noted = await appendFalsePositive(ledger, runId, `  ${reason}  `, new Date('2026-11-02T12:00:00Z'))
+  const after = await readFile(ledger, 'utf8')
+  assert.ok(after.startsWith(before))
+  assert.equal(after.split('\n').filter(line => line).length, 2)
+  assert.equal(noted.seq, 2)
+  assert.equal(noted.kind, 'annotation')
+  if (noted.kind === 'annotation') {
+    assert.equal(noted.payload.note, 'false_positive')
+    assert.equal(noted.payload.reason, reason)
+  }
+  const events = after.split('\n').filter(line => line).map(line => parseEvent(JSON.parse(line) as unknown))
+  const text = doraText([...events, pass])
+  assert.match(text, /deploys: 1/)
+  assert.match(text, /false_positive: 1/)
+  assert.match(text, new RegExp(runId))
+  assert.match(text, /change failure rate: 0\.000/)
+  assert.match(text, /0 rollbacks \/ 1 deploys/)
+  const blamed = doraText([rollback, pass])
+  assert.match(blamed, /change failure rate: 0\.500/)
 })
 
 test('chart png is a png', () => {

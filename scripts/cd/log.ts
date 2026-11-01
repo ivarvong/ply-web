@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { appendFile, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, relative } from 'node:path'
 import { asRecord } from './json.ts'
+import { RUN_ID } from './run-dir.ts'
 import { redact } from './redact.ts'
 import type { Fault } from './result.ts'
 import { isSecret, type Secret } from './secret.ts'
@@ -134,6 +135,7 @@ export type CdEvent =
     }
   })
   | (Base & { readonly kind: 'error'; readonly payload: { readonly message: string; readonly context: Json } })
+  | (Base & { readonly kind: 'annotation'; readonly payload: { readonly note: 'false_positive'; readonly reason: string } })
 
 export type RunFacts = {
   versionId: string | null
@@ -354,6 +356,13 @@ function parsePayload(kind: CdEvent['kind'], payload: unknown): CdEvent['payload
       artifactsRay: stringOrNull(rec.artifactsRay, 'artifactsRay'),
     }
   }
+  if (kind === 'annotation') {
+    const note = needString(rec, 'note')
+    if (note !== 'false_positive') throw new Error(`unknown annotation ${note}`)
+    const reason = needString(rec, 'reason')
+    if (!reason.trim()) throw new Error('annotation reason is empty')
+    return { note: 'false_positive', reason }
+  }
   return { message: needString(rec, 'message'), context: jsonValue(rec.context, 'context') }
 }
 
@@ -361,7 +370,7 @@ function parsePayload(kind: CdEvent['kind'], payload: unknown): CdEvent['payload
 export function parseEvent(value: unknown): CdEvent {
   const rec = needRecord(value, 'event')
   const kind = needString(rec, 'kind')
-  const known = ['lifecycle', 'command', 'observation', 'decision', 'state_change', 'request', 'error']
+  const known = ['lifecycle', 'command', 'observation', 'decision', 'state_change', 'request', 'error', 'annotation']
   if (!known.includes(kind)) throw new Error(`unknown event kind ${kind}`)
   const ts = needString(rec, 'ts')
   if (!ISO.test(ts)) throw new Error('ts is not an ISO timestamp with a numeric offset')
@@ -374,6 +383,43 @@ export function parseEvent(value: unknown): CdEvent {
     payload: parsePayload(kind as CdEvent['kind'], rec.payload),
   }
   return event as CdEvent
+}
+
+/**
+ * Append a false-positive note for a past run. The line is added to the ledger.
+ * Earlier lines are not rewritten, and the sealed run directory is not opened.
+ */
+export async function appendFalsePositive(ledgerPath: string, runId: string, reason: string, now = new Date()): Promise<CdEvent> {
+  if (!RUN_ID.test(runId)) throw new Error('run id must look like 2026-11-01T00-10-02-620Z')
+  const trimmed = reason.trim()
+  if (!trimmed || /[\n\r]/.test(reason)) throw new Error('false-positive reason must be one line')
+  let seq = 1
+  try {
+    const text = await readFile(ledgerPath, 'utf8')
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const event = parseEvent(JSON.parse(line) as unknown)
+        if (event.run_id === runId && event.seq >= seq) seq = event.seq + 1
+      } catch {
+        // A bad ledger line stays where it is. The annotation is still appended.
+      }
+    }
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error ? (error as { code?: unknown }).code : undefined
+    if (code !== 'ENOENT') throw error
+  }
+  const event: CdEvent = {
+    seq,
+    ts: isoOffset(now),
+    run_id: runId,
+    stage: 'run',
+    kind: 'annotation',
+    payload: { note: 'false_positive', reason: trimmed },
+  }
+  await mkdir(dirname(ledgerPath), { recursive: true })
+  await appendFile(ledgerPath, JSON.stringify(event) + '\n')
+  return event
 }
 
 /** Seq starts at 1 and each decision cites an earlier observation in this run. */

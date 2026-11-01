@@ -8,13 +8,13 @@ import { ROOT } from './cf.ts'
 import { loadConfig, publicConfig, type CdConfig } from './config.ts'
 import { writeDebrief } from './debrief.ts'
 import { VERSION_ID } from './deploy-plan.ts'
-import { RunLog, withRun } from './log.ts'
+import { appendFalsePositive, RunLog, withRun } from './log.ts'
 import { runPipeline } from './pipeline.ts'
-import { binaryNodeVersion, checkNode, NODE_IMAGE_BIN, nodeSatisfies, selectNode } from './preflight.ts'
+import { binaryNodeVersion, checkNode, NODE_IMAGE_BIN, nodeSatisfies, pathWithNodeBin, selectNode } from './preflight.ts'
 import { errorMessage, run } from './proc.ts'
 import { unfinishedRunDir } from './reconcile.ts'
 import { reportLedger } from './report.ts'
-import { createRunDir, writeJson } from './run-dir.ts'
+import { createRunDir, RUN_ID, writeJson } from './run-dir.ts'
 import { stageBump } from './stage-bump.ts'
 import { stageDeploy } from './stage-deploy.ts'
 import { stageRamp } from './stage-ramp.ts'
@@ -34,6 +34,7 @@ export type Parsed =
   | { readonly kind: 'ramp'; readonly version: string; readonly previous: string | null; readonly verdict: string | null }
   | { readonly kind: 'rollback'; readonly to: string }
   | { readonly kind: 'report' }
+  | { readonly kind: 'annotate'; readonly runId: string; readonly reason: string }
   | { readonly kind: 'debrief'; readonly runDir: string }
   | { readonly kind: 'usage' }
   | { readonly kind: 'error'; readonly reason: string }
@@ -124,6 +125,15 @@ export function parseArgs(argv: readonly string[], pin: string | null = null): P
     return { kind: 'rollback', to }
   }
   if (command === 'report') return { kind: 'report' }
+  if (command === 'annotate') {
+    const runId = rest[0]
+    if (!runId || runId.startsWith('--')) return { kind: 'error', reason: 'annotate needs a run id' }
+    if (!RUN_ID.test(runId)) return { kind: 'error', reason: 'run id must look like 2026-11-01T00-10-02-620Z' }
+    const reason = flag(rest, 'false-positive')
+    if (reason === null) return { kind: 'error', reason: 'annotate needs --false-positive "reason"' }
+    if (!reason.trim() || /[\n\r]/.test(reason)) return { kind: 'error', reason: 'false-positive reason must be one line' }
+    return { kind: 'annotate', runId, reason: reason.trim() }
+  }
   if (command === 'debrief') {
     const runDir = rest[0]
     if (!runDir || runDir.startsWith('--')) return { kind: 'error', reason: 'debrief needs a run directory' }
@@ -144,6 +154,7 @@ export function usageText(): string {
     '  ramp --version <id> [--previous <id>] [--verdict telemetry.json]',
     '  rollback --to <id>',
     '  report',
+    '  annotate <run-id> --false-positive "reason"',
     '  debrief <run-dir>',
   ].join('\n')
 }
@@ -197,7 +208,7 @@ function reexecNode(): number | null {
   if (!better) return null
   const child = spawnSync(better, [...process.execArgv, ...process.argv.slice(1)], {
     stdio: 'inherit',
-    env: { ...process.env, PLY_CD_NODE_REEXEC: '1' },
+    env: { ...process.env, PLY_CD_NODE_REEXEC: '1', PATH: pathWithNodeBin(better, process.env.PATH) },
   })
   return child.status === null ? 1 : child.status
 }
@@ -219,6 +230,14 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
   if (parsed.kind === 'report') {
     log(await reportLedger(config.ledgerPath))
     return 0
+  }
+  if (parsed.kind === 'annotate') {
+    try {
+      await appendFalsePositive(config.ledgerPath, parsed.runId, parsed.reason)
+      return finish(log, 0, `annotated ${parsed.runId} as a false positive`)
+    } catch (error) {
+      return finish(log, 1, `cd: FAIL annotate: ${errorMessage(error)}`)
+    }
   }
   if (parsed.kind === 'debrief') {
     try {
@@ -277,7 +296,7 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
 type Outcome = { readonly code: number; readonly reason: string | null }
 
 async function dispatch(
-  parsed: Exclude<Parsed, { kind: 'usage' | 'error' | 'report' | 'debrief' }>,
+  parsed: Exclude<Parsed, { kind: 'usage' | 'error' | 'report' | 'debrief' | 'annotate' }>,
   config: CdConfig,
   token: string,
   runDir: string,

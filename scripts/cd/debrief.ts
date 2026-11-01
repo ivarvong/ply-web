@@ -43,6 +43,7 @@ function summarize(event: CdEvent): string {
     return `traffic → ${after || 'empty'}`
   }
   if (event.kind === 'request') return `${event.payload.method} ${event.payload.status} ${event.payload.version ?? '-'} ${event.payload.latencyMs}ms`
+  if (event.kind === 'annotation') return `${event.payload.note}: ${event.payload.reason}`
   return event.payload.message
 }
 

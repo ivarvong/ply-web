@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { applyRamp, decideRampStep, progressLine, rampStart, runRamp, type Observation } from '../scripts/cd/ramp.ts'
 import type { VersionStats } from '../scripts/cd/telemetry.ts'
+import { TELEMETRY_WAIT_MS } from '../scripts/cd/baseline.ts'
 import { MIN_SAMPLES } from '../scripts/cd/slo.ts'
 
 function stats(over: Partial<VersionStats> = {}): VersionStats {
@@ -159,6 +160,23 @@ test('a state conflict stops and does not roll back', async () => {
     fault: 'state_conflict',
   })
   assert.equal(rolled, 0)
+})
+
+test('the ramp waits out ingest lag before it reads the step', async () => {
+  const slept: number[] = []
+  const result = await runRamp({ percents: [100], dwellMs: 40, probeRps: 0 }, {
+    now: () => 0,
+    sleep: async ms => { slept.push(ms) },
+    applySplit: async () => null,
+    observe: async () => sample({
+      wallMs: Array.from({ length: MIN_SAMPLES }, () => 10),
+    }, {
+      wallMs: Array.from({ length: MIN_SAMPLES }, () => 10),
+    }),
+    rollback: async () => null,
+  })
+  assert.equal(result.state.kind, 'complete')
+  assert.deepEqual(slept, [40, TELEMETRY_WAIT_MS])
 })
 
 test('a decision callback without an observation ref throws', async () => {

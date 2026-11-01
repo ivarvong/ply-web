@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { defaultRunRoot, defaultTokenFile, loadConfig } from '../scripts/cd/config.ts'
-import { judgeOriginMain, nodeSatisfies, originMainReason, selectNode } from '../scripts/cd/preflight.ts'
+import { judgeOriginMain, nodeSatisfies, originMainReason, pathWithNodeBin, selectNode } from '../scripts/cd/preflight.ts'
 
 const MAIN = 'f9a3416001e0f89187cbc293738021c31a289c34'
 const HEAD = '610913e0aabbccddeeff00112233445566778899'
@@ -40,6 +41,13 @@ test('token file and run dir have documented defaults', () => {
   const config = loadConfig({})
   assert.equal(config.tokenFile, defaultTokenFile())
   assert.equal(config.runRoot, defaultRunRoot())
+})
+
+test('the chosen node bin is placed first on PATH', () => {
+  assert.equal(pathWithNodeBin('/workspace/node-v24.22.1-linux-x64/bin/node', '/usr/bin'), `/workspace/node-v24.22.1-linux-x64/bin${delimiter}/usr/bin`)
+  assert.equal(pathWithNodeBin('/opt/node/bin/node', undefined), '/opt/node/bin')
+  const wrapper = readFileSync(new URL('../scripts/cd.sh', import.meta.url), 'utf8')
+  assert.match(wrapper, /PATH="\$node_dir\$\{PATH:\+:\$PATH\}"/)
 })
 
 test('a missing sha is origin-main-unavailable', () => {

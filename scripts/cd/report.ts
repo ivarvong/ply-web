@@ -60,6 +60,21 @@ function stamp(value: string | null): number | null {
 
 type Aside = 'aborted' | 'held' | 'harness_fault'
 
+export type FalsePositive = {
+  readonly runId: string
+  readonly reason: string
+}
+
+/** The latest false-positive note for each run. An annotation does not delete the run_finished line. */
+export function falsePositives(events: readonly CdEvent[]): FalsePositive[] {
+  const notes = new Map<string, string>()
+  for (const event of events) {
+    if (event.kind !== 'annotation' || event.payload.note !== 'false_positive') continue
+    notes.set(event.run_id, event.payload.reason)
+  }
+  return [...notes].map(([runId, reason]) => ({ runId, reason }))
+}
+
 /** A deploy reached 100% and was not a harness fault. Aborted, held, and harness_fault runs are not deploys. */
 function isDeploy(run: FinishedRun): boolean {
   return run.liveAt !== null && run.fault !== 'harness_fault'
@@ -77,23 +92,31 @@ function asideOf(run: FinishedRun): Aside {
  * harness_fault runs are counted separately and are not deploys.
  * Frequency is deploys / days between the first and last deploy. One timestamp has no rate.
  * Lead time is plyMergedAt → liveAt on a passing deploy.
- * Change failure is rollbacks / deploys.
+ * Change failure is rollbacks / deploys. A run annotated as a false positive is in neither number.
  * Time to restore is failedAt → restoredAt on a rolled-back deploy.
  */
 export function doraText(events: readonly CdEvent[]): string {
+  const notes = falsePositives(events)
+  const annotated = new Set(notes.map(note => note.runId))
   const finished = finishedRuns(events)
-  if (finished.length === 0) return 'no run_finished events in the ledger\n'
-  const deploys = finished.filter(isDeploy)
-  const aside = finished.filter(run => !isDeploy(run))
+  if (finished.length === 0 && notes.length === 0) return 'no run_finished events in the ledger\n'
+  const counted = finished.filter(run => !annotated.has(run.runId))
+  const fpRuns = finished.filter(run => annotated.has(run.runId))
+  const deploys = counted.filter(isDeploy)
+  const aside = counted.filter(run => !isDeploy(run))
   const asideCount = (kind: Aside) => aside.filter(run => asideOf(run) === kind).length
   const lines = [
     `runs: ${finished.length}`,
     `deploys: ${deploys.length}`,
-    `excluded from deploys: ${aside.length}`,
+    `excluded from deploys: ${aside.length + fpRuns.length}`,
     `  aborted: ${asideCount('aborted')}`,
     `  held: ${asideCount('held')}`,
     `  harness_fault: ${asideCount('harness_fault')}`,
+    `  false_positive: ${fpRuns.length}`,
+    `false positives: ${notes.length}`,
   ]
+  for (const note of notes) lines.push(`  ${note.runId}: ${note.reason}`)
+  if (notes.length > 0) lines.push('  excluded from deploys and from change failure rate')
   const times = deploys.map(run => stamp(run.at)).filter((value): value is number => value !== null).sort((a, b) => a - b)
   const first = times[0]
   const last = times[times.length - 1]

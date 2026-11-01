@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import {
   AVAILABILITY,
@@ -9,7 +10,9 @@ import {
   errorBudget,
   FAST_BURN,
   judgeStep,
+  LATENCY_EFFECT_FLOOR_MS,
   mannWhitneyGreater,
+  MANN_WHITNEY_ALPHA,
   MIN_SAMPLES,
   QUANTILE_P99_RATIO,
   READ_LATENCY,
@@ -123,6 +126,40 @@ test('quantile comparison is used below the Mann-Whitney floor', () => {
   assert.equal(atMax.kind, 'not_slower')
   const short = compareLatency(walls(4, 10), walls(4, 10))
   assert.equal(short.kind, 'insufficient_data')
+})
+
+test('the 2026-11-01 5% walls are a significant tie-heavy shift and do not roll back', () => {
+  const fixture = JSON.parse(readFileSync(new URL('./fixtures/cd/ramp-5pct-walls.json', import.meta.url), 'utf8')) as {
+    next: number[]
+    previous: number[]
+  }
+  const rank = mannWhitneyGreater(fixture.next, fixture.previous, MANN_WHITNEY_ALPHA)
+  assert.equal(rank?.slower, true)
+  // Tie-corrected variance. Dropping the tie term changes this to 3.96e-3.
+  assert.equal(rank?.pGreater.toExponential(2), '3.23e-3')
+  const step = judgeStep({
+    next: side({ requests: fixture.next.length, wallMs: fixture.next }),
+    previous: side({ requests: fixture.previous.length, wallMs: fixture.previous }),
+    probeFailures: 0,
+  })
+  assert.equal(step.outcome, 'advance')
+  assert.equal(step.rules[1]?.name, 'latency_effect_floor_ms')
+  assert.equal(step.rules[1]?.value, LATENCY_EFFECT_FLOOR_MS)
+  assert.match(step.reason, /3\.23e-3/)
+  const clear = judgeStep({
+    next: side({ requests: MIN_SAMPLES, wallMs: walls(MIN_SAMPLES, 80) }),
+    previous: side({ requests: MIN_SAMPLES, wallMs: walls(MIN_SAMPLES, 20) }),
+    probeFailures: 0,
+  })
+  assert.equal(clear.outcome, 'rollback')
+  assert.match(clear.reason, /Mann-Whitney p=/)
+  assert.match(clear.reason, /p50 \+60ms > 10ms/)
+})
+
+test('a short p99 ratio on tiny millisecond walls does not roll back', () => {
+  const tiny = compareLatency(walls(6, 8), walls(6, 3))
+  assert.equal(tiny.kind, 'not_slower')
+  assert.equal(tiny.rule.name, 'latency_effect_floor_ms')
 })
 
 test('a clean compared sample advances', () => {
