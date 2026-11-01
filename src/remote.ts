@@ -1,6 +1,8 @@
 // /v1 remote policy. decideRemote is the discriminated result. The fetch layer takes only an
 // AllowedRemote, follows redirects manually, and re-runs the same policy on every hop.
 import { fail } from 'ply';
+import { atIndex, captureGroup, chainGet, recordGet } from './absent.ts';
+import { unwrapOr } from './option.ts';
 import { extractRequestPath, rawPathHasUnsafeSegment } from './pathguard.ts';
 
 const allowedRemoteBrand: unique symbol = Symbol('AllowedRemote');
@@ -49,7 +51,7 @@ const WILDCARD_DNS = Object.freeze([
   'traefik.me',
 ]);
 
-const PRIVATE_SUFFIX = /(?:^|\.)(?:localhost|local|localdomain|internal|intranet|lan|home\.arpa|corp|private)$/i;
+const PRIVATE_SUFFIX = /(^|\.)(localhost|local|localdomain|internal|intranet|lan|home\.arpa|corp|private)$/i;
 
 const REASON_TEXT: Record<RemoteReason, string> = {
   empty: 'remote is required',
@@ -69,7 +71,7 @@ const REASON_TEXT: Record<RemoteReason, string> = {
   control: 'remote is not a URL',
 };
 
-export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+export type FetchLike = typeof globalThis.fetch;
 
 function rejected(reason: RemoteReason): Rejected {
   return { kind: 'rejected', reason };
@@ -86,8 +88,9 @@ export function isAllowedRemote(value: unknown): value is AllowedRemote {
 /** True when the raw authority's host ends in `.`, even if a URL parser would keep or drop that dot. */
 export function authorityHasTrailingDot(raw: string): boolean {
   const match = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(raw.trim());
-  if (!match?.[1]) return false;
-  let authority = match[1];
+  const found = captureGroup(match, 1);
+  if (found.tag === 'none' || !found.value) return false;
+  let authority = found.value;
   const at = authority.lastIndexOf('@');
   if (at >= 0) authority = authority.slice(at + 1);
   if (authority.startsWith('[')) {
@@ -101,8 +104,9 @@ export function authorityHasTrailingDot(raw: string): boolean {
 
 function rawAuthorityHost(raw: string): string {
   const match = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(raw.trim());
-  if (!match?.[1]) return '';
-  let authority = match[1];
+  const found = captureGroup(match, 1);
+  if (found.tag === 'none' || !found.value) return '';
+  let authority = found.value;
   const at = authority.lastIndexOf('@');
   if (at >= 0) authority = authority.slice(at + 1);
   if (authority.startsWith('[')) {
@@ -121,15 +125,15 @@ export function rawHostIsIpEncoding(host: string): boolean {
   if (bare.includes(':')) return true;
   if (/^0x[0-9a-f]+$/i.test(bare)) return true;
   if (/^\d+$/.test(bare)) return true;
-  if (/^(?:\d+|0x[0-9a-f]+)(?:\.(?:\d+|0x[0-9a-f]+)){1,3}$/i.test(bare)) return true;
+  if (/^(\d+|0x[0-9a-f]+)(\.(\d+|0x[0-9a-f]+)){1,3}$/i.test(bare)) return true;
   return false;
 }
 
 export function isIpHostname(hostname: string): boolean {
   if (hostname.startsWith('[') || hostname.includes(':')) return true;
-  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname)) return true;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) return true;
   // 127.0.0.1.nip.io and 10.0.0.1.example.com both encode an address in the name.
-  return /(?:^|\.)(?:\d{1,3}\.){3}\d{1,3}(?:\.|$)/.test(hostname);
+  return /(^|\.)(\d{1,3}\.){3}\d{1,3}(\.|$)/.test(hostname);
 }
 
 export function isWildcardDns(hostname: string): boolean {
@@ -150,7 +154,7 @@ function requestUrl(input: RequestInfo | URL): string {
   return input.url;
 }
 
-export type DecideOpts = { allowQuery?: boolean; maxLength?: number };
+export type DecideOpts = Partial<{ allowQuery: boolean; maxLength: number }>;
 
 /**
  * Strict parse of a caller-supplied remote. `allow` is an origin list (tests, ALLOW_REMOTE_ORIGINS)
@@ -158,7 +162,8 @@ export type DecideOpts = { allowQuery?: boolean; maxLength?: number };
  * port, with a public DNS name: no IP literal in any encoding, no wildcard-DNS suffix, no trailing dot.
  */
 export function decideRemote(raw: string, allow: readonly string[] = [], opts: DecideOpts = {}): RemoteDecision {
-  const maxLength = opts.maxLength ?? MAX_REMOTE;
+  const maxField = chainGet(opts, 'maxLength');
+  const maxLength = maxField.tag === 'none' ? MAX_REMOTE : maxField.value as number;
   if (typeof raw !== 'string' || !raw.trim()) return rejected('empty');
   if (raw.length > maxLength) return rejected('too_long');
   // oxlint-disable-next-line no-control-regex -- a remote with controls is not a URL
@@ -212,8 +217,8 @@ function authorizeHop(raw: string, home: AllowedRemote, allow: readonly string[]
 function rejectRedirectLocation(location: string): boolean {
   if (!location || location.length > MAX_REMOTE) return true;
   // oxlint-disable-next-line no-control-regex -- a redirect with controls is not followed
-  if (/[\u0000-\u001f\u007f]/.test(location) || location.includes('\\') || /%(?:2e|2f|5c)/i.test(location)) return true;
-  const path = location.split(/[?#]/)[0] ?? '';
+  if (/[\u0000-\u001f\u007f]/.test(location) || location.includes('\\') || /%(2e|2f|5c)/i.test(location)) return true;
+  const path = unwrapOr(atIndex(location.split(/[?#]/), 0), '');
   return rawPathHasUnsafeSegment(path.startsWith('/') || /^[a-z][a-z0-9+.-]*:/i.test(location) ? extractRequestPath(location.startsWith('/') ? `https://reject.invalid${path}` : location) : path);
 }
 
@@ -225,20 +230,23 @@ export function createGuardedFetch(inner: FetchLike, remote: AllowedRemote, allo
   if (!isAllowedRemote(remote)) throw fail('bad_request', 'remote was not allowlisted');
   const guarded: FetchLike = async (input, init) => {
     let current = authorizeHop(requestUrl(input), remote, allow);
-    const method = init?.method ?? 'GET';
-    const body = init?.body ?? null;
+    const methodField = chainGet(init, 'method');
+    const method = methodField.tag === 'none' ? 'GET' : methodField.value as string;
+    const bodyField = chainGet(init, 'body');
+    const body = bodyField.tag === 'none' ? null : bodyField.value;
     if (body !== null && !(body instanceof Uint8Array)) throw fail('bad_request', 'upstream body is not replayable');
+    const initRecord = init !== null && typeof init === 'object' ? init as Record<string, unknown> : null;
+    const headerField = recordGet(initRecord, 'headers');
+    const signalField = chainGet(init, 'signal');
     for (let hop = 0; hop <= maxRedirects; hop++) {
-      const res = await inner(current.href, {
-        method,
-        headers: init?.headers,
-        body: body ?? undefined,
-        redirect: 'manual',
-        signal: init?.signal ?? undefined,
-      });
+      const requestInit: RequestInit = { method, redirect: 'manual' };
+      if (headerField.tag === 'some') requestInit.headers = headerField.value as HeadersInit;
+      if (body !== null) requestInit.body = body as BodyInit;
+      if (signalField.tag === 'some') requestInit.signal = signalField.value as AbortSignal;
+      const res = await inner(current.href, requestInit);
       if (res.status >= 300 && res.status < 400) {
         const location = res.headers.get('location');
-        await res.body?.cancel().catch(() => {});
+        if (res.body) await res.body.cancel().catch(() => {});
         if (!location || rejectRedirectLocation(location)) throw fail('bad_request', 'redirect host is not an allowlisted host');
         if (hop === maxRedirects) throw fail('bad_request', 'too many redirects');
         let next: string;

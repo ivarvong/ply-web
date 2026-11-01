@@ -26,8 +26,10 @@ export type ViewerSpan = {
   error: (err: unknown) => ViewerSpan;
 };
 
+type StartOpts = Partial<{ parent: unknown; kind: number; attrs: Record<string, unknown> }>;
+
 export type ViewerTracer = {
-  start: (name: string, opts?: { parent?: unknown; kind?: number; attrs?: Record<string, unknown> }) => ViewerSpan;
+  start: (name: string, opts: StartOpts | null) => ViewerSpan;
 };
 
 export type DiscoverInfo = {
@@ -45,7 +47,7 @@ type Fetched = { type: number; data: Uint8Array; oid: string; size: number };
 type CommitView = {
   tree: string | null;
   parents: string[];
-  author: { name?: string; email?: string; time?: string | null; tz?: string } | null;
+  author: Partial<{ name: string; email: string; time: string | null; tz: string }> | null;
   message: string | null;
   signed: boolean;
 };
@@ -62,13 +64,13 @@ export function createGitTransport(url: string, opts: {
 }
 
 export const discoverRepo: (transport: GitTransport) => Promise<DiscoverInfo> = loose(discoverJs);
-export const listRefs: (transport: GitTransport, prefixes: string[]) => Promise<{ refs: Map<string, { oid: string; peeled?: string }>; head: string | null }> = loose(lsRefsJs);
+export const listRefs: (transport: GitTransport, prefixes: string[]) => Promise<{ refs: Map<string, { oid: string } & Partial<{ peeled: string }>>; head: string | null }> = loose(lsRefsJs);
 export const candidates: (ref: string | null) => string[] = loose(refCandidatesJs);
 export const viewCommit: (data: Uint8Array, limits: object) => CommitView = loose(commitViewJs);
 export const treeEntryType: (mode: string) => string = loose(entryTypeJs);
 export const treeMode: (mode: string) => string = loose(lsModeJs);
-export const readObject: (transport: GitTransport, opts: { oid: string; filter?: string; deepen?: number; expectType?: number | null }) => Promise<Fetched> = loose(fetchObjectJs);
-export const readPack: (transport: GitTransport, opts: object, extra?: { resolve?: boolean; attrs?: Record<string, unknown> }) => Promise<{ parsed: ParsedPack | null; objects: Map<string, { type: number; data: Uint8Array }> | null }> = loose(fetchPackJs);
+export const readObject: (transport: GitTransport, opts: { oid: string } & Partial<{ filter: string; deepen: number; expectType: number | null }>) => Promise<Fetched> = loose(fetchObjectJs);
+export const readPack: (transport: GitTransport, opts: object, extra: Partial<{ resolve: boolean; attrs: Record<string, unknown> }> | null) => Promise<{ parsed: ParsedPack | null; objects: Map<string, { type: number; data: Uint8Array }> | null }> = loose(fetchPackJs);
 export const filterRejected: (err: unknown) => boolean = loose(isFilterRejectionJs);
 export const streamPack: (transport: GitTransport, opts: object, span: ViewerSpan) => AsyncIterable<Uint8Array> = loose(packStreamJs);
 export const cursorInit: () => PackCursor = loose(spInitJs);
