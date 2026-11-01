@@ -10,6 +10,13 @@ import { parseFlagKey } from '../../src/flags/brand.ts';
 import { parseUnit } from '../../src/flags/document.ts';
 import type { FlagSelection, Unit } from '../../src/flags/types.ts';
 
+/** One property. A null receiver and a missing key are holes. A stored null stays null. */
+function slot(receiver: unknown, key: string): unknown {
+  if (receiver === null || receiver === void 0) return void 0;
+  if (typeof receiver !== 'object' && typeof receiver !== 'function') return void 0;
+  return (receiver as Record<string, unknown>)[key];
+}
+
 const env = { FLAGS: { present: true }, FLAGS_MAX_AGE_S: String(FLAGS_MAX_AGE_S), FLAGS_SWR_S: String(FLAGS_SWR_S) };
 const ABSENT_UNIT = { kind: 'absent' } as const;
 
@@ -98,7 +105,7 @@ describe('ruleset cache', () => {
       } finally {
         spy.mockRestore();
       }
-      const parsed = lines.map(line => JSON.parse(line) as { msg?: string; cache_status?: string });
+      const parsed = lines.map(line => JSON.parse(line) as { msg: string; cache_status: string });
       expect(parsed.filter(row => row.msg === 'flags.resolve').every(row => row.cache_status === status)).toBe(true);
       expect(parsed.some(row => row.msg === 'flags.resolve' && row.cache_status === status)).toBe(true);
     }
@@ -135,8 +142,8 @@ describe('ruleset cache', () => {
 
 describe('in-worker gate', () => {
   it('stays off when the binding is missing, and on for an allow-listed unit', async () => {
-    expect(await isEnabled({}, undefined, 'ply.usage.note', { id: 'anonymous', attributes: ABSENT_UNIT })).toBe(false);
-    expect(await usageNote({}, undefined, { kind: 'absent' })).toBeNull();
+    expect(await isEnabled({}, void 0, 'ply.usage.note', { id: 'anonymous', attributes: ABSENT_UNIT })).toBe(false);
+    expect(await usageNote({}, void 0, { kind: 'absent' })).toBeNull();
     const store = memoryStore();
     const created = await setRollout(store, { invalidate: async () => ({ kind: 'ok' }) }, 'ply.usage.note', 0, ABSENT_REVISION);
     if (created.kind !== 'ok') throw new Error(created.kind);
@@ -198,9 +205,9 @@ describe('resolve timing', () => {
     }
     expect(spanOpenDuringFetch).toBe(true);
     expect(spans[0]).toBe('flags.eval');
-    const evalLine = lines.map(line => JSON.parse(line) as { msg?: string; resolve_ms?: number; eval_ms?: number }).find(row => row.msg === 'flags.eval');
-    expect(evalLine?.resolve_ms).toBe(12.5);
-    expect(evalLine?.eval_ms).toBe(0);
+    const evalLine = lines.map(line => JSON.parse(line) as { msg: string; resolve_ms: number; eval_ms: number }).find(row => row.msg === 'flags.eval');
+    expect(slot(evalLine, 'resolve_ms')).toBe(12.5);
+    expect(slot(evalLine, 'eval_ms')).toBe(0);
     expect(spans.indexOf('flags.resolve')).toBeGreaterThan(spans.indexOf('flags.eval'));
     expect(spans.indexOf('flags.resolve:end')).toBeLessThan(spans.indexOf('flags.eval:end'));
   });

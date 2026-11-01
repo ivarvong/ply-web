@@ -4,6 +4,13 @@ import { memoryStore, r2Store, type R2BucketLike } from '../../src/flags/store.t
 import { ABSENT_REVISION, FLAGS_OBJECT_KEY } from '../../src/flags/ttl.ts';
 import type { InvalidateResult } from '../../src/flags/store.ts';
 
+/** One property. A null receiver and a missing key are holes. A stored null stays null. */
+function slot(receiver: unknown, key: string): unknown {
+  if (receiver === null || receiver === void 0) return void 0;
+  if (typeof receiver !== 'object' && typeof receiver !== 'function') return void 0;
+  return (receiver as Record<string, unknown>)[key];
+}
+
 const okInvalidate = async (): Promise<InvalidateResult> => ({ kind: 'ok' });
 
 describe('compare-and-swap', () => {
@@ -18,7 +25,7 @@ describe('compare-and-swap', () => {
     expect(stale.kind).toBe('conflict');
     if (stale.kind !== 'conflict') return;
     expect(stale.actual).toBe(created.revision);
-    expect(store.snapshot()?.etag).toBe(created.revision);
+    expect(slot(store.snapshot(), 'etag')).toBe(created.revision);
     const next = await setRollout(store, { invalidate: okInvalidate }, 'ply.usage.note', 5, created.revision);
     expect(next.kind).toBe('ok');
     if (next.kind !== 'ok') return;
@@ -31,7 +38,7 @@ describe('compare-and-swap', () => {
     if (created.kind !== 'ok') throw new Error(created.kind);
     const rejected = await setRollout(store, { invalidate: okInvalidate }, 'ply.usage.note', 10_001, created.revision);
     expect(rejected.kind).toBe('invalid');
-    expect(store.snapshot()?.etag).toBe(created.revision);
+    expect(slot(store.snapshot(), 'etag')).toBe(created.revision);
   });
 
   it('logs the revision pair and the diff, and reports a failed invalidate', async () => {
@@ -41,9 +48,9 @@ describe('compare-and-swap', () => {
     const created = await setRollout(store, { invalidate: okInvalidate }, 'ply.usage.note', 1, ABSENT_REVISION);
     expect(created.kind).toBe('ok');
     if (created.kind !== 'ok') return;
-    const write = lines.map(line => JSON.parse(line) as { msg?: string; oldRevision: string | null; newRevision: string; diff: { op: string }[] }).find(entry => entry.msg === 'flags.write');
+    const write = lines.map(line => JSON.parse(line) as { msg: string; oldRevision: string | null; newRevision: string; diff: { op: string }[] }).find(entry => entry.msg === 'flags.write');
     expect(write).toMatchObject({ msg: 'flags.write', op: 'setRollout', flag: 'ply.usage.note', oldRevision: null, newRevision: created.revision });
-    expect(write?.diff[0]?.op).toBe('create');
+    expect(slot(write == null ? void 0 : write.diff[0], 'op')).toBe('create');
     const targeted = await setTargeting(store, { invalidate: async () => ({ kind: 'failed', reason: 'tag busy' }) }, 'ply.usage.note', { allow: ['user-1'], deny: [], rules: [] }, created.revision);
     expect(targeted).toMatchObject({ kind: 'ok', invalidated: false });
     spy.mockRestore();
@@ -76,10 +83,11 @@ describe('compare-and-swap', () => {
     if (created.kind !== 'ok') return;
     expect(created.revision).toBe('"abc"');
     const createdPut = puts[0];
-    expect(createdPut?.key).toBe(FLAGS_OBJECT_KEY);
-    expect(createdPut?.onlyIf).toBeInstanceOf(Headers);
-    if (!(createdPut?.onlyIf instanceof Headers)) return;
-    expect(createdPut.onlyIf.get('if-none-match')).toBe('*');
+    const onlyIf = slot(createdPut, 'onlyIf');
+    expect(slot(createdPut, 'key')).toBe(FLAGS_OBJECT_KEY);
+    expect(onlyIf).toBeInstanceOf(Headers);
+    if (!(onlyIf instanceof Headers)) return;
+    expect(onlyIf.get('if-none-match')).toBe('*');
     const updated = await setRollout(store, { invalidate: okInvalidate }, 'ply.usage.note', 5, created.revision);
     expect(updated.kind).toBe('ok');
     expect(puts[1]).toMatchObject({ key: FLAGS_OBJECT_KEY, onlyIf: { etagMatches: 'abc' } });

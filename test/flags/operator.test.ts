@@ -16,6 +16,18 @@ import {
 } from '../../src/flags/operator.ts';
 import { readOperatorToken, runFlagsCli, writeOperatorTokenFile } from '../../scripts/flags-cli.ts';
 
+/** Null and a missing value take the fallback. An empty string and 0 stay. */
+function fill<T>(value: unknown, fallback: T): T {
+  return value === null || value === void 0 ? fallback : value as T;
+}
+
+/** One property. A null receiver and a missing key are holes. A stored null stays null. */
+function slot(receiver: unknown, key: string): unknown {
+  if (receiver === null || receiver === void 0) return void 0;
+  if (typeof receiver !== 'object' && typeof receiver !== 'function') return void 0;
+  return (receiver as Record<string, unknown>)[key];
+}
+
 const TOKEN = 'operator-test-token-value';
 const ROLLED_BACK = 0;
 const ADVANCE_MS = 4.25;
@@ -39,11 +51,13 @@ function deps(clock: () => number, lines: string[], order: string[]): OperatorDe
   };
 }
 
-function request(path: string, method: string, token: string | null, body?: string): Request {
+function request(path: string, method: string, token: string | null, body: string | void = void 0): Request {
   const headers = new Headers();
   if (token !== null) headers.set('authorization', `Bearer ${token}`);
-  if (body !== undefined) headers.set('content-type', 'application/json');
-  return new Request(`https://operator.test${path}`, { method, headers, body });
+  if (body !== void 0) headers.set('content-type', 'application/json');
+  const init: RequestInit = { method, headers };
+  if (body !== void 0) init.body = body;
+  return new Request(`https://operator.test${path}`, init);
 }
 
 function control(impl: Partial<FlagControlBinding> = {}): FlagControlBinding {
@@ -73,7 +87,7 @@ describe('operator http', () => {
     expect(wrong.status).toBe(401);
     expect(calls).toBe(0);
     expect(lines.join('\n')).not.toContain(TOKEN);
-    const logged = JSON.parse(lines[0] ?? '{}') as { msg?: string; operator_ms?: number; result?: string };
+    const logged = JSON.parse(fill(lines[0], '{}')) as { msg: string; operator_ms: number; result: string };
     expect(logged.msg).toBe('flags.operator');
     expect(logged.result).toBe('unauthorized');
     expect(logged.operator_ms).toBe(0);
@@ -90,7 +104,7 @@ describe('operator http', () => {
       deps(() => 0, lines, []),
     );
     expect(unbound.status).toBe(503);
-    const body = await unbound.json() as { reason?: string };
+    const body = await unbound.json() as { reason: string };
     expect(body.reason).toContain('FLAG_CONTROL');
   });
 
@@ -98,7 +112,7 @@ describe('operator http', () => {
     let now = 0;
     const order: string[] = [];
     const lines: string[] = [];
-    let seen: { flag?: string; basisPoints?: number; expected?: string } = {};
+    let seen: Partial<{ flag: string; basisPoints: number; expected: string }> = {};
     const env: OperatorEnv = {
       FLAG_OPERATOR_TOKEN: TOKEN,
       FLAG_CONTROL: control({
@@ -121,7 +135,7 @@ describe('operator http', () => {
     expect(order[0]).toBe('span:flags.operator');
     expect(order).toContain('rpc');
     expect(order.at(-1)).toBe('end');
-    const logged = JSON.parse(lines[0] ?? '{}') as { op?: string; result?: string; operator_ms?: number; expected?: string; invalidated?: boolean };
+    const logged = JSON.parse(fill(lines[0], '{}')) as { op: string; result: string; operator_ms: number; expected: string; invalidated: boolean };
     expect(logged).toMatchObject({ op: 'setRollout', result: 'ok', operator_ms: ADVANCE_MS, expected: 'absent', invalidated: true });
     expect(lines[0]).not.toContain(TOKEN);
   });
@@ -227,8 +241,8 @@ describe('flags cli', () => {
       { FLAG_OPERATOR_TOKEN_FILE: path },
       {
         async fetch(_url, init) {
-          authorization = new Headers(init?.headers).get('authorization') ?? '';
-          body = String(init?.body ?? '');
+          authorization = fill(new Headers(slot(init, 'headers') as HeadersInit).get('authorization'), '');
+          body = String(fill(slot(init, 'body'), ''));
           return new Response(JSON.stringify({ kind: 'ok', revision: '"rev"', note: TOKEN }), { status: 200 });
         },
         stdout: line => stdout.push(line),

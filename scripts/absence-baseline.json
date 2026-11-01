@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 45,
-    "optional": 79,
-    "chain": 128,
-    "nullish": 160,
-    "total": 412
+    "word": 42,
+    "optional": 60,
+    "chain": 106,
+    "nullish": 156,
+    "total": 364
   },
   "files": {
     "cloudflare.config.ts": {
@@ -315,34 +315,6 @@
       "chain": 0,
       "nullish": 1,
       "total": 1
-    },
-    "test/flags/cache.test.ts": {
-      "word": 2,
-      "optional": 5,
-      "chain": 2,
-      "nullish": 0,
-      "total": 9
-    },
-    "test/flags/operator.test.ts": {
-      "word": 1,
-      "optional": 13,
-      "chain": 2,
-      "nullish": 4,
-      "total": 20
-    },
-    "test/flags/report.test.ts": {
-      "word": 0,
-      "optional": 0,
-      "chain": 11,
-      "nullish": 0,
-      "total": 11
-    },
-    "test/flags/store.test.ts": {
-      "word": 0,
-      "optional": 1,
-      "chain": 7,
-      "nullish": 0,
-      "total": 8
     },
     "test/proxy.js": {
       "word": 0,
