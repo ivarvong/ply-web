@@ -32,6 +32,7 @@ import { describeFailure } from '../src/viewer/failure.ts';
 import { compareTagNames, tagsFromRefs } from '../src/viewer/tags.ts';
 import { plyBuildValue } from '../src/version.ts';
 import { LAYOUT } from '../src/viewer/layout.ts';
+import { none, some } from '../src/option.ts';
 import { VIEWER_CAPS, VIEWER_GIT_LIMITS, VIEWER_UA, rateLimitFor } from '../src/viewer/limits.ts';
 import type { Loaded, RateNamespace, TraceModel } from '../src/viewer/model.ts';
 import { renderMarkdown } from '../src/viewer/markdown.ts';
@@ -386,12 +387,12 @@ test('header identity: public-v0 leads with namespace / repo; GitHub with owner 
 })
 
 test('rate and byte caps clamp and fail closed', () => {
-  assert.equal(rateLimitFor('page', undefined), 60);
-  assert.equal(rateLimitFor('pack', ''), 20);
-  assert.equal(rateLimitFor('page', '99999'), VIEWER_CAPS.rateCeiling);
-  assert.equal(rateLimitFor('page', '0'), 1);
-  assert.equal(rateLimitFor('page', 'nope'), 60);
-  assert.equal(rateLimitFor('pack', '3'), 3);
+  assert.equal(rateLimitFor('page', none()), 60);
+  assert.equal(rateLimitFor('pack', some('')), 20);
+  assert.equal(rateLimitFor('page', some('99999')), VIEWER_CAPS.rateCeiling);
+  assert.equal(rateLimitFor('page', some('0')), 1);
+  assert.equal(rateLimitFor('page', some('nope')), 60);
+  assert.equal(rateLimitFor('pack', some('3')), 3);
   const budget = createBudget(100, 2);
   budget.countSubrequest();
   budget.countSubrequest();

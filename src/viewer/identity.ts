@@ -1,6 +1,8 @@
 // How a repository is named on the page. The URL keeps the raw host and path; the page leads with what a person
 // recognises: "public-v0 / ply" for the public Artifacts namespace, "owner / repo" on a forge. The raw remote stays
 // available in the Diagnostics section.
+import { atIndex, recordGet } from '../absent.ts'
+import { unwrapOr } from '../option.ts'
 import { PUBLIC_GIT_HOST, PUBLIC_NAMESPACE } from '../public.ts'
 
 export type RepoIdentity = {
@@ -29,15 +31,15 @@ export function repoIdentity(host: string, repoPath: string): RepoIdentity {
   const parts = repoPath.replace(/\.git$/, '').split('/').filter(part => part.length > 0)
   const artifacts = host === PUBLIC_GIT_HOST || host.endsWith('.artifacts.cloudflare.net')
   if (artifacts && parts[0] === 'git' && parts.length === 3) {
-    const scope = parts[1] ?? ''
+    const scope = unwrapOr(atIndex(parts, 1), '')
     return {
       scope,
       scopeHref: host === PUBLIC_GIT_HOST && scope === PUBLIC_NAMESPACE ? '/r' : null,
-      name: parts[2] ?? '',
+      name: unwrapOr(atIndex(parts, 2), ''),
       hostLabel: 'Artifacts',
       remote,
     }
   }
-  const name = parts[parts.length - 1] ?? repoPath
-  return { scope: parts.slice(0, -1).join('/'), scopeHref: null, name, hostLabel: FORGES[host] ?? host, remote }
+  const name = unwrapOr(atIndex(parts, parts.length - 1), repoPath)
+  return { scope: parts.slice(0, -1).join('/'), scopeHref: null, name, hostLabel: unwrapOr(recordGet(FORGES, host), host), remote }
 }
