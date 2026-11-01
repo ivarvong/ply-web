@@ -3,6 +3,8 @@
 // Production backs this class with SQLite (new_sqlite_classes). The counter uses the Durable Object
 // storage API so the same code runs under workerd's in-memory storage, which has no SQL API.
 import { DurableObject } from 'cloudflare:workers';
+import { fromNullable } from '../absent.ts';
+import { unwrapOr } from '../option.ts';
 import type { RateDecision } from './model.ts';
 
 export class ViewerRateLimit extends DurableObject {
@@ -10,7 +12,7 @@ export class ViewerRateLimit extends DurableObject {
     if (bucket !== 'page' && bucket !== 'pack') return { ok: false, remaining: 0, retryAfterMs: windowMs };
     const cutoff = now - windowMs;
     const stored = await this.ctx.storage.get<number[]>(bucket);
-    const hits = (stored ?? []).filter(ts => typeof ts === 'number' && ts > cutoff);
+    const hits = unwrapOr(fromNullable(stored), []).filter(ts => typeof ts === 'number' && ts > cutoff);
     if (hits.length >= limit) {
       const oldest = hits.reduce((min, ts) => Math.min(min, ts), now);
       return { ok: false, remaining: 0, retryAfterMs: Math.max(0, oldest + windowMs - now) };

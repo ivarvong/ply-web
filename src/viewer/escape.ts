@@ -1,7 +1,10 @@
+import { atIndex } from '../absent.ts';
+import { unwrapOr } from '../option.ts';
 export { escapeHtml } from './safehtml.ts';
 
 export function safeFilename(name: string): string {
-  const base = name.split('/').pop() ?? 'file';
+  const parts = name.split('/');
+  const base = unwrapOr(atIndex(parts, parts.length - 1), 'file');
   const cleaned = base.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
   return cleaned || 'file';
 }

@@ -14,8 +14,13 @@ declare const platformAbsentBrand: unique symbol;
  * JavaScript's `undefined`, branded so a mention is a boundary crossing.
  * The brand is a unique symbol: another module cannot forge the type without this symbol.
  * The runtime value is still the host's absent value. Only this module reads or writes it.
+ * Also published globally so an ambient host declaration can name it without becoming a module.
  */
 export type PlatformAbsent = undefined & { readonly [platformAbsentBrand]: "platform-absent" };
+
+declare global {
+  type PlatformAbsent = undefined & { readonly [platformAbsentBrand]: "platform-absent" };
+}
 
 /** True for the host's absent value. Tests use this. Domain code matches on Option. */
 export function isPlatformAbsent(value: unknown): value is PlatformAbsent {

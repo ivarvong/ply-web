@@ -1,5 +1,5 @@
 // Names shared by the operator Worker config, the CLI, and the ply HTTP 405 text.
-// A normal `cf deploy` evaluates cloudflare.config.ts with mode undefined or "production" and uploads ply.
+// A normal `cf deploy` evaluates cloudflare.config.ts with mode unset or "production" and uploads ply.
 // `cf deploy --mode flag-operator` is the only mode that uploads this Worker.
 
 /** Mode that selects the operator Worker. Every other mode, including production, stays on ply. */
