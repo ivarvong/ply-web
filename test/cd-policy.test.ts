@@ -26,7 +26,10 @@ test('the checked-in policy is the correctness ramp', () => {
   assert.equal(loaded.policy.ingestWaitMs, 20_000)
   assert.equal(loaded.policy.warmupMs, 0)
   assert.equal(loaded.policy.probe.rps, 25)
-  assert.deepEqual(loaded.policy.probe.calls.map(call => call.path), ['/', '/v1/discover'])
+  assert.deepEqual(loaded.policy.probe.calls.map(call => call.path), [
+    '/',
+    '/v1/discover?remote=https%3A%2F%2F5ad2236b39de4c8bd8f6270ea63f3ea9.artifacts.cloudflare.net%2Fgit%2Fpublic-v0%2Fply.git',
+  ])
   assert.deepEqual(loaded.policy.steps.map(step => step.percent), [10, 25, 50, 75, 100])
   assert.equal(loaded.policy.burn.fastBurn, FAST_BURN)
   assert.equal(loaded.policy.burn.minSamples, MIN_SAMPLES)
@@ -61,6 +64,18 @@ test('a policy that cannot be run is rejected', () => {
   const zee = raw()
   zee.split = { ...(zee.split as Record<string, unknown>), z: 0 }
   assert.throws(() => parsePolicy(JSON.stringify(zee)), /split\.z/)
+  const spaced = raw()
+  const spacedCalls = (spaced.probe as { calls: { path: string }[] }).calls
+  const discover = spacedCalls[1]
+  if (!discover) throw new Error('missing discover call')
+  discover.path = '/v1/discover?remote=a b'
+  assert.throws(() => parsePolicy(JSON.stringify(spaced)), /probe\.calls\[1\]\.path/)
+  const bare = raw()
+  const bareCalls = (bare.probe as { calls: { path: string }[] }).calls
+  const root = bareCalls[0]
+  if (!root) throw new Error('missing root call')
+  root.path = 'discover'
+  assert.throws(() => parsePolicy(JSON.stringify(bare)), /must be a path starting with \//)
 })
 
 test('the checked-in probe can see a correctness regression on the smallest step', () => {

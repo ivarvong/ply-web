@@ -1,8 +1,7 @@
 // Pure reading of a write body. Every rejection here is bad_request and happens before any fetch.
-import { fail, validateRef } from 'ply';
+import { fail, parseOid, validateRef, ZERO_OID, type Oid } from 'ply';
 import { BLOB_MODES, MODE_BLOB, OP_CREATE, OP_DELETE, OP_EDIT, OP_RENAME, OP_WRITE } from './constants.ts';
 import { stamp, type Stamp, type UnixSeconds } from './identity.ts';
-import { asOid, isOid, isZeroOid, type Oid } from './oid.ts';
 
 export type BlobMode = typeof BLOB_MODES[number];
 
@@ -35,6 +34,11 @@ export type EditRequest = {
 
 type Body = Record<string, unknown>;
 
+function parsedOid(value: unknown): Oid | null {
+  const parsed = parseOid(value);
+  return parsed.ok ? parsed.value : null;
+}
+
 export function asBody(value: unknown): Body {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw fail('bad_request', 'body must be a JSON object');
   return value as Body;
@@ -47,8 +51,8 @@ export function fullRef(name: string): string {
 /** A branch we may push. A 40-hex string is a commit id, never a branch called that. */
 export function branchRef(value: unknown, field: string): string {
   if (typeof value !== 'string' || value === '') throw fail('bad_request', `${field} is required`);
-  if (isZeroOid(value)) throw fail('bad_request', `${field} must not be the zero oid`);
-  if (isOid(value)) throw fail('bad_request', `${field} must be a branch name, not a commit id`);
+  if (value === ZERO_OID) throw fail('bad_request', `${field} must not be the zero oid`);
+  if (parsedOid(value)) throw fail('bad_request', `${field} must be a branch name, not a commit id`);
   return validateRef(fullRef(value)) as string;
 }
 
@@ -58,14 +62,14 @@ export function branchRef(value: unknown, field: string): string {
  */
 export function refOrCommit(value: unknown, field: string): string {
   if (typeof value !== 'string' || value === '') throw fail('bad_request', `${field} is required`);
-  if (isZeroOid(value)) throw fail('bad_request', `${field} must not be the zero oid`);
-  if (isOid(value)) return value;
+  if (value === ZERO_OID) throw fail('bad_request', `${field} must not be the zero oid`);
+  if (parsedOid(value)) return value;
   return branchRef(value, field);
 }
 
 export function tagRef(value: unknown): string {
   if (typeof value !== 'string' || value === '') throw fail('bad_request', 'name is required');
-  if (isOid(value) || isZeroOid(value)) throw fail('bad_request', 'name must be a tag name, not an object id');
+  if (parsedOid(value)) throw fail('bad_request', 'name must be a tag name, not an object id');
   const full = value.startsWith('refs/tags/') ? value : `refs/tags/${value}`;
   return validateRef(full) as string;
 }
@@ -73,29 +77,33 @@ export function tagRef(value: unknown): string {
 export function parseBase(value: unknown): BaseSpec {
   if (value === undefined || value === null || value === '') return { kind: 'omit' };
   if (typeof value !== 'string') throw fail('bad_request', 'base must be a branch name or a 40-hex commit id');
-  if (isZeroOid(value)) throw fail('bad_request', 'base must not be the zero oid; omit base to create a root commit');
-  if (isOid(value)) return { kind: 'oid', oid: asOid(value) };
+  if (value === ZERO_OID) throw fail('bad_request', 'base must not be the zero oid; omit base to create a root commit');
+  const baseOid = parsedOid(value);
+  if (baseOid) return { kind: 'oid', oid: baseOid };
   return { kind: 'ref', ref: branchRef(value, 'base') };
 }
 
 /** The oid a delete compares against. Omitted means "whatever ls-refs shows now". The zero oid is not a tip. */
 export function parseDeleteOid(value: unknown): Oid | null {
   if (value === undefined || value === null || value === '') return null;
-  if (isZeroOid(value)) throw fail('bad_request', 'oid must not be the zero oid');
-  if (!isOid(value)) throw fail('bad_request', 'oid must be a 40-hex oid');
-  return asOid(value);
+  if (value === ZERO_OID) throw fail('bad_request', 'oid must not be the zero oid');
+  const oid = parsedOid(value);
+  if (!oid) throw fail('bad_request', 'oid must be a 40-hex oid');
+  return oid;
 }
 
 export function parseExpectedHead(value: unknown): ExpectedHead {
   if (value === undefined || value === null || value === '') return { kind: 'any' };
-  if (!isOid(value)) throw fail('bad_request', 'head must be a 40-hex oid');
-  return { kind: 'oid', oid: asOid(value) };
+  const oid = parsedOid(value);
+  if (!oid) throw fail('bad_request', 'head must be a 40-hex oid');
+  return { kind: 'oid', oid };
 }
 
 function parseHint(value: unknown): Oid | null {
   if (value === undefined || value === null || value === '') return null;
-  if (isZeroOid(value) || !isOid(value)) throw fail('bad_request', 'hint must be a 40-hex commit id');
-  return asOid(value);
+  const oid = parsedOid(value);
+  if (value === ZERO_OID || !oid) throw fail('bad_request', 'hint must be a 40-hex commit id');
+  return oid;
 }
 
 export function parseMode(value: unknown): BlobMode {

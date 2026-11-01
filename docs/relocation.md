@@ -1,6 +1,6 @@
 # Git logic still in ply-web
 
-ply-web drives [ply](https://github.com/ivarvong/ply). General git logic belongs in ply. This file is the inventory of what is still here after ply `1274f2d` (ply-web `99e9b26`, PR #45) and the deletions in this PR.
+ply-web drives [ply](https://github.com/ivarvong/ply). General git logic belongs in ply. This file is the inventory of what is still here after ply `af5cac03`.
 
 Each numbered step is one ply change. It names the ply issue, the functions ply-web still owns, and the API that lets ply-web delete that workaround in the next ply-web PR. A step depends only on steps above it (or on ply that has already shipped). Independent steps can land in parallel; the order is the one that lets each deletion compile on its own.
 
@@ -13,9 +13,12 @@ ply [#126](https://github.com/ivarvong/ply/issues/126) orders ply's own work dif
 | Removed | Replaced by |
 | --- | --- |
 | `head.ts` spoke unborn ls-refs itself (`unbornLsRefsBody`, `parseHeadLine`, `headFromLines`) | `readHead` calls `lsRefs(t, ['HEAD'], { unborn: true, info })`. `headFromListing` only classifies the result. |
-| `pick.ts` `treeMap`, `imagesMatch`, `patchApplied`, and the `merge_conflict` catch that rewrote an already-applied pick as empty | `mapPickOutcome` is exhaustive over ply's `PickOutcome`: `empty` or `ok`. `merge_conflict` is thrown and is HTTP 409. |
+| `pick.ts` `treeMap`, `imagesMatch`, `patchApplied`, and the `merge_conflict` catch that rewrote an already-applied pick as empty | `mapPickOutcome` is exhaustive over ply's `PickOutcome`: `empty`, `ok`, or `kept_empty`. `merge_conflict` is thrown and is HTTP 409. |
 | `identity.ts` `parseTz`, and `IDENT_TZ_*` / `LS_REFS_*` in `constants.ts` | `validateIdent` owns the zone. `stamp` passes `tz` through. |
 | `handle.ts` `sameStamp` on merge and rebase (one identity, one timestamp) | `author` and `committer` are separate `plyStamp`s. `from` and `onto` go through `refOrCommit` (branch name or 40-hex). |
+| `pick.ts` `writeEmpty`, `load`, `messageBody` | `allowEmpty` passes ply `empty: 'keep'`. `mapPickOutcome` maps `kept_empty` to an applied cherry-pick or revert. `empty` still writes nothing. |
+| `src/write/oid.ts` (`Oid`, `ZERO_OID`, `isOid`, `isZeroOid`, `asOid`, `parseCommitOid`) | ply `parseOid`, `parseCommitId`, `ZERO_OID`, and `Oid`. `request.ts` keeps its own `bad_request` text. Mode constants and the hex patterns in `abbrev.ts`, `pinned.ts`, and `version.ts` stay. |
+| `branch.ts` `tipOf`, `tag.ts` `commitOf`, `commit.ts` `commitOf` (regex and code maps) | `fetchCommit`, then a match on `miss` (`absent` or `not_commit`). `pack_corrupt` and every other code are thrown through. |
 
 `src/hold-last.ts` stays. ply [#111](https://github.com/ivarvong/ply/issues/111) is still open.
 
@@ -39,6 +42,8 @@ A server that does not advertise `ls-refs=unborn` is an absent HEAD, which is wh
 
 ### 1. Cherry-pick `--keep-redundant-commits` — ply #117
 
+Landed with ply `af5cac03`. `writeEmpty` is gone. The notes below are the API that replaced it.
+
 Depends on nothing new. ply `1274f2d` already returns `outcome: 'empty'`.
 
 | | |
@@ -59,12 +64,14 @@ pickCommit(url, { ref, commit, committer, message, empty?: 'stop' | 'keep' }, op
 
 ### 2. Oid and mode vocabulary — ply #125
 
+The oid half landed with ply `af5cac03` (`oid.ts` is gone). Mode constants and the hex patterns in `abbrev.ts`, `pinned.ts`, and `version.ts` are still here.
+
 Depends on nothing.
 
 | | |
 | --- | --- |
 | Files | `src/write/oid.ts` (`Oid`, `ZERO_OID`, `isOid`, `isZeroOid`, `asOid`, `parseCommitOid`); `src/write/constants.ts` (`OID_BYTES`, `OID_HEX_CHARS`, `MODE_BLOB`, `MODE_EXEC`, `MODE_LINK`, `MODE_TREE`, `BLOB_MODES`); the same `/^[0-9a-f]{40}$/` in `src/abbrev.ts` (`FULL_OID`), `src/pinned.ts` (`OID`), `src/version.ts` (`SHA1_HEX`) |
-| What it does | Re-declares git format facts ply already has and does not export from the package root. `parseCommitOid` rejects the zero oid. `OP_*` in `constants.ts` are HTTP op names and stay. `version.ts` checks a build-injected SHA, not an object id; it can keep a local pattern or share `parseOid`. |
+| What it does | Mode constants and the local hex patterns re-declare facts ply also exports. `OP_*` in `constants.ts` are HTTP op names and stay. `version.ts` checks a build-injected SHA, not an object id; it keeps its local pattern. |
 
 ```ts
 export type Oid = string & { readonly __oid: unique symbol }
@@ -97,6 +104,8 @@ Depends on nothing. **This workaround stays in this PR.** It blocks step 13.
 No new function name. `openBlob`'s stream holds its final chunk until the hash and trailer verify; on failure it errors without releasing that chunk. The exported form in step 13 carries the same guarantee.
 
 ### 5. Commit existence — ply #112
+
+Landed with ply `af5cac03`. `tipOf` and both `commitOf` helpers call `fetchCommit` and match `miss`. The notes below are the API that replaced the regex and code maps.
 
 Depends on nothing. Blocks steps 6, 8, and 9.
 

@@ -1,13 +1,12 @@
 // Build a commit from create/write/edit/delete/rename and push it. A missing ref is created (old oid = zero):
 // that is the root commit on an empty repository, and a new branch when `base` names another ref or a commit.
 // One find/replace on an existing file still goes through ply's editFile, which streams the blob.
-import { fail, editFile, encodeCommit, fetchObject, hashObject, isLfsPointerPrefix, lsRefs, operation, parseCommit, parseTree, push, resolveCommit, TYPE, validatePath, KIND, type Span } from 'ply'
+import { fail, editFile, encodeCommit, fetchCommit, fetchObject, hashObject, isLfsPointerPrefix, lsRefs, operation, parseOid, parseTree, push, resolveCommit, TYPE, validatePath, ZERO_OID, KIND, type Oid, type Span } from 'ply'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
 import { MODE_TREE, BLOB_MODES } from './constants.ts'
 import { refExists } from './errors.ts'
 import { readHead } from './head.ts'
 import { plyPerson, type Stamp } from './identity.ts'
-import { ZERO_OID, asOid, type Oid } from './oid.ts'
 import { sameBranch, type Change, type EditRequest } from './request.ts'
 import { writeResult } from './result.ts'
 import { emptyDir, encodeMem, fileLeaf, isTree, lazyNode, lookup, putAt, removeAt, renameAt, replaceOnce, setChild, type Mem } from './tree.ts'
@@ -49,27 +48,40 @@ async function resolveTarget(t: Transport, ref: string | null): Promise<Target> 
     throw fail('not_found', 'remote HEAD is absent; pass ref explicitly')
   }
   const listed = (await lsRefs(t, [ref])).refs.get(ref)?.oid as string | undefined
-  return { ref, oid: listed ? asOid(listed) : null }
+  return { ref, oid: listed ? oidOf(listed) : null }
+}
+
+function oidOf(value: string): Oid {
+  const parsed = parseOid(value)
+  if (!parsed.ok) throw parsed.error
+  return parsed.value
 }
 
 async function commitOf(t: Transport, oid: string): Promise<{ tree: string; parents: string[] }> {
-  try {
-    const obj = await fetchObject(t, { oid, filter: 'tree:0', deepen: 1, expectType: TYPE.COMMIT })
-    return parseCommit(obj.data, t.limits) as { tree: string; parents: string[] }
-  } catch (e) {
-    const code = (e as { code?: string })?.code
-    const message = String((e as { message?: string })?.message ?? '')
-    if (code === 'pack_corrupt' && /expected commit/.test(message)) throw fail('not_found', `${oid} is not a commit`)
-    if (code === 'remote_error' || code === 'not_found') throw fail('not_found', `commit ${oid} not found`)
-    throw e
+  const fetched = await fetchCommit(t, oid)
+  if (!fetched.ok) {
+    const error = fetched.error
+    if (error.code === 'not_found' && error.miss) {
+      switch (error.miss.kind) {
+        case 'absent':
+        case 'not_commit':
+          throw error
+        default: {
+          const unreachable: never = error.miss
+          throw unreachable
+        }
+      }
+    }
+    throw error
   }
+  return { tree: fetched.value.commit.tree, parents: fetched.value.commit.parents }
 }
 
 async function resolveParent(t: Transport, req: EditRequest, target: Target): Promise<Parent> {
   if (req.base.kind === 'oid') return { oid: req.base.oid, tree: (await commitOf(t, req.base.oid)).tree }
   if (req.base.kind === 'ref' && !sameBranch(req.base.ref, target.ref)) {
     const resolved = await resolveCommit(t, req.base.ref) as { commit: string }
-    return { oid: asOid(resolved.commit), tree: (await commitOf(t, resolved.commit)).tree }
+    return { oid: oidOf(resolved.commit), tree: (await commitOf(t, resolved.commit)).tree }
   }
   if (target.oid === null) return { oid: null, tree: null }
   return { oid: target.oid, tree: (await commitOf(t, target.oid)).tree }
