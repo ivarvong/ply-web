@@ -1,6 +1,7 @@
 import type { Child } from 'hono/jsx'
 import type { BranchInfo, RepoHeader, TagInfo, TraceBar, TraceModel } from './model.ts'
 import { PLY_SHA, PLY_WEB_SHA, plyBuildValue } from '../version.ts'
+import { atIndex } from '../absent.ts'
 
 /** Hex digits of each commit shown in the footer. */
 const BUILD_SHA_CHARS = 12
@@ -16,9 +17,10 @@ import { repoIdentity } from './identity.ts'
 import { LAYOUT } from './layout.ts'
 import { VIEWER_CSS_PATH } from './styles.ts'
 
-export function Button(props: { variant: ButtonVariant; size: ButtonSize; type?: 'submit' | 'button'; children: Child }) {
+export function Button(props: { variant: ButtonVariant; size: ButtonSize; type: 'submit' | 'button' | null; children: Child }) {
   const tone = props.variant === 'primary' ? 'is-primary' : 'is-secondary'
-  return <button type={props.type ?? 'submit'} class={`btn ${tone} ${buttonClass(props.variant, props.size)}`}>{props.children}</button>
+  const type = props.type === null ? 'submit' : props.type
+  return <button type={type} class={`btn ${tone} ${buttonClass(props.variant, props.size)}`}>{props.children}</button>
 }
 
 export function Banner(props: { tone: BannerTone; children: Child }) {
@@ -55,12 +57,12 @@ export function Sprite() {
   )
 }
 
-export function Icon(props: { name: keyof typeof ICONS; class?: string }) {
+export function Icon(props: { name: keyof typeof ICONS; class: string | null }) {
   return <svg class={`i i-${props.name}${props.class ? ` ${props.class}` : ''}`} width="16" height="16" aria-hidden="true" focusable="false"><use href={`#i-${props.name}`} /></svg>
 }
 
-export function IconFolder() { return <Icon name="dir" /> }
-export function IconFile() { return <Icon name="file" /> }
+export function IconFolder() { return <Icon name="dir" class={null} /> }
+export function IconFile() { return <Icon name="file" class={null} /> }
 
 // ── page frame ──────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -89,18 +91,18 @@ export function Document(props: { title: string; children: Child }) {
 }
 
 /** Kumo LayerCard: an elevated frame, an optional header strip (Secondary), and the raised panel (Primary). */
-export function Card(props: { head?: Child; id?: string; class?: string; children: Child }) {
+export function Card(props: { head: Child | null; id: string | null; class: string | null; children: Child }) {
   return (
-    <section class={`card ${KUMO_LAYER_CARD}${props.class ? ` ${props.class}` : ''}`} id={props.id}>
+    <section class={`card ${KUMO_LAYER_CARD}${props.class ? ` ${props.class}` : ''}`} {...(props.id ? { id: props.id } : {})}>
       {props.head ? <div class={`card-head ${KUMO_LAYER_CARD_SECONDARY}`}>{props.head}</div> : null}
       <div class={`card-body ${KUMO_LAYER_CARD_PRIMARY}`}>{props.children}</div>
     </section>
   )
 }
 
-export function Badge(props: { tone: 'neutral' | 'outline' | 'success' | 'info' | 'warning' | 'danger'; title?: string; children: Child }) {
+export function Badge(props: { tone: 'neutral' | 'outline' | 'success' | 'info' | 'warning' | 'danger'; title: string | null; children: Child }) {
   const cls = { neutral: KUMO_BADGE_NEUTRAL, outline: KUMO_BADGE_OUTLINE, success: KUMO_BADGE_SUCCESS, info: KUMO_BADGE_INFO, warning: KUMO_BADGE_WARNING, danger: KUMO_BADGE_DANGER }[props.tone]
-  return <span class={cls} title={props.title}>{props.children}</span>
+  return <span class={cls} {...(props.title ? { title: props.title } : {})}>{props.children}</span>
 }
 
 export function Signed() {
@@ -113,7 +115,7 @@ function shortRef(ref: string): string {
   return ref.replace(/^refs\/heads\//, '').replace(/^refs\/tags\//, '')
 }
 
-export function RepoIdentity(props: { host: string; repoPath: string; ref?: string | null }) {
+export function RepoIdentity(props: { host: string; repoPath: string; ref: string | null }) {
   const id = repoIdentity(props.host, props.repoPath)
   const root = viewerHref(props.host, props.repoPath, props.ref ? { ref: props.ref } : {})
   return (
@@ -177,7 +179,7 @@ export function RefSwitcher(props: { header: RepoHeader; path: string; branches:
   return (
     <details class="refbox">
       <summary class={`ref-summary ${KUMO_BUTTON_SIZE_SM} ${KUMO_BUTTON_SECONDARY} ${KUMO_BUTTON_FOCUS}`} aria-label={`Ref ${current}. Switch branch or tag`}>
-        <Icon name="branch" />
+        <Icon name="branch" class={null} />
         <span class="ref-v">{current}</span>
         <Icon name="chevron" class="i-sm" />
       </summary>
@@ -232,12 +234,21 @@ function barTone(bar: TraceBar): string {
   return 'c-fetch'
 }
 
+function lineValue(lines: readonly string[], prefix: string): string | null {
+  for (const line of lines) {
+    if (!line.startsWith(prefix)) continue
+    const value = atIndex(line.split('='), 1)
+    return value.tag === 'some' ? value.value : null
+  }
+  return null
+}
+
 function callLabel(bar: TraceBar): { name: string; tag: string } {
   const name = bar.name.replace(/^git\.(upload-pack|receive-pack)\s+/, '').replace(/^git\./, '')
-  const filter = bar.lines.find(line => line.startsWith('git.fetch.filter.fallback='))?.split('=')[1]
-    ?? bar.lines.find(line => line.startsWith('git.fetch.filter='))?.split('=')[1]
-  const deepen = bar.lines.find(line => line.startsWith('git.fetch.deepen='))?.split('=')[1]
-  const tag = [filter, deepen && deepen !== '0' ? `deepen ${deepen}` : ''].filter(Boolean).join(' · ')
+  const fallback = lineValue(bar.lines, 'git.fetch.filter.fallback=')
+  const filter = fallback === null ? lineValue(bar.lines, 'git.fetch.filter=') : fallback
+  const deepen = lineValue(bar.lines, 'git.fetch.deepen=')
+  const tag = [filter, deepen !== null && deepen !== '0' ? `deepen ${deepen}` : ''].filter(Boolean).join(' · ')
   return { name, tag }
 }
 
@@ -261,7 +272,7 @@ export function Waterfall(props: { trace: TraceModel; host: string; repoPath: st
         const failed = bar.status === 'error' || (bar.httpStatus !== null && bar.httpStatus >= 400)
         const label = callLabel(bar)
         const packHref = bar.packWant && bar.packFilter
-          ? viewerHref(props.host, props.repoPath, { ref: props.ref ?? undefined, want: bar.packWant, filter: bar.packFilter })
+          ? viewerHref(props.host, props.repoPath, { ref: props.ref === null ? '' : props.ref, want: bar.packWant, filter: bar.packFilter })
           : null
         return (
           <details class={failed ? 'wf-row err' : 'wf-row'} role="row">
@@ -302,11 +313,11 @@ function shownId(id: string): string {
  * Everything about how the page was fetched, collapsed by default (open with ?trace=1): the remote, the git calls
  * as a waterfall on one shared timeline, the protocol the server spoke, pack-map links, and request ids.
  */
-export function Diagnostics(props: { trace: TraceModel; header?: RepoHeader; host?: string; repoPath?: string; ref?: string | null; open?: boolean }) {
+export function Diagnostics(props: { trace: TraceModel; header: RepoHeader | null; host: string | null; repoPath: string | null; ref: string | null; open: boolean }) {
   const trace = props.trace
-  const host = props.header?.host ?? props.host ?? ''
-  const repoPath = props.header?.repoPath ?? props.repoPath ?? ''
-  const ref = props.header?.ref ?? props.ref ?? null
+  const host = props.header === null ? (props.host === null ? '' : props.host) : props.header.host
+  const repoPath = props.header === null ? (props.repoPath === null ? '' : props.repoPath) : props.header.repoPath
+  const ref = props.header === null ? props.ref : props.header.ref
   const wide = trace.bars.filter(bar => bar.lines.some(line => line.startsWith('git.fetch.filter.fallback=')))
   // learned=true: this page saw the 400 and retried. learned=false: the isolate already knew, so it asked for blob:none.
   // A refusal on this page (any call: the history window is often the first to ask for tree:0) counts as a retry here.
@@ -319,9 +330,9 @@ export function Diagnostics(props: { trace: TraceModel; header?: RepoHeader; hos
   const id = host && repoPath ? repoIdentity(host, repoPath) : null
   return (
     <section class="diag" id="diagnostics">
-      <details class="diag-box" open={props.open}>
+      <details class="diag-box" {...(props.open ? { open: true } : {})}>
         <summary class="diag-sum">
-          <Icon name="pulse" />
+          <Icon name="pulse" class={null} />
           <span class="diag-title">Diagnostics</span>
           <span class="diag-pill">{pill}</span>
           <Icon name="chevron" class="i-sm diag-chev" />
@@ -341,9 +352,9 @@ export function Diagnostics(props: { trace: TraceModel; header?: RepoHeader; hos
           {props.header ? (
             <p class="diag-links">
               Pack maps for this commit:{' '}
-              <a href={viewerHref(host, repoPath, { ref: ref ?? undefined, want: props.header.commit, filter: 'tree:0' })}>tree:0</a>
+              <a href={viewerHref(host, repoPath, { ref: ref === null ? '' : ref, want: props.header.commit, filter: 'tree:0' })}>tree:0</a>
               {' · '}
-              <a href={viewerHref(host, repoPath, { ref: ref ?? undefined, want: props.header.commit, filter: 'blob:none' })}>blob:none</a>
+              <a href={viewerHref(host, repoPath, { ref: ref === null ? '' : ref, want: props.header.commit, filter: 'blob:none' })}>blob:none</a>
             </p>
           ) : null}
         </div>
@@ -362,6 +373,6 @@ export function Diagnostics(props: { trace: TraceModel; header?: RepoHeader; hos
 }
 
 /** Old name kept for the pages that only need the footer. */
-export function Footer(props: { trace: TraceModel; header?: RepoHeader; host?: string; repoPath?: string; ref?: string | null; open?: boolean }) {
+export function Footer(props: { trace: TraceModel; header: RepoHeader | null; host: string | null; repoPath: string | null; ref: string | null; open: boolean }) {
   return <Diagnostics {...props} />
 }
