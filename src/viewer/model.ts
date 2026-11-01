@@ -43,14 +43,15 @@ export type TraceBar = {
   packFilter: FilterName | null;
 };
 
+/** ?trace=1: render the Diagnostics section open. A missing flag stays closed. */
+type TraceOpen = Partial<{ expanded: boolean }>;
+
 export type TraceModel = {
   bars: TraceBar[];
   totalMs: number;
   cfRay: string;
   requestId: string;
-  /** ?trace=1: render the Diagnostics section open. */
-  expanded?: boolean;
-};
+} & TraceOpen;
 
 export type RepoHeader = {
   host: string;
@@ -111,13 +112,13 @@ export type RateNamespace = {
   get(id: unknown): { admit(bucket: string, now: number, limit: number, windowMs: number): Promise<RateDecision> | RateDecision };
 };
 
-export type ViewerEnv = {
-  VIEWER_RATE?: RateNamespace;
+export type ViewerEnv = Partial<{
+  VIEWER_RATE: RateNamespace;
   /** Artifacts binding for the public namespace (cloudflare.config.ts). Mints read tokens; nothing else is called. */
-  PUBLIC_REPOS?: ArtifactsNamespace;
+  PUBLIC_REPOS: ArtifactsNamespace;
   /** Comma-separated exact hostnames appended to the built-in allowlist. Wildcards are ignored. */
-  VIEWER_EXTRA_HOSTS?: string;
-  VIEWER_RATE_PER_MIN?: string;
-  VIEWER_PACK_RATE_PER_MIN?: string;
-  PACK_CACHE?: string;
-};
+  VIEWER_EXTRA_HOSTS: string;
+  VIEWER_RATE_PER_MIN: string;
+  VIEWER_PACK_RATE_PER_MIN: string;
+  PACK_CACHE: string;
+}>;

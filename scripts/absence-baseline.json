@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 62,
-    "optional": 191,
-    "chain": 234,
-    "nullish": 256,
-    "total": 743
+    "word": 59,
+    "optional": 146,
+    "chain": 225,
+    "nullish": 243,
+    "total": 673
   },
   "files": {
     "cloudflare.config.ts": {
@@ -259,41 +259,6 @@
       "chain": 0,
       "nullish": 1,
       "total": 1
-    },
-    "src/flags/cache.ts": {
-      "word": 0,
-      "optional": 3,
-      "chain": 0,
-      "nullish": 0,
-      "total": 3
-    },
-    "src/rays.ts": {
-      "word": 1,
-      "optional": 7,
-      "chain": 2,
-      "nullish": 7,
-      "total": 17
-    },
-    "src/remote.ts": {
-      "word": 2,
-      "optional": 13,
-      "chain": 7,
-      "nullish": 6,
-      "total": 28
-    },
-    "src/viewer/model.ts": {
-      "word": 0,
-      "optional": 7,
-      "chain": 0,
-      "nullish": 0,
-      "total": 7
-    },
-    "src/viewer/ply.ts": {
-      "word": 0,
-      "optional": 15,
-      "chain": 0,
-      "nullish": 0,
-      "total": 15
     },
     "test/cd-flags-smoke.test.ts": {
       "word": 0,

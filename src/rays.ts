@@ -19,6 +19,8 @@
 // Server-Timing uses the same phases and durations, then `total` for the Worker request.
 // Nothing in either header is a URL, a credential, or a repository name.
 
+import { chainGet } from './absent.ts';
+
 /** Response header carrying the upstream ray log. */
 export const RAY_HEADER = 'x-artifacts-ray';
 
@@ -185,7 +187,7 @@ export function createRayLog(): RayLog {
 const REDIRECT_MIN = 300;
 const REDIRECT_MAX = 400;
 
-export type UpstreamFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+export type UpstreamFetch = typeof globalThis.fetch;
 
 function requestUrl(input: RequestInfo | URL): string {
   if (typeof input === 'string') return input;
@@ -193,7 +195,7 @@ function requestUrl(input: RequestInfo | URL): string {
   return input.url;
 }
 
-function bodyBytes(body: BodyInit | null | undefined): Uint8Array | null {
+function bodyBytes(body: unknown): Uint8Array | null {
   return body instanceof Uint8Array ? body : null;
 }
 
@@ -204,8 +206,10 @@ function bodyBytes(body: BodyInit | null | undefined): Uint8Array | null {
  */
 export function observeUpstream(inner: UpstreamFetch, log: RayLog): UpstreamFetch {
   return async (input, init) => {
-    const method = init?.method ?? 'GET';
-    const phase = phaseOf(method, requestUrl(input), bodyBytes(init?.body));
+    const methodField = chainGet(init, 'method');
+    const method = methodField.tag === 'none' ? 'GET' : methodField.value as string;
+    const bodyField = chainGet(init, 'body');
+    const phase = phaseOf(method, requestUrl(input), bodyBytes(bodyField.tag === 'none' ? null : bodyField.value));
     const index = phase === null ? null : log.reserve(phase);
     const start = Date.now();
     try {
@@ -223,8 +227,10 @@ export function observeUpstream(inner: UpstreamFetch, log: RayLog): UpstreamFetc
 }
 
 type OtlpAttribute = { key: string; value: { stringValue: string } | { intValue: string } };
-type OtlpSpan = { name?: string; startTimeUnixNano?: string; attributes?: OtlpAttribute[] };
-type OtlpLine = { resourceSpans?: { scopeSpans?: { spans?: OtlpSpan[] }[] }[] };
+type OtlpSpan = Partial<{ name: string; startTimeUnixNano: string; attributes: OtlpAttribute[] }>;
+type OtlpScope = Partial<{ spans: OtlpSpan[] }>;
+type OtlpResource = Partial<{ scopeSpans: OtlpScope[] }>;
+type OtlpLine = Partial<{ resourceSpans: OtlpResource[] }>;
 
 /**
  * Span names that wrap exactly one git HTTP exchange, in the order those exchanges start.
@@ -239,6 +245,12 @@ const SPAN_PHASE: Readonly<Record<string, Phase>> = {
   'git.receive-pack advertise': 'receive-pack',
 };
 
+function listed(value: unknown, key: string): unknown[] {
+  const found = chainGet(value, key);
+  if (found.tag === 'none') return [];
+  return found.value as unknown[];
+}
+
 const ATTR_RAY = 'git.upstream.cf_ray';
 const ATTR_PHASE = 'git.upstream.phase';
 const ATTR_DUR = 'git.upstream.dur_ms';
@@ -251,11 +263,14 @@ const ATTR_DUR = 'git.upstream.dur_ms';
 export function stampUpstreamSpans(lines: readonly unknown[], report: RayReport): void {
   const spans: { start: bigint; span: OtlpSpan }[] = [];
   for (const line of lines as OtlpLine[]) {
-    for (const resource of line.resourceSpans ?? []) {
-      for (const scope of resource.scopeSpans ?? []) {
-        for (const span of scope.spans ?? []) {
-          if (!span.name || !(span.name in SPAN_PHASE)) continue;
-          spans.push({ start: BigInt(span.startTimeUnixNano ?? '0'), span });
+    for (const resource of listed(line, 'resourceSpans')) {
+      for (const scope of listed(resource, 'scopeSpans')) {
+        for (const span of listed(scope, 'spans') as OtlpSpan[]) {
+          const name = chainGet(span, 'name');
+          if (name.tag === 'none' || typeof name.value !== 'string' || name.value.length === 0 || !(name.value in SPAN_PHASE)) continue;
+          const started = chainGet(span, 'startTimeUnixNano');
+          const nanos = started.tag === 'none' ? '0' : String(started.value);
+          spans.push({ start: BigInt(nanos), span });
         }
       }
     }
@@ -271,7 +286,9 @@ export function stampUpstreamSpans(lines: readonly unknown[], report: RayReport)
     const entry = delivered[i];
     const span = spans[i];
     if (!entry || !span) continue;
-    const attributes = span.span.attributes ?? (span.span.attributes = []);
+    const foundAttributes = chainGet(span.span, 'attributes');
+    const attributes = foundAttributes.tag === 'some' ? foundAttributes.value as OtlpAttribute[] : [];
+    if (foundAttributes.tag === 'none') span.span.attributes = attributes;
     attributes.push(
       { key: ATTR_RAY, value: { stringValue: renderRay(entry.ray) } },
       { key: ATTR_PHASE, value: { stringValue: entry.phase } },
@@ -288,7 +305,8 @@ const EXPOSE = [RAY_HEADER, 'server-timing'];
  */
 export function exposeRayHeaders(headers: Headers): void {
   if (!headers.has('access-control-allow-origin')) return;
-  const have = new Set((headers.get('access-control-expose-headers') ?? '').split(',').map(part => part.trim().toLowerCase()).filter(Boolean));
+  const expose = headers.get('access-control-expose-headers');
+  const have = new Set((expose === null ? '' : expose).split(',').map(part => part.trim().toLowerCase()).filter(Boolean));
   for (const name of EXPOSE) have.add(name);
   headers.set('access-control-expose-headers', [...have].join(', '));
 }
