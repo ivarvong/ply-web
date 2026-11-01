@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { envBinding } from '../absent.ts'
+import { chainGet, envBinding, fromAbsent } from '../absent.ts'
 import { createBudget } from './budget.ts'
 import { viewerCalls, type ViewerCall } from './call.ts'
 import { safeFilename } from './escape.ts'
@@ -10,7 +10,7 @@ import { htmlResponse, SECURITY, statusOf, textResponse } from './http.ts'
 import { VIEWER_CAPS, rateLimitFor, type RateBucket } from './limits.ts'
 import type { RateDecision, TraceModel, ViewerEnv } from './model.ts'
 import { makeTracer, plyCode, spanCollector } from './ply.ts'
-import { createLoopbackFetch } from '../gitcache.ts'
+import { createLoopbackFetch, isLoopback, type LoopbackBinding } from '../gitcache.ts'
 import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from '../rays.ts'
 import { parseViewerRequest, routeOptsFromEnv, type ViewerRoute } from './route.ts'
 import { renderError, renderHome, renderLoaded, renderNamespace } from './render.tsx'
@@ -126,7 +126,22 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
   // then checked again by withPublicReadCredential, and the pack cache above never sees it in its key.
   // Public, credential-free exchanges go to the cache-enabled GitCache entrypoint (Workers Caching) under the guard.
   const direct = withPublicReadCredential(call.opts.fetchImpl ?? globalThis.fetch, tokenSourceFor(env.PUBLIC_REPOS))
-  const loopback = call.opts.loopback !== undefined ? call.opts.loopback : env.PACK_CACHE === 'off' ? null : () => call.ctx.exports?.GitCache
+  const provided = fromAbsent(call.opts.loopback)
+  let loopback: (() => LoopbackBinding | null) | null
+  if (provided.tag === 'none') {
+    loopback = env.PACK_CACHE === 'off' ? null : () => {
+      const found = chainGet(call.ctx.exports, 'GitCache')
+      return found.tag === 'some' ? found.value as LoopbackBinding : null
+    }
+  } else if (provided.value === null) {
+    loopback = null
+  } else {
+    const chosen = provided.value
+    loopback = () => {
+      const binding = chosen()
+      return isLoopback(binding) ? binding : null
+    }
+  }
   const rays = createRayLog()
   const fetchImpl: FetchLike = createViewerFetch(observeUpstream(createLoopbackFetch(direct, loopback), rays), route.loc.url, route.loc.allowedHosts, budget, pageSignal)
   let stamped = false

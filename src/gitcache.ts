@@ -20,8 +20,10 @@
 //
 // ply's retry after a corrupt cached pack sends `x-ply-cache: bust`; the loopback then purges that key (GitCache, which
 // owns it) and fetches again.
+import { captureGroup, chainGet, dig, fromNullable, header } from './absent.ts';
 import { CACHE_VERSION } from './cache-version.ts';
 import { err, httpReply, isUnexpected, ok, responseOf, runRequest, type HttpReply, type Result, type UnexpectedFailure } from './http/machine.ts';
+import { unwrapOr } from './option.ts';
 import { extractRequestPath, rawPathHasUnsafeSegment } from './pathguard.ts';
 import { parseCfRay } from './rays.ts';
 import { publicUploadPackRepo, scrubSecrets, type TokenSource, withPublicReadCredential, type FetchLike } from './public.ts';
@@ -64,19 +66,27 @@ const wantsOf = (body: Uint8Array) => [...latin1(body).matchAll(/[0-9a-f]{4}want
 export async function verifyPackResponse(url: string, body: Uint8Array, bytes: Uint8Array, contentType: string): Promise<{ ok: true; objects: number } | { ok: false; reason: string }> {
   const wants = wantsOf(body);
   if (!wants.length) return { ok: false, reason: 'no wants' };
-  const deepen = /[0-9a-f]{4}deepen (\d+)\n/.exec(latin1(body))?.[1];
-  const filter = /[0-9a-f]{4}filter ([^\n]+)\n/.exec(latin1(body))?.[1];
+  const deepen = captureGroup(/[0-9a-f]{4}deepen (\d+)\n/.exec(latin1(body)), 1);
+  const filter = captureGroup(/[0-9a-f]{4}filter ([^\n]+)\n/.exec(latin1(body)), 1);
   const replay = async () => new Response(bytes.slice(), { status: 200, headers: { 'content-type': contentType } });
   try {
     const t = createGitTransport(url, { tracer: makeTracer(() => {}, { maxEvents: 0, resource: {} }), fetchImpl: replay, userAgent: 'ply-gitcache', limits: VERIFY_LIMITS, signal: AbortSignal.timeout(30_000), quirks: {} });
-    const r = await readPack(t, { wants, ...(deepen ? { deepen: Number(deepen) } : {}), ...(filter ? { filter } : {}), ofsDelta: true }, { resolve: true }) as { parsed: unknown; objects?: Map<string, unknown> | null };
-    const objects = r.objects;
-    if (!objects) return { ok: false, reason: 'no pack in the answer' };
-    const missing = wants.filter(w => !objects.has(w));
-    return missing.length ? { ok: false, reason: `wanted ${missing.length} oid(s) not in the pack` } : { ok: true, objects: objects.size };
+    const r = await readPack(t, { wants, ...(deepen.tag === 'some' ? { deepen: Number(deepen.value) } : {}), ...(filter.tag === 'some' ? { filter: filter.value } : {}), ofsDelta: true }, { resolve: true }) as { parsed: unknown; objects: Map<string, unknown> | null };
+    const objects = fromNullable(r.objects);
+    if (objects.tag === 'none') return { ok: false, reason: 'no pack in the answer' };
+    const missing = wants.filter(w => !objects.value.has(w));
+    return missing.length ? { ok: false, reason: `wanted ${missing.length} oid(s) not in the pack` } : { ok: true, objects: objects.value.size };
   } catch (e) {
-    return { ok: false, reason: String((e as { code?: string; message?: string })?.code ?? (e as Error)?.message ?? e).slice(0, 120) };
+    return { ok: false, reason: failureText(e).slice(0, 120) };
   }
+}
+
+function failureText(error: unknown): string {
+  const code = chainGet(error, 'code');
+  if (code.tag === 'some') return String(code.value);
+  const message = chainGet(error, 'message');
+  if (message.tag === 'some') return String(message.value);
+  return String(error);
 }
 
 const H_URL = 'x-ply-gc-url';
@@ -125,7 +135,7 @@ function fromBase64(s: string): Uint8Array { const bin = atob(s); const out = ne
 
 export async function keyHash(kind: CacheKind, url: string, gitProtocol: string, body: Uint8Array | null): Promise<string> {
   const head = new TextEncoder().encode(`ply-gitcache\n${kind}\n${url}\n${gitProtocol}\n`);
-  const all = new Uint8Array(head.length + (body?.length ?? 0));
+  const all = new Uint8Array(head.length + (body === null ? 0 : body.length));
   all.set(head);
   if (body) all.set(body, head.length);
   const d = new Uint8Array(await crypto.subtle.digest('SHA-256', all));
@@ -140,6 +150,10 @@ export function keyPath(kind: CacheKind, hash: string, version: number = CACHE_V
 
 export type LoopbackBinding = { fetch(req: Request): Promise<Response> };
 
+export function isLoopback(value: unknown): value is LoopbackBinding {
+  return typeof value === 'object' && value !== null && 'fetch' in value;
+}
+
 function requestUrl(input: RequestInfo | URL): string {
   if (typeof input === 'string') return input;
   if (input instanceof URL) return input.href;
@@ -151,41 +165,47 @@ function requestUrl(input: RequestInfo | URL): string {
  * with no Authorization goes to GitCache; everything else goes to `direct` unchanged. `loopback` is null when the
  * cache is off (PACK_CACHE=off) or there is no ctx.exports (node tests).
  */
-export function createLoopbackFetch(direct: FetchLike, loopback: (() => LoopbackBinding | null | undefined) | null): FetchLike {
+export function createLoopbackFetch(direct: FetchLike, loopback: (() => LoopbackBinding | null) | null): FetchLike {
   return async (input, init) => {
-    const binding = loopback?.();
-    if (!binding) return direct(input, init);
+    if (loopback === null) return direct(input, init);
+    const binding = loopback();
+    if (binding === null) return direct(input, init);
     const url = requestUrl(input);
-    const method = init?.method ?? 'GET';
-    const headers = new Headers(init?.headers);
+    const methodField = chainGet(init, 'method');
+    const method = methodField.tag === 'some' && typeof methodField.value === 'string' ? methodField.value : 'GET';
+    const headerField = chainGet(init, 'headers');
+    const headers = headerField.tag === 'some' ? new Headers(headerField.value as HeadersInit) : new Headers();
     if (headers.has('authorization')) return direct(input, init);
     if (!cacheableUpstream(method, url)) return direct(input, init);
-    const body = init?.body instanceof Uint8Array ? init.body : null;
-    if (init?.body && !body) return direct(input, init);
+    const bodyField = chainGet(init, 'body');
+    const body = bodyField.tag === 'some' && bodyField.value instanceof Uint8Array ? bodyField.value : null;
+    if (bodyField.tag === 'some' && bodyField.value && body === null) return direct(input, init);
     if (body && body.length > MAX_ROUTED_BODY) return direct(input, init);
     const kind = classify(method, url, body);
     if (!kind) return direct(input, init);
-    const proto = headers.get('git-protocol') ?? '';
+    const proto = unwrapOr(header(headers, 'git-protocol'), '');
     const hash = await keyHash(kind, url, proto, body);
-    const carry = new Headers({ [H_URL]: url, [H_PROTO]: proto, [H_UA]: headers.get('user-agent') ?? '' });
+    const carry = new Headers({ [H_URL]: url, [H_PROTO]: proto, [H_UA]: unwrapOr(header(headers, 'user-agent'), '') });
     if (body) carry.set(H_BODY, toBase64(body));
-    const signal = init?.signal ?? undefined;
+    const signalField = chainGet(init, 'signal');
+    const carried = { headers: carry, redirect: 'manual' as const, ...(signalField.tag === 'some' ? { signal: signalField.value as AbortSignal } : {}) };
     if (headers.get('x-ply-cache') === 'bust') {
-      const purged = await binding.fetch(new Request(`https://gitcache.internal/v${CACHE_VERSION}/bust/${kind}/${hash}`, { headers: carry, signal, redirect: 'manual' }));
-      await purged.body?.cancel().catch(() => {});
+      const purged = await binding.fetch(new Request(`https://gitcache.internal/v${CACHE_VERSION}/bust/${kind}/${hash}`, carried));
+      const purgedBody = fromNullable(purged.body);
+      if (purgedBody.tag === 'some') await purgedBody.value.cancel().catch(() => {});
     }
     // redirect: 'manual' — a 3xx from upstream must reach the guard above, which re-validates every hop. Followed here,
     // a relative Location would resolve against gitcache.internal and skip that check.
-    const res = await binding.fetch(new Request(`https://gitcache.internal${keyPath(kind, hash)}`, { headers: carry, signal, redirect: 'manual' }));
+    const res = await binding.fetch(new Request(`https://gitcache.internal${keyPath(kind, hash)}`, carried));
     // The cache tier, in the header ply turns into the `git.response.cache` span attribute.
     const out = new Headers(res.headers);
-    out.set('x-ply-pack-cache', res.headers.get('cf-cache-status') ?? 'NONE');
+    out.set('x-ply-pack-cache', unwrapOr(header(res.headers, 'cf-cache-status'), 'NONE'));
     return new Response(res.body, { status: res.status, statusText: res.statusText, headers: out });
   };
 }
 
-export type GitCacheEnv = { PUBLIC_REPOS?: unknown };
-export type PurgeCtx = { cache?: { purge?: (opts: { pathPrefixes: string[] }) => Promise<unknown> } };
+export type GitCacheEnv = { PUBLIC_REPOS: unknown };
+export type PurgeCtx = object;
 
 function plain(status: number, text: string): HttpReply {
   return httpReply(status, text, new Headers({ 'content-type': 'text/plain; charset=utf-8', 'cache-control': NO_STORE }));
@@ -220,8 +240,11 @@ function decodeCacheBody(value: string): { readonly kind: 'text'; readonly value
 function parseGitCache(req: Request): Result<CacheRequest, GitCacheFailure> {
   if (req.method !== 'GET' && req.method !== 'HEAD') return err({ kind: 'method' });
   const path = new URL(req.url).pathname;
-  const match = /^\/v(\d+)\/(?:(bust)\/)?(pack|refs|discover)\/([0-9a-f]{64})$/.exec(path);
-  if (!match || Number(match[1]) !== CACHE_VERSION) return err({ kind: 'not_key' });
+  const match = /^\/v(\d+)\/(bust\/)?(pack|refs|discover)\/([0-9a-f]{64})$/.exec(path);
+  const version = captureGroup(match, 1);
+  const kindText = captureGroup(match, 3);
+  const hashText = captureGroup(match, 4);
+  if (version.tag === 'none' || kindText.tag === 'none' || hashText.tag === 'none' || Number(version.value) !== CACHE_VERSION) return err({ kind: 'not_key' });
   const encoded = req.headers.get(H_BODY);
   let body: Uint8Array | null = null;
   if (encoded !== null) {
@@ -229,13 +252,13 @@ function parseGitCache(req: Request): Result<CacheRequest, GitCacheFailure> {
     if (decoded.kind === 'opaque') return err({ kind: 'bad_body' });
     body = decoded.value;
   }
-  const cacheKind = match[3] as CacheKind;
+  const cacheKind = kindText.value as CacheKind;
   return ok({
-    bust: match[2] === 'bust',
+    bust: captureGroup(match, 2).tag === 'some',
     cacheKind,
-    hash: match[4] as string,
-    url: req.headers.get(H_URL) ?? '',
-    proto: req.headers.get(H_PROTO) ?? '',
+    hash: hashText.value,
+    url: unwrapOr(header(req.headers, H_URL), ''),
+    proto: unwrapOr(header(req.headers, H_PROTO), ''),
     body,
     ua: req.headers.get(H_UA),
   });
@@ -309,7 +332,8 @@ export async function serveGitCache(req: Request, tokens: TokenSource | null, ct
 async function executeGitCache(req: Request, parsed: CacheRequest, tokens: TokenSource | null, ctx: PurgeCtx, upstream: FetchLike): Promise<Result<HttpReply, GitCacheFailure>> {
   const { cacheKind, url, proto, body, ua } = parsed;
   if (parsed.bust) {
-    await ctx.cache?.purge?.({ pathPrefixes: [keyPath(cacheKind, parsed.hash)] });
+    const purge = dig(ctx, ['cache', 'purge']);
+    if (purge.tag === 'some') await (purge.value as (opts: { pathPrefixes: string[] }) => Promise<unknown>)({ pathPrefixes: [keyPath(cacheKind, parsed.hash)] });
     return ok(httpReply(204, null, new Headers({ 'cache-control': NO_STORE })));
   }
   const method = cacheKind === 'discover' ? 'GET' : 'POST';
@@ -320,14 +344,17 @@ async function executeGitCache(req: Request, parsed: CacheRequest, tokens: Token
   const fetchUp = withPublicReadCredential(upstream, tokens);
   let res: Response;
   try {
-    res = await fetchUp(url, { method, headers, body: (body ?? undefined) as BodyInit | undefined, redirect: 'manual', signal: req.signal });
+    const upstreamInit: RequestInit = { method, headers, redirect: 'manual', signal: req.signal };
+    if (body !== null) upstreamInit.body = body as BodyInit;
+    res = await fetchUp(url, upstreamInit);
   } catch (e) {
     // A failure before any upstream answer (the read-token mint: no such repo, binding down; the network). Answer with
     // the HTTP status ply maps back to the same code (http.js httpCode): 404 → not_found, else 502 → upstream_5xx.
-    const code = (e as { code?: string })?.code;
-    return err({ kind: 'upstream', status: code === 'not_found' ? 404 : 502, text: code === 'not_found' ? 'repository not found' : 'upstream unavailable' });
+    const code = chainGet(e, 'code');
+    const notFound = code.tag === 'some' && code.value === 'not_found';
+    return err({ kind: 'upstream', status: notFound ? 404 : 502, text: notFound ? 'repository not found' : 'upstream unavailable' });
   }
-  const ct = res.headers.get('content-type') ?? '';
+  const ct = unwrapOr(header(res.headers, 'content-type'), '');
   const out = new Headers({ 'content-type': ct || 'application/octet-stream', 'x-ply-gc-kind': cacheKind, 'cache-tag': `ply-gc-v${CACHE_VERSION},ply-gc-${cacheKind}` });
   copyCfRay(res.headers, out);
   const location = res.headers.get('location');
@@ -338,7 +365,7 @@ async function executeGitCache(req: Request, parsed: CacheRequest, tokens: Token
     // but may be another isolate that never saw this token).
     const text = res.body ? (await res.text()).slice(0, MAX_ERROR_BODY) : '';
     out.set('cache-control', cacheKind === 'pack' && res.status === 400 && FILTER_REFUSAL.test(text) ? REFUSAL_CACHE : NO_STORE);
-    return ok(httpReply(res.status, res.status >= 300 && res.status < 400 ? null : scrubSecrets(tokens?.secrets() ?? [])(text), out));
+    return ok(httpReply(res.status, res.status >= 300 && res.status < 400 ? null : scrubSecrets(tokens === null ? [] : tokens.secrets())(text), out));
   }
   if (cacheKind === 'pack') {
     // Buffer up to the cap, verify, and only then call it immutable. Over the cap, or unverified: passed on, not stored.
