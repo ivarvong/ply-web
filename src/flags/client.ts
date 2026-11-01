@@ -5,7 +5,7 @@ import { parseUnit } from './document.ts';
 import { evaluateDocument } from './eval.ts';
 import { emitEval, endSpan, openSpan, resolutionSample, type TracingLike } from './telemetry.ts';
 import { USAGE_NOTE_FLAG, USAGE_NOTE_LINE } from './ttl.ts';
-import { EMPTY_DOCUMENT, isEnabledVariant, type FlagEvaluation, type Unit } from './types.ts';
+import { EMPTY_DOCUMENT, isEnabledVariant, type CacheStatus, type FlagEvaluation, type Unit } from './types.ts';
 
 export type FlagRuntime = {
   env: FlagCacheEnv;
@@ -18,7 +18,7 @@ function runtimeOf(env: FlagCacheEnv, ctx: { exports?: { FlagsCache?: FlagsCache
 }
 
 export type ResolveResult =
-  | { readonly kind: 'ok'; readonly evaluations: readonly FlagEvaluation[]; readonly revision: string | null; readonly cache: string }
+  | { readonly kind: 'ok'; readonly evaluations: readonly FlagEvaluation[]; readonly revision: string | null; readonly cache: CacheStatus }
   | { readonly kind: 'unavailable'; readonly reason: string };
 
 export async function resolveFlags(runtime: FlagRuntime, unit: Unit, keys: readonly string[] | null, clock: Clock = () => performance.now()): Promise<ResolveResult> {

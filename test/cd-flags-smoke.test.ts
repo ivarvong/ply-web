@@ -3,9 +3,13 @@ import { test } from 'node:test'
 import { judgeCall, type CallHeaders, type Expect, type Saved } from '../scripts/cd/judge.ts'
 import { expectedStatuses, lifecycle } from '../scripts/cd/lifecycle.ts'
 import { FLAGS_RULES_SAVE, HTTP_NOT_FOUND, HTTP_OK, SMOKE_FLAG_KEY, SMOKE_UNIT_ID, USAGE_MARK } from '../scripts/cd/flags-smoke.ts'
+import { setRollout } from '../src/flags/api.ts'
+import { rulesetRequest, serveFlags } from '../src/flags/cache.ts'
+import { handleFlagHttp } from '../src/flags/http.ts'
+import { memoryStore } from '../src/flags/store.ts'
 import { evaluateDocument } from '../src/flags/eval.ts'
-import { USAGE_NOTE_LINE } from '../src/flags/ttl.ts'
-import { EMPTY_DOCUMENT, variantKind, variantValue, type Flag } from '../src/flags/types.ts'
+import { ABSENT_REVISION, USAGE_NOTE_LINE } from '../src/flags/ttl.ts'
+import { CACHE_STATUSES, EMPTY_DOCUMENT, variantKind, variantValue, type CacheStatus, type Flag } from '../src/flags/types.ts'
 
 const BUILD = `ply=${'a'.repeat(40)} ply-web=${'b'.repeat(40)}`
 const REQUEST_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
@@ -146,12 +150,82 @@ test('a present ruleset keeps revision, cache status, and the rollout value', ()
     environment: 'production',
     flags: [note],
   })
-  assert.equal(expired.kind, 'fail')
+  assert.equal(expired.kind, 'ok', expired.kind === 'fail' ? expired.detail : '')
   const stored = judge({ kind: 'flags-eval' }, HTTP_OK, {
     revision: '"rev"',
     flags: [],
   }, listed.save, { cacheControl: 'public, max-age=5' })
   assert.equal(stored.kind, 'fail')
+})
+
+test('ruleset smoke names every Cache API status', () => {
+  const accepted = new Set<CacheStatus>(['HIT', 'MISS', 'STALE', 'UPDATING', 'EXPIRED', 'REVALIDATED'])
+  for (const status of CACHE_STATUSES) {
+    const judged = judge({ kind: 'flags-rules' }, HTTP_OK, {
+      revision: '"rev"',
+      cache: status,
+      environment: 'production',
+      flags: [note],
+    })
+    assert.equal(judged.kind, accepted.has(status) ? 'ok' : 'fail', `${status} ${judged.kind === 'fail' ? judged.detail : ''}`)
+  }
+  const ignored = judge({ kind: 'flags-rules' }, HTTP_OK, {
+    revision: '"rev"',
+    cache: 'IGNORED',
+    environment: 'production',
+    flags: [note],
+  })
+  assert.equal(ignored.kind, 'fail')
+  if (ignored.kind === 'fail') assert.match(ignored.detail, /not a Cache API status/)
+})
+
+test('a flag write then an immediate read is EXPIRED and the smoke rule accepts it', async () => {
+  const store = memoryStore()
+  // The empty ruleset is cached before the first seed. Invalidate marks that entry stale.
+  // The next read runs the entrypoint, which answers 200 with the new body, so Workers Cache
+  // reports EXPIRED (a 304 would be REVALIDATED).
+  let phase: 'empty' | 'fresh' | 'invalidated' = 'empty'
+  const cache = {
+    invalidate() {
+      if (phase === 'fresh') phase = 'invalidated'
+      return { kind: 'ok' as const }
+    },
+    async fetch(request: Request) {
+      const response = await serveFlags(request, { FLAGS: { present: true } }, store)
+      const status: CacheStatus = phase === 'invalidated'
+        ? (response.status === 304 ? 'REVALIDATED' : 'EXPIRED')
+        : phase === 'empty' ? 'MISS' : 'HIT'
+      if (phase === 'empty' || phase === 'invalidated') phase = 'fresh'
+      response.headers.set('cf-cache-status', status)
+      return response
+    },
+  }
+  const warm = await cache.fetch(rulesetRequest())
+  assert.equal(warm.status, 404)
+  await warm.body?.cancel()
+  const written = await setRollout(
+    store,
+    { invalidate: async () => cache.invalidate() },
+    SMOKE_FLAG_KEY,
+    0,
+    ABSENT_REVISION,
+  )
+  assert.equal(written.kind, 'ok')
+  if (written.kind !== 'ok') return
+  assert.equal(written.invalidated, true)
+  const response = await handleFlagHttp(
+    new Request('https://ply.example/v1/flags'),
+    { FLAGS: { present: true } },
+    { exports: { FlagsCache: cache } },
+  )
+  assert.equal(response.status, HTTP_OK)
+  const body: unknown = await response.json()
+  assert.ok(body && typeof body === 'object')
+  const listed = body as { cache?: unknown; revision?: unknown }
+  assert.equal(listed.cache, 'EXPIRED')
+  assert.equal(listed.revision, written.revision)
+  const judged = judge({ kind: 'flags-rules' }, response.status, body)
+  assert.equal(judged.kind, 'ok', judged.kind === 'fail' ? judged.detail : '')
 })
 
 test('GET / passes without the usage note and fails when the note is on', () => {
