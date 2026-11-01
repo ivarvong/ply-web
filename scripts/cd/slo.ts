@@ -209,7 +209,7 @@ export function burnMap(requests: readonly V1Request[], correctness: SloCount | 
 
 export type StepInput = {
   readonly requests: number
-  /** Fetch invocations. The routed share uses this, not `requests`, which falls back to logs. */
+  /** External fetch invocations. The routed share uses this, not `requests`, which falls back to logs. */
   readonly invocations: number
   readonly exceptions: number
   readonly errors: number
@@ -323,7 +323,7 @@ const SCOPES = [
 
 /**
  * One ramp step. Correctness and burn are judged per version and across the worker.
- * The routed share uses telemetry invocation counts. Too few new-version requests is
+ * The routed share uses external fetch invocations. Too few new-version requests is
  * `insufficient_data` or an advance, per the policy. A share outside the binomial
  * band holds or rolls back, per the policy. Latency rolls back only in `gate` mode.
  */

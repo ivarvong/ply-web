@@ -54,6 +54,11 @@ async function observe(config: CdConfig, version: string, previous: string, from
         previousWallP99: percentile(prior.wallMs, 0.99),
         nextCpuP99: percentile(next.cpuMs, 0.99),
         previousCpuP99: percentile(prior.cpuMs, 0.99),
+        internalInvocations: {
+          next: next.internal,
+          previous: prior.internal,
+          aggregate: aggregate.internal,
+        },
       },
       query: { events: all.query, spans: spans.query },
       from,

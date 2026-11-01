@@ -5,8 +5,13 @@ import { JOIN_MIN_LOGGED, SMOKE_LATENCY } from '../scripts/cd/baseline.ts'
 import { artifactsProbeUrl, revokeConfirmed } from '../scripts/cd/classify.ts'
 import { raysByRequestId } from '../scripts/cd/csv.ts'
 import { asRecord } from '../scripts/cd/json.ts'
+import { DEFAULT_POLICY_PATH, loadPolicy } from '../scripts/cd/policy.ts'
+import { progressLine } from '../scripts/cd/ramp.ts'
 import { readSmokeRequests } from '../scripts/cd/stage-telemetry.ts'
+import { judgeStep, routedShare } from '../scripts/cd/slo.ts'
 import {
+  DEFAULT_ENTRYPOINT,
+  fetchInvocation,
   fetchSample,
   isTraceSummary,
   judgeSmokeTelemetry,
@@ -286,4 +291,177 @@ test('the revoke probe URL does not carry the token', () => {
   assert.equal(revokeConfirmed(200), false)
   assert.equal(revokeConfirmed(401), false)
   assert.equal(revokeConfirmed(0), false)
+})
+
+/** The 10% flag-service rollback. Named entrypoints were counted as routed traffic. */
+const NEW_VERSION = '3a56fa4f-7b3d-4c1a-9e20-6f0a1b2c3d4e'
+const OLD_VERSION = '11111111-2222-4333-8444-555566667777'
+const NEW_EXTERNAL = 203
+const NEW_FLAGS = 92
+const OLD_EXTERNAL = 1774
+const OLD_GIT = 1
+const FLAGS_CACHE = 'FlagsCache'
+const GIT_CACHE = 'GitCache'
+const INTERNAL_WALL_MS = 99_000
+const LOGGED_MS = 12
+const EXTERNAL_FETCH_MS = 20
+
+function percentText(fraction: number | null): string {
+  if (fraction === null) return '-'
+  return (fraction * 100).toFixed(2)
+}
+
+function eventIdentity(n: number) {
+  const hex = n.toString(16).padStart(12, '0')
+  return {
+    requestId: `${hex.slice(0, 8)}-0000-4000-8000-${hex}`,
+    traceId: hex.padStart(32, 'c'),
+    rayId: `${hex.padStart(16, 'd')}-IAD`,
+  }
+}
+
+function workerFetch(
+  version: string,
+  n: number,
+  entrypoint: string | null,
+  workersOver: Record<string, unknown> = {},
+) {
+  const id = eventIdentity(n)
+  const workers: Record<string, unknown> = {
+    scriptVersion: { id: version },
+    eventType: 'fetch',
+    outcome: 'ok',
+    wallTimeMs: 40,
+    cpuTimeMs: 8,
+    ...workersOver,
+  }
+  if (entrypoint !== null) workers.entrypoint = entrypoint
+  return {
+    $metadata: {
+      id: `inv-${id.requestId}`,
+      requestId: id.requestId,
+      traceId: id.traceId,
+      type: 'cf-worker-event',
+      service: 'ply',
+    },
+    rayId: id.rayId,
+    traceId: id.traceId,
+    $workers: workers,
+  }
+}
+
+test('named entrypoints are not routed traffic', () => {
+  const bare = workerFetch(NEW_VERSION, 1, null)
+  const namedDefault = workerFetch(NEW_VERSION, 2, DEFAULT_ENTRYPOINT)
+  const flags = workerFetch(NEW_VERSION, 3, FLAGS_CACHE)
+  const classified = fetchInvocation(flags)
+  assert.equal(fetchInvocation(bare)?.kind, 'external')
+  assert.equal(fetchInvocation(namedDefault)?.kind, 'external')
+  assert.equal(classified?.kind, 'internal')
+  if (classified?.kind === 'internal') assert.equal(classified.entrypoint, FLAGS_CACHE)
+  assert.equal(fetchInvocation({ $metadata: { type: 'span' }, $workers: { eventType: 'fetch' } }), null)
+
+  const events: ReturnType<typeof workerFetch>[] = []
+  for (let n = 0; n < NEW_EXTERNAL; n++) events.push(workerFetch(NEW_VERSION, n, n === 0 ? null : DEFAULT_ENTRYPOINT))
+  const flagsStart = NEW_EXTERNAL
+  for (let n = 0; n < NEW_FLAGS; n++) {
+    const extra = n === 0
+      ? { outcome: 'exception', exceptions: [{ name: 'Error' }], wallTimeMs: INTERNAL_WALL_MS, cpuTimeMs: INTERNAL_WALL_MS }
+      : {}
+    events.push(workerFetch(NEW_VERSION, flagsStart + n, FLAGS_CACHE, extra))
+  }
+  const oldStart = flagsStart + NEW_FLAGS
+  for (let n = 0; n < OLD_EXTERNAL; n++) events.push(workerFetch(OLD_VERSION, oldStart + n, DEFAULT_ENTRYPOINT))
+  const gitIndex = oldStart + OLD_EXTERNAL
+  events.push(workerFetch(OLD_VERSION, gitIndex, GIT_CACHE))
+
+  const requestIds = new Set(events.map(event => event.$metadata.requestId))
+  const rays = new Set(events.map(event => event.rayId))
+  const traces = new Set(events.map(event => event.traceId))
+  const inflated = events.length
+  assert.equal(inflated, NEW_EXTERNAL + NEW_FLAGS + OLD_EXTERNAL + OLD_GIT)
+  assert.equal(requestIds.size, inflated)
+  assert.equal(rays.size, inflated)
+  assert.equal(traces.size, inflated)
+
+  const flagsId = eventIdentity(flagsStart)
+  const logTrace = 'f'.repeat(32)
+  const logRay = `${'e'.repeat(16)}-IAD`
+  events.push({
+    $metadata: { id: 'log-flags', requestId: flagsId.requestId, traceId: logTrace, type: 'log', service: 'ply', level: 'info' },
+    rayId: logRay,
+    traceId: logTrace,
+    $workers: { scriptVersion: { id: NEW_VERSION }, outcome: 'ok' },
+    source: { msg: 'ply.request', id: 'flags-log', status: 200, method: 'GET', path: '/v1/discover', ms: LOGGED_MS },
+  } as ReturnType<typeof workerFetch>)
+
+  const externalRay = eventIdentity(0).rayId
+  const internalRay = flagsId.rayId
+  const spans = [
+    { rayId: externalRay, traceId: eventIdentity(0).traceId, name: 'fetch', durationMs: EXTERNAL_FETCH_MS, $metadata: { type: 'span', requestId: null, traceId: eventIdentity(0).traceId } },
+    { rayId: internalRay, traceId: flagsId.traceId, name: 'fetch', durationMs: INTERNAL_WALL_MS, $metadata: { type: 'span', requestId: null, traceId: flagsId.traceId } },
+  ]
+  const onNew = events.filter(event => (event.$workers.scriptVersion as { id: string }).id === NEW_VERSION)
+  const onOld = events.filter(event => (event.$workers.scriptVersion as { id: string }).id === OLD_VERSION)
+  const next = statsFromEvents(onNew, spans)
+  const previous = statsFromEvents(onOld, spans)
+  const aggregate = statsFromEvents(events, spans)
+
+  assert.equal(next.invocations, NEW_EXTERNAL)
+  assert.equal(previous.invocations, OLD_EXTERNAL)
+  assert.equal(aggregate.invocations, NEW_EXTERNAL + OLD_EXTERNAL)
+  assert.equal(next.requests, NEW_EXTERNAL)
+  assert.equal(next.errors, 0)
+  assert.equal(next.exceptions, 0)
+  assert.equal(next.wallMs.includes(INTERNAL_WALL_MS), false)
+  assert.equal(next.cpuMs.includes(INTERNAL_WALL_MS), false)
+  assert.deepEqual(next.fetchMs, [EXTERNAL_FETCH_MS])
+  assert.deepEqual(next.internal, [{ entrypoint: FLAGS_CACHE, count: NEW_FLAGS }])
+  assert.deepEqual(previous.internal, [{ entrypoint: GIT_CACHE, count: OLD_GIT }])
+  assert.equal(next.v1.length, 1)
+  assert.equal(next.v1[0]?.exception, false)
+  assert.equal(next.v1[0]?.wallMs, LOGGED_MS)
+
+  const summary = summarizeTelemetry(NEW_VERSION, [], onNew, [])
+  assert.equal(summary.invocations, NEW_EXTERNAL)
+  assert.equal(summary.health.exceptions, 0)
+  assert.equal(summary.health.nonOk, 0)
+
+  const policy = loadPolicy(DEFAULT_POLICY_PATH).policy
+  const targetPercent = policy.steps[0]?.percent
+  if (targetPercent === undefined) throw new Error('policy has no step')
+  const counted = routedShare(next.invocations, aggregate.invocations, targetPercent, policy.split.z)
+  const asFetched = routedShare(NEW_EXTERNAL + NEW_FLAGS, inflated, targetPercent, policy.split.z)
+  assert.equal(percentText(asFetched.share), '14.25')
+  assert.equal(asFetched.kind, 'mismatch')
+  assert.equal(`${percentText(asFetched.low)}..${percentText(asFetched.high)}`, '8.02..11.98')
+  assert.equal(percentText(counted.share), '10.27')
+  assert.equal(counted.kind, 'match')
+  assert.equal(counted.newRequests, NEW_EXTERNAL)
+  assert.equal(counted.n, NEW_EXTERNAL + OLD_EXTERNAL)
+  assert.ok(counted.share !== null && asFetched.low !== null && asFetched.high !== null)
+  if (counted.share !== null && asFetched.low !== null && asFetched.high !== null) {
+    assert.ok(counted.share >= asFetched.low && counted.share <= asFetched.high)
+  }
+  const decision = judgeStep({ next, previous, aggregate, targetPercent, policy })
+  assert.equal(decision.outcome, 'advance')
+  const line = progressLine({
+    step: 1,
+    steps: policy.steps.length,
+    percent: targetPercent,
+    next,
+    previous,
+    carriedPrevious: null,
+    share: counted,
+    decision,
+    latency: policy.gates.latency.mode,
+  })
+  assert.match(line, new RegExp(`samples=${NEW_EXTERNAL}/${OLD_EXTERNAL}`))
+  assert.match(line, /routed_share=10.27/)
+  assert.match(line, /tolerance=7.98..12.02/)
+  assert.match(line, new RegExp(`agg=${NEW_EXTERNAL + OLD_EXTERNAL}`))
+  assert.match(line, new RegExp(`internal_next=${FLAGS_CACHE}:${NEW_FLAGS}`))
+  assert.match(line, new RegExp(`internal_previous=${GIT_CACHE}:${OLD_GIT}`))
+  assert.match(line, /decision=advance/)
+  assert.equal(line.includes('reason='), false)
 })
