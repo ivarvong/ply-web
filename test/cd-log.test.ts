@@ -211,6 +211,7 @@ test('debrief cites the decision, its rule, and writes charts', async () => {
   const markdownPath = await writeDebrief(runDir)
   const markdown = await readFile(markdownPath, 'utf8')
   assert.match(markdown, /insufficient_data/)
+  assert.match(markdown, /Informational unless a policy event sets latency to gate/)
   assert.match(markdown, /fast_burn/)
   assert.match(markdown, /14\.4/)
   assert.match(markdown, /raw\/2\.json/)

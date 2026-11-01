@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { PIN } from './bump-plan.ts'
 import { ROOT } from './cf.ts'
 import { loadConfig, publicConfig, type CdConfig } from './config.ts'
+import { splitPolicy } from './policy.ts'
 import { writeDebrief } from './debrief.ts'
 import { VERSION_ID } from './deploy-plan.ts'
 import { appendFalsePositive, RunLog, withRun } from './log.ts'
@@ -144,7 +145,7 @@ export function parseArgs(argv: readonly string[], pin: string | null = null): P
 
 export function usageText(): string {
   return [
-    'usage: npm run cd -- [command]',
+    'usage: npm run cd -- [--policy <path>] [command]',
     '  cd [--sha <40 hex>] [--no-bump]',
     '  [--sha <40 hex>] [--no-bump]',
     '  bump [--sha <40 hex>]',
@@ -218,12 +219,14 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
   if (switched !== null) return switched
   const nodeError = checkNode(process.version)
   if (nodeError) return finish(log, 1, `cd: harness_fault preflight: ${nodeError}`)
-  const parsed = parseArgs(argv, await checkoutPlyPin())
+  const split = splitPolicy(argv)
+  if ('error' in split) return finish(log, 2, split.error)
+  const parsed = parseArgs(split.argv, await checkoutPlyPin())
   if (parsed.kind === 'usage') return finish(log, 2, usageText())
   if (parsed.kind === 'error') return finish(log, 2, parsed.reason)
   let config: CdConfig
   try {
-    config = loadConfig(env)
+    config = loadConfig(env, split.policyPath ?? undefined)
   } catch (error) {
     return finish(log, 2, errorMessage(error))
   }
@@ -276,6 +279,7 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
         const recorded = resumeSha ? { ...started, config: { ...started.config, sha: resumeSha } } : started
         await runLog.started(recorded)
       }
+      await runLog.recordPolicy({ sha256: config.policySha256, path: config.policyPath, body: config.policyBody })
       const outcome = await dispatch(parsed, config, token, runDir, runLog, log)
       code = outcome.code
       reason = outcome.reason

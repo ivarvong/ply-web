@@ -9,6 +9,7 @@ import { errorMessage } from './proc.ts'
 import { activeLog } from './log.ts'
 import { readPassVerdict, runRamp, type Observation } from './ramp.ts'
 import { fail, pass, type StageResult } from './result.ts'
+import type { ProbeCall } from './policy.ts'
 import { writeJson } from './run-dir.ts'
 import { percentile, queryTo, serviceFilter, spanTypeFilter, statsFromEvents, versionFilter } from './telemetry.ts'
 import { applySplit, readShares, rollbackTo } from './traffic.ts'
@@ -39,8 +40,11 @@ async function observe(config: CdConfig, version: string, previous: string, from
         nextRequests: next.requests,
         previousRequests: prior.requests,
         observedPercent: next.requests + prior.requests === 0 ? null : (100 * next.requests) / (next.requests + prior.requests),
+        latency: config.policy.gates.latency.mode,
         nextWallP99: percentile(next.wallMs, 0.99),
         previousWallP99: percentile(prior.wallMs, 0.99),
+        nextCpuP99: percentile(next.cpuMs, 0.99),
+        previousCpuP99: percentile(prior.cpuMs, 0.99),
       },
       query: { next: nextEvents.query, previous: previousEvents.query, spans: spans.query },
       from,
@@ -98,25 +102,30 @@ async function probeCall(
   }
 }
 
+/** `/v1/discover` is the public ply mirror. Other paths are requested as written. */
+function probeUrl(base: string, path: string): string {
+  if (path === '/v1/discover') return `${base}/v1/discover?remote=${encodeURIComponent(publicRemote('ply'))}`
+  return `${base}${path}`
+}
+
 /** Each arm is pinned, so the new version is sampled at the probe rate instead of the split. */
 async function probeOnce(
   config: CdConfig,
   version: string,
   previous: string,
   token: string,
+  calls: readonly ProbeCall[],
 ): Promise<{ readonly failures: number; readonly harness: number }> {
-  const remote = publicRemote('ply')
-  const discover = `${config.baseUrl}/v1/discover?remote=${encodeURIComponent(remote)}`
   let failures = 0
   let harness = 0
   await Promise.all([version, previous].map(async pin => {
-    const root = await probeCall(config, version, pin, 'GET', `${config.baseUrl}/`, {})
-    failures += root.failures
-    harness += root.harness
-    if (!token) return
-    const read = await probeCall(config, version, pin, 'GET', discover, { authorization: `Bearer ${token}` })
-    failures += read.failures
-    harness += read.harness
+    await Promise.all(calls.map(async call => {
+      if (call.auth && !token) return
+      const headers: Record<string, string> = call.auth ? { authorization: `Bearer ${token}` } : {}
+      const probed = await probeCall(config, version, pin, call.method, probeUrl(config.baseUrl, call.path), headers)
+      failures += probed.failures
+      harness += probed.harness
+    }))
   }))
   return { failures, harness }
 }
@@ -128,6 +137,7 @@ async function dwell(
   token: string,
   ms: number,
   rps: number,
+  calls: readonly ProbeCall[],
 ): Promise<{ probeFailures: number; harnessFaults: number }> {
   if (rps <= 0) {
     await new Promise(resolve => setTimeout(resolve, ms))
@@ -139,7 +149,7 @@ async function dwell(
   let harnessFaults = 0
   while (Date.now() < deadline) {
     const tick = Date.now()
-    const probed = await probeOnce(config, version, previous, token)
+    const probed = await probeOnce(config, version, previous, token, calls)
     probeFailures += probed.failures
     harnessFaults += probed.harness
     const remain = Math.min(period - (Date.now() - tick), deadline - Date.now())
@@ -207,17 +217,18 @@ export async function stageRamp(
   }
   if (!previous) return fail('ramp', 'no previous version; traffic was not changed')
   const target = previous
-  const schedule = fromPercent === undefined
-    ? config.schedule
-    : { ...config.schedule, percents: config.schedule.percents.filter(percent => percent >= fromPercent) }
-  if (fromPercent !== undefined && schedule.percents.length === 0) {
+  const steps = fromPercent === undefined
+    ? config.policy.steps
+    : config.policy.steps.filter(step => step.percent >= fromPercent)
+  if (fromPercent !== undefined && steps.length === 0) {
     return fail('ramp', `schedule has no step at or above ${fromPercent}%`)
   }
+  const policy = { ...config.policy, steps }
   const logPath = join(opts.runDir, 'ramp.jsonl')
-  const result = await runRamp(schedule, {
+  const result = await runRamp(policy, {
     now: () => Date.now(),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
-    dwell: ms => dwell(config, opts.version, target, opts.token, ms, config.schedule.probeRps),
+    dwell: ms => dwell(config, opts.version, target, opts.token, ms, config.policy.probe.rps, config.policy.probe.calls),
     applySplit: async percent => {
       const want = trafficSplit(percent, opts.version, target)
       if (!isTrafficSplit(want)) return want.reason
