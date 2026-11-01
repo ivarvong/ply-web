@@ -4,7 +4,7 @@ import { SMOKE_LATENCY, TELEMETRY_CHUNK, TELEMETRY_POLLS_MS, TELEMETRY_WAIT_MS }
 import { raysByRequestId } from './csv.ts'
 import { asRecord } from './json.ts'
 import { activeLog } from './log.ts'
-import { queryAll } from './o11y.ts'
+import { queryAll, telemetryQueryRetry, type QueryRetry } from './o11y.ts'
 import { errorMessage } from './proc.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import { writeJson, writeText } from './run-dir.ts'
@@ -85,7 +85,14 @@ async function withRays(reportPath: string, requests: readonly SmokeRequest[]): 
   })
 }
 
-async function logsFor(config: CdConfig, from: number, to: number, ids: readonly string[], version: string | null): Promise<unknown[]> {
+async function logsFor(
+  config: CdConfig,
+  from: number,
+  to: number,
+  ids: readonly string[],
+  version: string | null,
+  retry: QueryRetry,
+): Promise<unknown[]> {
   const filters: Filter[] = [serviceFilter(config.worker)]
   if (version) filters.push(versionFilter(version))
   const out: unknown[] = []
@@ -94,7 +101,7 @@ async function logsFor(config: CdConfig, from: number, to: number, ids: readonly
       ...filters,
       { key: 'msg', operation: 'eq', type: 'string', value: 'ply.request' },
       { key: 'id', operation: 'in', type: 'string', value: group.join(',') },
-    ]))
+    ], retry))
   }
   return out
 }
@@ -105,11 +112,12 @@ export async function stageTelemetry(
 ): Promise<StageResult<TelemetryValue>> {
   try {
     const requests = await withRays(opts.reportPath, readSmokeRequests(await readFile(opts.reportPath, 'utf8')))
+    const retry = telemetryQueryRetry(config.policy)
     const from = opts.since
     let events: unknown[] = []
     const started = Date.now()
     for (let attempt = 0; ; attempt++) {
-      events = await logsFor(config, from, queryTo(Date.now()), requests.map(request => request.id), opts.version)
+      events = await logsFor(config, from, queryTo(Date.now()), requests.map(request => request.id), opts.version, retry)
       const seen = new Set(events.map(event => {
         const source = asRecord(asRecord(event)?.source)
         return typeof source?.id === 'string' ? source.id : ''
@@ -120,14 +128,14 @@ export async function stageTelemetry(
       await sleep(Math.min(pause, TELEMETRY_WAIT_MS - waiting))
     }
     const missing = requests.filter(request => !events.some(event => asRecord(asRecord(event)?.source)?.id === request.id)).map(request => request.id)
-    if (missing.length) events.push(...await logsFor(config, from, queryTo(Date.now()), missing, null))
+    if (missing.length) events.push(...await logsFor(config, from, queryTo(Date.now()), missing, null, retry))
     const to = queryTo(Date.now())
     const scoped = [serviceFilter(config.worker), versionFilter(opts.version)]
-    const health = await queryAll('events', from, to, scoped)
+    const health = await queryAll('events', from, to, scoped, retry)
     const service = serviceFilter(config.worker)
     // The traces view is one summary row per trace and has no child spans. Fetch durations come from span events.
-    const traces = await queryAll('traces', from, to, [service])
-    const spans = await queryAll('events', from, to, [service, spanTypeFilter()])
+    const traces = await queryAll('traces', from, to, [service], retry)
+    const spans = await queryAll('events', from, to, [service, spanTypeFilter()], retry)
     const seen = new Set<string>()
     const combined = []
     for (const event of [...events, ...health]) {
