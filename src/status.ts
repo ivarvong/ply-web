@@ -2,6 +2,7 @@
 // `satisfies Record<PlyCode, number>` makes the table exhaustive both ways: a code ply adds fails typecheck until it
 // is mapped here, and a code ply drops fails until it is removed. test/status.test.ts checks the same at runtime.
 import { CODES } from 'ply'
+import { chainGet } from './absent.ts'
 import { CODE_REF_EXISTS, CODE_STALE_EXPECTED } from './write/errors.ts'
 
 type PlyCode = (typeof CODES)[number]
@@ -18,8 +19,10 @@ const WORKER_STATUS = { [CODE_REF_EXISTS]: 409, [CODE_STALE_EXPECTED]: 409 } as 
 export const STATUS: Readonly<Record<string, number>> = Object.freeze({ ...PLY_STATUS, ...WORKER_STATUS })
 
 /** `auth` keeps the upstream's own 401 or 403; anything unmapped is 500. */
-export function statusOf(err: { code?: unknown; status?: unknown } | null | undefined): number {
-  if (err?.code === 'auth' && (err.status === 401 || err.status === 403)) return err.status
-  const code = err?.code
-  return typeof code === 'string' && Object.prototype.hasOwnProperty.call(STATUS, code) ? STATUS[code]! : 500
+export function statusOf(err: unknown): number {
+  const code = chainGet(err, 'code')
+  const status = chainGet(err, 'status')
+  if (code.tag === 'some' && code.value === 'auth' && status.tag === 'some' && (status.value === 401 || status.value === 403)) return status.value
+  const name = code.tag === 'some' && typeof code.value === 'string' ? code.value : ''
+  return name !== '' && Object.prototype.hasOwnProperty.call(STATUS, name) ? STATUS[name]! : 500
 }
