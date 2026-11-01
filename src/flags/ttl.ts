@@ -26,6 +26,9 @@ export const DEFAULT_SALT = 'v1';
  */
 export const USAGE_NOTE_FLAG = 'ply.usage.note';
 
+/** The one line GET / appends when ply.usage.note resolves to boolean true. Off leaves GET / unchanged. */
+export const USAGE_NOTE_LINE = 'ply.usage.note is on for this unit.';
+
 export const MAX_FLAGS = 64;
 export const MAX_RULES = 16;
 export const MAX_UNITS = 128;

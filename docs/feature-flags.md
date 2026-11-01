@@ -1,6 +1,6 @@
 # Feature flags
 
-A feature release is a flag ramp. The flag type stores an allocation, not a schedule. `setRollout` accepts any integer number of basis points from 0 through 10000. One basis point is one hash bucket, and 10000 is every unit. Which steps a release walks is config: the checked-in CD policy at `scripts/cd/cd.policy.json` (the same file `scripts/cd` loads). This document does not copy that list. `scripts/cd*` is unchanged; the follow-up below is how CD will drive the ramp.
+A feature release is a flag ramp. The flag type stores an allocation, not a schedule. `setRollout` accepts any integer number of basis points from 0 through 10000. One basis point is one hash bucket, and 10000 is every unit. Which steps a release walks is config: the checked-in CD policy at `scripts/cd/cd.policy.json` (the same file `scripts/cd` loads). This document does not copy that list. The version ramp in `scripts/cd` is unchanged. Smoke now checks the flag routes. The follow-up below is how CD will later drive a flag ramp through `scripts/flags`. That ramp is not implemented.
 
 ## Storage
 
@@ -12,7 +12,35 @@ Every successful change logs `flags.write` with the old revision, the new revisi
 
 The bucket is declared in `cloudflare.config.ts` and is not created by this repo. It has to exist before a deploy that uploads the binding. `cf deploy` can provision an R2 bucket that is missing; create `ply-flags` first.
 
-No D1, no KV, and no new secret. The write API is the service binding, not a bearer.
+No D1 and no KV. ply does not gain a secret. HTTP writes on `/v1/flags` stay 405. The write API on ply is still the `FlagControl` service binding.
+
+## Operator writes
+
+Nothing outside ply can call that binding. `ply-flag-operator` is a second Worker whose only job is to call it. `cloudflare.config.ts` selects it when `--mode` is exactly `flag-operator`. Every other mode, including `production` and `development`, uploads ply. A normal `cf deploy` does not upload the operator, and `cf deploy --mode flag-operator` does not upload ply.
+
+The operator Worker holds `FLAG_OPERATOR_TOKEN` (a secret on that Worker, not on ply) and `FLAG_CONTROL`, a service binding `bindings.worker({ worker: "ply", exportName: "FlagControl" })`. It has no R2 binding. Its routes are `GET /config`, `POST /rollout`, and `POST /targeting`. Each requires `Authorization: Bearer`. A missing secret is 503 and does not call `FlagControl`. A wrong or missing bearer is 401 and does not read the body. Responses are `cache-control: no-store`.
+
+The body carries the expected revision as `{kind:"absent"}` or `{kind:"revision", value}`. An empty string is not a revision. The operator turns `absent` into the `ABSENT_REVISION` (`""`) that `FlagControl` puts with `If-None-Match: *`, which is how the first write seeds `flags/config.json`. A lost race is 409 `{kind:"conflict", expected, actual}`.
+
+Every request emits a `flags.operator` span and a `flags.operator` log: `op`, `result`, `flag`, `expected`, `revision`, `invalidated`, and `operator_ms`. `operator_ms` is the handler wall time, including the token compare and the `FlagControl` RPC when one is made.
+
+`scripts/flags` is the operator CLI (`npm run flags`). It reads the token from `FLAG_OPERATOR_TOKEN_FILE` (default `~/.ply-flag-token`, mode 0600) and the origin from `PLY_FLAG_OPERATOR_URL` or `--url`. The token is never an argument and never printed. There is no default host.
+
+```
+npm run flags -- get
+npm run flags -- rollout ply.usage.note 0 --expected absent
+npm run flags -- rollout ply.usage.note 1000 --expected <revision from get>
+npm run flags -- targeting ply.usage.note --expected <revision> --allow user:smoke
+```
+
+`get` prints the `FlagControl` read, including `{kind:"absent"}` when the object has not been written. The next write then passes `--expected absent`. A later write passes the revision from the last `ok` result. Do not CAS against the cached `GET /v1/flags` view.
+
+Deploy (this repo does not run it):
+
+1. `cf deploy --mode flag-operator` uploads `ply-flag-operator` only.
+2. `cf workers secrets update FLAG_OPERATOR_TOKEN --worker ply-flag-operator --type secret_text` (the CLI prompts; the same value goes in the 0600 file, never on argv).
+3. Set `PLY_FLAG_OPERATOR_URL` to the workers.dev URL that deploy prints.
+4. No new ply binding and no new ply secret. The `FLAGS` R2 bucket is unchanged.
 
 ## Rollout
 
@@ -89,25 +117,30 @@ Each evaluation emits a `flags.eval` span and a `flags.resolve` child per flag. 
 |---|---|
 | `flags.cache_status` | eval span. `HIT`, `UPDATING`, `REVALIDATED`, `EXPIRED`, `MISS`, plus `STALE`, `BYPASS`, `NONE` when the platform says so |
 | `flags.revision` | both |
-| `flags.eval_ms` | eval span, pure evaluation |
+| `flags.eval_ms` | eval span, pure evaluation. On Workers this stays 0: the clock does not move until the isolate yields |
+| `flags.resolve_ms` | eval span and the `flags.eval` / `flags.resolve` logs. Wall time of the awaited FlagsCache read. A hit is the cache lookup. A miss, stale, or revalidation includes the R2 read inside that await |
 | `flags.r2_read_ms` | eval span when this request read R2 (not a hit) |
 | `flags.count` | eval span |
 | `flags.unit_id` | eval span only |
 | `flags.key`, `flags.variant_kind`, `flags.variant_value`, `flags.reason`, `flags.bucket` | resolve span |
 
-The same low-cardinality fields are logged as `flags.eval` and `flags.resolve`. The unit id is not on those lines, so it is not a dimension of the report. `scripts/flags-o11y.ts` queries Workers observability for those two messages and prints p50/p95/p99 of `eval_ms` per cache status, then the count of resolved variants per flag, revision, variant, and reason.
+The same low-cardinality fields are logged as `flags.eval` and `flags.resolve`. The unit id is not on those lines, so it is not a dimension of the report. `scripts/flags-o11y.ts` queries Workers observability for those two messages and prints p50/p95/p99 of `resolve_ms` per cache status, then the count of resolved variants per flag, revision, variant, and reason. Zero is not a sample. If `resolve_ms` is missing or 0, the report uses a positive `eval_ms`, then the invocation `wallTimeMs`, then the span duration. `flags.resolve` events are the variant counts only; they are not a second timing sample. The script prints that definition on stderr and leaves the stdout table unchanged.
+
+`flags.eval` is opened before the FlagsCache await and ended after it, so the platform span duration includes that yield. The `flags.resolve` children are opened after the await. Their platform duration stays near 0. The number to aggregate is the `resolve_ms` attribute and log field.
+
+Smoke accepts `GET /v1/flags` cache status `HIT`, `MISS`, `STALE`, or `UPDATING`. `REVALIDATED` and `EXPIRED` are real platform statuses and would fail that check.
 
 ## CD follow-up
 
-`scripts/cd*` is not modified here. A later change can drive a feature ramp through the service binding the same way the version ramp walks `scripts/cd/cd.policy.json`:
+The version ramp is unchanged. A later change can drive a feature ramp through `scripts/flags` the same way the version ramp walks `scripts/cd/cd.policy.json`. This section is the procedure. It is not implemented, and `scripts/cd` does not shell out to `scripts/flags`.
 
-1. Load that policy (the CD pipeline's `loadPolicy`). Do not keep a second copy of `steps`.
-2. `const config = await env.FLAG_CONTROL.getConfig()` and keep `config.revision`.
-3. For each `step` in `policy.steps`, `await env.FLAG_CONTROL.setRollout(flag, step.percent * 100, revision)`. A policy percent is a whole percent; the flag argument is basis points, so 10% is 1000.
-4. On `{ kind: "ok" }`, dwell for `step.dwellMs`, judge the SLO from `flags.resolve` (variant and reason by revision), then pass `result.revision` into the next step.
-5. On `{ kind: "conflict" }`, stop the way a `state_conflict` stops the version ramp. Re-read with `getConfig()` and decide whether to retry.
-6. A rollback is `setRollout(flag, 0, revision)`, which is the `rolled-back` state. It is not a Worker version rollback.
+1. Load that policy with the CD pipeline's `loadPolicy`. Do not keep a second copy of `steps`.
+2. `scripts/flags get`. An `{kind:"absent"}` result means the next write is `--expected absent`. An `{kind:"ok"}` result keeps `revision`.
+3. For each `step` in `policy.steps`, `scripts/flags rollout <flag> <step.percent * 100> --expected <revision>`. A policy percent is a whole percent; the flag argument is basis points, so 10% is 1000.
+4. On `{kind:"ok"}`, dwell for `step.dwellMs`, judge the SLO from `flags.resolve` (variant and reason by revision), then pass `revision` from that result into the next step.
+5. On `{kind:"conflict"}` (exit 1), stop the way a `state_conflict` stops the version ramp. Run `get` again and decide whether to retry. Do not write with the stale revision.
+6. A rollback is `scripts/flags rollout <flag> 0 --expected <revision>`, which is the `rolled-back` state. It is not a Worker version rollback.
 
-Editing `cd.policy.json` changes the steps the follow-up will walk. The flag API does not need a matching change: it already accepts any basis point in 0..10000, including allocations the policy does not name.
+Editing `cd.policy.json` changes the steps that follow-up will walk. The flag API does not need a matching change: it already accepts any basis point in 0..10000, including allocations the policy does not name.
 
-The binding is `bindings.worker({ worker: "ply", exportName: "FlagControl" })`. This Worker already publishes that binding as `FLAG_CONTROL`.
+The first seed of `ply.usage.note` at 0 basis points, while the object is absent, is `rollout ply.usage.note 0 --expected absent`. That creates the flag already rolled back.

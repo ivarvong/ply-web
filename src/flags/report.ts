@@ -29,10 +29,6 @@ function stringField(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
-function numberField(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
-}
-
 function fieldsOf(event: Obj): Obj {
   const source = record(event.source) ?? {};
   const attributes = record(event.attributes) ?? record(source.attributes) ?? {};
@@ -49,7 +45,35 @@ function quantiles(values: readonly number[]): Quantiles {
   return { n: values.length, p50: percentile(values, 0.5), p95: percentile(values, 0.95), p99: percentile(values, 0.99) };
 }
 
-type EvalPoint = { readonly cacheStatus: string; readonly evalMs: number };
+type EvalPoint = { readonly cacheStatus: string; readonly resolveMs: number };
+
+/** A positive duration. Zero is not a measurement: the Workers clock did not move. */
+function positiveMs(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function wallMs(fields: Obj): number | null {
+  const workers = record(fields.$workers);
+  return positiveMs(workers?.wallTimeMs) ?? positiveMs(fields.wallTimeMs) ?? positiveMs(fields['$workers.wallTimeMs']);
+}
+
+function spanMs(fields: Obj): number | null {
+  return positiveMs(fields.durationMs) ?? positiveMs(fields.durationMS) ?? positiveMs(fields.duration_ms);
+}
+
+/**
+ * Prefer the awaited cache/R2 wall time. A legacy positive eval_ms is the next choice.
+ * Zero is skipped so a frozen Workers clock does not become the percentile: the invocation
+ * wallTimeMs, then the span duration, fill that gap.
+ */
+function measuredMs(fields: Obj): number | null {
+  return positiveMs(fields.resolve_ms)
+    ?? positiveMs(fields['flags.resolve_ms'])
+    ?? positiveMs(fields.eval_ms)
+    ?? positiveMs(fields['flags.eval_ms'])
+    ?? wallMs(fields)
+    ?? spanMs(fields);
+}
 type ResolvePoint = { readonly key: string; readonly revision: string; readonly variantKind: string; readonly variantValue: string; readonly reason: string };
 
 function evalPoint(event: Obj): EvalPoint | null {
@@ -57,10 +81,10 @@ function evalPoint(event: Obj): EvalPoint | null {
   const name = stringField(fields.name) ?? stringField(fields.spanName);
   const msg = stringField(fields.msg);
   if (msg !== 'flags.eval' && name !== 'flags.eval') return null;
-  const evalMs = numberField(fields.eval_ms) ?? numberField(fields['flags.eval_ms']);
+  const resolveMs = measuredMs(fields);
   const cacheStatus = stringField(fields.cache_status) ?? stringField(fields['flags.cache_status']);
-  if (evalMs === null || !cacheStatus) return null;
-  return { cacheStatus, evalMs };
+  if (resolveMs === null || !cacheStatus) return null;
+  return { cacheStatus, resolveMs };
 }
 
 function resolvePoint(event: Obj): ResolvePoint | null {
@@ -86,7 +110,7 @@ export function reportFromEvents(events: readonly unknown[]): FlagReport {
     const sample = evalPoint(rec);
     if (sample) {
       const list = durations.get(sample.cacheStatus) ?? [];
-      list.push(sample.evalMs);
+      list.push(sample.resolveMs);
       durations.set(sample.cacheStatus, list);
     }
     const resolved = resolvePoint(rec);
@@ -102,6 +126,13 @@ export function reportFromEvents(events: readonly unknown[]): FlagReport {
   const rows = [...variants.values()].sort((a, b) => a.key.localeCompare(b.key) || a.revision.localeCompare(b.revision) || b.count - a.count || a.reason.localeCompare(b.reason));
   return { cache, variants: rows };
 }
+
+/**
+ * What the percentile columns measure. stdout of scripts/flags-o11y.ts stays the table;
+ * the script prints this on stderr.
+ */
+export const MEASUREMENT =
+  'p50/p95/p99 are resolve_ms on flags.eval: the awaited FlagsCache read (a hit is the cache lookup; a miss, stale, or revalidation includes the R2 read inside that await). Grouped by cache_status. Zero is not a sample. Fallback is a positive eval_ms, then invocation wallTimeMs, then span duration. flags.resolve events are variant counts only and are not timed again.';
 
 export function renderReport(report: FlagReport): string {
   const lines = ['cache_status n p50_ms p95_ms p99_ms'];

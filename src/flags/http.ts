@@ -45,7 +45,7 @@ export async function handleFlagHttp(request: Request, env: FlagCacheEnv, ctx: F
   if (url.pathname === '/v1/flags' && request.method === 'GET') return getRules(env, ctx);
   if (url.pathname === '/v1/flags/eval' && request.method === 'POST') return postEval(request, env, ctx);
   if (url.pathname === '/v1/flags' || url.pathname === '/v1/flags/eval') {
-    return json(405, { code: 'unsupported', message: 'flag writes are FlagControl RPC (setRollout, setTargeting), not HTTP', retry: 'no' });
+    return json(405, { code: 'unsupported', message: 'flag writes are FlagControl RPC (setRollout, setTargeting) via ply-flag-operator (scripts/flags), not HTTP', retry: 'no' });
   }
   return json(404, { code: 'not_found', message: 'no flag route', retry: 'no' });
 }

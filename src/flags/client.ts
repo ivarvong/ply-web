@@ -1,9 +1,10 @@
 // In-Worker reads. isEnabled is false when the flag is missing, the store is down, or the variant is not boolean true.
 import { loadRuleset, type FlagCacheEnv, type FlagsCacheBinding } from './cache.ts';
+import { elapsed, type Clock } from './clock.ts';
 import { parseUnit } from './document.ts';
 import { evaluateDocument } from './eval.ts';
-import { emitEval, resolutionSample, type TracingLike } from './telemetry.ts';
-import { USAGE_NOTE_FLAG } from './ttl.ts';
+import { emitEval, endSpan, openSpan, resolutionSample, type TracingLike } from './telemetry.ts';
+import { USAGE_NOTE_FLAG, USAGE_NOTE_LINE } from './ttl.ts';
 import { EMPTY_DOCUMENT, isEnabledVariant, type FlagEvaluation, type Unit } from './types.ts';
 
 export type FlagRuntime = {
@@ -20,22 +21,31 @@ export type ResolveResult =
   | { readonly kind: 'ok'; readonly evaluations: readonly FlagEvaluation[]; readonly revision: string | null; readonly cache: string }
   | { readonly kind: 'unavailable'; readonly reason: string };
 
-export async function resolveFlags(runtime: FlagRuntime, unit: Unit, keys: readonly string[] | null): Promise<ResolveResult> {
-  const loaded = await loadRuleset(runtime.env, runtime.cache);
-  if (loaded.kind === 'unavailable') return { kind: 'unavailable', reason: loaded.reason };
-  const document = loaded.kind === 'ready' ? loaded.document : EMPTY_DOCUMENT;
-  const started = performance.now();
-  const evaluations = evaluateDocument(document, unit, keys);
-  const evalMs = performance.now() - started;
-  emitEval(runtime.tracing, {
-    cacheStatus: loaded.cache,
-    revision: loaded.kind === 'ready' ? loaded.revision : null,
-    evalMs,
-    r2ReadMs: loaded.r2ReadMs,
-    unitId: unit.id,
-    resolutions: evaluations.map(resolutionSample),
-  });
-  return { kind: 'ok', evaluations, revision: loaded.kind === 'ready' ? loaded.revision : null, cache: loaded.cache };
+export async function resolveFlags(runtime: FlagRuntime, unit: Unit, keys: readonly string[] | null, clock: Clock = () => performance.now()): Promise<ResolveResult> {
+  // Open the span before the await so its platform duration includes the cache/R2 yield.
+  // The hash itself does not move the Workers clock; resolve_ms is this await, not the hash.
+  const span = openSpan(runtime.tracing, 'flags.eval');
+  try {
+    const timed = await elapsed(clock, () => loadRuleset(runtime.env, runtime.cache));
+    const loaded = timed.value;
+    if (loaded.kind === 'unavailable') return { kind: 'unavailable', reason: loaded.reason };
+    const document = loaded.kind === 'ready' ? loaded.document : EMPTY_DOCUMENT;
+    const evalStarted = clock();
+    const evaluations = evaluateDocument(document, unit, keys);
+    const evalMs = clock() - evalStarted;
+    emitEval(runtime.tracing, {
+      cacheStatus: loaded.cache,
+      revision: loaded.kind === 'ready' ? loaded.revision : null,
+      evalMs,
+      resolveMs: timed.ms,
+      r2ReadMs: loaded.r2ReadMs,
+      unitId: unit.id,
+      resolutions: evaluations.map(resolutionSample),
+    }, undefined, span);
+    return { kind: 'ok', evaluations, revision: loaded.kind === 'ready' ? loaded.revision : null, cache: loaded.cache };
+  } finally {
+    endSpan(span);
+  }
 }
 
 export async function isEnabled(env: FlagCacheEnv, ctx: { exports?: { FlagsCache?: FlagsCacheBinding }; tracing?: TracingLike | null } | undefined, key: string, unit: { readonly id: string; readonly attributes?: Readonly<Record<string, string>> }): Promise<boolean> {
@@ -52,7 +62,7 @@ export async function usageNote(env: FlagCacheEnv, ctx: { exports?: { FlagsCache
   try {
     const id = unitHeader && unitHeader.length > 0 ? unitHeader : 'anonymous';
     const on = await isEnabled(env, ctx, USAGE_NOTE_FLAG, { id });
-    return on ? 'ply.usage.note is on for this unit.' : null;
+    return on ? USAGE_NOTE_LINE : null;
   } catch {
     return null;
   }

@@ -7,7 +7,7 @@ import { artifactsProbeUrl, classifyCall, openingRevokeResult, revokeConfirmed, 
 import { csvDocument, type CsvRow } from './csv.ts'
 import { asRecord, extractJson } from './json.ts'
 import { judgeCall, type Saved } from './judge.ts'
-import { expectedStatus, lifecycle, type HttpStep } from './lifecycle.ts'
+import { expectedStatuses, lifecycle, type HttpStep } from './lifecycle.ts'
 import { activeLog } from './log.ts'
 import { errorMessage, run } from './proc.ts'
 import { createdTokenSecret, harvestSecrets, redact } from './redact.ts'
@@ -222,7 +222,14 @@ async function oneCall(
   const judgement = judgeCall({
     status: response.status,
     bodyText,
-    headers: { requestId, build, version: seen, ray },
+    headers: {
+      requestId,
+      build,
+      version: seen,
+      ray,
+      cacheControl: header(response, 'cache-control'),
+      contentType: header(response, 'content-type'),
+    },
     ray: step.ray,
     rayIncludes: step.rayIncludes,
     version: pin || version ? version : null,
@@ -278,7 +285,7 @@ async function oneCall(
     judgementDetail: detail,
     ok: judgement.kind === 'ok',
     save: judgement.kind === 'ok' ? judgement.save : {},
-    request: requestId ? { id: requestId, version: seen, step: step.name, status: response.status, expected: [expectedStatus(step)], ray: header(response, 'cf-ray') } : null,
+    request: requestId ? { id: requestId, version: seen, step: step.name, status: response.status, expected: expectedStatuses(step), ray: header(response, 'cf-ray') } : null,
     refs,
     fault: judgement.kind === 'ok' ? null : classifyCall({
       status: response.status,

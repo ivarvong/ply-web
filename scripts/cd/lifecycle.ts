@@ -1,8 +1,17 @@
+import {
+  HTTP_BAD_REQUEST,
+  HTTP_METHOD_NOT_ALLOWED,
+  HTTP_NOT_FOUND,
+  HTTP_OK,
+  HTTP_UNAUTHORIZED,
+  SMOKE_FLAG_KEY,
+  SMOKE_UNIT_ID,
+} from './flags-smoke.ts'
 import type { RayNeed, Expect, Saved } from './judge.ts'
 
 export type HttpStep = {
   readonly name: string
-  readonly method: 'GET' | 'POST' | 'DELETE'
+  readonly method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   readonly path: string
   readonly query?: Readonly<Record<string, string>>
   readonly body?: (saved: Saved) => object
@@ -75,12 +84,80 @@ const read = (name: string, path: string, expect: Expect, rayIncludes?: string):
   rayIncludes,
 })
 
+/** Flag routes, before the git lifecycle. They do not talk to Artifacts. Eval reads the rules snapshot. */
+function flagChecks(): readonly HttpStep[] {
+  const quiet = { git: false, ray: 'absent' as const }
+  const unsupported = { kind: 'code' as const, status: HTTP_METHOD_NOT_ALLOWED, code: 'unsupported' }
+  const refused = (name: string, method: HttpStep['method'], path: string): HttpStep => ({
+    name,
+    method,
+    path,
+    ...quiet,
+    expect: unsupported,
+  })
+  return [
+    {
+      name: 'flags-unauth',
+      method: 'GET',
+      path: '/v1/flags',
+      ply: false,
+      ...quiet,
+      expect: { kind: 'code', status: HTTP_UNAUTHORIZED, code: 'unauthorized' },
+    },
+    {
+      name: 'flags-rules',
+      method: 'GET',
+      path: '/v1/flags',
+      ...quiet,
+      expect: { kind: 'flags-rules' },
+    },
+    {
+      name: 'flags-eval',
+      method: 'POST',
+      path: '/v1/flags/eval',
+      ...quiet,
+      body: () => ({ unit: SMOKE_UNIT_ID, keys: [SMOKE_FLAG_KEY] }),
+      expect: { kind: 'flags-eval' },
+    },
+    {
+      name: 'flags-eval-body',
+      method: 'POST',
+      path: '/v1/flags/eval',
+      ...quiet,
+      body: () => ({ keys: [SMOKE_FLAG_KEY] }),
+      expect: { kind: 'code', status: HTTP_BAD_REQUEST, code: 'bad_request', message: /unit is required/ },
+    },
+    {
+      name: 'flags-eval-key',
+      method: 'POST',
+      path: '/v1/flags/eval',
+      ...quiet,
+      body: () => ({ unit: SMOKE_UNIT_ID, keys: ['NOT_A_KEY'] }),
+      expect: { kind: 'code', status: HTTP_BAD_REQUEST, code: 'bad_request', message: /flag key is not valid/ },
+    },
+    refused('flags-put', 'PUT', '/v1/flags'),
+    refused('flags-post', 'POST', '/v1/flags'),
+    refused('flags-patch', 'PATCH', '/v1/flags'),
+    refused('flags-delete', 'DELETE', '/v1/flags'),
+    refused('flags-eval-get', 'GET', '/v1/flags/eval'),
+    {
+      name: 'usage-off',
+      method: 'GET',
+      path: '/',
+      ply: false,
+      ...quiet,
+      expect: { kind: 'usage-off' },
+    },
+  ]
+}
+
 /**
  * One empty Artifacts repo, never seeded with stock git. Oids returned by earlier steps are
  * passed into later ones. The order is the contract in src/index.js.
  */
 export function lifecycle(): readonly HttpStep[] {
   return [
+    ...flagChecks(),
     {
       name: 'ply-unauth',
       method: 'GET',
@@ -596,8 +673,23 @@ export function lifecycle(): readonly HttpStep[] {
 
 export function expectedStatus(step: HttpStep): number {
   const expect = step.expect
-  if (expect.kind === 'empty-commit' || expect.kind === 'refs-empty' || expect.kind === 'tree' || expect.kind === 'parents' || expect.kind === 'born' || expect.kind === 'stamps' || expect.kind === 'refs-final') {
-    return 200
-  }
+  if (
+    expect.kind === 'empty-commit'
+    || expect.kind === 'refs-empty'
+    || expect.kind === 'tree'
+    || expect.kind === 'parents'
+    || expect.kind === 'born'
+    || expect.kind === 'stamps'
+    || expect.kind === 'refs-final'
+    || expect.kind === 'flags-rules'
+    || expect.kind === 'flags-eval'
+    || expect.kind === 'usage-off'
+  ) return HTTP_OK
   return expect.status
+}
+
+/** Statuses a smoke request may log. flags-rules is 200 when the ruleset exists and 404 when it does not. */
+export function expectedStatuses(step: HttpStep): readonly number[] {
+  if (step.expect.kind === 'flags-rules') return [HTTP_OK, HTTP_NOT_FOUND]
+  return [expectedStatus(step)]
 }
