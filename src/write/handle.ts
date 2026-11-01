@@ -4,7 +4,7 @@ import { fail, mergeBranch, operation, parseCommitId, readCommit, rebaseBranch }
 import { type CallOpts } from './call.ts'
 import { createBranch, deleteRef } from './branch.ts'
 import { commitEdit } from './commit.ts'
-import { readHead, type HeadState } from './head.ts'
+import { noteUnbornAdvertised, readHead, type HeadState } from './head.ts'
 import { nowSeconds, plyStamp, stamp } from './identity.ts'
 import { pick } from './pick.ts'
 import { asBody, branchRef, parseDeleteOid, parseEdit, refOrCommit, sameBranch } from './request.ts'
@@ -33,7 +33,7 @@ async function clarifyUnborn(remote: string, opts: CallOpts, err: unknown, verb:
   const message = String((err as { message?: string })?.message ?? '')
   try {
     const head = await readHeadState(remote, opts, 'head')
-    if (head.kind === 'unborn' && message.includes(head.ref)) return fail('not_found', `ref ${head.ref} is unborn; create a commit before ${verb}`)
+    if (head.kind === 'unborn' && message.includes(head.ref)) return fail('not_found', `ref ${head.ref} is unborn; create a commit before ${verb}`, { miss: { kind: 'head_unborn', target: head.ref } })
   } catch { /* the original not_found names whatever the remote actually rejected */ }
   return err
 }
@@ -135,7 +135,13 @@ const EMPTY_COMMIT = { empty: true, oid: null, tree: null, parents: [], author: 
 export async function readCommitOrEmpty(remote: string, ref: string | null, opts: CallOpts): Promise<Record<string, unknown>> {
   try {
     // The declaration types `ref` as null, which is only the default. A branch name or oid is what readCommit resolves.
-    return await readCommit(remote, { ref } as { ref?: null }, opts) as Record<string, unknown>
+    // ply returns `{ empty: true, ref }` for an unborn HEAD. The documented body also carries the null commit fields.
+    const read = await readCommit(remote, { ref } as { ref?: null }, opts)
+    if ('empty' in read) {
+      noteUnbornAdvertised(remote)
+      return { ...EMPTY_COMMIT, ref: read.ref }
+    }
+    return read
   } catch (e) {
     if ((e as { code?: string })?.code !== 'not_found') throw e
     try {

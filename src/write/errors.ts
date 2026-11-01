@@ -14,6 +14,11 @@ export function isWorkerCode(code: unknown): code is string {
   return typeof code === 'string' && Object.prototype.hasOwnProperty.call(WORKER_RETRY, code);
 }
 
+/** A switch that names every member of a closed union. A new member is a type error here, not a silent fall-through. */
+export function assertNever(value: never): never {
+  throw new Error(`unreachable: ${String(value)}`);
+}
+
 type RefExists = { oid: string };
 type StaleExpected = { expected: string; actual: string };
 

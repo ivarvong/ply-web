@@ -144,8 +144,8 @@ export function parseViewerRoute(url: URL, opts: RouteOpts): ViewerRoute {
   if (url.pathname.startsWith('/r/')) {
     const rest = url.pathname.slice('/r/'.length);
     let name: string;
-    try { name = decodeURIComponent(rest); } catch { throw fail('not_found', `not a repository in ${PUBLIC_NAMESPACE}`); }
-    if (name.includes('/') || !isPublicRepoName(name)) throw fail('not_found', `not a repository in ${PUBLIC_NAMESPACE}`);
+    try { name = decodeURIComponent(rest); } catch { throw fail('not_found', `not a repository in ${PUBLIC_NAMESPACE}`, { miss: { kind: 'repository' } }); }
+    if (name.includes('/') || !isPublicRepoName(name)) throw fail('not_found', `not a repository in ${PUBLIC_NAMESPACE}`, { miss: { kind: 'repository' } });
     loc = validateLocation(publicRemote(name), opts);
   } else {
     if (!url.pathname.startsWith('/view/')) bad('not a viewer route');

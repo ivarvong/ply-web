@@ -39,6 +39,14 @@ function rememberUnborn(origin: string, advertised: boolean): boolean {
   return advertised;
 }
 
+/**
+ * ply's readCommit learns `ls-refs=unborn` while answering an empty repository, and does not tell this cache.
+ * Record the bit so a later HEAD read in this isolate is ls-refs only, the same as a readHead that discovered it.
+ */
+export function noteUnbornAdvertised(url: string): void {
+  rememberUnborn(new URL(url).origin, true);
+}
+
 /** ply's `lsRefsUnborn` for this origin: one discover per isolate, then the cached bit. */
 async function lsRefsUnbornOf(t: GitTransport): Promise<{ readonly advertised: boolean; readonly source: DiscoverSource }> {
   const origin = new URL(t.url).origin;
