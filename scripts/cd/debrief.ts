@@ -52,6 +52,29 @@ function link(fromDir: string, file: string): string {
   return relative(fromDir, file).split('\\').join('/')
 }
 
+/** Informational: smoke ids telemetry never returned, per telemetry stage. Fails the run only when `exceeded`. */
+export function telemetryLossSection(events: readonly CdEvent[]): string[] {
+  const losses = events.map(measurement).filter((value): value is Measurement => value?.source === 'telemetry-loss')
+  if (losses.length === 0) return []
+  const lines = ['## Telemetry loss', '', '| stage | missing | total | rate | max | exceeded |', '| --- | --- | --- | --- | --- | --- |']
+  for (const loss of losses) {
+    const rate = num(loss.rate)
+    const max = num(loss.maxLossRate)
+    lines.push(`| ${loss.live === true ? 'live' : 'pinned'} | ${num(loss.count) ?? '-'} | ${num(loss.total) ?? '-'} | ${rate === null ? '-' : `${(rate * 100).toFixed(1)}%`} | ${max === null ? '-' : `${(max * 100).toFixed(1)}%`} | ${loss.exceeded === true ? 'yes' : 'no'} |`)
+  }
+  lines.push('')
+  for (const loss of losses) {
+    const ids = Array.isArray(loss.ids) ? loss.ids : []
+    for (const item of ids) {
+      if (item === null || typeof item !== 'object') continue
+      const lost = item as Measurement
+      lines.push(`- ${loss.live === true ? 'live' : 'pinned'} ${String(lost.step)} \`${String(lost.id)}\` log ${lost.log === true ? 'missing' : 'ok'}, trace ${lost.trace === true ? 'missing' : 'ok'}`)
+    }
+  }
+  lines.push('')
+  return lines
+}
+
 /** One point per state_change. The 0% canary is the version that was introduced at 0. */
 export function canarySplit(events: readonly CdEvent[]): { readonly percent: number; readonly seen: number }[] {
   const changes = events.filter(event => event.kind === 'state_change')
@@ -173,6 +196,7 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
     }
     lines.push('')
   }
+  lines.push(...telemetryLossSection(events))
   lines.push('## Traffic', '', '| seq | before | after | deployment |', '| --- | --- | --- | --- |')
   const changes = events.filter(event => event.kind === 'state_change')
   if (changes.length === 0) lines.push('| - | - | - | - |')

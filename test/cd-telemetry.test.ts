@@ -5,7 +5,7 @@ import { JOIN_MIN_LOGGED, SMOKE_LATENCY } from '../scripts/cd/baseline.ts'
 import { artifactsProbeUrl, revokeConfirmed } from '../scripts/cd/classify.ts'
 import { raysByRequestId } from '../scripts/cd/csv.ts'
 import { asRecord } from '../scripts/cd/json.ts'
-import { DEFAULT_POLICY_PATH, loadPolicy } from '../scripts/cd/policy.ts'
+import { DEFAULT_MAX_LOSS_RATE, DEFAULT_POLICY_PATH, loadPolicy } from '../scripts/cd/policy.ts'
 import { progressLine } from '../scripts/cd/ramp.ts'
 import { readSmokeRequests } from '../scripts/cd/stage-telemetry.ts'
 import { judgeStep, routedShare } from '../scripts/cd/slo.ts'
@@ -21,6 +21,7 @@ import {
   queryFault,
   statsFromEvents,
   summarizeTelemetry,
+  telemetryLoss,
   unwrapEvents,
   type SmokeRequest,
 } from '../scripts/cd/telemetry.ts'
@@ -464,4 +465,61 @@ test('named entrypoints are not routed traffic', () => {
   assert.match(line, new RegExp(`internal_previous=${GIT_CACHE}:${OLD_GIT}`))
   assert.match(line, /decision=advance/)
   assert.equal(line.includes('reason='), false)
+})
+
+/** N smoke requests; the first `lost` have no log, invocation or trace. Each traced one has its own ray. */
+function lossFixture(total: number, lost: number, status = 200) {
+  const requests: SmokeRequest[] = []
+  const events: unknown[] = []
+  const spans: unknown[] = []
+  for (let i = 0; i < total; i++) {
+    const hex = i.toString(16).padStart(12, '0')
+    const id = `44444444-4444-4444-8444-${hex}`
+    const requestId = `dddddddd-dddd-4ddd-8ddd-${hex}`
+    const ray = `${hex}abcd-IAD`
+    const trace = `${hex}${'e'.repeat(20)}`
+    requests.push({ ...smoke(id, ray, status), step: `step-${i}` })
+    if (i < lost) continue
+    events.push(logEvent(id, requestId, trace, status), invocation(id, requestId, trace))
+    spans.push(spanEvent('fetch', 20, ray, trace))
+  }
+  return { requests, summary: summarizeTelemetry(VERSION, requests, events, spans) }
+}
+
+const LOSS_TOTAL = 79
+const LOSS_SEEN = 6
+
+test('telemetry loss below maxLossRate is informational, with count, rate and ids', () => {
+  const { requests, summary } = lossFixture(LOSS_TOTAL, LOSS_SEEN)
+  const loss = telemetryLoss(requests, summary, DEFAULT_MAX_LOSS_RATE)
+  assert.equal(loss.count, LOSS_SEEN)
+  assert.equal(loss.total, LOSS_TOTAL)
+  assert.equal(loss.rate, LOSS_SEEN / LOSS_TOTAL)
+  assert.equal(loss.exceeded, false)
+  assert.deepEqual(loss.ids.map(lost => lost.step), requests.slice(0, LOSS_SEEN).map(request => request.step))
+  assert.ok(loss.ids.every(lost => lost.log && lost.trace))
+  const judge = judgeSmokeTelemetry({ version: VERSION, requests, summary, ceilings: SMOKE_LATENCY, maxLossRate: DEFAULT_MAX_LOSS_RATE })
+  assert.equal(judge.kind, 'pass')
+  assert.match(judge.line, /telemetry loss 6\/79 .* informational/)
+})
+
+test('telemetry loss above maxLossRate is a harness fault', () => {
+  const lost = Math.ceil(LOSS_TOTAL * DEFAULT_MAX_LOSS_RATE) + 1
+  const { requests, summary } = lossFixture(LOSS_TOTAL, lost)
+  const judge = judgeSmokeTelemetry({ version: VERSION, requests, summary, ceilings: SMOKE_LATENCY, maxLossRate: DEFAULT_MAX_LOSS_RATE })
+  assert.equal(judge.kind, 'harness_fault')
+  if (judge.kind === 'harness_fault') assert.match(judge.reason, /telemetry-loss: telemetry loss/)
+})
+
+test('a tight maxLossRate fails the same loss the default tolerates', () => {
+  const { requests, summary } = lossFixture(LOSS_TOTAL, LOSS_SEEN)
+  const tight = (LOSS_SEEN - 1) / LOSS_TOTAL
+  const judge = judgeSmokeTelemetry({ version: VERSION, requests, summary, ceilings: SMOKE_LATENCY, maxLossRate: tight })
+  assert.equal(judge.kind, 'harness_fault')
+})
+
+test('loss never hides a correctness fault: a 5xx with loss is still a worker fault', () => {
+  const { requests, summary } = lossFixture(LOSS_TOTAL, LOSS_SEEN, 500)
+  const judge = judgeSmokeTelemetry({ version: VERSION, requests, summary, ceilings: SMOKE_LATENCY, maxLossRate: DEFAULT_MAX_LOSS_RATE })
+  assert.equal(judge.kind, 'worker')
 })

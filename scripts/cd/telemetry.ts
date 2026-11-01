@@ -1,7 +1,7 @@
-import { lossAllowance, verdict, type CanaryVerdict } from '../canary-verdict.mjs'
+import { verdict, type CanaryVerdict } from '../canary-verdict.mjs'
 import { CF_RAY_HEX_LENGTH, JOIN_MIN_LOGGED, JOIN_MIN_SHARE, QUERY_SLACK_MS, TELEMETRY_PAGE, type LatencyCeiling } from './baseline.ts'
 import { asRecord } from './json.ts'
-import type { RolloutGates } from './policy.ts'
+import { DEFAULT_MAX_LOSS_RATE, type RolloutGates } from './policy.ts'
 import type { V1Request } from './slo.ts'
 
 /**
@@ -21,7 +21,7 @@ export type ObservedFault =
 export type UnevaluableCheck =
   | { readonly kind: 'missing'; readonly detail: string }
   | { readonly kind: 'shape'; readonly detail: string }
-  | { readonly kind: 'trace-count'; readonly detail: string }
+  | { readonly kind: 'telemetry-loss'; readonly detail: string }
   | { readonly kind: 'join'; readonly detail: string }
 
 export type SmokeRequest = {
@@ -784,10 +784,50 @@ function isObserved(check: ObservedFault | UnevaluableCheck): check is ObservedF
       return true
     case 'missing':
     case 'shape':
-    case 'trace-count':
+    case 'telemetry-loss':
     case 'join':
       return false
   }
+}
+
+/** One smoke id telemetry did not return: no ply.request log from any version, no trace, or both. */
+export type LostId = { readonly id: string; readonly step: string; readonly log: boolean; readonly trace: boolean }
+
+/** Informational loss metric. `rate` is `ids.length / total`; zero when there were no smoke requests. */
+export type TelemetryLoss = {
+  readonly total: number
+  readonly count: number
+  readonly rate: number
+  readonly maxLossRate: number
+  readonly exceeded: boolean
+  readonly ids: readonly LostId[]
+}
+
+/**
+ * Smoke ids missing from telemetry. A request logged by another version is a routing fault, not loss,
+ * and is not counted here.
+ */
+export function telemetryLoss(
+  requests: readonly SmokeRequest[],
+  summary: Pick<SmokeSummary, 'loggedBy' | 'tracedIds'>,
+  maxLossRate: number,
+): TelemetryLoss {
+  const ids: LostId[] = []
+  const counted = new Set<string>()
+  for (const request of requests) {
+    if (counted.has(request.id)) continue
+    counted.add(request.id)
+    const log = (summary.loggedBy.get(request.id)?.size ?? 0) === 0
+    const trace = !summary.tracedIds.has(request.id)
+    if (log || trace) ids.push({ id: request.id, step: request.step, log, trace })
+  }
+  const total = counted.size
+  const rate = total === 0 ? 0 : ids.length / total
+  return { total, count: ids.length, rate, maxLossRate, exceeded: rate > maxLossRate, ids }
+}
+
+export function lossLine(loss: TelemetryLoss): string {
+  return `telemetry loss ${loss.count}/${loss.total} (${(loss.rate * 100).toFixed(1)}%, max ${(loss.maxLossRate * 100).toFixed(1)}%)`
 }
 
 export function judgeSmokeTelemetry(input: {
@@ -795,8 +835,11 @@ export function judgeSmokeTelemetry(input: {
   readonly requests: readonly SmokeRequest[]
   readonly summary: SmokeSummary
   readonly ceilings: { readonly cpuMs: LatencyCeiling; readonly wallMs: LatencyCeiling; readonly fetchMs: LatencyCeiling }
+  /** Policy `telemetry.maxLossRate`. Loss at or below it is informational. */
+  readonly maxLossRate?: number
 }): SmokeJudge {
   const { version, requests, summary, ceilings } = input
+  const loss = telemetryLoss(requests, summary, input.maxLossRate ?? DEFAULT_MAX_LOSS_RATE)
   const decided = verdict({
     version,
     requests: requests.map(request => ({ id: request.id, version: request.version, step: request.step })),
@@ -819,11 +862,7 @@ export function judgeSmokeTelemetry(input: {
   if (requests.length === 0 || decided.matched === 0) {
     checks.push({ kind: 'missing', detail: requests.length === 0 ? 'smoke recorded no requests' : 'zero invocations matched the smoke' })
   } else {
-    const missingTraces = requests.filter(request => !summary.tracedIds.has(request.id)).length
-    const allowance = lossAllowance(requests.length)
-    if (missingTraces > allowance) {
-      checks.push({ kind: 'trace-count', detail: `${missingTraces} smoke requests have no trace, allowance ${allowance}` })
-    }
+    if (loss.exceeded) checks.push({ kind: 'telemetry-loss', detail: lossLine(loss) })
     checks.push(...latencyChecks('wall', summary.wallMs, ceilings.wallMs))
     checks.push(...latencyChecks('cpu', summary.cpuMs, ceilings.cpuMs))
     if (summary.spanShape === 'summaries') {
@@ -832,8 +871,9 @@ export function judgeSmokeTelemetry(input: {
       checks.push(...latencyChecks('fetch', summary.fetchMs, ceilings.fetchMs))
     }
   }
-  if (decided.unconfirmed.length > 0 || decided.lost.length > decided.allowance) {
-    checks.push({ kind: 'missing', detail: decided.reasons.join('; ') || 'smoke ids missing from telemetry' })
+  // Lost ids are counted by `loss`. An id no response proved the version for still cannot be judged.
+  if (decided.unconfirmed.length > 0) {
+    checks.push({ kind: 'missing', detail: `${decided.unconfirmed.length} lost without x-ply-version ${version} recorded by the smoke` })
   }
   const observed = checks.filter(isObserved)
   const unevaluable = checks.filter((check): check is UnevaluableCheck => !isObserved(check))
@@ -858,11 +898,13 @@ export function judgeSmokeTelemetry(input: {
       verdict: decided,
     }
   }
-  if (unevaluable.length > 0 || !decided.pass) {
+  // `decided.pass` also fails on lost > allowance. That is loss, judged above against maxLossRate.
+  const decidedFault = decided.otherVersion.length > 0 || decided.unconfirmed.length > 0
+  if (unevaluable.length > 0 || decidedFault) {
     const reason = unevaluable.map(check => `${check.kind}: ${check.detail}`).join('; ') || decided.line
     return { kind: 'harness_fault', line: `telemetry: harness_fault: ${reason}`, reason, checks: unevaluable, verdict: decided }
   }
-  return { kind: 'pass', failures: [], line, verdict: decided }
+  return { kind: 'pass', failures: [], line: loss.count > 0 ? `${line}; ${lossLine(loss)} informational` : line, verdict: decided }
 }
 
 export function telemetryMarkdown(input: {
@@ -871,8 +913,9 @@ export function telemetryMarkdown(input: {
   readonly to: number
   readonly judge: SmokeJudge
   readonly summary: SmokeSummary
+  readonly loss: TelemetryLoss
 }): string {
-  const { version, from, to, judge, summary } = input
+  const { version, from, to, judge, summary, loss } = input
   const lines = [
     `# Telemetry ${version}`,
     '',
@@ -880,13 +923,18 @@ export function telemetryMarkdown(input: {
     '',
     judge.line,
     '',
-    `- invocations matched: ${judge.verdict.matched}/${judge.verdict.total} (loss allowance ${judge.verdict.allowance})`,
+    `- invocations matched: ${judge.verdict.matched}/${judge.verdict.total}`,
+    `- ${lossLine(loss)}${loss.exceeded ? ' EXCEEDED' : ' informational'}`,
     `- non-ok ${summary.health.nonOk}, 5xx ${summary.health.fivexx}, error logs ${summary.health.errorLogs}, exceptions ${summary.health.exceptions}`,
     `- wall p50/p99 ${percentile(summary.wallMs, 0.5) ?? '-'} / ${percentile(summary.wallMs, 0.99) ?? '-'} ms`,
     `- cpu p50/p99 ${percentile(summary.cpuMs, 0.5) ?? '-'} / ${percentile(summary.cpuMs, 0.99) ?? '-'} ms`,
     `- fetch p50/p99 ${percentile(summary.fetchMs, 0.5) ?? '-'} / ${percentile(summary.fetchMs, 0.99) ?? '-'} ms`,
     `- traces for ${summary.tracedIds.size} smoke requests; ${summary.invocations} invocations logged by the worker`,
   ]
+  if (loss.count > 0) {
+    lines.push('', '## Telemetry loss', '', '| id | step | log | trace |', '| --- | --- | --- | --- |')
+    for (const lost of loss.ids) lines.push(`| ${lost.id} | ${lost.step} | ${lost.log ? 'missing' : 'ok'} | ${lost.trace ? 'missing' : 'ok'} |`)
+  }
   if (judge.kind === 'harness_fault') {
     lines.push('', '## Harness fault', '', judge.reason)
   } else if (judge.failures.length) {

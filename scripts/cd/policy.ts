@@ -50,6 +50,18 @@ export type SplitPolicy = {
   readonly onInsufficient: EvidenceAction
 }
 
+/**
+ * Workers Observability drops whole invocations in bursts. A smoke id with no log line or no trace is
+ * telemetry loss: recorded with a count, rate and id list, and only fails the run above `maxLossRate`.
+ */
+export type TelemetryPolicy = {
+  /** Fraction of smoke ids in (0, 1] that may be missing from telemetry before the run fails. */
+  readonly maxLossRate: number
+}
+
+/** Default when the policy omits `telemetry`: fail only when more than half of the smoke is missing. */
+export const DEFAULT_MAX_LOSS_RATE = 0.5
+
 export type RolloutPolicy = {
   readonly steps: readonly RolloutStep[]
   readonly ingestWaitMs: number
@@ -64,6 +76,7 @@ export type RolloutPolicy = {
     readonly minSamples: number
   }
   readonly split: SplitPolicy
+  readonly telemetry: TelemetryPolicy
 }
 
 export type LoadedPolicy = {
@@ -203,9 +216,21 @@ function splitOf(value: unknown): SplitPolicy {
   }
 }
 
+function rate(value: unknown, path: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > 1) reject(path, 'must be a number in (0, 1]')
+  return value
+}
+
+function telemetryOf(value: unknown): TelemetryPolicy {
+  if (value === undefined) return { maxLossRate: DEFAULT_MAX_LOSS_RATE }
+  const rec = record(value, 'telemetry')
+  exactKeys(rec, 'telemetry', [], ['maxLossRate'])
+  return { maxLossRate: rec.maxLossRate === undefined ? DEFAULT_MAX_LOSS_RATE : rate(rec.maxLossRate, 'telemetry.maxLossRate') }
+}
+
 function validate(value: unknown): RolloutPolicy {
   const rec = record(value, 'policy')
-  exactKeys(rec, 'policy', ['steps', 'ingestWaitMs', 'probe', 'gates', 'burn', 'split'], ['warmupMs'])
+  exactKeys(rec, 'policy', ['steps', 'ingestWaitMs', 'probe', 'gates', 'burn', 'split'], ['warmupMs', 'telemetry'])
   const probe = record(rec.probe, 'probe')
   exactKeys(probe, 'probe', ['rps', 'calls'])
   const rps = probe.rps
@@ -225,6 +250,7 @@ function validate(value: unknown): RolloutPolicy {
       minSamples: integer(burn.minSamples, 'burn.minSamples', 1),
     },
     split: splitOf(rec.split),
+    telemetry: telemetryOf(rec.telemetry),
   }
 }
 
@@ -261,6 +287,7 @@ function policyBody(policy: RolloutPolicy): Json {
       onMismatch: policy.split.onMismatch,
       onInsufficient: policy.split.onInsufficient,
     },
+    telemetry: { maxLossRate: policy.telemetry.maxLossRate },
   }
 }
 

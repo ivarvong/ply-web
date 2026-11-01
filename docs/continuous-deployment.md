@@ -214,7 +214,7 @@ It fails when any of these are true:
 
 - an exception, a non-ok invocation, a 5xx, or an error log on that version
 - a smoke id logged by a different version
-- smoke ids missing from telemetry beyond the loss allowance in `scripts/canary-verdict.mjs` (max of 2 and 2% of the ids). An id the smoke did not see answered by this version is never waived
+- smoke ids missing from telemetry (no `ply.request` log, or no trace) above `telemetry.maxLossRate` in `scripts/cd/cd.policy.json` (default 0.5). Workers Observability loses whole invocations in bursts, so loss at or below that rate is informational: the telemetry stage records the count, rate, and every missing id in `telemetry.md`, `telemetry.json` (`loss`), a `telemetry-loss` observation in `events.jsonl`, and the debrief's Telemetry loss section. An id the smoke did not see answered by this version is never waived. Status mismatches, 5xx, exceptions, error logs, and burn stay hard gates regardless of loss
 - a response status the smoke did not expect
 - an exception, a 5xx log, a non-ok outcome, or an error log
 - wall, CPU, or upstream `fetch` span p50/p99 over the ceilings below, on samples the query returned
