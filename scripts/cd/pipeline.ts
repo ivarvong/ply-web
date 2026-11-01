@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { CLEANUP_FILE, cleanupLeakNames } from './cleanup.ts'
 import type { CdConfig } from './config.ts'
 import { cfOk, ROOT } from './cf.ts'
 import { fullSplit, isTrafficSplit, versionsFromList, type VersionShare } from './deploy-plan.ts'
@@ -22,6 +23,46 @@ import { readDeployment } from './traffic.ts'
 export type PipelineExit = {
   readonly code: number
   readonly reason: string | null
+}
+
+async function recordedProbeLoss(runDir: string): Promise<readonly { readonly percent: number; readonly count: number; readonly rate: number; readonly ids: readonly string[] }[]> {
+  let text: string
+  try {
+    text = await readFile(join(runDir, 'ramp.json'), 'utf8')
+  } catch {
+    return []
+  }
+  let value: unknown
+  try {
+    value = JSON.parse(text) as unknown
+  } catch {
+    return []
+  }
+  const rec = asRecord(value)
+  if (!rec || !Array.isArray(rec.probeLoss)) return []
+  const rows: { readonly percent: number; readonly count: number; readonly rate: number; readonly ids: readonly string[] }[] = []
+  for (const item of rec.probeLoss) {
+    const row = asRecord(item)
+    if (!row) continue
+    const ids = Array.isArray(row.ids) ? row.ids.filter(id => typeof id === 'string') : []
+    if (typeof row.percent !== 'number' || typeof row.count !== 'number' || typeof row.rate !== 'number') continue
+    rows.push({ percent: row.percent, count: row.count, rate: row.rate, ids })
+  }
+  return rows
+}
+
+async function recordedCleanupLeaks(runDir: string): Promise<readonly string[]> {
+  let text: string
+  try {
+    text = await readFile(join(runDir, CLEANUP_FILE), 'utf8')
+  } catch {
+    return []
+  }
+  try {
+    return cleanupLeakNames(JSON.parse(text) as unknown)
+  } catch {
+    return []
+  }
 }
 
 function outcomeOf(result: StageResult<unknown>): PhaseOutcome {
@@ -317,14 +358,19 @@ export async function runPipeline(
     }
     state = { phase: 'halt', smoke: state.smoke }
   }
-  const verdictKind = failure?.fault === 'harness_fault'
+  const fault = failure === null ? null : failure.fault
+  const verdictKind = fault === 'harness_fault'
     ? 'harness_fault' as const
-    : failure?.fault === 'state_conflict'
+    : fault === 'state_conflict'
       ? 'state_conflict' as const
-      : 'fail' as const
+      : fault === 'insufficient_samples'
+        ? 'insufficient_samples' as const
+        : 'fail' as const
+  const probeLoss = await recordedProbeLoss(runDir)
+  const cleanupLeak = await recordedCleanupLeaks(runDir)
   const verdict = failure
-    ? { kind: verdictKind, version, previous, stage: failure.stage, reason: failure.reason, rolledBack: failure.rolledBack, fault: failure.fault, failures: [failure.reason] }
-    : { kind: 'pass' as const, version, previous, failures: [] as string[] }
+    ? { kind: verdictKind, version, previous, stage: failure.stage, reason: failure.reason, rolledBack: failure.rolledBack, fault: failure.fault, failures: [failure.reason], probe_loss: probeLoss, cleanup_leak: cleanupLeak }
+    : { kind: 'pass' as const, version, previous, failures: [] as string[], probe_loss: probeLoss, cleanup_leak: cleanupLeak }
   await writeJson(runDir, 'verdict.json', verdict, [opts.token])
   if (failure) {
     const label = failure.fault === 'worker' ? 'FAIL' : failure.fault

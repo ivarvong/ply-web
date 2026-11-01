@@ -1,5 +1,6 @@
 import { readFile, appendFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { orNull } from '../../src/option.ts'
 import { SMOKE_HTTP_MS } from './baseline.ts'
 import type { CdConfig } from './config.ts'
 import { isTrafficSplit, sameSplit, trafficSplit, type VersionShare } from './deploy-plan.ts'
@@ -9,6 +10,7 @@ import { activeLog } from './log.ts'
 import { readPassVerdict, runRamp, type Observation } from './ramp.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import type { ProbeCall } from './policy.ts'
+import { accountProbeLoss, classifyProbe, probeLossRecord, rayOf, type ProbeOutcome } from './probe.ts'
 import { writeJson } from './run-dir.ts'
 import { routedShare } from './slo.ts'
 import { percentile, queryTo, scriptVersionId, serviceFilter, spanTypeFilter, statsFromEvents } from './telemetry.ts'
@@ -79,12 +81,13 @@ async function observe(config: CdConfig, version: string, previous: string, from
   }
 }
 
-/** Unpinned. The response version is recorded; the gate reads telemetry, not this status. */
+/** Unpinned. A thrown fetch is a loss. A real status is a response, and only that response is logged. */
 async function probeCall(
+  id: string,
   method: string,
   url: string,
   headers: Record<string, string>,
-): Promise<number> {
+): Promise<ProbeOutcome> {
   const log = activeLog()
   const started = Date.now()
   try {
@@ -93,22 +96,24 @@ async function probeCall(
       headers,
       signal: AbortSignal.timeout(SMOKE_HTTP_MS),
     })
-    const status = response.status
-    await log?.request({
-      method,
-      url,
-      status,
-      version: response.headers.get('x-ply-version'),
-      latencyMs: Date.now() - started,
-      cfRay: response.headers.get('cf-ray'),
-      requestId: response.headers.get('x-ply-request-id'),
-      artifactsRay: response.headers.get('x-artifacts-ray'),
-    })
-    if (status === 0) return 1
-    return 0
+    const outcome = classifyProbe(id, { kind: 'response', status: response.status, ray: rayOf(response.headers.get('cf-ray')) })
+    if (outcome.kind === 'responded' && log) {
+      await log.request({
+        method,
+        url,
+        status: outcome.status,
+        version: response.headers.get('x-ply-version'),
+        latencyMs: Date.now() - started,
+        cfRay: orNull(outcome.ray),
+        requestId: response.headers.get('x-ply-request-id'),
+        artifactsRay: response.headers.get('x-artifacts-ray'),
+      })
+    }
+    return outcome
   } catch (error) {
-    await log?.error(errorMessage(error), { stage: 'ramp', url })
-    return 1
+    const name = error instanceof Error ? error.name : 'Error'
+    const message = error instanceof Error ? error.message : 'probe failed'
+    return classifyProbe(id, { kind: 'thrown', name, message })
   }
 }
 
@@ -117,13 +122,16 @@ async function probeOnce(
   token: string,
   baseUrl: string,
   calls: readonly ProbeCall[],
-): Promise<number> {
-  const counts = await Promise.all(calls.map(async call => {
-    if (call.auth && !token) return 0
+  identify: (method: string, url: string) => string,
+): Promise<ProbeOutcome[]> {
+  const pending: Promise<ProbeOutcome>[] = []
+  for (const call of calls) {
+    if (call.auth && !token) continue
     const headers: Record<string, string> = call.auth ? { authorization: `Bearer ${token}` } : {}
-    return probeCall(call.method, `${baseUrl}${call.path}`, headers)
-  }))
-  return counts.reduce((sum, count) => sum + count, 0)
+    const url = `${baseUrl}${call.path}`
+    pending.push(probeCall(identify(call.method, url), call.method, url, headers))
+  }
+  return Promise.all(pending)
 }
 
 /** How many ticks may be in flight: one second of the scheduled rate, at least one. */
@@ -137,21 +145,26 @@ async function dwell(
   ms: number,
   rps: number,
   calls: readonly ProbeCall[],
-): Promise<{ harnessFaults: number }> {
+): Promise<ProbeOutcome[]> {
   if (rps <= 0) {
     await new Promise(resolve => setTimeout(resolve, ms))
-    return { harnessFaults: 0 }
+    return []
   }
   const deadline = Date.now() + ms
   const period = 1000 / rps
   const cap = maxInflight(rps)
-  let harnessFaults = 0
+  const outcomes: ProbeOutcome[] = []
+  let issued = 0
+  const identify = (method: string, url: string) => {
+    issued += 1
+    return `${issued} ${method} ${url}`
+  }
   const inflight = new Set<Promise<void>>()
   while (Date.now() < deadline) {
     const tick = Date.now()
     const tracked: { promise?: Promise<void> } = {}
-    const promise = probeOnce(token, baseUrl, calls).then(harness => {
-      harnessFaults += harness
+    const promise = probeOnce(token, baseUrl, calls, identify).then(batch => {
+      for (const outcome of batch) outcomes.push(outcome)
     }).finally(() => {
       if (tracked.promise) inflight.delete(tracked.promise)
     })
@@ -162,7 +175,7 @@ async function dwell(
     if (remain > 0) await new Promise(resolve => setTimeout(resolve, remain))
   }
   await Promise.all(inflight)
-  return { harnessFaults }
+  return outcomes
 }
 
 export async function stageRamp(
@@ -235,7 +248,33 @@ export async function stageRamp(
   const result = await runRamp(policy, {
     now: () => Date.now(),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
-    dwell: ms => dwell(opts.token, config.baseUrl, ms, config.policy.probe.rps, config.policy.probe.calls),
+    dwell: async (ms, percent) => {
+      const outcomes = await dwell(opts.token, config.baseUrl, ms, config.policy.probe.rps, config.policy.probe.calls)
+      const loss = accountProbeLoss(outcomes, config.policy.probe.maxLossRate)
+      const log = activeLog()
+      if (log) {
+        const at = Date.now()
+        await log.observation({
+          measurement: {
+            source: 'probe-loss',
+            percent,
+            count: loss.count,
+            rate: loss.rate,
+            total: loss.total,
+            responded: loss.responded,
+            serverErrors: loss.serverErrors,
+            maxLossRate: loss.maxLossRate,
+            exceeded: loss.exceeded,
+            ids: [...loss.ids],
+          },
+          query: { source: 'probe' },
+          from: at,
+          to: at,
+          raw: JSON.stringify({ ids: loss.ids }),
+        })
+      }
+      return { outcomes }
+    },
     applySplit: async percent => {
       const want = trafficSplit(percent, opts.version, target)
       if (!isTrafficSplit(want)) return want.reason
@@ -269,21 +308,33 @@ export async function stageRamp(
       return applied.reason
     },
   })
-  for (const line of result.lines) {
-    opts.log(line)
-    await appendFile(logPath, JSON.stringify({ line }) + '\n')
+  const probeLoss = result.steps.map(step => probeLossRecord(step.percent, step.probeLoss))
+  for (const step of result.steps) {
+    opts.log(step.line)
+    await appendFile(logPath, JSON.stringify({ line: step.line, probe_loss: probeLossRecord(step.percent, step.probeLoss) }) + '\n')
   }
   await writeJson(opts.runDir, 'ramp.json', {
     state: result.state,
     lines: result.lines,
     steps: result.steps,
+    probeLoss,
     rollbackError: result.rollbackError,
     version: opts.version,
     previous: target,
   })
   if (result.state.kind === 'complete') return pass('ramp', { version: opts.version, previous: target, lines: result.lines })
-  if (result.state.kind === 'held') return fail('ramp', result.state.reason, false)
-  if (result.state.kind === 'stopped') return fail('ramp', result.state.reason, false, result.state.fault)
+  if (result.state.kind === 'held') {
+    if (result.state.outcome === 'insufficient_samples') return fail('ramp', result.state.reason, false, 'insufficient_samples')
+    return fail('ramp', result.state.reason, false)
+  }
+  if (result.state.kind === 'stopped') {
+    if (result.state.fault === 'harness_fault') {
+      const rolledBack = result.state.traffic === 'rolled_back' && result.rollbackError === null
+      const reason = result.rollbackError ? `${result.state.reason}; traffic change failed: ${result.rollbackError}` : result.state.reason
+      return fail('ramp', reason, rolledBack, 'harness_fault')
+    }
+    return fail('ramp', result.state.reason, false, result.state.fault)
+  }
   const reason = result.state.kind === 'rolled-back' ? result.state.reason : 'ramp stopped'
   if (result.rollbackError) return fail('ramp', `${reason}; rollback to ${target} failed: ${result.rollbackError}`)
   return fail('ramp', reason, true)

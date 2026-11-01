@@ -1,14 +1,26 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { REPO_PREFIX, REVOKE_ATTEMPTS, REVOKE_PROBE_MS, REVOKE_WAIT_MS, SMOKE_HTTP_MS, STALE_REPO_MS, TOKEN_TTL_SECONDS } from './baseline.ts'
+import { REPO_PREFIX, REVOKE_ATTEMPTS, REVOKE_PROBE_MS, REVOKE_WAIT_MS, SMOKE_HTTP_MS, TOKEN_TTL_SECONDS } from './baseline.ts'
 import { cfOk, runCf } from './cf.ts'
+import {
+  appendCleanupFile,
+  confirmDelete,
+  recordCleanup,
+  reposFromList,
+  sweepLeaks,
+  type CleanupBound,
+  type CleanupResult,
+  type DeleteCommand,
+  type SweepReport,
+} from './cleanup.ts'
 import { artifactsProbeUrl, classifyCall, openingRevokeResult, revokeConfirmed, type FailureClass } from './classify.ts'
 import { csvDocument, type CsvRow } from './csv.ts'
 import { asRecord, extractJson } from './json.ts'
 import { judgeCall, type Saved } from './judge.ts'
 import { expectedStatuses, lifecycle, type HttpStep } from './lifecycle.ts'
 import { activeLog } from './log.ts'
+import { assertNever } from '../../src/never.ts'
 import { errorMessage, run } from './proc.ts'
 import { createdTokenSecret, harvestSecrets, redact } from './redact.ts'
 import { judgeFsck, judgeRefs, parseShowRef, type ApiRefs } from './refs.ts'
@@ -23,12 +35,18 @@ export type SmokeReport = {
   readonly version: string | null
   readonly repo: string
   readonly deleted: boolean
+  /** Scratch repos whose delete could not be confirmed. Informational: it does not fail a pass. */
+  readonly cleanup_leak: readonly string[]
   readonly requests: readonly SmokeRequest[]
   readonly refs: ApiRefs | null
   readonly detail: string
   readonly passed: number
   readonly failed: number
 }
+
+export type SweepRun =
+  | { readonly kind: 'swept'; readonly deleted: readonly string[]; readonly leaks: readonly string[] }
+  | { readonly kind: 'unlistable'; readonly detail: string }
 
 const REMOTE = /^https:\/\/[a-z0-9]+\.artifacts\.cloudflare\.net\/git\//
 
@@ -143,23 +161,82 @@ async function listTokenIds(config: CdConfig, name: string, secrets: readonly st
   }
 }
 
-async function sweep(config: CdConfig, secrets: readonly string[]): Promise<void> {
+function cleanupBound(config: CdConfig): CleanupBound {
+  return { attempts: config.policy.cleanup.attempts, backoffMs: config.policy.cleanup.backoffMs }
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise(resolve => {
+    setTimeout(resolve, ms)
+  })
+}
+
+async function deleteOnce(name: string, config: CdConfig, secrets: readonly string[]): Promise<DeleteCommand> {
+  const started = Date.now()
+  const removed = await runCf(['artifacts', 'namespaces', 'repos', 'delete', name, '--namespace', config.namespace, '--force'], secrets)
+  return { code: removed.code, stdout: removed.stdout, stderr: removed.stderr, latencyMs: Date.now() - started }
+}
+
+async function noteCleanup(result: CleanupResult, bound: CleanupBound): Promise<void> {
+  const log = activeLog()
+  if (!log) return
+  await recordCleanup(log, result, bound)
+}
+
+async function sweep(config: CdConfig, secrets: readonly string[]): Promise<SweepReport | null> {
   const listed = await runCf(['artifacts', 'namespaces', 'repos', 'list', '--namespace', config.namespace, '--search', REPO_PREFIX], secrets)
-  if (listed.code !== 0) return
-  let repos: unknown[] = []
+  if (listed.code !== 0) return null
+  let parsed: unknown
   try {
-    const parsed = extractJson(listed.stdout)
-    repos = Array.isArray(parsed) ? parsed : []
+    parsed = extractJson(listed.stdout)
   } catch {
-    return
+    return null
   }
-  for (const repo of repos) {
-    const rec = asRecord(repo)
-    const name = typeof rec?.name === 'string' ? rec.name : ''
-    const created = Date.parse(typeof rec?.created_at === 'string' ? rec.created_at : '')
-    if (!name.startsWith(REPO_PREFIX) || !Number.isFinite(created) || Date.now() - created <= STALE_REPO_MS) continue
-    await runCf(['artifacts', 'namespaces', 'repos', 'delete', name, '--namespace', config.namespace, '--force'], secrets)
+  const bound = cleanupBound(config)
+  return sweepLeaks({
+    listed: reposFromList(parsed),
+    nowMs: Date.now(),
+    staleMs: config.policy.cleanup.staleMinutes * 60_000,
+    prefix: REPO_PREFIX,
+    bound,
+    once: name => deleteOnce(name, config, secrets),
+    sleep: wait,
+    note: result => noteCleanup(result, bound),
+  })
+}
+
+/** Delete leaked `ply-web-cd-*` repos older than `cleanup.staleMinutes`. A leak stays informational. */
+export async function stageSweep(config: CdConfig, runDir: string): Promise<SweepRun> {
+  const listed = await runCf(['artifacts', 'namespaces', 'repos', 'list', '--namespace', config.namespace, '--search', REPO_PREFIX], [])
+  if (listed.code !== 0) {
+    const detail = listed.stderr.replace(/\s+/g, ' ').trim().slice(0, 300)
+    return { kind: 'unlistable', detail: detail.length === 0 ? `cf list exited ${listed.code}` : detail }
   }
+  let parsed: unknown
+  try {
+    parsed = extractJson(listed.stdout)
+  } catch (error) {
+    return { kind: 'unlistable', detail: errorMessage(error) }
+  }
+  const bound = cleanupBound(config)
+  const report = await sweepLeaks({
+    listed: reposFromList(parsed),
+    nowMs: Date.now(),
+    staleMs: config.policy.cleanup.staleMinutes * 60_000,
+    prefix: REPO_PREFIX,
+    bound,
+    once: name => deleteOnce(name, config, []),
+    sleep: wait,
+    note: result => noteCleanup(result, bound),
+  })
+  await appendCleanupFile(runDir, report.leaks)
+  await writeJson(runDir, 'verdict.json', {
+    kind: 'pass',
+    failures: [],
+    cleanup_leak: report.leaks,
+    deleted: report.deleted,
+  })
+  return { kind: 'swept', deleted: report.deleted, leaks: report.leaks }
 }
 
 function stepPath(step: HttpStep): string {
@@ -337,7 +414,11 @@ export async function stageSmoke(
   const secrets = [opts.token]
   const smokeStarted = Date.now()
   activeLog()?.conceal(opts.token)
-  await sweep(config, secrets)
+  const leaks: string[] = []
+  const swept = await sweep(config, secrets)
+  if (swept) {
+    for (const repoName of swept.leaks) leaks.push(repoName)
+  }
   const name = `${REPO_PREFIX}${new Date().toISOString().replace(/\D/g, '').slice(0, 14)}-${Math.random().toString(36).slice(2, 8)}`
   let gitToken = ''
   let remote = ''
@@ -434,20 +515,32 @@ export async function stageSmoke(
       harness = true
     }
     if (passed) {
-      const removed = await runCf(['artifacts', 'namespaces', 'repos', 'delete', name, '--namespace', config.namespace, '--force'], secrets)
-      deleted = removed.code === 0
-      if (!deleted) {
-        detail = `smoke passed but repo ${name} was not deleted`
-        passed = false
-        harness = true
+      const bound = cleanupBound(config)
+      const removed = await confirmDelete(name, bound, {
+        once: () => deleteOnce(name, config, secrets),
+        sleep: wait,
+      })
+      await noteCleanup(removed, bound)
+      switch (removed.kind) {
+        case 'deleted':
+          deleted = true
+          break
+        case 'leak':
+          deleted = false
+          leaks.push(removed.repo)
+          break
+        default:
+          assertNever(removed)
       }
     }
+    if (passed && leaks.length > 0) detail = `ok; cleanup_leak ${leaks.join(' ')}`
+    await appendCleanupFile(opts.runDir, leaks)
   }
   const httpPass = rows.filter(row => row.pass).length
   const httpFail = rows.length - httpPass
   const passedCount = httpPass + (passed ? 1 : 0)
   const failedCount = httpFail + (!passed && httpFail === 0 ? 1 : 0)
-  const report: SmokeReport = { version: opts.version, repo: name, deleted, requests, refs, detail, passed: passedCount, failed: failedCount }
+  const report: SmokeReport = { version: opts.version, repo: name, deleted, cleanup_leak: leaks, requests, refs, detail, passed: passedCount, failed: failedCount }
   await writeJson(opts.runDir, opts.pin ? 'smoke.json' : 'live-smoke.json', report, secrets)
   const runLog = activeLog()
   if (runLog) {
@@ -457,7 +550,7 @@ export async function stageSmoke(
       query: { source: 'lifecycle' },
       from: smokeStarted,
       to: Date.now(),
-      raw: JSON.stringify({ detail, requests: requests.length, repo: name, deleted }),
+      raw: JSON.stringify({ detail, requests: requests.length, repo: name, deleted, cleanup_leak: leaks }),
     })
     const informationalSmoke = !passed && !harness && config.policy.gates.smoke === 'informational'
     await runLog.decision({

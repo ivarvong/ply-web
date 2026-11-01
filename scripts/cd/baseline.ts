@@ -11,8 +11,6 @@ export const NODE_PROBE_MS = 5_000
 
 /** Write-token lifetime for the scratch repo. The smoke must finish inside this window. */
 export const TOKEN_TTL_SECONDS = 600
-/** Scratch repos older than this are deleted at the start of the next smoke. */
-export const STALE_REPO_MS = 3_600_000
 export const REVOKE_ATTEMPTS = 5
 export const REVOKE_WAIT_MS = 1_000
 

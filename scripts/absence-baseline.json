@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 146,
-    "optional": 343,
-    "chain": 524,
-    "nullish": 527,
-    "total": 1540
+    "word": 132,
+    "optional": 337,
+    "chain": 503,
+    "nullish": 514,
+    "total": 1486
   },
   "files": {
     "cloudflare.config.ts": {
@@ -123,9 +123,9 @@
     "scripts/cd/pipeline.ts": {
       "word": 2,
       "optional": 3,
-      "chain": 7,
+      "chain": 5,
       "nullish": 5,
-      "total": 17
+      "total": 15
     },
     "scripts/cd/policy.ts": {
       "word": 6,
@@ -150,10 +150,10 @@
     },
     "scripts/cd/ramp.ts": {
       "word": 2,
-      "optional": 3,
+      "optional": 2,
       "chain": 10,
-      "nullish": 5,
-      "total": 20
+      "nullish": 4,
+      "total": 18
     },
     "scripts/cd/reconcile.ts": {
       "word": 0,
@@ -214,9 +214,9 @@
     "scripts/cd/stage-ramp.ts": {
       "word": 4,
       "optional": 2,
-      "chain": 4,
+      "chain": 2,
       "nullish": 0,
-      "total": 10
+      "total": 8
     },
     "scripts/cd/stage-rollback.ts": {
       "word": 0,
@@ -228,9 +228,9 @@
     "scripts/cd/stage-smoke.ts": {
       "word": 1,
       "optional": 0,
-      "chain": 12,
+      "chain": 10,
       "nullish": 10,
-      "total": 23
+      "total": 21
     },
     "scripts/cd/stage-telemetry.ts": {
       "word": 0,
@@ -497,27 +497,6 @@
       "chain": 0,
       "nullish": 2,
       "total": 11
-    },
-    "src/write/branch.ts": {
-      "word": 5,
-      "optional": 2,
-      "chain": 6,
-      "nullish": 3,
-      "total": 16
-    },
-    "src/write/commit.ts": {
-      "word": 3,
-      "optional": 2,
-      "chain": 6,
-      "nullish": 7,
-      "total": 18
-    },
-    "src/write/tag.ts": {
-      "word": 6,
-      "optional": 1,
-      "chain": 3,
-      "nullish": 2,
-      "total": 12
     },
     "test/cd-flags-smoke.test.ts": {
       "word": 0,

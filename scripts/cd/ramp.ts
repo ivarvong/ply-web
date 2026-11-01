@@ -1,6 +1,9 @@
+import { assertNever } from '../../src/never.ts'
+import { none, some, type Option } from '../../src/option.ts'
 import { asRecord } from './json.ts'
 import type { ObservationRef } from './log.ts'
 import type { RolloutPolicy } from './policy.ts'
+import { emptyProbeLoss, judgeProbeWindow, type ProbeLoss, type ProbeOutcome } from './probe.ts'
 import { percentile, type VersionStats } from './telemetry.ts'
 import { burnMap, CARRY_WALL_SAMPLES, judgeStep, routedShare, type RoutedShare, type StepVerdict } from './slo.ts'
 
@@ -24,15 +27,25 @@ export type HarnessRamp = {
   readonly burns: StepVerdict['burns']
 }
 
-export type RampDecision = StepVerdict | HarnessRamp
+export type ProbeSampleDecision = {
+  readonly outcome: 'insufficient_samples'
+  readonly reason: string
+  readonly rules: StepVerdict['rules']
+  readonly burns: StepVerdict['burns']
+}
+
+export type RampDecision = StepVerdict | HarnessRamp | ProbeSampleDecision
 
 export type HeldWrite = { readonly kind: 'state_conflict'; readonly reason: string }
+
+export type HarnessTraffic = 'rolled_back' | 'held'
 
 export type RampState =
   | { readonly kind: 'ramping'; readonly step: number }
   | { readonly kind: 'rolled-back'; readonly reason: string }
-  | { readonly kind: 'stopped'; readonly reason: string; readonly fault: 'harness_fault' | 'state_conflict' }
-  | { readonly kind: 'held'; readonly reason: string; readonly outcome: 'hold' | 'insufficient_data' }
+  | { readonly kind: 'stopped'; readonly reason: string; readonly fault: 'state_conflict' }
+  | { readonly kind: 'stopped'; readonly reason: string; readonly fault: 'harness_fault'; readonly traffic: HarnessTraffic }
+  | { readonly kind: 'held'; readonly reason: string; readonly outcome: 'hold' | 'insufficient_data' | 'insufficient_samples' }
   | { readonly kind: 'complete' }
 
 export function rampStart(): RampState {
@@ -58,12 +71,12 @@ export function decideRampStep(obs: Observation, policy: RolloutPolicy, targetPe
   })
 }
 
-/** Advance on a clean step. A terminal state stays terminal. A harness fault, a hold, or insufficient evidence stops without rolling back. */
+/** Advance on a clean step. A terminal state stays terminal. Traffic for a harness fault is settled by `runRamp`. */
 export function applyRamp(state: RampState, decision: RampDecision, stepCount: number): RampState {
   if (state.kind !== 'ramping') return state
-  if (decision.outcome === 'harness_fault') return { kind: 'stopped', reason: decision.reason, fault: 'harness_fault' }
+  if (decision.outcome === 'harness_fault') return { kind: 'stopped', reason: decision.reason, fault: 'harness_fault', traffic: 'held' }
   if (decision.outcome === 'rollback') return { kind: 'rolled-back', reason: decision.reason }
-  if (decision.outcome === 'hold' || decision.outcome === 'insufficient_data') {
+  if (decision.outcome === 'hold' || decision.outcome === 'insufficient_data' || decision.outcome === 'insufficient_samples') {
     return { kind: 'held', reason: decision.reason, outcome: decision.outcome }
   }
   const next = state.step + 1
@@ -117,6 +130,7 @@ export function progressLine(input: {
   readonly share: RoutedShare
   readonly decision: RampDecision
   readonly latency: RolloutPolicy['gates']['latency']['mode']
+  readonly probe: { readonly kind: 'none' } | { readonly kind: 'measured'; readonly loss: ProbeLoss }
 }): string {
   const previousPercent = input.percent >= 100 ? 0 : 100 - input.percent
   const samples = `${input.next?.requests ?? '-'}/${input.previous?.requests ?? '-'}`
@@ -128,7 +142,8 @@ export function progressLine(input: {
   const latency = input.latency === 'off' ? '' : ` p99_wall_ms=${walls} p99_cpu_ms=${cpu} latency=${input.latency}`
   const routed = `routed_share=${points(input.share.share)} target=${input.percent} tolerance=${tolerance(input.share)} agg=${input.share.n}`
   const internal = internalNote(input.next, input.previous)
-  const head = `ramp step=${input.step}/${input.steps} percent=${input.percent} previous=${previousPercent} samples=${samples} error_rate=${errors} ${routed}${internal}${latency} decision=${input.decision.outcome}`
+  const probe = input.probe.kind === 'measured' ? ` probe_loss=${input.probe.loss.count}/${input.probe.loss.total}` : ''
+  const head = `ramp step=${input.step}/${input.steps} percent=${input.percent} previous=${previousPercent} samples=${samples} error_rate=${errors} ${routed}${internal}${latency}${probe} decision=${input.decision.outcome}`
   const carried = input.carriedPrevious ? ' previous_sample=carried' : ''
   const informational = input.decision.outcome === 'advance' && input.decision.reason.includes('informational:')
   if (input.decision.outcome === 'advance' && !informational) return head + carried
@@ -154,8 +169,8 @@ export function readPassVerdict(text: string, version: string): { readonly ok: t
 export type RampIo = {
   now(): number
   sleep(ms: number): Promise<void>
-  /** Probe during the dwell. When omitted, `sleep` is the whole dwell. A harness fault is a probe that got no response. */
-  dwell?(ms: number): Promise<{ readonly harnessFaults?: number }>
+  /** Probe during the dwell. When omitted, `sleep` is the whole dwell and no probe sample is judged. */
+  dwell?(ms: number, percent: number): Promise<{ readonly outcomes: readonly ProbeOutcome[] }>
   applySplit(percent: number): Promise<null | string | HeldWrite>
   observe(from: number, to: number, percent: number): Promise<Observation>
   /** Called with the observation ref. A missing ref is a bug: a decision without an observation. */
@@ -167,6 +182,8 @@ export type RampStepRecord = {
   readonly percent: number
   readonly burns: RampDecision['burns']
   readonly outcome: RampDecision['outcome']
+  readonly line: string
+  readonly probeLoss: ProbeLoss
 }
 
 export type RampLoopResult = {
@@ -185,12 +202,64 @@ function asConflict(value: null | string | HeldWrite): HeldWrite | null {
   return null
 }
 
+const UNTESTED_SHARE: RoutedShare = { n: 0, newRequests: 0, share: null, low: null, high: null, kind: 'untested' }
+
+type Settled = { readonly state: RampState; readonly rollbackError: string | null }
+
+async function rollbackTraffic(io: RampIo, reason: string): Promise<Settled> {
+  const rolled = await io.rollback()
+  const conflict = asConflict(rolled)
+  if (conflict) return { state: { kind: 'stopped', reason: conflict.reason, fault: 'state_conflict' }, rollbackError: null }
+  return {
+    state: { kind: 'stopped', reason, fault: 'harness_fault', traffic: 'rolled_back' },
+    rollbackError: typeof rolled === 'string' ? rolled : null,
+  }
+}
+
+/** A harness fault above 0% rolls back to `previous`, or holds the last fully passed split. */
+async function settleHarnessFault(
+  policy: RolloutPolicy,
+  io: RampIo,
+  percent: number,
+  reason: string,
+  lastPassed: Option<number>,
+): Promise<Settled> {
+  if (percent <= 0) return { state: { kind: 'stopped', reason, fault: 'harness_fault', traffic: 'held' }, rollbackError: null }
+  switch (policy.probe.onHarnessFault) {
+    case 'rollback':
+      return rollbackTraffic(io, reason)
+    case 'hold': {
+      if (lastPassed.tag === 'none' || lastPassed.value <= 0) return rollbackTraffic(io, reason)
+      const held = await io.applySplit(lastPassed.value)
+      const conflict = asConflict(held)
+      if (conflict) return { state: { kind: 'stopped', reason: conflict.reason, fault: 'state_conflict' }, rollbackError: null }
+      if (typeof held === 'string') {
+        return {
+          state: { kind: 'stopped', reason: `${reason}; hold at ${lastPassed.value}% failed: ${held}`, fault: 'harness_fault', traffic: 'held' },
+          rollbackError: held,
+        }
+      }
+      return { state: { kind: 'stopped', reason, fault: 'harness_fault', traffic: 'held' }, rollbackError: null }
+    }
+    default:
+      return assertNever(policy.probe.onHarnessFault)
+  }
+}
+
+function withProbeRules(decision: RampDecision, loss: ProbeLoss): RampDecision {
+  return {
+    ...decision,
+    rules: [...decision.rules, { name: 'probe_loss_count', value: loss.count }, { name: 'probe_loss_rate', value: loss.rate }],
+  }
+}
+
 export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLoopResult> {
   const lines: string[] = []
   const steps: RampStepRecord[] = []
   let state = rampStart()
   let carried: VersionStats | null = null
   let rollbackError: string | null = null
+  let lastPassed: Option<number> = none()
   const cap = policy.steps.length
   for (let guard = 0; guard < cap && state.kind === 'ramping'; guard++) {
     const index = state.step
@@ -219,10 +288,41 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
     }
     if (policy.warmupMs > 0) await io.sleep(policy.warmupMs)
     const from = io.now()
-    const probed = io.dwell ? await io.dwell(step.dwellMs) : (await io.sleep(step.dwellMs), { harnessFaults: 0 })
-    if ((probed.harnessFaults ?? 0) > 0) {
-      state = { kind: 'stopped', reason: 'harness fault during probes', fault: 'harness_fault' }
-      break
+    let probeLoss = emptyProbeLoss(policy.probe.maxLossRate)
+    if (io.dwell) {
+      const probed = await io.dwell(step.dwellMs, percent)
+      const window = judgeProbeWindow(probed.outcomes, policy.probe.maxLossRate, policy.burn.minSamples)
+      probeLoss = window.loss
+      if (window.kind !== 'ok') {
+        const decision: RampDecision = window.kind === 'harness_fault'
+          ? { outcome: 'harness_fault', reason: window.reason, rules: [{ name: 'probe_max_loss_rate', value: policy.probe.maxLossRate }], burns: burnMap([]) }
+          : { outcome: 'insufficient_samples', reason: window.reason, rules: [{ name: 'probe_min_samples', value: policy.burn.minSamples }], burns: burnMap([]) }
+        const noted = withProbeRules(decision, probeLoss)
+        const line = progressLine({
+          step: index + 1,
+          steps: policy.steps.length,
+          percent,
+          next: null,
+          previous: null,
+          carriedPrevious: null,
+          share: UNTESTED_SHARE,
+          decision: noted,
+          latency: policy.gates.latency.mode,
+          probe: { kind: 'measured', loss: probeLoss },
+        })
+        lines.push(line)
+        steps.push({ percent, burns: noted.burns, outcome: noted.outcome, line, probeLoss })
+        if (window.kind === 'harness_fault') {
+          const settled = await settleHarnessFault(policy, io, percent, window.reason, lastPassed)
+          state = settled.state
+          rollbackError = settled.rollbackError
+        } else {
+          state = { kind: 'held', reason: window.reason, outcome: 'insufficient_samples' }
+        }
+        break
+      }
+    } else {
+      await io.sleep(step.dwellMs)
     }
     const to = io.now()
     // Wait for the dwell's own tail to land, then query that window. The next step
@@ -238,11 +338,10 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
       && carried.wallMs.length >= CARRY_WALL_SAMPLES
       ? carried
       : null
-    const decision = decideRampStep(observed, policy, percent)
-    steps.push({ percent, burns: decision.burns, outcome: decision.outcome })
+    const decision = withProbeRules(decideRampStep(observed, policy, percent), probeLoss)
     const liveShare = observed.kind === 'sample'
       ? routedShare(observed.next.invocations, observed.aggregate.invocations, percent, policy.split.z)
-      : { n: 0, newRequests: 0, share: null, low: null, high: null, kind: 'untested' as const }
+      : UNTESTED_SHARE
     const line = progressLine({
       step: index + 1,
       steps: policy.steps.length,
@@ -253,13 +352,22 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
       share: liveShare,
       decision,
       latency: policy.gates.latency.mode,
+      probe: io.dwell ? { kind: 'measured', loss: probeLoss } : { kind: 'none' },
     })
     lines.push(line)
+    steps.push({ percent, burns: decision.burns, outcome: decision.outcome, line, probeLoss })
     if (io.onDecision) {
       if (!observed.ref) throw new Error('decision without an observation')
       await io.onDecision(observed.ref, decision, percent)
     }
     state = applyRamp(state, decision, policy.steps.length)
+    if (state.kind === 'stopped' && state.fault === 'harness_fault') {
+      const settled = await settleHarnessFault(policy, io, percent, decision.reason, lastPassed)
+      state = settled.state
+      rollbackError = settled.rollbackError
+      break
+    }
+    if (state.kind === 'ramping' || state.kind === 'complete') lastPassed = some(percent)
     if (state.kind === 'rolled-back') {
       const rolled = await io.rollback()
       const rolledConflict = asConflict(rolled)

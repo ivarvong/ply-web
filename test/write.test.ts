@@ -4,7 +4,10 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { encodeTag, hashObject, ZERO_OID } from 'ply'
 import { MODE_BLOB } from '../src/write/constants.ts'
+import { type CallOpts } from '../src/write/call.ts'
+import { createBranch } from '../src/write/branch.ts'
 import { parseTime, stamp, nowSeconds } from '../src/write/identity.ts'
+import { createTag } from '../src/write/tag.ts'
 import { headFromListing } from '../src/write/head.ts'
 import { mapPickOutcome } from '../src/write/pick.ts'
 import { asBody, parseBase, parseEdit, refOrCommit } from '../src/write/request.ts'
@@ -19,6 +22,10 @@ const code = (fn: () => unknown) => {
 }
 const errCode = (err: ReturnType<typeof code>): string => {
   if (err === null) return ''
+  return typeof err.code === 'string' ? err.code : ''
+}
+const thrownCode = (err: unknown): string => {
+  if (err === null || typeof err !== 'object' || !('code' in err)) return ''
   return typeof err.code === 'string' ? err.code : ''
 }
 
@@ -124,6 +131,22 @@ test('HEAD listing: unborn, born, detached, absent', () => {
   assert.equal(headFromListing({ refs: bornRefs, head: 'refs/heads/main', unborn: { target: 'refs/heads/trunk' } }).kind, 'unborn')
   assert.deepEqual(headFromListing({ refs: new Map([['HEAD', { oid }]]), head: null, unborn: null }), { kind: 'detached', oid })
   assert.deepEqual(headFromListing({ refs: new Map(), head: null, unborn: null }), { kind: 'absent' })
+})
+
+test('a bad branch from, tag message, or annotated flag is rejected before a transport', async () => {
+  const opts = {} as CallOpts
+  const remote = 'https://example.invalid/repo'
+  const from = await createBranch(remote, 'main', 1, opts).then(() => null, (err: unknown) => err)
+  assert.equal(thrownCode(from), 'bad_request')
+  const zero = await createBranch(remote, 'main', '0'.repeat(40), opts).then(() => null, (err: unknown) => err)
+  assert.equal(thrownCode(zero), 'bad_request')
+  const tagger = { name: 'w', email: 'w@x' }
+  const message = await createTag(remote, { name: 'v1', target: 'main', message: 1, tagger }, opts).then(() => null, (err: unknown) => err)
+  assert.equal(thrownCode(message), 'bad_request')
+  const flag = await createTag(remote, { name: 'v1', target: 'main', annotated: 'yes' }, opts).then(() => null, (err: unknown) => err)
+  assert.equal(thrownCode(flag), 'bad_request')
+  const nullMessage = await createTag(remote, { name: 'v1', target: 'main', message: null }, opts).then(() => null, (err: unknown) => err)
+  assert.equal(thrownCode(nullMessage), 'bad_request')
 })
 
 test('refOrCommit accepts a branch or a 40-hex commit and rejects zero', () => {
