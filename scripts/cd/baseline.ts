@@ -54,6 +54,12 @@ export const REVOKE_PROBE_MS = 15_000
 
 export const MESSAGE_MAX = 100
 
+/** `workers/tag` on a version upload. The API rejects a longer tag. */
+export const VERSION_TAG_MAX = 100
+
+/** A full git object id, the only sha a release will carry. */
+export const GIT_SHA_HEX = 40
+
 export type LatencyCeiling = {
   readonly p50Ms: number
   readonly p99Ms: number

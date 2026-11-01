@@ -3,7 +3,6 @@ import { readFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { PIN } from './bump-plan.ts'
 import { ROOT } from './cf.ts'
 import { loadConfig, publicConfig, type CdConfig } from './config.ts'
 import { splitPolicy } from './policy.ts'
@@ -14,9 +13,10 @@ import { runPipeline } from './pipeline.ts'
 import { binaryNodeVersion, checkNode, NODE_IMAGE_BIN, nodeSatisfies, pathWithNodeBin, selectNode } from './preflight.ts'
 import { errorMessage, run } from './proc.ts'
 import { unfinishedRunDir } from './reconcile.ts'
+import { checkoutReason, isReleaseId, readCheckout, releaseId, releasePair, type ReleaseId } from './release.ts'
 import { reportLedger } from './report.ts'
 import { createRunDir, RUN_ID, writeJson } from './run-dir.ts'
-import { stageBump } from './stage-bump.ts'
+import { readPlyPin, resolvePlySha, stageBump } from './stage-bump.ts'
 import { stageDeploy } from './stage-deploy.ts'
 import { stageRamp } from './stage-ramp.ts'
 import { stageRollback } from './stage-rollback.ts'
@@ -189,13 +189,22 @@ async function identity(config: CdConfig) {
   }
 }
 
-async function checkoutPlyPin(): Promise<string | null> {
+async function commandRelease(parsed: Parsed): Promise<ReleaseId | string | null> {
+  if (parsed.kind !== 'cd' && parsed.kind !== 'deploy-canary') return null
+  const checkout = await readCheckout(ROOT)
+  if (!checkout.ok) return `cd: harness_fault ${checkoutReason(checkout)}`
+  let ply: string | null
   try {
-    const pkg = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8')) as { dependencies?: { ply?: string } }
-    return PIN.exec(pkg.dependencies?.ply ?? '')?.[1] ?? null
-  } catch {
-    return null
+    if (parsed.kind === 'deploy-canary') ply = await readPlyPin()
+    else if (parsed.noBump) ply = parsed.sha ?? await readPlyPin()
+    else ply = await resolvePlySha(parsed.sha)
+  } catch (error) {
+    return `cd: harness_fault bad-ply-sha: ${errorMessage(error)}`
   }
+  if (!ply) return 'cd: harness_fault bad-ply-sha: package.json has no ply pin'
+  const made = releaseId(ply, checkout.web)
+  if (!isReleaseId(made)) return `cd: harness_fault ${made.kind}: ply and ply-web shas must be 40 hex`
+  return made
 }
 
 /** Leave the process on a Node that satisfies `package.json` engines when this one does not. */
@@ -221,7 +230,7 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
   if (nodeError) return finish(log, 1, `cd: harness_fault preflight: ${nodeError}`)
   const split = splitPolicy(argv)
   if ('error' in split) return finish(log, 2, split.error)
-  const parsed = parseArgs(split.argv, await checkoutPlyPin())
+  const parsed = parseArgs(split.argv, await readPlyPin())
   if (parsed.kind === 'usage') return finish(log, 2, usageText())
   if (parsed.kind === 'error') return finish(log, 2, parsed.reason)
   let config: CdConfig
@@ -250,6 +259,9 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
       return finish(log, 1, `cd: FAIL debrief: ${errorMessage(error)}`)
     }
   }
+  const opened = await commandRelease(parsed)
+  if (typeof opened === 'string') return finish(log, 1, opened)
+  const release = opened
   const needsToken = parsed.kind === 'cd' || parsed.kind === 'smoke' || parsed.kind === 'ramp'
   let token = ''
   if (needsToken) {
@@ -259,8 +271,7 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
       return finish(log, 1, `cd: harness_fault preflight: ${errorMessage(error)}`)
     }
   }
-  const resumeSha = parsed.kind === 'cd' ? parsed.sha : null
-  const existing = resumeSha ? await unfinishedRunDir(config.runRoot, resumeSha) : null
+  const existing = parsed.kind === 'cd' && release ? await unfinishedRunDir(config.runRoot, release) : null
   const runDir = existing ?? await createRunDir(config.runRoot)
   const runLog = existing
     ? await RunLog.reopen(runDir, config.ledgerPath)
@@ -272,15 +283,25 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
     let reason: string | null = 'run ended before finish'
     try {
       if (token) runLog.conceal(token)
-      if (existing && resumeSha) {
-        await runLog.resumed(resumeSha)
+      if (existing && release) {
+        await runLog.resumed(release.ply, releasePair(release))
       } else {
         const started = await identity(config)
-        const recorded = resumeSha ? { ...started, config: { ...started.config, sha: resumeSha } } : started
+        const pair = release ? releasePair(release) : null
+        const recorded = {
+          ...started,
+          ...(pair ? { plySha: pair.ply, plyWebSha: pair.web, release: pair } : { release: null }),
+          config: pair ? { ...started.config, sha: pair.ply, release: pair } : started.config,
+        }
         await runLog.started(recorded)
       }
-      await runLog.recordPolicy({ sha256: config.policySha256, path: config.policyPath, body: config.policyBody })
-      const outcome = await dispatch(parsed, config, token, runDir, runLog, log)
+      await runLog.recordPolicy({
+        sha256: config.policySha256,
+        path: config.policyPath,
+        body: config.policyBody,
+        release: release ? releasePair(release) : null,
+      })
+      const outcome = await dispatch(parsed, config, token, runDir, runLog, log, release)
       code = outcome.code
       reason = outcome.reason
       return code
@@ -306,9 +327,11 @@ async function dispatch(
   runDir: string,
   runLog: RunLog,
   log: (line: string) => void,
+  release: ReleaseId | null,
 ): Promise<Outcome> {
   if (parsed.kind === 'cd') {
-    const exit = await runPipeline(config, { token, sha: parsed.sha, noBump: parsed.noBump, log, runDir, runLog })
+    if (!release) return { code: 1, reason: 'cd: harness_fault bad-ply-sha: release was not read' }
+    const exit = await runPipeline(config, { token, sha: parsed.sha, noBump: parsed.noBump, release, log, runDir, runLog })
     return { code: exit.code, reason: exit.reason }
   }
   if (parsed.kind === 'bump') {
@@ -325,7 +348,8 @@ async function dispatch(
     return { code: 0, reason: null }
   }
   if (parsed.kind === 'deploy-canary') {
-    const result = await stageDeploy(config)
+    if (!release) return { code: 1, reason: 'cd: harness_fault bad-ply-sha: release was not read' }
+    const result = await stageDeploy(config, release)
     await writeJson(runDir, 'deploy.json', result)
     if (result.kind === 'fail') {
       runLog.patch({ fault: result.fault })

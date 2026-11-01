@@ -55,17 +55,18 @@ npm run cd -- cd --sha 1274f2dd05b83d70f8d421cdcc79628692d848df
 npm run cd -- --sha 1274f2dd05b83d70f8d421cdcc79628692d848df
 ```
 
-Running the same sha again is safe. The command reads the current deployment and the version tagged with that sha, records the observation, and decides the next stage (rule `reconcile`):
+Running the same release again is safe. A release is the pair of the ply sha and the ply-web commit of this checkout. The command reads the current deployment and the version tagged with that pair, records the observation, and decides the next stage (rule `reconcile`):
 
 | What is live | Next |
 | --- | --- |
-| No version tagged with the sha | Upload, then pin it at 0% |
+| No version tagged with that pair | Upload, then pin it at 0% |
+| A version tagged only with the ply sha, or with a different ply-web sha | Upload, then pin it at 0% |
 | That version at 0% | Pinned smoke, then telemetry |
 | That version at a ramp percent | Ramp onward from that percent |
 | That version at 100% | Live smoke, then telemetry |
 | Live smoke already passed for that version | Done |
 
-A re-entry appends `resumed` on the unfinished run directory for that sha and keeps the same run id. A finished run starts a new one. Each smoke mints a fresh repo and a fresh token. Every traffic write still compares the deployment to the split it expects, and does not write when they differ.
+A checkout with tracked modifications stops before a run directory is opened (`cd: harness_fault dirty-checkout: tracked files are modified`). The commit sha would not describe the code about to be uploaded. A re-entry appends `resumed` on the unfinished run directory for that pair and keeps the same run id. A finished run, or an older run that recorded only the ply sha, starts a new one. Each smoke mints a fresh repo and a fresh token. Every traffic write still compares the deployment to the split it expects, and does not write when they differ.
 
 `--no-bump` skips the pin and deploys the checkout as it is. The run records that as a decision (`no_bump`, outcome `advance`). `--sha` may be passed with it only when that sha is already the pin; a different sha is an argument error.
 
@@ -83,14 +84,14 @@ version: 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 previous: 1aa0bb11-2222-4333-8444-555566667777
 ramp step=1/5 percent=10 previous=90 samples=200/1800 error_rate=0.0000/0.0000 routed_share=10.00 target=10 tolerance=7.99..12.01 agg=2000 p99_wall_ms=88/74 p99_cpu_ms=12/11 latency=informational decision=advance
 …
-cd: PASS 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
+cd: PASS 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e ply 1274f2dd05b83d70f8d421cdcc79628692d848df web be08f0406dab6d5b2d1167e934f7716463a757ed
 ```
 
-`version` is the upload you just created. `previous` is the version that was alone at 100% and is the rollback target. `run` is the directory that has the CSV, the telemetry note, and the ramp lines. The last line is the verdict.
+`version` is the upload you just created. `previous` is the version that was alone at 100% and is the rollback target. `run` is the directory that has the CSV, the telemetry note, and the ramp lines. The last line is the verdict. `ply` and `web` are the release pair.
 
 | Last line | Exit | What happened |
 | --- | --- | --- |
-| `cd: PASS <version id>` | 0 | The new version is at 100%, and the live smoke and telemetry passed. |
+| `cd: PASS <version id> ply <ply sha> web <ply-web sha>` | 0 | The new version is at 100%, and the live smoke and telemetry passed. |
 | `cd: FAIL <stage>: <reason>` | 1 | That stage stopped the run. If the line is from ramp or from the live checks, traffic is already back on `previous` unless the line says the rollback itself failed. |
 | `cd: harness_fault <stage>: <reason>` | 1 | A request got no response, a revoked Artifacts token did not get 403, or a check could not be evaluated (the telemetry query, a span-query shape mismatch, zero samples where samples are required, an implausible span join, a preflight miss). The split is unchanged. This is not a change failure. |
 | `cd: state_conflict <stage>: <reason>` | 1 | The deployment was not the expected prior split, so the write was skipped. The split is unchanged. |
@@ -136,7 +137,7 @@ You push `bump-ply` yourself if you want a pull request for the pin. Deploy runs
 npm run cd -- deploy-canary
 ```
 
-Fetches `origin main` first. Unless `HEAD` is that commit, it stops with `not-on-origin-main` (or `origin-main-unavailable` when the fetch fails), writes that typed error on the run, and uploads nothing. Otherwise it builds and uploads a version with `cf workers versions create`. The version id is the row in `cf workers versions list` whose tag is the 12-character HEAD sha. The full pipeline (`--sha`) tags the version with that sha instead, and reuses the version when the tag is already there. The create command's own text is not parsed. A missing tag stops before traffic changes. It then routes that version to **0%** beside the single version that is at 100%, and only when the deployment is still the split it just read. A mismatch stops with `state_conflict` and leaves the split alone. It will not upload into a 50/50 split, a deployment with more than two versions, or a version that is already the live one. If a different version is already sitting at 0%, that slot is replaced. The new version is never given traffic here.
+Fetches `origin main` first. Unless `HEAD` is that commit, it stops with `not-on-origin-main` (or `origin-main-unavailable` when the fetch fails), writes that typed error on the run, and uploads nothing. Otherwise it builds and uploads a version with `cf workers versions create`. The version id is the row in `cf workers versions list` whose tag is the release pair, `<ply sha>+<ply-web sha>`, both full object ids. The version message is `cd canary` plus that tag. A row tagged with only the ply sha, or with a different ply-web sha, is not this release, so the pair is uploaded. The version is reused when that pair tag is already there. The create command's own text is not parsed. A missing tag stops before traffic changes. It then routes that version to **0%** beside the single version that is at 100%, and only when the deployment is still the split it just read. A mismatch stops with `state_conflict` and leaves the split alone. It will not upload into a 50/50 split, a deployment with more than two versions, or a version that is already the live one. If a different version is already sitting at 0%, that slot is replaced. The new version is never given traffic here.
 
 Pass:
 
@@ -379,7 +380,7 @@ If the rollback request itself does not stick, the last line says so and names t
 
 `npm run cd` does not stop at the last ramp line. It smokes again with **no** version override (`--expect-version`), then runs telemetry on that live window. Both have to pass.
 
-Pass is the same `cd: PASS <version id>` as the whole run.
+Pass is the same `cd: PASS <version id> ply <ply sha> web <ply-web sha>` as the whole run.
 
 Fail rolls back to `previous` at 100% and exits:
 
@@ -514,11 +515,11 @@ The event log is the record of the run. Every line is one JSON object:
 
 | Kind | Payload |
 | --- | --- |
-| `lifecycle` | `run_started` (config, node/cf/git versions, ply and ply-web shas, host), `resumed` (the same run id and the sha), or `run_finished` (verdict, rollback, smoke counts, stage timings, per-step burns, live/fail/restore times, `fault`) |
+| `lifecycle` | `run_started` (config, node/cf/git versions, ply and ply-web shas, host, and `release` as `{ply, web}` or null), `resumed` (the same run id, the ply sha, and the release pair), or `run_finished` (verdict, rollback, smoke counts, stage timings, per-step burns, live/fail/restore times, `fault`, and the release pair) |
 | `command` | argv with secrets already replaced by `<redacted>`, cwd, exit code, duration, sha256 of stdout and stderr, and the paths of those captures |
 | `observation` | The measurement, the exact `cf o11y` query (or the smoke source) and its window, and `responsePath` of the raw body under `raw/` |
 | `decision` | `inputs` (one or more earlier observation seqs), `rules` (`name` and `value` from the policy or `slo.ts`, the smoke rule, or `reconcile` with the next stage), `outcome` (`advance`, `hold`, `insufficient_data`, `rollback`, `stop`, `harness_fault`, `state_conflict`), and `reason` |
-| `policy` | `sha256` of the policy file bytes, the path, and the body that ran. The debrief prints this first so the rules of that run are the ones you read |
+| `policy` | `sha256` of the policy file bytes, the path, the body that ran, and the release pair (`ply`, `web`) or null. The debrief prints this first so the rules of that run are the ones you read |
 | `state_change` | Traffic split before and after, and the deployment id when cf returned one |
 | `request` | One smoke or probe call: method, url, status, version, latency, `cf-ray`, `x-ply-request-id`, `x-artifacts-ray` |
 | `error` | An unexpected failure and a JSON context |

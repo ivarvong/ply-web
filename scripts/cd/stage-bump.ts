@@ -1,5 +1,5 @@
 import { readFile, writeFile } from 'node:fs/promises'
-import { planBump, pinSpec } from './bump-plan.ts'
+import { PIN, planBump, pinSpec } from './bump-plan.ts'
 import { ROOT } from './cf.ts'
 import { fetchOriginMain, originMainReason } from './preflight.ts'
 import { errorMessage, run } from './proc.ts'
@@ -18,6 +18,15 @@ export type BumpValue = {
 
 async function git(args: readonly string[], cwd = ROOT): Promise<{ code: number; stdout: string; stderr: string }> {
   return run('git', args, { cwd })
+}
+
+export async function readPlyPin(): Promise<string | null> {
+  try {
+    const pkg = JSON.parse(await readFile(`${ROOT}/package.json`, 'utf8')) as { dependencies?: { ply?: string } }
+    return PIN.exec(pkg.dependencies?.ply ?? '')?.[1] ?? null
+  } catch {
+    return null
+  }
 }
 
 export async function resolvePlySha(sha: string | null): Promise<string> {

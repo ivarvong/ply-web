@@ -1,13 +1,16 @@
-import { PIN_ATTEMPTS, PIN_CONFIRMATIONS, PIN_INTERVAL_MS } from './baseline.ts'
+import { MESSAGE_MAX, PIN_ATTEMPTS, PIN_CONFIRMATIONS, PIN_INTERVAL_MS } from './baseline.ts'
 import { cfOk, ROOT } from './cf.ts'
 import { isTrafficSplit, planCanary, trafficSplit, versionByTag } from './deploy-plan.ts'
 import { extractJson } from './json.ts'
 import { activeLog } from './log.ts'
 import { originMainReason, requireOriginMain } from './preflight.ts'
-import { errorMessage, run } from './proc.ts'
+import { errorMessage } from './proc.ts'
+import { checkoutReason, readCheckout, releaseTag, type ReleaseId } from './release.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import type { CdConfig } from './config.ts'
 import { applySplit, readShares, rollbackTo } from './traffic.ts'
+
+const CANARY_PREFIX = 'cd canary '
 
 export type DeployValue = {
   readonly version: string
@@ -43,7 +46,13 @@ async function versionTagged(worker: string, tag: string): Promise<string | null
   return found.ok ? found.versionId : null
 }
 
-export async function stageDeploy(config: CdConfig, tag?: string): Promise<StageResult<DeployValue>> {
+function canaryMessage(tag: string): string {
+  const message = `${CANARY_PREFIX}${tag}`
+  if (message.length > MESSAGE_MAX) throw new Error('canary message exceeds workers/message')
+  return message
+}
+
+export async function stageDeploy(config: CdConfig, release: ReleaseId): Promise<StageResult<DeployValue>> {
   const mainRef = await requireOriginMain(ROOT)
   if (!mainRef.ok) {
     const reason = originMainReason(mainRef)
@@ -53,22 +62,19 @@ export async function stageDeploy(config: CdConfig, tag?: string): Promise<Stage
     await activeLog()?.error(reason, context)
     return fail('deploy-canary', reason, false, 'harness_fault')
   }
-  const status = await run('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: ROOT })
-  if (status.code !== 0) return fail('deploy-canary', `git status failed: ${status.stderr.slice(0, 300)}`, false, 'harness_fault')
-  if (status.stdout.trim()) return fail('deploy-canary', 'tracked files are modified; deploy a commit', false, 'harness_fault')
-  let resolved = tag ?? ''
-  if (!resolved) {
-    const sha = await run('git', ['rev-parse', '--short=12', 'HEAD'], { cwd: ROOT })
-    if (sha.code !== 0) return fail('deploy-canary', 'git rev-parse failed', false, 'harness_fault')
-    resolved = sha.stdout.trim()
+  const checkout = await readCheckout(ROOT)
+  if (!checkout.ok) return fail('deploy-canary', checkoutReason(checkout), false, 'harness_fault')
+  if (checkout.web !== release.web) {
+    return fail('deploy-canary', `checkout-unavailable: HEAD ${checkout.web} is not the release ply-web sha`, false, 'harness_fault')
   }
+  const resolved = releaseTag(release)
   try {
-    let version = tag ? await versionTagged(config.worker, resolved) : null
+    let version = await versionTagged(config.worker, resolved)
     if (!version) {
       await cfOk(['build', '--mode', 'production'])
       await cfOk([
         'workers', 'versions', 'create', '--prebuilt', '--mode', 'production',
-        '--worker', config.worker, '--tag', resolved, '--message', `cd canary ${resolved}`.slice(0, 100),
+        '--worker', config.worker, '--tag', resolved, '--message', canaryMessage(resolved),
       ])
       version = await versionTagged(config.worker, resolved)
     }
@@ -78,7 +84,7 @@ export async function stageDeploy(config: CdConfig, tag?: string): Promise<Stage
     if (plan.kind === 'refuse') return fail('deploy-canary', plan.reason, false, 'harness_fault')
     const want = trafficSplit(0, version, plan.live)
     if (!isTrafficSplit(want)) return fail('deploy-canary', `${want.reason}; traffic was not changed`, false, 'harness_fault')
-    const applied = await applySplit(config.worker, `canary ${resolved}`, want, shares)
+    const applied = await applySplit(config.worker, canaryMessage(resolved), want, shares)
     if (!applied.ok && applied.kind === 'state_conflict') return fail('deploy-canary', applied.reason, false, 'state_conflict')
     if (!applied.ok) {
       const seen = await readShares(config.worker)

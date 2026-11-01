@@ -5,6 +5,7 @@ import { dirname, join, relative } from 'node:path'
 import { asRecord } from './json.ts'
 import { RUN_ID } from './run-dir.ts'
 import { redact } from './redact.ts'
+import { isGitSha, type ReleasePair } from './release.ts'
 import type { Fault } from './result.ts'
 import { isSecret, type Secret } from './secret.ts'
 import type { CommandNote } from './trace.ts'
@@ -52,6 +53,8 @@ export type LifecycleStarted = {
   readonly plySha: string | null
   readonly plyWebSha: string
   readonly host: string
+  /** The release this run is shipping. Null on a command that does not deploy. */
+  readonly release: ReleasePair | null
 }
 
 export type LifecycleFinished = {
@@ -64,6 +67,7 @@ export type LifecycleFinished = {
   readonly plySha: string | null
   readonly plyMergedAt: string | null
   readonly plyWebSha: string
+  readonly release: ReleasePair | null
   readonly smoke: { readonly passed: number; readonly failed: number }
   readonly stages: readonly StageTiming[]
   readonly steps: readonly StepBurn[]
@@ -78,6 +82,7 @@ export type LifecycleFinished = {
 export type LifecycleResumed = {
   readonly event: 'resumed'
   readonly sha: string
+  readonly release: ReleasePair | null
 }
 
 export type CdEvent =
@@ -136,13 +141,14 @@ export type CdEvent =
   })
   | (Base & { readonly kind: 'error'; readonly payload: { readonly message: string; readonly context: Json } })
   | (Base & { readonly kind: 'annotation'; readonly payload: { readonly note: 'false_positive'; readonly reason: string } })
-  | (Base & { readonly kind: 'policy'; readonly payload: { readonly sha256: string; readonly path: string; readonly body: Json } })
+  | (Base & { readonly kind: 'policy'; readonly payload: { readonly sha256: string; readonly path: string; readonly body: Json; readonly release: ReleasePair | null } })
 
 export type RunFacts = {
   versionId: string | null
   plySha: string | null
   plyMergedAt: string | null
   plyWebSha: string
+  release: ReleasePair | null
   rolledBack: boolean
   rollbackReason: string | null
   smokePassed: number
@@ -249,6 +255,16 @@ function parseFault(value: unknown): Fault | null {
   throw new Error('fault is not a known kind')
 }
 
+function parseRelease(value: unknown): ReleasePair | null {
+  if (value === undefined || value === null) return null
+  const rec = asRecord(value)
+  if (!rec) throw new Error('release is not a pair')
+  const ply = needString(rec, 'ply')
+  const web = needString(rec, 'web')
+  if (!isGitSha(ply) || !isGitSha(web)) throw new Error('release shas must be 40 hex')
+  return { ply, web }
+}
+
 function parseLifecycle(payload: Record<string, unknown>): LifecycleStarted | LifecycleFinished | LifecycleResumed {
   const event = needString(payload, 'event')
   if (event === 'run_started') {
@@ -260,9 +276,10 @@ function parseLifecycle(payload: Record<string, unknown>): LifecycleStarted | Li
       plySha: stringOrNull(payload.plySha, 'plySha'),
       plyWebSha: needString(payload, 'plyWebSha'),
       host: needString(payload, 'host'),
+      release: parseRelease(payload.release),
     }
   }
-  if (event === 'resumed') return { event, sha: needString(payload, 'sha') }
+  if (event === 'resumed') return { event, sha: needString(payload, 'sha'), release: parseRelease(payload.release) }
   if (event === 'run_finished') {
     const smoke = needRecord(payload.smoke, 'smoke')
     if (!Array.isArray(payload.stages) || !Array.isArray(payload.steps)) throw new Error('run_finished needs stages and steps')
@@ -276,6 +293,7 @@ function parseLifecycle(payload: Record<string, unknown>): LifecycleStarted | Li
       plySha: stringOrNull(payload.plySha, 'plySha'),
       plyMergedAt: stringOrNull(payload.plyMergedAt, 'plyMergedAt'),
       plyWebSha: needString(payload, 'plyWebSha'),
+      release: parseRelease(payload.release),
       smoke: { passed: needNumber(smoke, 'passed'), failed: needNumber(smoke, 'failed') },
       stages: payload.stages.map((item, index) => {
         const rec = needRecord(item, `stages[${index}]`)
@@ -367,7 +385,7 @@ function parsePayload(kind: CdEvent['kind'], payload: unknown): CdEvent['payload
   if (kind === 'policy') {
     const sha256 = needString(rec, 'sha256')
     if (!/^[0-9a-f]{64}$/.test(sha256)) throw new Error('policy sha256 is not 64 hex')
-    return { sha256, path: needString(rec, 'path'), body: jsonValue(rec.body, 'body') }
+    return { sha256, path: needString(rec, 'path'), body: jsonValue(rec.body, 'body'), release: parseRelease(rec.release) }
   }
   return { message: needString(rec, 'message'), context: jsonValue(rec.context, 'context') }
 }
@@ -496,6 +514,7 @@ export class RunLog {
     plySha: null,
     plyMergedAt: null,
     plyWebSha: 'unknown',
+    release: null,
     rolledBack: false,
     rollbackReason: null,
     smokePassed: 0,
@@ -533,6 +552,7 @@ export class RunLog {
     if (started && started.kind === 'lifecycle' && started.payload.event === 'run_started') {
       log.facts.plySha = started.payload.plySha
       log.facts.plyWebSha = started.payload.plyWebSha
+      log.facts.release = started.payload.release
     }
     return log
   }
@@ -587,25 +607,26 @@ export class RunLog {
     this.facts.smokeFailed += failed
   }
 
-  async resumed(sha: string): Promise<void> {
+  async resumed(sha: string, release: ReleasePair | null = null): Promise<void> {
     await this.#enqueue(async () => {
-      await this.#append('lifecycle', { event: 'resumed', sha }, 'run')
+      await this.#append('lifecycle', { event: 'resumed', sha, release }, 'run')
     })
   }
 
-  async recordPolicy(input: { readonly sha256: string; readonly path: string; readonly body: Json }): Promise<void> {
+  async recordPolicy(input: { readonly sha256: string; readonly path: string; readonly body: Json; readonly release?: ReleasePair | null }): Promise<void> {
     await this.#enqueue(async () => {
-      await this.#append('policy', { sha256: input.sha256, path: input.path, body: input.body }, 'run')
+      await this.#append('policy', { sha256: input.sha256, path: input.path, body: input.body, release: input.release ?? null }, 'run')
     })
   }
 
-  async started(input: Omit<LifecycleStarted, 'event'>): Promise<void> {
+  async started(input: Omit<LifecycleStarted, 'event' | 'release'> & { readonly release?: ReleasePair | null }): Promise<void> {
     await this.#enqueue(async () => {
       if (this.#started) throw new Error('run already started')
       this.#started = true
       this.facts.plySha = input.plySha
       this.facts.plyWebSha = input.plyWebSha
-      await this.#append('lifecycle', { event: 'run_started', ...input }, 'run')
+      this.facts.release = input.release ?? null
+      await this.#append('lifecycle', { event: 'run_started', ...input, release: input.release ?? null }, 'run')
     })
   }
 
@@ -623,6 +644,7 @@ export class RunLog {
         plySha: this.facts.plySha,
         plyMergedAt: this.facts.plyMergedAt,
         plyWebSha: this.facts.plyWebSha,
+        release: this.facts.release,
         smoke: { passed: this.facts.smokePassed, failed: this.facts.smokeFailed },
         stages: this.facts.stages,
         steps: this.facts.steps,
