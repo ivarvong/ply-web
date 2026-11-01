@@ -135,6 +135,16 @@ function stepsOf(value: unknown): readonly RolloutStep[] {
   return steps
 }
 
+/** `/path` plus an optional `?query`. The engine sends this string unchanged. */
+const PROBE_PATH = /^\/[^\s?#]*(\?[^\s#]*)?$/
+
+function probePath(value: unknown, path: string): string {
+  if (typeof value !== 'string' || !PROBE_PATH.test(value)) {
+    reject(path, 'must be a path starting with /, plus an optional query')
+  }
+  return value
+}
+
 function callsOf(value: unknown): readonly ProbeCall[] {
   if (!Array.isArray(value)) reject('probe.calls', 'must be a list')
   return value.map((item, index) => {
@@ -142,9 +152,9 @@ function callsOf(value: unknown): readonly ProbeCall[] {
     const rec = record(item, path)
     exactKeys(rec, path, ['method', 'path', 'auth'])
     if (rec.method !== 'GET' && rec.method !== 'POST') reject(`${path}.method`, 'must be GET or POST')
-    if (typeof rec.path !== 'string' || !rec.path.startsWith('/')) reject(`${path}.path`, 'must start with /')
+    const callPath = probePath(rec.path, `${path}.path`)
     if (typeof rec.auth !== 'boolean') reject(`${path}.auth`, 'must be a boolean')
-    return { method: rec.method, path: rec.path, auth: rec.auth }
+    return { method: rec.method, path: callPath, auth: rec.auth }
   })
 }
 

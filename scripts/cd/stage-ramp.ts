@@ -1,6 +1,5 @@
 import { readFile, appendFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { publicRemote } from '../../src/public.ts'
 import { SMOKE_HTTP_MS } from './baseline.ts'
 import type { CdConfig } from './config.ts'
 import { isTrafficSplit, sameSplit, trafficSplit, type VersionShare } from './deploy-plan.ts'
@@ -108,13 +107,7 @@ async function probeCall(
   }
 }
 
-/** `/v1/discover` is the public ply mirror. Other paths are requested as written. */
-function probeUrl(base: string, path: string): string {
-  if (path === '/v1/discover') return `${base}/v1/discover?remote=${encodeURIComponent(publicRemote('ply'))}`
-  return `${base}${path}`
-}
-
-/** One tick of the unpinned mix. Cloudflare's split chooses the version. */
+/** One tick of the unpinned mix. Cloudflare's split chooses the version. The call path includes its query. */
 async function probeOnce(
   token: string,
   baseUrl: string,
@@ -123,7 +116,7 @@ async function probeOnce(
   const counts = await Promise.all(calls.map(async call => {
     if (call.auth && !token) return 0
     const headers: Record<string, string> = call.auth ? { authorization: `Bearer ${token}` } : {}
-    return probeCall(call.method, probeUrl(baseUrl, call.path), headers)
+    return probeCall(call.method, `${baseUrl}${call.path}`, headers)
   }))
   return counts.reduce((sum, count) => sum + count, 0)
 }
