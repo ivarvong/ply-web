@@ -3,9 +3,9 @@
   "counts": {
     "word": 212,
     "optional": 381,
-    "chain": 565,
+    "chain": 563,
     "nullish": 632,
-    "total": 1790
+    "total": 1788
   },
   "files": {
     "cloudflare.config.ts": {
@@ -914,9 +914,9 @@
     "test/worker.test.js": {
       "word": 7,
       "optional": 0,
-      "chain": 9,
+      "chain": 7,
       "nullish": 17,
-      "total": 33
+      "total": 31
     },
     "test/write.test.ts": {
       "word": 1,
