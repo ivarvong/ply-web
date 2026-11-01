@@ -3,8 +3,8 @@
 // until max-age. This module measures both with a model of that cache; it does not talk to the network.
 import { setRollout } from './api.ts';
 import { percentile } from './report.ts';
-import { memoryStore, type InvalidateResult } from './store.ts';
-import { ABSENT_REVISION, FLAGS_MAX_AGE_S, FLAGS_SWR_S } from './ttl.ts';
+import { memoryStore, type FlagStore, type InvalidateResult } from './store.ts';
+import { ABSENT_REVISION, FLAGS_MAX_AGE_S, FLAGS_OBJECT_KEY, FLAGS_SWR_S } from './ttl.ts';
 import { basisPointsOf } from './types.ts';
 
 export type CacheView = { readonly revision: string | null; readonly cache: 'HIT' | 'REVALIDATED' | 'MISS' };
@@ -48,9 +48,15 @@ export class RulesetCache {
 
 export type PropagationRound = { readonly lagMs: number; readonly from: string; readonly to: string };
 
+async function storedRevision(store: FlagStore): Promise<string | null> {
+  const stored = await store.get(FLAGS_OBJECT_KEY);
+  if (stored === null) return null;
+  return stored.etag;
+}
+
 export async function measureRounds(rounds: number, now: () => number = () => performance.now()): Promise<{ readonly rounds: readonly PropagationRound[]; readonly p50: number | null; readonly p95: number | null; readonly p99: number | null; readonly staleWithoutInvalidate: boolean }> {
   const store = memoryStore();
-  const cache = new RulesetCache(async () => (await store.get('flags/config.json'))?.etag ?? null, now, FLAGS_MAX_AGE_S * 1000, FLAGS_SWR_S * 1000);
+  const cache = new RulesetCache(async () => storedRevision(store), now, FLAGS_MAX_AGE_S * 1000, FLAGS_SWR_S * 1000);
   let revision: string = ABSENT_REVISION;
   const created = await setRollout(store, { invalidate: async () => cache.invalidate() }, 'ply.usage.note', 0, revision);
   if (created.kind !== 'ok') throw new Error(`seed failed: ${created.kind}`);
@@ -69,7 +75,7 @@ export async function measureRounds(rounds: number, now: () => number = () => pe
     samples.push({ lagMs: now() - started, from: before, to: revision });
   }
   const held = memoryStore();
-  const quiet = new RulesetCache(async () => (await held.get('flags/config.json'))?.etag ?? null, now, FLAGS_MAX_AGE_S * 1000, FLAGS_SWR_S * 1000);
+  const quiet = new RulesetCache(async () => storedRevision(held), now, FLAGS_MAX_AGE_S * 1000, FLAGS_SWR_S * 1000);
   const first = await setRollout(held, { invalidate: async () => quiet.invalidate() }, 'ply.usage.note', 1, ABSENT_REVISION);
   if (first.kind !== 'ok') throw new Error('hold seed failed');
   await quiet.read();
