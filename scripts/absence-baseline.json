@@ -2,10 +2,10 @@
   "boundary": "src/absent.ts",
   "counts": {
     "word": 190,
-    "optional": 364,
+    "optional": 361,
     "chain": 537,
-    "nullish": 600,
-    "total": 1691
+    "nullish": 585,
+    "total": 1673
   },
   "files": {
     "cloudflare.config.ts": {
@@ -533,26 +533,12 @@
       "nullish": 0,
       "total": 5
     },
-    "src/write/pick.ts": {
-      "word": 0,
-      "optional": 3,
-      "chain": 0,
-      "nullish": 3,
-      "total": 6
-    },
     "src/write/request.ts": {
       "word": 21,
       "optional": 0,
       "chain": 0,
       "nullish": 0,
       "total": 21
-    },
-    "src/write/result.ts": {
-      "word": 0,
-      "optional": 0,
-      "chain": 0,
-      "nullish": 12,
-      "total": 12
     },
     "src/write/tag.ts": {
       "word": 6,

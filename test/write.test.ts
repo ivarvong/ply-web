@@ -122,6 +122,21 @@ test('cherry-pick outcomes map exhaustively: empty, ok, kept_empty, and nothing 
     assert.equal(reverted.name, 'revert')
     assert.equal(reverted.oldOid, onto)
   }
+  assert.deepEqual(mapPickOutcome({ outcome: 'ok', ref, oid }, false), {
+    kind: 'applied', name: 'cherry_pick', ref, oid, oldOid: null, tree: null, pushBytes: 0,
+  })
+  assert.deepEqual(mapPickOutcome({ outcome: 'ok', ref, oid, onto: null, tree: null, pushBytes: 0 }, false), {
+    kind: 'applied', name: 'cherry_pick', ref, oid, oldOid: null, tree: null, pushBytes: 0,
+  })
+  assert.deepEqual(mapPickOutcome({ outcome: 'empty', ref, oid, tree: 't', onto, pushBytes: 12 }, false), { kind: 'empty', ref, oid })
+  // A non-null non-string is kept. writeResult is what turns a non-string onto into null.
+  const numbered = mapPickOutcome({ outcome: 'ok', ref, oid, onto: 4, tree: 5, pushBytes: '12' }, false)
+  assert.equal(numbered.kind, 'applied')
+  if (numbered.kind === 'applied') {
+    assert.equal(numbered.oldOid, 4)
+    assert.equal(numbered.tree, 5)
+    assert.equal(numbered.pushBytes, '12')
+  }
   assert.equal(code(() => mapPickOutcome({ outcome: 'applied', ref, oid }, false))?.code, 'internal')
 })
 
@@ -130,15 +145,45 @@ test('write results share oid aliases and empty outcomes are noops', () => {
   assert.equal(empty.noop, true)
   assert.equal(empty.newCommit, 'abc')
   assert.equal(empty.oldCommit, 'abc')
+  assert.equal(empty.onto, 'abc')
   const created = writeResult('commit', 'refs/heads/main', 'abc', null)
   assert.equal(created.oldOid, null)
+  assert.equal(created.onto, null)
   assert.equal(created.noop, false)
+  const viaTheirs = writeResult('merge', 'refs/heads/main', 'abc', 'def', { onto: null, theirs: 'ghi' })
+  assert.equal(viaTheirs.onto, 'ghi')
+  assert.equal(viaTheirs.theirs, 'ghi')
+  assert.equal(writeResult('merge', 'refs/heads/main', 'abc', 'def', { onto: '' }).onto, '')
+  assert.equal(writeResult('merge', 'refs/heads/main', 'abc', 'def', { onto: 1, theirs: 'ghi' }).onto, null)
   const folded = unifyPly({ newCommit: 'abc', oldCommit: 'def', tree: 'ttt', pushBytes: 4 }, 'commit', 'refs/heads/main')
   assert.equal(folded.oid, 'abc')
   assert.equal(folded.oldOid, 'def')
   assert.equal(folded.newCommit, 'abc')
+  assert.equal(folded.oldCommit, 'def')
+  assert.equal(folded.onto, 'def')
   assert.equal(folded.outcome, 'commit')
   assert.equal(folded.tree, 'ttt')
+  assert.equal(folded.pushBytes, 4)
+  assert.equal(folded.noop, false)
+  const ranked = unifyPly({
+    oid: null, newCommit: 'abc',
+    oldCommit: null, ours: null, oldTip: 'def',
+    onto: null, theirs: 'ghi',
+    tree: null, newTree: 'ttt',
+    pushBytes: null,
+  }, 'merge', 'refs/heads/main')
+  assert.equal(ranked.oid, 'abc')
+  assert.equal(ranked.oldOid, 'def')
+  assert.equal(ranked.onto, 'ghi')
+  assert.equal(ranked.tree, 'ttt')
+  assert.equal(ranked.pushBytes, 0)
+  const preferred = unifyPly({ oid: 'aaa', newCommit: 'bbb', oldCommit: 'ccc', ours: 'ddd', onto: 'eee', theirs: 'fff', pushBytes: 0 }, 'commit', 'refs/heads/main')
+  assert.equal(preferred.oid, 'aaa')
+  assert.equal(preferred.oldOid, 'ccc')
+  assert.equal(preferred.onto, 'eee')
+  assert.equal(preferred.pushBytes, 0)
+  assert.equal(unifyPly({ oid: 'abc', oldCommit: 'def', noop: false }, 'empty', 'refs/heads/main').noop, false)
+  assert.equal(unifyPly({ oid: 'abc', oldCommit: 'def' }, 'empty', 'refs/heads/main').noop, true)
 })
 
 test('annotated tag bytes hash the way git hash-object does', () => {
