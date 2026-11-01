@@ -1,7 +1,9 @@
 // Create or delete a ref. `from: 000…0` is rejected before any transport is opened, so nothing is pushed.
 // An existing ref is ref_exists (retry no). A delete whose expected oid is stale is stale_expected and carries
 // the oid the ref actually points at.
-import { fail, fetchCommit, lsRefs, operation, parseOid, push, resolveCommit, ZERO_OID } from 'ply'
+import { fail, fetchCommit, operation, parseOid, push, resolveCommit, ZERO_OID } from 'ply'
+import { fromNullable } from '../absent.ts'
+import { advertisedOid, hasErrorCode } from './advertised.ts'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
 import { assertNever, refExists, staleExpected } from './errors.ts'
 import { readHead } from './head.ts'
@@ -53,10 +55,11 @@ export async function createBranch(remote: string, refName: unknown, from: unkno
   const ref = branchRef(refName, 'ref')
   // Zero is refused here, before operation() opens a transport, so receive-pack is never called.
   if (from === ZERO_OID) throw fail('bad_request', 'from must not be the zero oid')
-  if (from !== undefined && from !== null && from !== '' && typeof from !== 'string') throw fail('bad_request', 'from must be a branch name or a commit id')
+  const present = fromNullable(from)
+  if (present.tag === 'some' && present.value !== '' && typeof present.value !== 'string') throw fail('bad_request', 'from must be a branch name or a commit id')
   const specified = typeof from === 'string' && from !== '' ? from : null
   return operation('branch_create', remote, { ...opts, attrs: { 'git.branch_create.ref': ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
-    const existing = (await lsRefs(t, [ref])).refs.get(ref)?.oid as string | undefined
+    const existing = await advertisedOid(t, ref)
     if (existing) throw refExists(ref, existing)
     const commit = specified === null ? await bornTip(t) : await tipOf(t, specified)
     root.set({ 'git.branch_create.oid': commit })
@@ -64,9 +67,9 @@ export async function createBranch(remote: string, refName: unknown, from: unkno
       const pushed = await push(t, { ref, oldOid: ZERO_OID, newOid: commit, objects: [] }) as { packBytes: number }
       return outcome('created', writeResult('created', ref, commit, null, { pushBytes: pushed.packBytes }))
     } catch (e) {
-      if ((e as { code?: string })?.code === 'cas_conflict') {
-        const cur = (await lsRefs(t, [ref])).refs.get(ref)?.oid as string | undefined
-        throw refExists(ref, cur ?? commit)
+      if (hasErrorCode(e, 'cas_conflict')) {
+        const cur = await advertisedOid(t, ref)
+        throw refExists(ref, cur === null ? commit : cur)
       }
       throw e
     }
@@ -75,16 +78,16 @@ export async function createBranch(remote: string, refName: unknown, from: unkno
 
 export async function deleteRef(remote: string, ref: string, expected: string | null, opts: CallOpts, op: 'branch_delete' | 'tag_delete'): Promise<Record<string, unknown>> {
   return operation(op, remote, { ...opts, attrs: { [`git.${op}.ref`]: ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
-    const current = (await lsRefs(t, [ref])).refs.get(ref)?.oid as string | undefined
+    const current = await advertisedOid(t, ref)
     if (!current) throw fail('not_found', `ref ${ref} not found`, { miss: { kind: 'ref', ref, candidates: [ref] } })
     if (expected && expected !== current) throw staleExpected(ref, expected, current)
     root.set({ [`git.${op}.oid`]: current, [`git.${op}.cas_from_caller`]: expected !== null })
     try {
       await push(t, { ref, oldOid: current, newOid: ZERO_OID, objects: [] })
     } catch (e) {
-      if ((e as { code?: string })?.code !== 'cas_conflict') throw e
-      const now = (await lsRefs(t, [ref])).refs.get(ref)?.oid as string | undefined
-      throw staleExpected(ref, expected ?? current, now ?? current)
+      if (!hasErrorCode(e, 'cas_conflict')) throw e
+      const now = await advertisedOid(t, ref)
+      throw staleExpected(ref, expected === null ? current : expected, now === null ? current : now)
     }
     return outcome('deleted', writeResult('deleted', ref, null, current, { deleted: current }))
   }) as Promise<Record<string, unknown>>
