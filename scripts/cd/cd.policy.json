@@ -10,6 +10,20 @@
   "warmupMs": 0,
   "probe": {
     "rps": 25,
+    "maxLossRate": 0.0012658227848101266,
+    "onHarnessFault": "rollback",
+    "calibration": {
+      "source": "run 2026-11-01T17-06-08-780Z",
+      "date": "2026-11-01",
+      "window": "100% ramp step",
+      "n": 790,
+      "lost": 1,
+      "web": "789ba93",
+      "ply": "1743461",
+      "observedRate": "1/790",
+      "percentile": "one measured step, not a percentile",
+      "headroom": "none above the measured loss; a greater rate is a fault"
+    },
     "calls": [
       { "method": "GET", "path": "/", "auth": false },
       { "method": "GET", "path": "/v1/discover?remote=https%3A%2F%2F5ad2236b39de4c8bd8f6270ea63f3ea9.artifacts.cloudflare.net%2Fgit%2Fpublic-v0%2Fply.git", "auth": true }

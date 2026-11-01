@@ -14,6 +14,26 @@ export type ProbeCall = {
   readonly auth: boolean
 }
 
+/** Where a harness fault above 0% leaves traffic. Rollback restores `previous` at 100%. */
+export type ProbeFaultAction = 'rollback' | 'hold'
+
+/**
+ * Citation for `probe.maxLossRate`, per issue #73: source, window, date, n, and headroom.
+ * The number is the 100% step of run 2026-11-01T17-06-08-780Z: 1 client abort in 790 probes.
+ */
+export type ProbeCalibration = {
+  readonly source: string
+  readonly date: string
+  readonly window: string
+  readonly n: number
+  readonly lost: number
+  readonly web: string
+  readonly ply: string
+  readonly observedRate: string
+  readonly percentile: string
+  readonly headroom: string
+}
+
 export type RolloutStep = {
   readonly percent: number
   readonly dwellMs: number
@@ -69,6 +89,10 @@ export type RolloutPolicy = {
   readonly probe: {
     readonly rps: number
     readonly calls: readonly ProbeCall[]
+    /** Fraction of probes in (0, 1] that may be lost before the step is a harness fault. */
+    readonly maxLossRate: number
+    readonly onHarnessFault: ProbeFaultAction
+    readonly calibration: ProbeCalibration
   }
   readonly gates: RolloutGates
   readonly burn: {
@@ -158,6 +182,28 @@ function probePath(value: unknown, path: string): string {
   return value
 }
 
+function textOf(value: unknown, path: string): string {
+  if (typeof value !== 'string' || value.length === 0) reject(path, 'must be a non-empty string')
+  return value
+}
+
+function calibrationOf(value: unknown): ProbeCalibration {
+  const rec = record(value, 'probe.calibration')
+  exactKeys(rec, 'probe.calibration', ['source', 'date', 'window', 'n', 'lost', 'web', 'ply', 'observedRate', 'percentile', 'headroom'])
+  return {
+    source: textOf(rec.source, 'probe.calibration.source'),
+    date: textOf(rec.date, 'probe.calibration.date'),
+    window: textOf(rec.window, 'probe.calibration.window'),
+    n: integer(rec.n, 'probe.calibration.n', 1),
+    lost: integer(rec.lost, 'probe.calibration.lost', 0),
+    web: textOf(rec.web, 'probe.calibration.web'),
+    ply: textOf(rec.ply, 'probe.calibration.ply'),
+    observedRate: textOf(rec.observedRate, 'probe.calibration.observedRate'),
+    percentile: textOf(rec.percentile, 'probe.calibration.percentile'),
+    headroom: textOf(rec.headroom, 'probe.calibration.headroom'),
+  }
+}
+
 function callsOf(value: unknown): readonly ProbeCall[] {
   if (!Array.isArray(value)) reject('probe.calls', 'must be a list')
   return value.map((item, index) => {
@@ -232,18 +278,25 @@ function validate(value: unknown): RolloutPolicy {
   const rec = record(value, 'policy')
   exactKeys(rec, 'policy', ['steps', 'ingestWaitMs', 'probe', 'gates', 'burn', 'split'], ['warmupMs', 'telemetry'])
   const probe = record(rec.probe, 'probe')
-  exactKeys(probe, 'probe', ['rps', 'calls'])
+  exactKeys(probe, 'probe', ['rps', 'calls', 'maxLossRate', 'onHarnessFault', 'calibration'])
   const rps = probe.rps
   if (typeof rps !== 'number' || !Number.isFinite(rps) || rps < 0) reject('probe.rps', 'must be a number >= 0')
   const calls = callsOf(probe.calls)
   if (rps > 0 && calls.length === 0) reject('probe.calls', 'probe rps needs at least one call')
+  const onHarnessFault = oneOf(probe.onHarnessFault, 'probe.onHarnessFault', ['rollback', 'hold'])
   const burn = record(rec.burn, 'burn')
   exactKeys(burn, 'burn', ['fastBurn', 'minSamples'])
   return {
     steps: stepsOf(rec.steps),
     ingestWaitMs: integer(rec.ingestWaitMs, 'ingestWaitMs', 0),
     warmupMs: rec.warmupMs === undefined ? 0 : integer(rec.warmupMs, 'warmupMs', 0),
-    probe: { rps, calls },
+    probe: {
+      rps,
+      calls,
+      maxLossRate: rate(probe.maxLossRate, 'probe.maxLossRate'),
+      onHarnessFault,
+      calibration: calibrationOf(probe.calibration),
+    },
     gates: gatesOf(rec.gates),
     burn: {
       fastBurn: positive(burn.fastBurn, 'burn.fastBurn'),
@@ -269,6 +322,20 @@ function policyBody(policy: RolloutPolicy): Json {
     warmupMs: policy.warmupMs,
     probe: {
       rps: policy.probe.rps,
+      maxLossRate: policy.probe.maxLossRate,
+      onHarnessFault: policy.probe.onHarnessFault,
+      calibration: {
+        source: policy.probe.calibration.source,
+        date: policy.probe.calibration.date,
+        window: policy.probe.calibration.window,
+        n: policy.probe.calibration.n,
+        lost: policy.probe.calibration.lost,
+        web: policy.probe.calibration.web,
+        ply: policy.probe.calibration.ply,
+        observedRate: policy.probe.calibration.observedRate,
+        percentile: policy.probe.calibration.percentile,
+        headroom: policy.probe.calibration.headroom,
+      },
       calls: policy.probe.calls.map(call => ({ method: call.method, path: call.path, auth: call.auth })),
     },
     gates: {

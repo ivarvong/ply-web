@@ -24,6 +24,32 @@ export type PipelineExit = {
   readonly reason: string | null
 }
 
+async function recordedProbeLoss(runDir: string): Promise<readonly { readonly percent: number; readonly count: number; readonly rate: number; readonly ids: readonly string[] }[]> {
+  let text: string
+  try {
+    text = await readFile(join(runDir, 'ramp.json'), 'utf8')
+  } catch {
+    return []
+  }
+  let value: unknown
+  try {
+    value = JSON.parse(text) as unknown
+  } catch {
+    return []
+  }
+  const rec = asRecord(value)
+  if (!rec || !Array.isArray(rec.probeLoss)) return []
+  const rows: { readonly percent: number; readonly count: number; readonly rate: number; readonly ids: readonly string[] }[] = []
+  for (const item of rec.probeLoss) {
+    const row = asRecord(item)
+    if (!row) continue
+    const ids = Array.isArray(row.ids) ? row.ids.filter(id => typeof id === 'string') : []
+    if (typeof row.percent !== 'number' || typeof row.count !== 'number' || typeof row.rate !== 'number') continue
+    rows.push({ percent: row.percent, count: row.count, rate: row.rate, ids })
+  }
+  return rows
+}
+
 function outcomeOf(result: StageResult<unknown>): PhaseOutcome {
   if (result.kind === 'pass') return 'pass'
   if (result.fault === 'harness_fault') return 'harness-stop'
@@ -317,14 +343,18 @@ export async function runPipeline(
     }
     state = { phase: 'halt', smoke: state.smoke }
   }
-  const verdictKind = failure?.fault === 'harness_fault'
+  const fault = failure === null ? null : failure.fault
+  const verdictKind = fault === 'harness_fault'
     ? 'harness_fault' as const
-    : failure?.fault === 'state_conflict'
+    : fault === 'state_conflict'
       ? 'state_conflict' as const
-      : 'fail' as const
+      : fault === 'insufficient_samples'
+        ? 'insufficient_samples' as const
+        : 'fail' as const
+  const probeLoss = await recordedProbeLoss(runDir)
   const verdict = failure
-    ? { kind: verdictKind, version, previous, stage: failure.stage, reason: failure.reason, rolledBack: failure.rolledBack, fault: failure.fault, failures: [failure.reason] }
-    : { kind: 'pass' as const, version, previous, failures: [] as string[] }
+    ? { kind: verdictKind, version, previous, stage: failure.stage, reason: failure.reason, rolledBack: failure.rolledBack, fault: failure.fault, failures: [failure.reason], probe_loss: probeLoss }
+    : { kind: 'pass' as const, version, previous, failures: [] as string[], probe_loss: probeLoss }
   await writeJson(runDir, 'verdict.json', verdict, [opts.token])
   if (failure) {
     const label = failure.fault === 'worker' ? 'FAIL' : failure.fault

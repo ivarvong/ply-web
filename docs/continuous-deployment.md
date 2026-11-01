@@ -93,7 +93,7 @@ cd: PASS 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e ply 1274f2dd05b83d70f8d421cdcc7962
 | --- | --- | --- |
 | `cd: PASS <version id> ply <ply sha> web <ply-web sha>` | 0 | The new version is at 100%, and the live smoke and telemetry passed. |
 | `cd: FAIL <stage>: <reason>` | 1 | That stage stopped the run. If the line is from ramp or from the live checks, traffic is already back on `previous` unless the line says the rollback itself failed. |
-| `cd: harness_fault <stage>: <reason>` | 1 | A request got no response, a revoked Artifacts token did not get 403, or a check could not be evaluated (the telemetry query, a span-query shape mismatch, zero samples where samples are required, an implausible span join, a preflight miss). The split is unchanged. This is not a change failure. |
+| `cd: harness_fault <stage>: <reason>` | 1 | A probe loss above `probe.maxLossRate`, a revoked Artifacts token that did not get 403, or a check that could not be evaluated (the telemetry query, a span-query shape mismatch, zero samples where samples are required, an implausible span join, a preflight miss). A ramp step above 0% then follows `probe.onHarnessFault`. Any other stage leaves the split unchanged. This is not a change failure. |
 | `cd: state_conflict <stage>: <reason>` | 1 | The deployment was not the expected prior split, so the write was skipped. The split is unchanged. |
 | a usage line, no `cd: PASS` / `cd: FAIL` | 2 | The arguments were wrong. Traffic was not touched. |
 
@@ -266,7 +266,7 @@ The checked-in steps are `10, 25, 50, 75, 100`, each with a `40000` ms dwell. Th
 
 The only pinned traffic is the 0% gate: the lifecycle smoke and the deploy check, both sent with `Cloudflare-Workers-Version-Overrides`. From the first ramp step on, probes are ordinary requests. They do not set that header, and they do not pin the old version to balance the arms. Right now those requests are the only load. Real users would be judged by the same telemetry.
 
-During the probe the ramp calls at `probe.rps` (25) ticks per second, once per entry in `probe.calls`. Each call's `path` is the request path and query, and the engine sends that string as written. The checked-in mix is `GET /` (the usage text, no bearer) and `GET /v1/discover?remote=https%3A%2F%2F5ad2236b39de4c8bd8f6270ea63f3ea9.artifacts.cloudflare.net%2Fgit%2Fpublic-v0%2Fply.git` (the public `ply` mirror, with the bearer from `PLY_TOKEN_FILE`). That is 50 requests per second. Ticks overlap, up to one second of them in flight, so a response slower than `1000 / rps` ms does not stretch the dwell. There is no `/health` route. The response's `x-ply-version` is written on the request event. It is not the gate. A probe that gets no response stops the ramp as `harness_fault` and leaves the current split in place. Before each percentage change the ramp reads the deployment and writes only when it is still the previous step's split. Otherwise it stops with `state_conflict` and does not roll back.
+During the probe the ramp calls at `probe.rps` (25) ticks per second, once per entry in `probe.calls`. Each call's `path` is the request path and query, and the engine sends that string as written. The checked-in mix is `GET /` (the usage text, no bearer) and `GET /v1/discover?remote=https%3A%2F%2F5ad2236b39de4c8bd8f6270ea63f3ea9.artifacts.cloudflare.net%2Fgit%2Fpublic-v0%2Fply.git` (the public `ply` mirror, with the bearer from `PLY_TOKEN_FILE`). That is 50 requests per second. Ticks overlap, up to one second of them in flight, so a response slower than `1000 / rps` ms does not stretch the dwell. There is no `/health` route. The response's `x-ply-version` is written on the request event. It is not the gate. A probe that gets no response (no status and no ray: a client abort or a network failure) is a probe loss, not a server error. The step records `probe_loss` (count, rate, and ids) on the `ramp.jsonl` line, as a `probe-loss` observation in `events.jsonl`, and on `verdict.json`. Loss at or below `probe.maxLossRate` stays in the sample only as loss: correctness and availability use the probes that responded, and that count still has to reach `burn.minSamples`. Fewer responded probes than that is `insufficient_samples`, not a pass. A loss rate above `probe.maxLossRate` is `harness_fault`. Above 0%, that fault leaves traffic where `probe.onHarnessFault` says: `rollback` restores `previous` at 100% (the checked-in choice), and `hold` returns to the last fully passed split. The verdict kind stays `harness_fault`, distinct from a correctness fail. The checked-in rate is 1/790, the single client abort on the 100% step of run `2026-11-01T17-06-08-780Z` (web `789ba93`, ply `1743461`), with no headroom above that measurement. Before each percentage change the ramp reads the deployment and writes only when it is still the previous step's split. Otherwise it stops with `state_conflict` and does not roll back.
 
 Five dwells are 200s. Five ingest waits are 100s. A clean ramp is about 5 minutes plus the queries. The 20s wait is the tail measured on run `2026-11-01T00-10-02-620Z`: the query ran about 1.4s after the dwell and the newest event was still 12640ms behind the dwell end at 1% and 17313ms behind it at 5%. `20000` is above that. Those two steps are no longer in the file; the lag is.
 
@@ -282,7 +282,7 @@ The step decision is the policy. A signal set to `hard` rolls back. The same sig
 | Routed share | `rollback` | `routedNewShare` outside the binomial band. `split.onMismatch` may instead be `hold`, which leaves the split |
 | Thin evidence | `hold` | Fewer than `split.minNewRequests` (**100**) new-version invocations, or no invocations at all. Outcome `insufficient_data`. `onInsufficient: advance` moves on and still says so |
 | Latency | `informational` | Never, under this file. Wall p99 and CPU p99 are on the line and on the ramp observation. `off` omits them from the line. `gate` needs `minSamples`, `p99Ratio` (> 1), and `effectFloorMs`, and rolls back only when both sides have that many wall samples and p99 clears both thresholds |
-| Query failed | always | `harness_fault`. The split stays. A missing query is not zero errors and is not a rollback |
+| Query failed | always | `harness_fault`. Above 0% the split follows `probe.onHarnessFault` (checked-in: roll back to `previous`). A missing query is not zero errors |
 
 ### How many requests that is
 
@@ -413,12 +413,12 @@ cd: FAIL rollback: rollback to 1aa0bb11-… failed: …
 
 | File | What you open it for |
 | --- | --- |
-| `verdict.json` | `{ "kind": "pass", "version": "…", "failures": [] }`, `kind: "fail"` with `stage`, `reason`, and `rolledBack`, or `kind: "harness_fault"` / `kind: "state_conflict"` with the split left as it was |
+| `verdict.json` | `{ "kind": "pass", "version": "…", "failures": [], "probe_loss": [] }`, `kind: "fail"` with `stage`, `reason`, and `rolledBack`, `kind: "insufficient_samples"` when responded probes missed `burn.minSamples`, or `kind: "harness_fault"` / `kind: "state_conflict"`. A ramp `harness_fault` names whether traffic was rolled back. `probe_loss` is one record per ramp step (count, rate, ids) |
 | `smoke.csv` / `live-smoke.csv` | One row per HTTP call. `pass` is the step. `detail` is why a row failed. |
 | `smoke.json` / `live-smoke.json` | The ids telemetry asks for, plus the scratch repo name if it was kept |
 | `telemetry.md` / `live-telemetry.md` | The verdict line and the percentiles |
 | `telemetry.json` | The pass/fail the ramp reads. A ramp with a fail here does not change traffic. |
-| `ramp.jsonl` | The same progress lines that went to stdout, one JSON object per step: `{ "line": "ramp step=…" }` |
+| `ramp.jsonl` | One JSON object per step: `{ "line": "ramp step=…", "probe_loss": { "percent", "count", "rate", "total", "responded", "ids" } }` |
 | `events.jsonl` | Append-only log. One typed event per line. This is the record a debrief reads |
 | `manifest.json` | sha256 of every other file, written after `run_finished`. The directory is not modified after this |
 | `captures/` | stdout and stderr of each command, redacted |
@@ -438,7 +438,7 @@ cd: FAIL rollback: rollback to 1aa0bb11-… failed: …
 | A ramp line with `decision=rollback`, then `cd: FAIL ramp:` | Previous at 100% | Relay the line. The new version is off traffic. |
 | `cd: FAIL ramp:` and the text says rollback failed | **Not** safe | Run `npm run cd -- rollback --to <previous>` and read the deployment list. The id to restore is the one in that sentence. |
 | `cd: FAIL smoke:` or `cd: FAIL telemetry:` after ramp lines that reached `percent=100` | Previous at 100% if rollback landed | Same as a ramp rollback. The live check is what rejected it. |
-| `cd: harness_fault` | The split where the run stopped | The version was not blamed. No retry and no rollback. Decide from the request that got no response, the 403 on the token this stage minted, or the telemetry query or span join. |
+| `cd: harness_fault` | On a ramp step above 0%, `previous` at 100% when `probe.onHarnessFault` is `rollback`, or the last fully passed split when it is `hold`. Elsewhere, the split where the run stopped | The version was not blamed. A probe loss above `probe.maxLossRate`, a 403 on the token this stage minted, or a telemetry query or span join. The verdict kind is `harness_fault`, not a correctness fail. |
 | `cd: state_conflict` | The split that was already there | Something else changed the deployment. Do not apply the step again until you have read `cf workers deployments list`. |
 
 ## Metrics
