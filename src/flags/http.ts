@@ -1,18 +1,15 @@
 // Read and eval over HTTP. Writes are FlagControl RPC, so PUT/POST of a ruleset is 405.
 // parse, then authorize, then execute each return a Result. json() is the only status mapping.
-import { loadRuleset, type FlagCacheEnv, type FlagsCacheBinding } from './cache.ts';
-import { resolveFlags } from './client.ts';
+import { loadRuleset, type FlagCacheEnv } from './cache.ts';
+import { flagRuntime, resolveFlags } from './client.ts';
 import { parseUnit, type AttributeInput } from './document.ts';
 import { parseFlagKey, type AttributeName, type AttributeValue, type FlagKey, type UnitId } from './brand.ts';
 import { headerNumber, jsonField, jsonRecord, readHeader } from '../http/inbound.ts';
 import { err, isUnexpected, ok, runRequest, type Result, type UnexpectedFailure } from '../http/machine.ts';
-import type { TracingLike } from './telemetry.ts';
 import { variantKind, variantValue, type FlagEvaluation, type FlagSelection } from './types.ts';
 
 const NO_STORE = 'no-store';
 const MAX_BODY = 64 * 1024;
-
-type FlagCtx = { exports?: { FlagsCache?: FlagsCacheBinding }; tracing?: TracingLike | null };
 
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': NO_STORE } });
@@ -99,7 +96,7 @@ async function parseFlagRoute(request: Request): Promise<Result<FlagRoute, FlagF
   return ok({ kind: 'eval', id: parsed.id, attributes: parsed.attributes, keys });
 }
 
-export async function handleFlagHttp(request: Request, env: FlagCacheEnv, ctx: FlagCtx): Promise<Response> {
+export async function handleFlagHttp(request: Request, env: FlagCacheEnv, ctx: unknown): Promise<Response> {
   return runRequest(
     {
       parse: () => parseFlagRoute(request),
@@ -113,15 +110,16 @@ export async function handleFlagHttp(request: Request, env: FlagCacheEnv, ctx: F
   );
 }
 
-async function executeFlag(route: FlagRoute, env: FlagCacheEnv, ctx: FlagCtx): Promise<Result<FlagBody, FlagFailure>> {
+async function executeFlag(route: FlagRoute, env: FlagCacheEnv, ctx: unknown): Promise<Result<FlagBody, FlagFailure>> {
+  const runtime = flagRuntime(env, ctx);
   if (route.kind === 'rules') {
-    const loaded = await loadRuleset(env, ctx.exports?.FlagsCache ?? null);
+    const loaded = await loadRuleset(env, runtime.cache);
     if (loaded.kind === 'unavailable') return flagFailure('unavailable', 503, loaded.reason, 'yes');
     if (loaded.kind === 'absent') return flagFailure('not_found', 404, 'no flag config', 'no');
     return ok({ status: 200, body: { revision: loaded.revision, cache: loaded.cache, environment: loaded.document.environment, flags: loaded.document.flags } });
   }
   const resolved = await resolveFlags(
-    { env, cache: ctx.exports?.FlagsCache ?? null, tracing: ctx.tracing ?? null },
+    runtime,
     { id: route.id, attributes: route.attributes },
     route.keys,
   );
