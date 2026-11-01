@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 192,
-    "optional": 365,
+    "word": 190,
+    "optional": 364,
     "chain": 537,
     "nullish": 600,
-    "total": 1694
+    "total": 1691
   },
   "files": {
     "cloudflare.config.ts": {
@@ -429,11 +429,11 @@
       "total": 7
     },
     "src/viewer/markdown.ts": {
-      "word": 10,
+      "word": 8,
       "optional": 10,
       "chain": 10,
       "nullish": 54,
-      "total": 84
+      "total": 82
     },
     "src/viewer/model.ts": {
       "word": 0,
@@ -476,13 +476,6 @@
       "chain": 4,
       "nullish": 4,
       "total": 19
-    },
-    "src/viewer/safehtml.ts": {
-      "word": 0,
-      "optional": 1,
-      "chain": 0,
-      "nullish": 0,
-      "total": 1
     },
     "src/viewer/session.ts": {
       "word": 0,
