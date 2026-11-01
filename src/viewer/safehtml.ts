@@ -29,8 +29,8 @@ export type MdTag = 'p' | 'ul' | 'ol' | 'li' | 'pre' | 'code' | 'strong' | 'em' 
 /** Fixed class names the markdown renderer may attach. Never derived from the source text. */
 export type MdClass = 'md-code' | 'md-code-lang' | 'md-table' | 'task' | 'task done' | 'task-item' | 'al-l' | 'al-c' | 'al-r' | 'md-img' | 'md-frontmatter';
 
-export function tag(name: MdTag, content: SafeHtml, cls?: MdClass): SafeHtml {
-  const open = cls ? `<${name} class="${cls}">` : `<${name}>`;
+export function tag(name: MdTag, content: SafeHtml, cls: MdClass | null): SafeHtml {
+  const open = cls === null ? `<${name}>` : `<${name} class="${cls}">`;
   return concatHtml([mark(open), content, mark(`</${name}>`)]);
 }
 

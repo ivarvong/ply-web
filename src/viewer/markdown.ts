@@ -4,6 +4,7 @@
 // come from fixed sets in safehtml.ts; a link becomes an anchor only when its URL passes classifyHref (or a
 // repository-relative path that the caller resolves to a viewer URL). Raw HTML is shown as text. Images are links, not
 // <img>: the viewer's CSP is img-src 'none', and a README must not make visitors' browsers fetch third-party pixels.
+import { atIndex } from '../absent.ts';
 import { anchor, concatHtml, escapeHtml, heading, orderedList, tag, voidTag, type MdClass, type SafeHtml } from './safehtml.ts';
 
 const NAMED: Record<string, string> = {
@@ -234,7 +235,7 @@ function inline(src: string, ctx: Ctx, inLink = false, depth = 0): SafeHtml {
         let code = src.slice(i + n, end - n).replace(/\n/g, ' ');
         if (/^ .* $/.test(code) && code.trim()) code = code.slice(1, -1);
         flush();
-        out.push(tag('code', escapeHtml(code)));
+        out.push(tag('code', escapeHtml(code), null));
         i = end;
         continue;
       }
@@ -319,7 +320,7 @@ function inline(src: string, ctx: Ctx, inLink = false, depth = 0): SafeHtml {
           if (inner.length) {
             flush();
             const name = ch === '~' ? 'del' : two ? 'strong' : 'em';
-            out.push(tag(name, inline(inner, ctx, inLink, depth + 1)));
+            out.push(tag(name, inline(inner, ctx, inLink, depth + 1), null));
             i = close + delim.length;
             continue;
           }
@@ -380,14 +381,14 @@ function splitRow(line: string): string[] {
   return cells;
 }
 
-function alignOf(cell: string): MdClass | undefined {
+function alignOf(cell: string): MdClass | null {
   const c = cell.trim();
   const left = c.startsWith(':');
   const right = c.endsWith(':');
   if (left && right) return 'al-c';
   if (right) return 'al-r';
   if (left) return 'al-l';
-  return undefined;
+  return null;
 }
 
 function startsBlock(line: string, inParagraph: boolean): boolean {
@@ -420,7 +421,7 @@ function dedent(line: string, n: number): string {
 }
 
 function codeBlock(lang: string, text: string): SafeHtml {
-  const pre = tag('pre', tag('code', escapeHtml(text)));
+  const pre = tag('pre', tag('code', escapeHtml(text), null), null);
   const label = lang ? tag('div', escapeHtml(lang.slice(0, 32)), 'md-code-lang') : escapeHtml('');
   return tag('div', concatHtml([label, pre]), 'md-code');
 }
@@ -484,7 +485,7 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
         inner.push(l);
         i++;
       }
-      out.push(tag('blockquote', depth < MAX_DEPTH ? renderBlocks(inner, ctx, depth + 1) : escapeHtml(inner.join('\n'))));
+      out.push(tag('blockquote', depth < MAX_DEPTH ? renderBlocks(inner, ctx, depth + 1) : escapeHtml(inner.join('\n')), null));
       continue;
     }
 
@@ -495,8 +496,12 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
       if (aligns.length === head.length || (aligns.length > 0 && head.length > 0)) {
         const cols = head.length;
         const row = (cells: string[], cell: 'th' | 'td') => tag('tr', concatHtml(
-          Array.from({ length: cols }, (_, c) => tag(cell, inline(cells[c] ?? '', ctx), aligns[c])),
-        ));
+          Array.from({ length: cols }, (_, c) => {
+            const align = atIndex(aligns, c);
+            const cls = align.tag === 'some' ? align.value : null;
+            return tag(cell, inline(cells[c] ?? '', ctx), cls);
+          }),
+        ), null);
         const body: SafeHtml[] = [];
         i += 2;
         while (i < lines.length) {
@@ -505,7 +510,7 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
           body.push(row(splitRow(l), 'td'));
           i++;
         }
-        const table = tag('table', concatHtml([tag('thead', row(head, 'th')), body.length ? tag('tbody', concatHtml(body)) : escapeHtml('')]));
+        const table = tag('table', concatHtml([tag('thead', row(head, 'th'), null), body.length ? tag('tbody', concatHtml(body), null) : escapeHtml('')]), null);
         out.push(tag('div', table, 'md-table'));
         continue;
       }
@@ -555,12 +560,12 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
         const task = /^\[([ xX])\][ \t]+/.exec(first);
         if (task) body[0] = first.slice(task[0].length);
         const content = renderBlocks(body, ctx, depth + 1, !looseList);
-        if (!task) return tag('li', content);
+        if (!task) return tag('li', content, null);
         const box = tag('span', escapeHtml(task[1] === ' ' ? '' : '✓'), task[1] === ' ' ? 'task' : 'task done');
         return tag('li', concatHtml([box, content]), 'task-item');
       });
       const start = ordered ? Number.parseInt(item[2] ?? '1', 10) : 1;
-      out.push(ordered ? orderedList(start, concatHtml(lis)) : tag('ul', concatHtml(lis)));
+      out.push(ordered ? orderedList(start, concatHtml(lis)) : tag('ul', concatHtml(lis), null));
       continue;
     }
 
@@ -583,7 +588,7 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
     }
     if (para.length) {
       const html = inline(para.join('\n').replace(/[ \t]+$/, ''), ctx);
-      out.push(tight ? html : tag('p', html));
+      out.push(tight ? html : tag('p', html, null));
     }
   }
   return concatHtml(out);
