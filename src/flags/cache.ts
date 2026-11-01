@@ -1,5 +1,6 @@
 // Workers Cache sits in front of FlagsCache.fetch. The default entrypoint stays uncached and calls this
 // over ctx.exports, so a ruleset hit does not run the Worker. Per-user evaluations are not cached.
+import { envBinding } from '../absent.ts';
 import { parseDocumentText } from './document.ts';
 import {
   FLAGS_CACHE_PATH,
@@ -125,8 +126,8 @@ function countedR2Read(cache: CacheStatus): boolean {
 
 function ttls(env: FlagCacheEnv): { maxAge: number; swr: number } {
   return {
-    maxAge: ttlFromEnv(env.FLAGS_MAX_AGE_S, FLAGS_MAX_AGE_S),
-    swr: ttlFromEnv(env.FLAGS_SWR_S, FLAGS_SWR_S),
+    maxAge: ttlFromEnv(envBinding(env.FLAGS_MAX_AGE_S), FLAGS_MAX_AGE_S),
+    swr: ttlFromEnv(envBinding(env.FLAGS_SWR_S), FLAGS_SWR_S),
   };
 }
 
