@@ -17,11 +17,11 @@ import {
 import { assertNever } from '../never.ts';
 import { parseCacheStatus, type CacheStatus, type FlagDocument } from './types.ts';
 
-export type FlagCacheEnv = {
-  FLAGS?: unknown;
-  FLAGS_MAX_AGE_S?: string;
-  FLAGS_SWR_S?: string;
-};
+export type FlagCacheEnv = Partial<{
+  FLAGS: unknown;
+  FLAGS_MAX_AGE_S: string;
+  FLAGS_SWR_S: string;
+}>;
 
 export type ReadableStore = { get(key: string): Promise<{ etag: string; body: string } | null> };
 
