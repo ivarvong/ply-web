@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 212,
-    "optional": 381,
-    "chain": 555,
-    "nullish": 628,
-    "total": 1776
+    "word": 207,
+    "optional": 380,
+    "chain": 551,
+    "nullish": 614,
+    "total": 1752
   },
   "files": {
     "cloudflare.config.ts": {
@@ -306,22 +306,15 @@
       "word": 0,
       "optional": 3,
       "chain": 2,
-      "nullish": 2,
-      "total": 7
+      "nullish": 1,
+      "total": 6
     },
     "src/flags/client.ts": {
       "word": 4,
-      "optional": 10,
+      "optional": 9,
       "chain": 3,
       "nullish": 2,
-      "total": 19
-    },
-    "src/flags/document.ts": {
-      "word": 1,
-      "optional": 0,
-      "chain": 0,
-      "nullish": 2,
-      "total": 3
+      "total": 18
     },
     "src/flags/entry.ts": {
       "word": 1,
@@ -330,19 +323,12 @@
       "nullish": 0,
       "total": 18
     },
-    "src/flags/eval.ts": {
-      "word": 1,
-      "optional": 0,
-      "chain": 2,
-      "nullish": 4,
-      "total": 7
-    },
     "src/flags/http.ts": {
-      "word": 3,
+      "word": 0,
       "optional": 3,
       "chain": 2,
-      "nullish": 4,
-      "total": 12
+      "nullish": 3,
+      "total": 8
     },
     "src/flags/operator-entry.ts": {
       "word": 0,
@@ -361,9 +347,9 @@
     "src/flags/operator.ts": {
       "word": 7,
       "optional": 2,
-      "chain": 15,
-      "nullish": 6,
-      "total": 30
+      "chain": 14,
+      "nullish": 3,
+      "total": 26
     },
     "src/flags/propagation.ts": {
       "word": 0,
@@ -417,9 +403,9 @@
     "src/index.js": {
       "word": 1,
       "optional": 0,
-      "chain": 27,
-      "nullish": 19,
-      "total": 47
+      "chain": 26,
+      "nullish": 16,
+      "total": 43
     },
     "src/mirror.ts": {
       "word": 0,
