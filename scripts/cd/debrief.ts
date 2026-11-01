@@ -67,7 +67,7 @@ export function canarySplit(events: readonly CdEvent[]): { readonly percent: num
   const seenAt = new Map<number, number>()
   for (const step of rampSteps(events)) {
     const percent = num(step.percent)
-    const seen = num(step.observedPercent)
+    const seen = num(step.routedNewShare) ?? num(step.observedPercent)
     if (percent !== null && seen !== null) seenAt.set(percent, seen)
   }
   return changes.flatMap(event => {
@@ -187,7 +187,7 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
     ]
     : [
       { name: 'cfg', rgb: [194, 65, 12], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.percent) ?? 0 })) },
-      { name: 'seen', rgb: [15, 118, 110], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.observedPercent) ?? 0 })) },
+      { name: 'seen', rgb: [15, 118, 110], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.routedNewShare) ?? num(step.observedPercent) ?? 0 })) },
     ]
   const latency: ChartSeries[] = [
     { name: 'new', rgb: [194, 65, 12], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.nextWallP99) ?? 0 })) },
@@ -211,8 +211,8 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
   await writeFile(join(outDir, 'latency.png'), chartPng({ title: 'wall p99 ms', series: latency }))
   await writeFile(join(outDir, 'burn.png'), chartPng({ title: 'burn rate', series: burn, hLine: { y: fastBurn, rgb: [185, 28, 28] } }))
   lines.push('', '## Charts', '')
-  lines.push('Every state_change, including the 0% canary, against the share of requests the new version received at that percentage. Seen is 0 when that change was not a ramp step.', '')
-  lines.push('![Configured and observed split](split.png)', '')
+  lines.push('Every state_change, including the 0% canary, against `routedNewShare`: the percent of telemetry invocations the new version served. The band around that share is `toleranceLow`..`toleranceHigh` on the ramp observation. An older run stored `observedPercent` from pinned probes; that field is the fallback. Seen is 0 when that change was not a ramp step.', '')
+  lines.push('![Configured and routed split](split.png)', '')
   const latencyCaption = mode
     ? `Wall-time p99 and CPU p99 are recorded on each ramp observation. Latency mode for this run is ${mode}.`
     : 'Wall-time p99, new version and old version. Informational unless a policy event sets latency to gate.'

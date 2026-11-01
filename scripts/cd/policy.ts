@@ -35,6 +35,21 @@ export type RolloutGates = {
   readonly latency: LatencyPolicy
 }
 
+/** What a routed-share miss does. It does not advance. */
+export type SplitAction = 'hold' | 'rollback'
+
+/** What too few new-version requests does. Rollback is not a choice: thin evidence is not a fault. */
+export type EvidenceAction = 'advance' | 'hold'
+
+export type SplitPolicy = {
+  /** Half-width of the acceptance band, in standard errors of a binomial at the target percent. */
+  readonly z: number
+  /** New-version fetch invocations required before a step may advance. */
+  readonly minNewRequests: number
+  readonly onMismatch: SplitAction
+  readonly onInsufficient: EvidenceAction
+}
+
 export type RolloutPolicy = {
   readonly steps: readonly RolloutStep[]
   readonly ingestWaitMs: number
@@ -48,6 +63,7 @@ export type RolloutPolicy = {
     readonly fastBurn: number
     readonly minSamples: number
   }
+  readonly split: SplitPolicy
 }
 
 export type LoadedPolicy = {
@@ -93,6 +109,11 @@ function aboveOne(value: unknown, path: string): number {
 function signal(value: unknown, path: string): SignalMode {
   if (value !== 'hard' && value !== 'informational') reject(path, 'must be hard or informational')
   return value
+}
+
+function oneOf<T extends string>(value: unknown, path: string, allowed: readonly T[]): T {
+  if (typeof value === 'string' && (allowed as readonly string[]).includes(value)) return value as T
+  reject(path, `must be ${allowed.join(' or ')}`)
 }
 
 function stepsOf(value: unknown): readonly RolloutStep[] {
@@ -161,9 +182,20 @@ function gatesOf(value: unknown): RolloutGates {
   }
 }
 
+function splitOf(value: unknown): SplitPolicy {
+  const rec = record(value, 'split')
+  exactKeys(rec, 'split', ['z', 'minNewRequests', 'onMismatch', 'onInsufficient'])
+  return {
+    z: positive(rec.z, 'split.z'),
+    minNewRequests: integer(rec.minNewRequests, 'split.minNewRequests', 1),
+    onMismatch: oneOf(rec.onMismatch, 'split.onMismatch', ['hold', 'rollback']),
+    onInsufficient: oneOf(rec.onInsufficient, 'split.onInsufficient', ['advance', 'hold']),
+  }
+}
+
 function validate(value: unknown): RolloutPolicy {
   const rec = record(value, 'policy')
-  exactKeys(rec, 'policy', ['steps', 'ingestWaitMs', 'probe', 'gates', 'burn'], ['warmupMs'])
+  exactKeys(rec, 'policy', ['steps', 'ingestWaitMs', 'probe', 'gates', 'burn', 'split'], ['warmupMs'])
   const probe = record(rec.probe, 'probe')
   exactKeys(probe, 'probe', ['rps', 'calls'])
   const rps = probe.rps
@@ -182,6 +214,7 @@ function validate(value: unknown): RolloutPolicy {
       fastBurn: positive(burn.fastBurn, 'burn.fastBurn'),
       minSamples: integer(burn.minSamples, 'burn.minSamples', 1),
     },
+    split: splitOf(rec.split),
   }
 }
 
@@ -212,6 +245,12 @@ function policyBody(policy: RolloutPolicy): Json {
       latency,
     },
     burn: { fastBurn: policy.burn.fastBurn, minSamples: policy.burn.minSamples },
+    split: {
+      z: policy.split.z,
+      minNewRequests: policy.split.minNewRequests,
+      onMismatch: policy.split.onMismatch,
+      onInsufficient: policy.split.onInsufficient,
+    },
   }
 }
 

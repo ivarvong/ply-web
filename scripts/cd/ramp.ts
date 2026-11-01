@@ -2,13 +2,19 @@ import { asRecord } from './json.ts'
 import type { ObservationRef } from './log.ts'
 import type { RolloutPolicy } from './policy.ts'
 import { percentile, type VersionStats } from './telemetry.ts'
-import { burnMap, CARRY_WALL_SAMPLES, judgeStep, type StepVerdict } from './slo.ts'
+import { burnMap, CARRY_WALL_SAMPLES, judgeStep, routedShare, type RoutedShare, type StepVerdict } from './slo.ts'
 
 export type { VersionStats } from './telemetry.ts'
 
 export type Observation =
   | { readonly kind: 'unavailable'; readonly reason: string; readonly ref?: ObservationRef }
-  | { readonly kind: 'sample'; readonly next: VersionStats; readonly previous: VersionStats; readonly ref?: ObservationRef }
+  | {
+    readonly kind: 'sample'
+    readonly next: VersionStats
+    readonly previous: VersionStats
+    readonly aggregate: VersionStats
+    readonly ref?: ObservationRef
+  }
 
 /** A query the ramp could not run. This is not a rollback: no observed burn or error was seen. */
 export type HarnessRamp = {
@@ -26,6 +32,7 @@ export type RampState =
   | { readonly kind: 'ramping'; readonly step: number }
   | { readonly kind: 'rolled-back'; readonly reason: string }
   | { readonly kind: 'stopped'; readonly reason: string; readonly fault: 'harness_fault' | 'state_conflict' }
+  | { readonly kind: 'held'; readonly reason: string; readonly outcome: 'hold' | 'insufficient_data' }
   | { readonly kind: 'complete' }
 
 export function rampStart(): RampState {
@@ -33,7 +40,7 @@ export function rampStart(): RampState {
 }
 
 /** One ramp step. Unavailable telemetry is a harness fault and does not roll back. A clean step advances. */
-export function decideRampStep(obs: Observation, policy: RolloutPolicy, probeFailures = 0): RampDecision {
+export function decideRampStep(obs: Observation, policy: RolloutPolicy, targetPercent: number): RampDecision {
   if (obs.kind === 'unavailable') {
     return {
       outcome: 'harness_fault',
@@ -45,16 +52,20 @@ export function decideRampStep(obs: Observation, policy: RolloutPolicy, probeFai
   return judgeStep({
     next: obs.next,
     previous: obs.previous,
-    probeFailures,
+    aggregate: obs.aggregate,
+    targetPercent,
     policy,
   })
 }
 
-/** Advance on a clean step. A terminal state stays terminal. A harness fault stops without rolling back. */
+/** Advance on a clean step. A terminal state stays terminal. A harness fault, a hold, or insufficient evidence stops without rolling back. */
 export function applyRamp(state: RampState, decision: RampDecision, stepCount: number): RampState {
   if (state.kind !== 'ramping') return state
   if (decision.outcome === 'harness_fault') return { kind: 'stopped', reason: decision.reason, fault: 'harness_fault' }
   if (decision.outcome === 'rollback') return { kind: 'rolled-back', reason: decision.reason }
+  if (decision.outcome === 'hold' || decision.outcome === 'insufficient_data') {
+    return { kind: 'held', reason: decision.reason, outcome: decision.outcome }
+  }
   const next = state.step + 1
   if (next >= stepCount) return { kind: 'complete' }
   return { kind: 'ramping', step: next }
@@ -71,25 +82,39 @@ function p99(values: readonly number[] | undefined): string {
   return value === null ? '-' : String(Math.round(value))
 }
 
-/** One line an operator can paste. `step` is 1-based. */
+function points(fraction: number | null): string {
+  if (fraction === null) return '-'
+  return (fraction * 100).toFixed(2)
+}
+
+function tolerance(share: RoutedShare): string {
+  if (share.low === null || share.high === null) return '-'
+  return `${points(share.low)}..${points(share.high)}`
+}
+
+/** One line an operator can paste. `step` is 1-based. Sample counts are this window. Carried p99 is display only. */
 export function progressLine(input: {
   readonly step: number
   readonly steps: number
   readonly percent: number
   readonly next: VersionStats | null
   readonly previous: VersionStats | null
+  readonly carriedPrevious: VersionStats | null
+  readonly share: RoutedShare
   readonly decision: RampDecision
   readonly latency: RolloutPolicy['gates']['latency']['mode']
-  readonly carried?: boolean
 }): string {
   const previousPercent = input.percent >= 100 ? 0 : 100 - input.percent
   const samples = `${input.next?.requests ?? '-'}/${input.previous?.requests ?? '-'}`
   const errors = `${input.next ? fixedRate(input.next.errors, input.next.requests) : '-'}/${input.previous ? fixedRate(input.previous.errors, input.previous.requests) : '-'}`
-  const walls = `${p99(input.next?.wallMs)}/${p99(input.previous?.wallMs)}`
-  const cpu = `${p99(input.next?.cpuMs)}/${p99(input.previous?.cpuMs)}`
+  const oldWalls = input.carriedPrevious?.wallMs ?? input.previous?.wallMs
+  const oldCpu = input.carriedPrevious?.cpuMs ?? input.previous?.cpuMs
+  const walls = `${p99(input.next?.wallMs)}/${p99(oldWalls)}`
+  const cpu = `${p99(input.next?.cpuMs)}/${p99(oldCpu)}`
   const latency = input.latency === 'off' ? '' : ` p99_wall_ms=${walls} p99_cpu_ms=${cpu} latency=${input.latency}`
-  const head = `ramp step=${input.step}/${input.steps} percent=${input.percent} previous=${previousPercent} samples=${samples} error_rate=${errors}${latency} decision=${input.decision.outcome}`
-  const carried = input.carried ? ' previous_sample=carried' : ''
+  const routed = `routed_share=${points(input.share.share)} target=${input.percent} tolerance=${tolerance(input.share)} agg=${input.share.n}`
+  const head = `ramp step=${input.step}/${input.steps} percent=${input.percent} previous=${previousPercent} samples=${samples} error_rate=${errors} ${routed}${latency} decision=${input.decision.outcome}`
+  const carried = input.carriedPrevious ? ' previous_sample=carried' : ''
   const informational = input.decision.outcome === 'advance' && input.decision.reason.includes('informational:')
   if (input.decision.outcome === 'advance' && !informational) return head + carried
   const reason = input.decision.reason.replace(/[\n\r"]/g, "'")
@@ -114,8 +139,8 @@ export function readPassVerdict(text: string, version: string): { readonly ok: t
 export type RampIo = {
   now(): number
   sleep(ms: number): Promise<void>
-  /** Probe during the dwell. When omitted, `sleep` is the whole dwell and probes are zero. */
-  dwell?(ms: number): Promise<{ readonly probeFailures: number; readonly harnessFaults?: number }>
+  /** Probe during the dwell. When omitted, `sleep` is the whole dwell. A harness fault is a probe that got no response. */
+  dwell?(ms: number): Promise<{ readonly harnessFaults?: number }>
   applySplit(percent: number): Promise<null | string | HeldWrite>
   observe(from: number, to: number, percent: number): Promise<Observation>
   /** Called with the observation ref. A missing ref is a bug: a decision without an observation. */
@@ -179,7 +204,7 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
     }
     if (policy.warmupMs > 0) await io.sleep(policy.warmupMs)
     const from = io.now()
-    const probed = io.dwell ? await io.dwell(step.dwellMs) : (await io.sleep(step.dwellMs), { probeFailures: 0 })
+    const probed = io.dwell ? await io.dwell(step.dwellMs) : (await io.sleep(step.dwellMs), { harnessFaults: 0 })
     if ((probed.harnessFaults ?? 0) > 0) {
       state = { kind: 'stopped', reason: 'harness fault during probes', fault: 'harness_fault' }
       break
@@ -191,34 +216,33 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
     await io.sleep(policy.ingestWaitMs)
     const observed = await io.observe(from, to, percent)
     if (observed.kind === 'sample' && observed.previous.wallMs.length >= CARRY_WALL_SAMPLES) carried = observed.previous
-    let used = observed
-    let usedCarried = false
-    if (
-      observed.kind === 'sample'
+    const carriedPrevious = observed.kind === 'sample'
       && percent === 100
       && observed.previous.wallMs.length < CARRY_WALL_SAMPLES
       && carried
       && carried.wallMs.length >= CARRY_WALL_SAMPLES
-    ) {
-      used = { kind: 'sample', next: observed.next, previous: carried, ref: observed.ref }
-      usedCarried = true
-    }
-    const decision = decideRampStep(used, policy, probed.probeFailures)
+      ? carried
+      : null
+    const decision = decideRampStep(observed, policy, percent)
     steps.push({ percent, burns: decision.burns, outcome: decision.outcome })
+    const liveShare = observed.kind === 'sample'
+      ? routedShare(observed.next.invocations, observed.aggregate.invocations, percent, policy.split.z)
+      : { n: 0, newRequests: 0, share: null, low: null, high: null, kind: 'untested' as const }
     const line = progressLine({
       step: index + 1,
       steps: policy.steps.length,
       percent,
-      next: used.kind === 'sample' ? used.next : null,
-      previous: used.kind === 'sample' ? used.previous : null,
+      next: observed.kind === 'sample' ? observed.next : null,
+      previous: observed.kind === 'sample' ? observed.previous : null,
+      carriedPrevious,
+      share: liveShare,
       decision,
       latency: policy.gates.latency.mode,
-      carried: usedCarried,
     })
     lines.push(line)
     if (io.onDecision) {
-      if (!used.ref) throw new Error('decision without an observation')
-      await io.onDecision(used.ref, decision, percent)
+      if (!observed.ref) throw new Error('decision without an observation')
+      await io.onDecision(observed.ref, decision, percent)
     }
     state = applyRamp(state, decision, policy.steps.length)
     if (state.kind === 'rolled-back') {
