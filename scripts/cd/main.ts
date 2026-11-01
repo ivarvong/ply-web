@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { basename, join, resolve } from 'node:path'
@@ -9,7 +10,7 @@ import { writeDebrief } from './debrief.ts'
 import { VERSION_ID } from './deploy-plan.ts'
 import { RunLog, withRun } from './log.ts'
 import { runPipeline } from './pipeline.ts'
-import { checkNode } from './preflight.ts'
+import { binaryNodeVersion, checkNode, NODE_IMAGE_BIN, nodeSatisfies, selectNode } from './preflight.ts'
 import { errorMessage, run } from './proc.ts'
 import { unfinishedRunDir } from './reconcile.ts'
 import { reportLedger } from './report.ts'
@@ -185,7 +186,25 @@ async function checkoutPlyPin(): Promise<string | null> {
   }
 }
 
+/** Leave the process on a Node that satisfies `package.json` engines when this one does not. */
+function reexecNode(): number | null {
+  if (process.env.PLY_CD_NODE_REEXEC === '1' || nodeSatisfies(process.version)) return null
+  const candidates = []
+  const preferred = process.env.PLY_NODE
+  if (preferred) candidates.push({ bin: preferred, version: binaryNodeVersion(preferred) })
+  candidates.push({ bin: NODE_IMAGE_BIN, version: binaryNodeVersion(NODE_IMAGE_BIN) })
+  const better = selectNode(process.version, candidates)
+  if (!better) return null
+  const child = spawnSync(better, [...process.execArgv, ...process.argv.slice(1)], {
+    stdio: 'inherit',
+    env: { ...process.env, PLY_CD_NODE_REEXEC: '1' },
+  })
+  return child.status === null ? 1 : child.status
+}
+
 export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: (line: string) => void = console.log): Promise<number> {
+  const switched = reexecNode()
+  if (switched !== null) return switched
   const nodeError = checkNode(process.version)
   if (nodeError) return finish(log, 1, `cd: harness_fault preflight: ${nodeError}`)
   const parsed = parseArgs(argv, await checkoutPlyPin())
@@ -212,7 +231,6 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
   const needsToken = parsed.kind === 'cd' || parsed.kind === 'smoke' || parsed.kind === 'ramp'
   let token = ''
   if (needsToken) {
-    if (!config.tokenFile) return finish(log, 1, 'cd: harness_fault preflight: PLY_TOKEN_FILE is not set')
     try {
       token = await readTokenFile(config.tokenFile)
     } catch (error) {
@@ -324,7 +342,7 @@ async function dispatch(
     }
     const result = await stageTelemetry(config, { version: parsed.version, since, reportPath: parsed.report, runDir, live: false })
     if (result.kind === 'fail') {
-      const line = `cd: FAIL telemetry: ${result.reason}`
+      const line = `cd: ${result.fault === 'worker' ? 'FAIL' : result.fault} telemetry: ${result.reason}`
       log(line)
       return { code: 1, reason: line }
     }
@@ -342,7 +360,7 @@ async function dispatch(
       log,
     })
     if (result.kind === 'fail') {
-      const line = `cd: FAIL ramp: ${result.reason}`
+      const line = `cd: ${result.fault === 'worker' ? 'FAIL' : result.fault} ramp: ${result.reason}`
       log(line)
       return { code: 1, reason: line }
     }

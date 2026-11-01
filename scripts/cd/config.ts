@@ -7,7 +7,6 @@ import {
   RAMP_DWELL_MS,
   RAMP_PERCENTS,
   RAMP_PROBE_RPS,
-  RUN_ROOT_DEFAULT,
   WORKER_DEFAULT,
   type RampSchedule,
 } from './baseline.ts'
@@ -19,7 +18,7 @@ export type CdConfig = {
   readonly namespace: string
   readonly bumpBranch: string
   readonly runRoot: string
-  readonly tokenFile: string | null
+  readonly tokenFile: string
   readonly sha: string | null
   readonly schedule: RampSchedule
   readonly ledgerPath: string
@@ -73,6 +72,16 @@ export function defaultLedgerPath(): string {
   return join(homedir(), '.local', 'state', 'ply-cd', 'ledger.jsonl')
 }
 
+/** Scratch run directories. Override with `PLY_CD_RUN_DIR`. */
+export function defaultRunRoot(): string {
+  return join(homedir(), '.local', 'state', 'ply-cd', 'runs')
+}
+
+/** Worker bearer, mode 0600. Override with `PLY_TOKEN_FILE`. The file is read and never printed. */
+export function defaultTokenFile(): string {
+  return join(homedir(), '.ply-token')
+}
+
 /** What run_started records. Paths only; never a token. */
 export function publicConfig(config: CdConfig) {
   return {
@@ -113,8 +122,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): CdConfig {
     baseUrl: (env.PLY_BASE_URL || BASE_URL_DEFAULT).replace(/\/+$/, ''),
     namespace: env.PLY_ARTIFACTS_NAMESPACE || NAMESPACE_DEFAULT,
     bumpBranch: env.PLY_BUMP_BRANCH || BUMP_BRANCH_DEFAULT,
-    runRoot: env.PLY_CD_RUN_DIR || RUN_ROOT_DEFAULT,
-    tokenFile: env.PLY_TOKEN_FILE || null,
+    runRoot: env.PLY_CD_RUN_DIR || defaultRunRoot(),
+    tokenFile: env.PLY_TOKEN_FILE || defaultTokenFile(),
     sha: env.PLY_SHA || null,
     ledgerPath: env.PLY_CD_LEDGER || defaultLedgerPath(),
     schedule: {

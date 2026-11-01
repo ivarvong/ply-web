@@ -9,7 +9,7 @@ import { cfWorkdir } from '../scripts/cd/cf.ts'
 import { canarySplit, writeDebrief } from '../scripts/cd/debrief.ts'
 import { fullSplit, isTrafficSplit, trafficSplit } from '../scripts/cd/deploy-plan.ts'
 import { parseEvent, readEvents, RunLog, validateRun, type CdEvent } from '../scripts/cd/log.ts'
-import { harvestSecrets } from '../scripts/cd/redact.ts'
+import { createdTokenSecret, harvestSecrets } from '../scripts/cd/redact.ts'
 import { checkNode } from '../scripts/cd/preflight.ts'
 import { doraText } from '../scripts/cd/report.ts'
 import { Secret } from '../scripts/cd/secret.ts'
@@ -30,12 +30,14 @@ test('cf runs from the repo directory', () => {
   assert.equal(existsSync(join(cwd, 'scripts', 'cd', 'cf.ts')), true)
 })
 
-test('node preflight names 22.18', () => {
-  assert.equal(checkNode('v22.18.0'), null)
+test('node preflight follows package.json engines', () => {
+  assert.equal(checkNode('v22.23.0'), null)
   assert.equal(checkNode('v22.23.4'), null)
-  assert.equal(checkNode('v24.0.0'), null)
-  assert.match(checkNode('v22.17.9') ?? '', /older than 22\.18/)
-  assert.match(checkNode('v20.11.0') ?? '', /cd|22\.18|older/)
+  assert.equal(checkNode('v24.22.1'), null)
+  assert.equal(checkNode('v26.12.0'), null)
+  assert.match(checkNode('v22.14.0') ?? '', /does not satisfy package.json engines/)
+  assert.match(checkNode('v22.14.0') ?? '', /node-v24\.22\.1/)
+  assert.match(checkNode('v24.0.0') ?? '', /engines/)
 })
 
 test('an empty or unbalanced split cannot be built', () => {
@@ -110,7 +112,11 @@ test('plaintext is a Secret and does not require a token prefix', () => {
   const token = 'art_v2_plaintext_token_value'
   const found = harvestSecrets({ id: 'tok', plaintext: token, nested: { plaintext: 'art_v2_also_a_secret_value' } })
   assert.deepEqual(found.map(secret => secret.reveal()), [token, 'art_v2_also_a_secret_value'])
-  assert.equal(harvestSecrets({ token: 'art_v1_not_a_plaintext_field' }).length, 0)
+  const created = 'art_v1_not_a_plaintext_field'
+  const harvested = harvestSecrets({ token: created, id: 'tok' })
+  assert.deepEqual(harvested.map(secret => secret.reveal()), [created])
+  assert.equal(createdTokenSecret({ result: { token: created } }, harvested)?.reveal(), created)
+  assert.equal(harvestSecrets({ token: 'short' }).length, 0)
   assert.equal(harvestSecrets({ plaintext: '' }).length, 0)
 })
 

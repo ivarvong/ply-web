@@ -1,10 +1,24 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { JOIN_MIN_LOGGED, SMOKE_LATENCY } from '../scripts/cd/baseline.ts'
 import { artifactsProbeUrl, revokeConfirmed } from '../scripts/cd/classify.ts'
 import { raysByRequestId } from '../scripts/cd/csv.ts'
+import { asRecord } from '../scripts/cd/json.ts'
 import { readSmokeRequests } from '../scripts/cd/stage-telemetry.ts'
-import { implausibleJoin, judgeSmokeTelemetry, queryFault, summarizeTelemetry, type SmokeRequest } from '../scripts/cd/telemetry.ts'
+import {
+  fetchSample,
+  isTraceSummary,
+  judgeSmokeTelemetry,
+  implausibleJoin,
+  pageCursor,
+  percentile,
+  queryFault,
+  statsFromEvents,
+  summarizeTelemetry,
+  unwrapEvents,
+  type SmokeRequest,
+} from '../scripts/cd/telemetry.ts'
 
 const VERSION = '8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e'
 const SMOKE_ID = '11111111-1111-4111-8111-111111111111'
@@ -140,6 +154,126 @@ test('the smoke CSV cf-ray is the join key the report can omit', () => {
   const ray = raysByRequestId(csv).get(SMOKE_ID) ?? null
   const joined = requests.map(request => request.ray ? request : { ...request, ray })
   assert.equal(joined[0]?.ray, RAY)
+})
+
+test('trace summaries with a full join are a harness fault, not a worker fault', () => {
+  const trace = {
+    traceId: LOG_TRACE,
+    spans: 4,
+    traceDurationMs: 80,
+    rootSpanName: 'POST',
+    rootTransactionName: 'POST https://ply.ivar.workers.dev/v1/commit',
+    errors: [],
+    id: '01TRACE',
+    services: ['ply'],
+    traceStartMs: 1,
+    traceEndMs: 81,
+  }
+  const summary = summarizeTelemetry(
+    VERSION,
+    [smoke(SMOKE_ID, RAY)],
+    [logEvent(SMOKE_ID, PLATFORM, LOG_TRACE), invocation(SMOKE_ID, PLATFORM, LOG_TRACE)],
+    [trace],
+  )
+  assert.equal(isTraceSummary(trace), true)
+  assert.equal(summary.spanShape, 'summaries')
+  assert.equal(summary.tracedIds.has(SMOKE_ID), true)
+  assert.deepEqual([...summary.fetchMs], [])
+  const judge = judgeSmokeTelemetry({ version: VERSION, requests: [smoke(SMOKE_ID, RAY)], summary, ceilings: SMOKE_LATENCY })
+  assert.equal(judge.kind, 'harness_fault')
+  if (judge.kind === 'harness_fault') {
+    assert.match(judge.reason, /trace summaries/)
+    assert.equal(judge.checks.some(check => check.kind === 'shape'), true)
+  }
+})
+
+test('an observed fetch duration over the ceiling is a worker fault', () => {
+  const slow = {
+    source: {
+      name: 'fetch',
+      durationMS: SMOKE_LATENCY.fetchMs.p99Ms + 1,
+      url: { path: '/git/ply-loadgen/repo.git/git-upload-pack' },
+      http: { response: { status_code: 200 } },
+    },
+    $metadata: { id: 'span-slow', type: 'span', spanName: 'fetch', requestId: null, traceId: LOG_TRACE, rayId: RAY, service: 'ply' },
+  }
+  const sample = fetchSample(slow)
+  assert.equal(sample?.durationMs, SMOKE_LATENCY.fetchMs.p99Ms + 1)
+  assert.equal(sample?.artifacts, true)
+  const summary = summarizeTelemetry(
+    VERSION,
+    [smoke(SMOKE_ID, RAY)],
+    [logEvent(SMOKE_ID, PLATFORM, LOG_TRACE), invocation(SMOKE_ID, PLATFORM, LOG_TRACE)],
+    [slow],
+  )
+  const judge = judgeSmokeTelemetry({ version: VERSION, requests: [smoke(SMOKE_ID, RAY)], summary, ceilings: SMOKE_LATENCY })
+  assert.equal(judge.kind, 'worker')
+  if (judge.kind === 'worker') assert.equal(judge.failures.some(failure => failure.kind === 'latency'), true)
+})
+
+const CANARY = 'c2713bac-95bb-4a4a-b3c1-f5b07c86fddd'
+const recordedTraces = unwrapEvents(JSON.parse(readFileSync(new URL('./fixtures/cd/canary-traces.json', import.meta.url), 'utf8')))
+const recordedSpans = unwrapEvents(JSON.parse(readFileSync(new URL('./fixtures/cd/canary-spans.json', import.meta.url), 'utf8')))
+
+test('recorded query responses exercise every telemetry evaluator', () => {
+  assert.ok(recordedTraces.length > 0)
+  assert.ok(recordedTraces.every(row => {
+    const rec = asRecord(row)
+    return rec !== null && isTraceSummary(rec) && typeof rec.spans === 'number'
+  }))
+  assert.equal(fetchSample(recordedTraces[0]), null)
+  const samples = recordedSpans.flatMap(span => {
+    const sample = fetchSample(span)
+    return sample ? [sample] : []
+  })
+  const upload = samples.filter(sample => sample.version === CANARY && sample.path.endsWith('/git-upload-pack') && sample.status === 200)
+  const receive = samples.filter(sample => sample.version === CANARY && sample.path.endsWith('/git-receive-pack') && sample.status === 200)
+  const refs = samples.filter(sample => sample.path.endsWith('/info/refs') && sample.status === 200)
+  assert.equal(upload.length, 160)
+  assert.equal(percentile(upload.map(sample => sample.durationMs), 0.5), 108)
+  assert.equal(upload.some(sample => sample.durationMs === 523), true)
+  assert.equal(receive.length, 36)
+  assert.equal(percentile(receive.map(sample => sample.durationMs), 0.5), 107)
+  assert.equal(receive.some(sample => sample.durationMs === 691), true)
+  assert.equal(refs.length, 1)
+  assert.equal(refs[0]?.durationMs, 49)
+  const cursor = pageCursor(recordedSpans)
+  const last = asRecord(asRecord(recordedSpans[recordedSpans.length - 1])?.$metadata)
+  assert.equal(cursor, last?.id)
+
+  const requests: SmokeRequest[] = []
+  const events: unknown[] = []
+  for (const row of recordedTraces) {
+    const traceId = asRecord(row)?.traceId
+    if (typeof traceId !== 'string') continue
+    const requestId = `req-${traceId.slice(0, 12)}`
+    requests.push({ id: traceId, version: CANARY, step: 'commit', status: 200, expected: [200], ray: null })
+    events.push({
+      $metadata: { id: `log-${traceId}`, requestId, traceId, service: 'ply', level: 'info' },
+      $workers: { scriptVersion: { id: CANARY }, outcome: 'ok' },
+      source: { msg: 'ply.request', id: traceId, status: 200, method: 'POST', path: '/v1/commit', ms: 80 },
+    })
+    events.push({
+      $metadata: { id: `inv-${traceId}`, requestId, traceId, type: 'cf-worker-event', service: 'ply' },
+      $workers: { scriptVersion: { id: CANARY }, eventType: 'fetch', outcome: 'ok', wallTimeMs: 80, cpuTimeMs: 12 },
+    })
+  }
+  const blinded = summarizeTelemetry(CANARY, requests, events, recordedTraces)
+  assert.equal(blinded.spanShape, 'summaries')
+  assert.equal(blinded.fetchMs.length, 0)
+  assert.equal(blinded.tracedIds.size, requests.length)
+  const blindedJudge = judgeSmokeTelemetry({ version: CANARY, requests, summary: blinded, ceilings: SMOKE_LATENCY })
+  assert.equal(blindedJudge.kind, 'harness_fault')
+  if (blindedJudge.kind === 'harness_fault') assert.match(blindedJudge.reason, /no child spans/)
+
+  const seen = summarizeTelemetry(CANARY, requests, events, recordedTraces, recordedSpans)
+  assert.equal(seen.spanShape, 'events')
+  assert.equal(seen.fetchMs.length, 200)
+  assert.ok((percentile(seen.fetchMs, 0.99) ?? 0) < SMOKE_LATENCY.fetchMs.p99Ms)
+  const judge = judgeSmokeTelemetry({ version: CANARY, requests, summary: seen, ceilings: SMOKE_LATENCY })
+  assert.equal(judge.kind, 'pass')
+  const versionStats = statsFromEvents(events, recordedSpans)
+  assert.equal(versionStats.fetchMs.length, 200)
 })
 
 test('the revoke probe URL does not carry the token', () => {

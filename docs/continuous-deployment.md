@@ -11,17 +11,16 @@ The left column is the only path that raises traffic. An arrow to the right is t
 On the box:
 
 - `cf auth login` already done. The login needs Workers Scripts Edit (versions and deployments; an account token calls this Workers Scripts Write), Workers Observability Read, and Artifacts Edit on the namespace below. It does not need routes, KV, R2, or tail.
-- `npm ci` in this repo. Node matches `package.json` `engines`. `npm run cd` also refuses Node older than 22.18, which is what `cloudflare.config.ts` needs when `cf` loads it.
+- `npm ci` in this repo. Node must satisfy `package.json` `engines` (`^22.23.0 || ^24.22.0 || >=26.12.0`). `.nvmrc` is `24.22.1`. `npm run cd` runs `scripts/cd.sh`, which uses `PLY_NODE` if you set it, then `/workspace/node-v24.22.1-linux-x64/bin/node` when that image directory is present, then `node` on `PATH`. If none of those satisfy engines, preflight stops and names that search. It does not judge the Worker.
 - `git config user.name` and `user.email` set only when a bump actually commits. An unchanged pin, and `--no-bump`, do not need them. The bump does not push.
 - A clean work tree. Deploy refuses a dirty one.
 - `HEAD` equal to `origin/main` after `git fetch origin main`. Deploy refuses any other commit (`not-on-origin-main`) and uploads nothing.
-- `PLY_TOKEN_FILE` pointing at the same bearer the Worker secret `PLY_TOKEN` uses, mode `0600` (no group or other bits). The file is read, never printed.
+- The Worker bearer in `~/.ply-token` (the `PLY_TOKEN_FILE` default), mode `0600` (no group or other bits). The file is read, never printed. Set `PLY_TOKEN_FILE` only to point somewhere else.
 - Namespace `ply-loadgen` already exists. The smoke does not create it.
 
 ```sh
 touch "$HOME/.ply-token" && chmod 0600 "$HOME/.ply-token"
-# paste the bearer into that file, then:
-export PLY_TOKEN_FILE="$HOME/.ply-token"
+# paste the bearer into that file. That path is the default; export PLY_TOKEN_FILE only to override it.
 ```
 
 Do not run `npm run worker:deploy` while this is in progress. It refuses unless `PLY_FORCE_FULL_DEPLOY=1`. With that set it sends the Worker to 100% in one shot and will replace the split you are ramping. GitHub does not bump the pin and does not deploy.
@@ -34,7 +33,8 @@ Optional overrides (anything you do not set keeps the default in the table furth
 | `PLY_BASE_URL` | `https://ply.ivar.workers.dev` | Where smoke sends HTTP |
 | `PLY_ARTIFACTS_NAMESPACE` | `ply-loadgen` | Scratch repos for the empty-repo smoke |
 | `PLY_BUMP_BRANCH` | `bump-ply` | Local branch for a pin commit. Not pushed. |
-| `PLY_CD_RUN_DIR` | `cd-runs` | Where the run directory is created |
+| `PLY_TOKEN_FILE` | `~/.ply-token` | Worker bearer, mode `0600`. Read, never printed |
+| `PLY_CD_RUN_DIR` | `~/.local/state/ply-cd/runs` | Where the run directory is created |
 | `PLY_SHA` | ply `main` | 40-hex pin, instead of resolving ply `main` |
 | `PLY_RAMP_PERCENTS` | `1,5,10,25,50,75,100` | Strictly increasing integers, each 1–100, last one 100 |
 | `PLY_RAMP_DWELL_MS` | `40000` | How long each percentage stays up before it is judged |
@@ -81,7 +81,7 @@ npm run cd -- --sha <current pin> --no-bump
 What prints, in order:
 
 ```text
-run: cd-runs/2026-10-31T21-05-00-123Z
+run: ~/.local/state/ply-cd/runs/2026-10-31T21-05-00-123Z
 version: 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 previous: 1aa0bb11-2222-4333-8444-555566667777
 ramp step=1/7 percent=1 previous=99 samples=8/140 error_rate=0.0000/0.0000 p99_wall_ms=88/74 decision=advance
@@ -95,7 +95,7 @@ cd: PASS 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 | --- | --- | --- |
 | `cd: PASS <version id>` | 0 | The new version is at 100%, and the live smoke and telemetry passed. |
 | `cd: FAIL <stage>: <reason>` | 1 | That stage stopped the run. If the line is from ramp or from the live checks, traffic is already back on `previous` unless the line says the rollback itself failed. |
-| `cd: harness_fault <stage>: <reason>` | 1 | A request got no response, a 403 named the token this stage minted, the telemetry query or span join could not be trusted, or the script failed before it could judge the version (bad cf output, a parse failure, a preflight miss). The split is unchanged. This is not a change failure. |
+| `cd: harness_fault <stage>: <reason>` | 1 | A request got no response, a revoked Artifacts token did not get 403, or a check could not be evaluated (the telemetry query, a span-query shape mismatch, zero samples where samples are required, an implausible span join, a preflight miss). The split is unchanged. This is not a change failure. |
 | `cd: state_conflict <stage>: <reason>` | 1 | The deployment was not the expected prior split, so the write was skipped. The split is unchanged. |
 | a usage line, no `cd: PASS` / `cd: FAIL` | 2 | The arguments were wrong. Traffic was not touched. |
 
@@ -177,7 +177,7 @@ Live (after the ramp, or any time you want to see who is actually serving). No o
 npm run cd -- smoke --expect-version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 ```
 
-The smoke creates an **empty** repo in `ply-loadgen` (prefix `ply-web-cd-`), mints a write token immediately before the requests, and replays the git lifecycle over `/v1`. It does not seed the repo with stock git. The token is revoked after those requests finish. Each token minted this run is then checked with a `GET` of the repo's `info/refs`: Artifacts must answer 403. That check is a `request` event (method, url, status). The token is not in the event, the URL, or the run directory. On a pass the repo is deleted. On a fail the repo name is in the verdict and the token is still revoked. A request that gets no response, a 403 naming that token as invalid or expired, or a revoke that does not stick as 403, stops the run as `harness_fault`. The split stays where it is. The operator decides what to do next. There is no retry and no rollback for that fault.
+The smoke creates an **empty** repo in `ply-loadgen` (prefix `ply-web-cd-`). Repo create returns a token. That auto-created token is revoked before the smoke mints its own write token, and the revoked bearer is checked with a `GET` of the repo's `info/refs`: Artifacts must answer 403. The smoke then mints a write token and replays the git lifecycle over `/v1`. It does not seed the repo with stock git. The minted token is revoked after those requests finish and checked the same way. Each check is a `request` event (method, url, status). The token is not in the event, the URL, or the run directory. On a pass the repo is deleted. On a fail the repo name is in the verdict and the token is still revoked. A request that gets no response, a 403 naming that token as invalid or expired, or a revoke that does not stick as 403, stops the run as `harness_fault`. The split stays where it is. The operator decides what to do next. There is no retry and no rollback for that fault.
 
 A 409 is a pass when that step expects it. The ones that matter after the current write API:
 
@@ -207,7 +207,7 @@ On a full `npm run cd`, a smoke failure leaves the canary at 0%. The ramp does n
 ```sh
 npm run cd -- telemetry --version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e \
   --since 2026-10-31T21:05:00Z \
-  --report cd-runs/2026-10-31T21-05-00-123Z/smoke.json
+  --report ~/.local/state/ply-cd/runs/2026-10-31T21-05-00-123Z/smoke.json
 ```
 
 `--since` is the start of the smoke window (ISO-8601, epoch milliseconds, or epoch seconds). The report is the smoke JSON from the same run. The check queries `cf o11y telemetry query` for that version in that window.
@@ -217,9 +217,9 @@ It fails when any of these are true:
 - an exception, a non-ok invocation, a 5xx, or an error log on that version
 - a smoke id logged by a different version
 - smoke ids missing from telemetry beyond the loss allowance in `scripts/canary-verdict.mjs` (max of 2 and 2% of the ids). An id the smoke did not see answered by this version is never waived
-- no invocation matched
-- wall, CPU, or upstream `fetch` span p50/p99 over the ceilings below
-- fewer traces than the loss allowance allows
+- a response status the smoke did not expect
+- an exception, a 5xx log, a non-ok outcome, or an error log
+- wall, CPU, or upstream `fetch` span p50/p99 over the ceilings below, on samples the query returned
 
 A 409 the smoke expected is not an unexpected status. A 500 the smoke did not expect is.
 
@@ -248,7 +248,9 @@ Ceilings for this smoke (a tiny repo, cold isolates included; tighten them after
 
 Span events have `$metadata.requestId` null. They carry `traceId` and `rayId`. The smoke CSV records each request's `cf-ray`, and the join uses that ray, then `traceId` when the ray does not match. A request id still on a span is only a last resort.
 
-If `cf o11y` cannot be queried, or the span join matches implausibly few of the invocations the worker logged, the stage is `harness_fault`. The split stays where it is. There is no rollback and no retry. It does not treat a missing query as a pass, and it does not label that miss as a worker fault. A 5xx, an exception, or a latency ceiling on samples the join did find is still a worker fault.
+The traces view returns one summary row per trace (`traceId`, a span count, a duration, a root span name) and no child spans. Outbound `fetch` durations come from a second query, `view: events` with `$metadata.type = span`. On those events the duration is `source.durationMS` and an Artifacts call has `source.name` `fetch` with a path ending in `git-upload-pack`, `git-receive-pack`, or `info/refs`.
+
+A check the harness cannot evaluate is `harness_fault`: the query threw, the span join matches implausibly few of the invocations the worker logged, the span query came back as trace summaries, or a required latency series has no samples. The split stays where it is. There is no rollback and no retry. That result is not a worker fault. A 5xx, an exception, an error log, a latency value over its ceiling, or a ramp burn over its threshold is a worker fault, because the value was observed.
 
 ## 5. Ramp
 
@@ -257,14 +259,14 @@ Only after the pinned smoke and the telemetry file are both a pass for this vers
 ```sh
 npm run cd -- ramp --version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e \
   --previous 1aa0bb11-2222-4333-8444-555566667777 \
-  --verdict cd-runs/2026-10-31T21-05-00-123Z/telemetry.json
+  --verdict ~/.local/state/ply-cd/runs/2026-10-31T21-05-00-123Z/telemetry.json
 ```
 
 Without `--verdict`, or with a verdict that is not a pass for that version, the command exits and does not change traffic.
 
 The schedule is `1, 5, 10, 25, 50, 75, 100`. Each step waits `40000` ms. During that wait the ramp probes at `PLY_RAMP_PROBE_RPS` (default 2) **on each version**: `GET /` (the usage text, 200, no bearer) and `GET /v1/discover?remote=…` for the public `ply` mirror with the bearer from `PLY_TOKEN_FILE`. Each call sends `Cloudflare-Workers-Version-Overrides` for the new version and, separately, for the previous one, so both arms are sampled at the probe rate rather than at the traffic split. There is no `/health` route. A non-2xx answer from the **new** version fails the step. A probe that gets no response stops the ramp as `harness_fault` and leaves the current split in place. Before each percentage change the ramp reads the deployment and writes only when it is still the previous step's split. Otherwise it stops with `state_conflict` and does not roll back.
 
-Then it reads `cf o11y` for **both** versions over that step's window. Span events have no `$workers.scriptVersion.id` and a null `$metadata.requestId`, so traces are queried by service only and joined on `rayId`, then `traceId`.
+Then it reads `cf o11y` for **both** versions over that step's window. Child spans are the events query with `$metadata.type = span`, not the traces view. Span events have no `$workers.scriptVersion.id` and a null `$metadata.requestId`, so they are queried by service and joined on `rayId`, then `traceId`.
 
 The step decision is the new version's SLO burn, not a hand-tuned rate delta. Burn rate is `(bad / total) / (1 − target)`. Definitions are in [Metrics](#metrics).
 
@@ -277,7 +279,7 @@ The step decision is the new version's SLO burn, not a hand-tuned rate delta. Bu
 | SLO burn | `bad/total` divided by the error budget is above **14.4**, and that SLO saw at least 20 requests in the window |
 | Latency vs the old version | Both sides have at least 20 wall samples and Mann-Whitney says the new version is slower (one-sided, alpha 0.01). With 5–19 samples on both sides, wall p99 new/old above 2. Equal to 2 still advances |
 | Sample too small for that compare | `decision=insufficient_data`. This is not a pass of the latency SLO. The percentage still advances when the hard checks above are clean |
-| Query failed | Rollback. A missing query is not zero errors |
+| Query failed | `harness_fault`. The split stays. A missing query is not zero errors and is not a rollback |
 
 There is no hold. A quiet 1% step with zero errors is `insufficient_data` and the ramp moves to 5%. The pinned probes are what put samples on the new version at 1%. Raise `PLY_RAMP_DWELL_MS` or `PLY_RAMP_PROBE_RPS` when you want the burn and Mann-Whitney checks to see more than that. Do not treat `insufficient_data` as a failure.
 
@@ -334,11 +336,11 @@ ramp step=2/7 percent=5 previous=95 samples=1/40 error_rate=1.0000/0.0000 p99_wa
 cd: FAIL ramp: 1 exception on the new version
 ```
 
-`cf o11y` down rolls back on that step. It does not wait:
+`cf o11y` down stops the ramp as `harness_fault`. It does not roll back and it does not wait:
 
 ```text
-ramp step=3/7 percent=10 previous=90 samples=-/- error_rate=-/- p99_wall_ms=-/- decision=rollback reason="telemetry unavailable: …"
-cd: FAIL ramp: telemetry unavailable: …
+ramp step=3/7 percent=10 previous=90 samples=-/- error_rate=-/- p99_wall_ms=-/- decision=harness_fault reason="telemetry unavailable: …"
+cd: harness_fault ramp: telemetry unavailable: …
 ```
 
 If the rollback request itself does not stick, the last line says so and names the version that should be at 100%. Do not treat that run as rolled back. Put it back yourself with the command in the next section.
@@ -375,7 +377,7 @@ cd: FAIL rollback: rollback to 1aa0bb11-… failed: …
 
 ## The run directory
 
-`cd-runs/<timestamp>/` (gitignored):
+`~/.local/state/ply-cd/runs/<timestamp>/` (`PLY_CD_RUN_DIR`; an older checkout used `cd-runs/`, which is still gitignored):
 
 | File | What you open it for |
 | --- | --- |
@@ -488,10 +490,10 @@ The ramp does not emit `hold`. The outcome stays in the schema so a recorded dec
 After `run_finished` the run writes `manifest.json` with the sha256 of every other file and then refuses further appends. Do not edit the run directory. A debrief writes beside it:
 
 ```sh
-npm run cd -- debrief cd-runs/2026-10-31T21-05-00-123Z
+npm run cd -- debrief ~/.local/state/ply-cd/runs/2026-10-31T21-05-00-123Z
 ```
 
-That prints `debrief: cd-runs/2026-10-31T21-05-00-123Z.debrief/debrief.md`. The markdown stands alone: a timeline, every decision with the rule and the observations it used, every traffic change, three charts (`split.png` is every `state_change`, including the 0% canary, against the share of requests the new version received, `latency.png` wall p99 by version, `burn.png` burn per SLO with a line at 14.4), and links back to `events.jsonl`, `raw/`, and `captures/`.
+That prints `debrief: ~/.local/state/ply-cd/runs/2026-10-31T21-05-00-123Z.debrief/debrief.md`. The markdown stands alone: a timeline, every decision with the rule and the observations it used, every traffic change, three charts (`split.png` is every `state_change`, including the 0% canary, against the share of requests the new version received, `latency.png` wall p99 by version, `burn.png` burn per SLO with a line at 14.4), and links back to `events.jsonl`, `raw/`, and `captures/`.
 
 ## Later
 

@@ -1,18 +1,88 @@
+import { spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { NODE_PROBE_MS } from './baseline.ts'
 import { run } from './proc.ts'
 
-/** cloudflare.config.ts is loaded by cf, which needs Node 22.18 or newer. */
-export const MIN_NODE = { major: 22, minor: 18 } as const
-
 const SHA = /^[0-9a-f]{40}$/
+const PACKAGE = fileURLToPath(new URL('../../package.json', import.meta.url))
 
-export function checkNode(version: string): string | null {
-  const match = /^v(\d+)\.(\d+)\.(\d+)/.exec(version)
-  if (!match) return `Node ${version} is not a recognized version`
-  const major = Number(match[1])
-  const minor = Number(match[2])
-  const ok = major > MIN_NODE.major || (major === MIN_NODE.major && minor >= MIN_NODE.minor)
-  if (ok) return null
-  return `Node ${version} is older than ${MIN_NODE.major}.${MIN_NODE.minor}, which cloudflare.config.ts needs`
+/**
+ * Node shipped on the operator image next to a default that is older than `engines`.
+ * `npm run cd` uses this binary when `node` on `PATH` does not satisfy `package.json`.
+ */
+export const NODE_IMAGE_BIN = '/workspace/node-v24.22.1-linux-x64/bin/node'
+
+type Semver = { readonly major: number; readonly minor: number; readonly patch: number }
+
+export function enginesRange(): string {
+  const pkg = JSON.parse(readFileSync(PACKAGE, 'utf8')) as { engines?: { node?: string } }
+  const node = pkg.engines?.node
+  if (!node) throw new Error('package.json engines.node is missing')
+  return node
+}
+
+function semver(version: string): Semver | null {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(version)
+  if (!match) return null
+  return { major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3]) }
+}
+
+function compare(left: Semver, right: Semver): number {
+  if (left.major !== right.major) return left.major - right.major
+  if (left.minor !== right.minor) return left.minor - right.minor
+  return left.patch - right.patch
+}
+
+/** `package.json` `engines.node`: `^X.Y.Z` or `>=X.Y.Z`, joined by `||`. */
+export function nodeSatisfies(version: string, engines: string = enginesRange()): boolean {
+  const got = semver(version)
+  if (!got) return false
+  for (const part of engines.split('||').map(item => item.trim()).filter(Boolean)) {
+    const caret = /^\^(\d+)\.(\d+)\.(\d+)$/.exec(part)
+    if (caret) {
+      const min = { major: Number(caret[1]), minor: Number(caret[2]), patch: Number(caret[3]) }
+      if (got.major === min.major && compare(got, min) >= 0) return true
+      continue
+    }
+    const floor = /^>=(\d+)\.(\d+)\.(\d+)$/.exec(part)
+    if (floor) {
+      const min = { major: Number(floor[1]), minor: Number(floor[2]), patch: Number(floor[3]) }
+      if (compare(got, min) >= 0) return true
+    }
+  }
+  return false
+}
+
+export function checkNode(version: string, engines: string = enginesRange()): string | null {
+  if (!semver(version)) return `Node ${version} is not a recognized version`
+  if (nodeSatisfies(version, engines)) return null
+  return [
+    `Node ${version} does not satisfy package.json engines (${engines}).`,
+    `The operator image keeps a matching build at ${NODE_IMAGE_BIN}.`,
+    '.nvmrc asks for 24.22.1.',
+    'Set PLY_NODE to a binary that satisfies engines, or run npm run cd so it selects one.',
+  ].join(' ')
+}
+
+export function binaryNodeVersion(bin: string): string | null {
+  const result = spawnSync(bin, ['-p', 'process.version'], { encoding: 'utf8', timeout: NODE_PROBE_MS })
+  if (result.status !== 0) return null
+  const line = result.stdout.trim()
+  return line.startsWith('v') ? line : null
+}
+
+/** A different binary when the current one misses engines. Null when the current one is fine or none of the candidates is. */
+export function selectNode(
+  current: string,
+  candidates: readonly { readonly bin: string; readonly version: string | null }[],
+  engines: string = enginesRange(),
+): string | null {
+  if (nodeSatisfies(current, engines)) return null
+  for (const candidate of candidates) {
+    if (candidate.version && nodeSatisfies(candidate.version, engines)) return candidate.bin
+  }
+  return null
 }
 
 export type OriginMain =

@@ -34,10 +34,26 @@ test('a short clean sample is insufficient_data and still advances', () => {
   assert.equal(last.kind, 'complete')
 })
 
-test('unavailable telemetry rolls back and is never a pass', () => {
+test('unavailable telemetry is a harness fault and does not roll back', async () => {
   const decision = decideRampStep({ kind: 'unavailable', reason: 'telemetry unavailable: cf o11y down' })
-  assert.equal(decision.outcome, 'rollback')
+  assert.equal(decision.outcome, 'harness_fault')
   assert.match(decision.reason, /telemetry unavailable/)
+  assert.equal(decision.rules[0]?.name, 'telemetry_required')
+  let rolled = 0
+  const result = await runRamp(schedule, {
+    now: () => 0,
+    sleep: async () => {},
+    applySplit: async () => null,
+    observe: async () => ({ kind: 'unavailable', reason: 'telemetry unavailable: cf o11y down' }),
+    rollback: async () => {
+      rolled += 1
+      return null
+    },
+  })
+  assert.equal(result.state.kind, 'stopped')
+  if (result.state.kind === 'stopped') assert.equal(result.state.fault, 'harness_fault')
+  assert.equal(rolled, 0)
+  assert.match(result.lines[0] ?? '', /decision=harness_fault/)
 })
 
 test('one exception on the new version rolls back before the sample minimum', () => {
