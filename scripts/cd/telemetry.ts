@@ -203,6 +203,12 @@ function versionOf(event: Record<string, unknown>): string | null {
   return typeof script?.id === 'string' ? script.id : null
 }
 
+/** `$workers.scriptVersion.id` on a telemetry event, or null. The ramp partitions one query with this. */
+export function scriptVersionId(event: unknown): string | null {
+  const rec = asRecord(event)
+  return rec ? versionOf(rec) : null
+}
+
 function stringField(value: unknown): string | null {
   return typeof value === 'string' && value !== '' ? value : null
 }
@@ -367,6 +373,8 @@ function walk(node: unknown, visit: (rec: Record<string, unknown>) => void, seen
 
 export type VersionStats = {
   readonly requests: number
+  /** Fetch invocations only. `requests` falls back to log rows when this is 0. */
+  readonly invocations: number
   readonly exceptions: number
   readonly errors: number
   readonly fivexx: number
@@ -476,6 +484,7 @@ export function statsFromEvents(events: readonly unknown[], spans: readonly unkn
   }
   return {
     requests: requests > 0 ? requests : logs,
+    invocations: requests,
     exceptions,
     errors,
     fivexx,

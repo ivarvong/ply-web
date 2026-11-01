@@ -1,6 +1,6 @@
 # Continuous deployment
 
-You ship ply-web from a Linux box where `cf` is already logged in. One command uploads the commit you have checked out, smokes it at 0%, then walks traffic from 0% to 100%. Each ramp step probes for 40s and then waits 20s so the telemetry tail is ingested. If a hard gate fails, traffic goes back to the previous version and the command exits. GitHub holds the code and the pull request. It does not deploy.
+You ship ply-web from a Linux box where `cf` is already logged in. One command uploads the commit you have checked out, smokes it at 0%, then walks traffic from 0% to 100%. Each ramp step sends unpinned probes for 40s and then waits 20s so the telemetry tail is ingested. If a hard gate fails, traffic goes back to the previous version and the command exits. GitHub holds the code and the pull request. It does not deploy.
 
 ![Operator pipeline. The left column is gate, deploy, smoke, telemetry, ramp, live smoke, live telemetry, done. Failures leave to the right.](img/cd-pipeline.png)
 
@@ -38,7 +38,7 @@ Optional overrides (anything you do not set keeps the default in the table furth
 | `PLY_SHA` | ply `main` | 40-hex pin, instead of resolving ply `main` |
 | `PLY_CD_LEDGER` | `~/.local/state/ply-cd/ledger.jsonl` | Append-only event ledger across runs |
 
-The rollout itself is `scripts/cd/cd.policy.json`: the steps (percent and dwell), the ingest wait, the optional warm-up, the probe rate and mix, which signals are hard or informational, and the burn multiple and sample floor. `npm run cd -- --policy <path>` uses another file for that run. The engine rejects a file that cannot be run (steps that do not increase, a last step that is not 100, `latency` set to `gate` without thresholds). Every run appends a `policy` event with the file's sha256 and the body that ran. `PLY_RAMP_PERCENTS`, `PLY_RAMP_DWELL_MS`, `PLY_RAMP_PROBE_RPS`, `PLY_RAMP_MAX_HOLDS`, and `PLY_RAMP_MIN_REQUESTS` are rejected if set.
+The rollout itself is `scripts/cd/cd.policy.json`: the steps (percent and dwell), the ingest wait, the optional warm-up, the probe rate and mix, which signals are hard or informational, the burn multiple and sample floor, and the routed-share band. `npm run cd -- --policy <path>` uses another file for that run. The engine rejects a file that cannot be run (steps that do not increase, a last step that is not 100, `latency` set to `gate` without thresholds, a share band with `z` of 0). Every run appends a `policy` event with the file's sha256 and the body that ran. `PLY_RAMP_PERCENTS`, `PLY_RAMP_DWELL_MS`, `PLY_RAMP_PROBE_RPS`, `PLY_RAMP_MAX_HOLDS`, and `PLY_RAMP_MIN_REQUESTS` are rejected if set.
 
 ## The whole run
 
@@ -81,7 +81,7 @@ What prints, in order:
 run: ~/.local/state/ply-cd/runs/2026-10-31T21-05-00-123Z
 version: 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 previous: 1aa0bb11-2222-4333-8444-555566667777
-ramp step=1/7 percent=1 previous=99 samples=8/140 error_rate=0.0000/0.0000 p99_wall_ms=88/74 p99_cpu_ms=12/11 latency=informational decision=advance
+ramp step=1/5 percent=10 previous=90 samples=200/1800 error_rate=0.0000/0.0000 routed_share=10.00 target=10 tolerance=7.99..12.01 agg=2000 p99_wall_ms=88/74 p99_cpu_ms=12/11 latency=informational decision=advance
 …
 cd: PASS 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 ```
@@ -261,32 +261,56 @@ npm run cd -- ramp --version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e \
 
 Without `--verdict`, or with a verdict that is not a pass for that version, the command exits and does not change traffic.
 
-The checked-in steps are `1, 5, 10, 25, 50, 75, 100`, each with a `40000` ms dwell. After the dwell the step waits `ingestWaitMs` (`20000` in the checked-in file) and then queries. Smoke id-matching still uses `TELEMETRY_WAIT_MS` (`60000`); that budget is not the ramp wait. `warmupMs` is `0`. Set it above 0 to pause after the split is applied and before the probes, and that pause is not part of the judged window.
+The checked-in steps are `10, 25, 50, 75, 100`, each with a `40000` ms dwell. The list is only in the policy file. After the dwell the step waits `ingestWaitMs` (`20000` in the checked-in file) and then queries. Smoke id-matching still uses `TELEMETRY_WAIT_MS` (`60000`); that budget is not the ramp wait. `warmupMs` is `0`. Set it above 0 to pause after the split is applied and before the probes, and that pause is not part of the judged window.
 
-During the probe the ramp calls at `probe.rps` (2) **on each version**, once per entry in `probe.calls`: `GET /` (the usage text, 200, no bearer) and `GET /v1/discover`, which the engine requests as `/v1/discover?remote=…` for the public `ply` mirror with the bearer from `PLY_TOKEN_FILE`. Each call sends `Cloudflare-Workers-Version-Overrides` for the new version and, separately, for the previous one, so both arms are sampled at the probe rate rather than at the traffic split. That is 4 requests per second per arm, about 160 invocations in a 40s dwell. There is no `/health` route. A non-2xx answer from the **new** version fails the step while `gates.smoke` is `hard`. A probe that gets no response stops the ramp as `harness_fault` and leaves the current split in place. Before each percentage change the ramp reads the deployment and writes only when it is still the previous step's split. Otherwise it stops with `state_conflict` and does not roll back.
+The only pinned traffic is the 0% gate: the lifecycle smoke and the deploy check, both sent with `Cloudflare-Workers-Version-Overrides`. From the first ramp step on, probes are ordinary requests. They do not set that header, and they do not pin the old version to balance the arms. Right now those requests are the only load. Real users would be judged by the same telemetry.
 
-Seven dwells are 280s. Seven ingest waits are 140s. A clean ramp is about 7 minutes plus the queries, which on 2026-11-01 returned in under a tenth of a second. The probe time alone is just under 5 minutes. The extra 20s per step is the tail those queries were missing, not a guess: on run `2026-11-01T00-10-02-620Z` the query ran about 1.4s after the dwell and the newest event was still 12640ms behind the dwell end at 1% and 17313ms behind it at 5%. `20000` is above that. Cutting the wait to force a 5-minute ramp would judge the step before those logs exist.
+During the probe the ramp calls at `probe.rps` (25) ticks per second, once per entry in `probe.calls`: `GET /` (the usage text, no bearer) and `GET /v1/discover`, which the engine requests as `/v1/discover?remote=…` for the public `ply` mirror with the bearer from `PLY_TOKEN_FILE`. That is 50 requests per second. Ticks overlap, up to one second of them in flight, so a response slower than `1000 / rps` ms does not stretch the dwell. There is no `/health` route. The response's `x-ply-version` is written on the request event. It is not the gate. A probe that gets no response stops the ramp as `harness_fault` and leaves the current split in place. Before each percentage change the ramp reads the deployment and writes only when it is still the previous step's split. Otherwise it stops with `state_conflict` and does not roll back.
 
-Then it reads `cf o11y` for **both** versions over that step's window. Child spans are the events query with `$metadata.type = span`, not the traces view. Span events have no `$workers.scriptVersion.id` and a null `$metadata.requestId`, so they are queried by service and joined on `rayId`, then `traceId`.
+Five dwells are 200s. Five ingest waits are 100s. A clean ramp is about 5 minutes plus the queries. The 20s wait is the tail measured on run `2026-11-01T00-10-02-620Z`: the query ran about 1.4s after the dwell and the newest event was still 12640ms behind the dwell end at 1% and 17313ms behind it at 5%. `20000` is above that. Those two steps are no longer in the file; the lag is.
+
+Then it reads one `cf o11y` events query for the whole worker over that step's window, and partitions it by `$workers.scriptVersion.id`. The new version, the old version, and the aggregate (every invocation in the window, which is what users feel) are judged separately. Child spans are a second events query with `$metadata.type = span`, not the traces view. Span events have no `$workers.scriptVersion.id` and a null `$metadata.requestId`, so they are queried by service and joined on `rayId`, then `traceId`.
 
 The step decision is the policy. A signal set to `hard` rolls back. The same signal set to `informational` is named on the advance reason and does not roll back. Burn rate is `(bad / total) / (1 − target)`. Definitions are in [Metrics](#metrics). The checked-in file:
 
-| Signal | Checked-in mode | Rolls back when |
+| Signal | Checked-in mode | What happens |
 | --- | --- | --- |
-| Smoke, including a probe response from the new version that is not 2xx | `hard` | Any |
-| Exception on the new version | `hard` | Any, even one request |
-| 5xx on the new version | `hard` | Any. A 5xx on the old version does not roll the canary back onto it |
-| Error log on the new version | `hard` | Any `$metadata.level` `error` on a `ply.request` log |
-| Non-ok Worker outcome on the new version | `hard` | Any |
-| SLO burn | `hard` | `bad/total` divided by the error budget is above `burn.fastBurn` (**14.4**), and that SLO saw at least `burn.minSamples` (**20**) requests |
+| Smoke | `hard` | The 0% lifecycle only. A ramp probe's HTTP status is not a gate |
+| Exception, 5xx, error log, non-ok outcome | `hard` | Any, on the new version, on the old version, or across the worker. One request is enough |
+| SLO burn | `hard` | The same three scopes. `bad/total` divided by the error budget is above `burn.fastBurn` (**14.4**), and that SLO saw at least `burn.minSamples` (**100**) requests |
+| Routed share | `rollback` | `routedNewShare` outside the binomial band. `split.onMismatch` may instead be `hold`, which leaves the split |
+| Thin evidence | `hold` | Fewer than `split.minNewRequests` (**100**) new-version invocations, or no invocations at all. Outcome `insufficient_data`. `onInsufficient: advance` moves on and still says so |
 | Latency | `informational` | Never, under this file. Wall p99 and CPU p99 are on the line and on the ramp observation. `off` omits them from the line. `gate` needs `minSamples`, `p99Ratio` (> 1), and `effectFloorMs`, and rolls back only when both sides have that many wall samples and p99 clears both thresholds |
 | Query failed | always | `harness_fault`. The split stays. A missing query is not zero errors and is not a rollback |
 
-`samples=` on a ramp line counts fetch invocations (`$metadata.type` `cf-worker-event`, `$workers.eventType` `fetch`), not every event. Each request also writes a `ply.request` log, so the event page is about twice the sample count. The query asks for `limit` 1000 and stops when a page comes back short. On the 2026-11-01 run that page was the whole match: `events.count`, the events array, and the series `_count` sum were the same number, every series bucket had `sampleInterval` 1, and `statistics.abr_level` was 1. The page was short because the index held about 28s of the 40s dwell. Ingest lag observed on 2026-10-31 was 10–30s, and the query used to run at the end of the dwell, so the tail had not landed. The window's `to` is the dwell end plus `60000` ms. A later query of that same window therefore includes the next step: the 1% window covered the following 5% dwell (about 160 + 160 invocations per arm) and the 5% window, queried again after rollback, covered only its own dwell (about 160). The script's about 100 samples per arm were the invocations already ingested, not a 1000-row cap and not a version filter.
+### How many requests that is
 
-The 1% line reported wall p99 237ms on the new version. With 99 samples, p99 is `sorted[floor(98 × 0.99)]`, the second-largest wall. Those two were 405ms and 237ms, the opening cold starts. An all-events query of the full window has about 320 samples, so those two sit above p99 and the steady-state body is about 11ms. The ingest wait above is what puts the dwell's own tail into the live sample before the next step starts. It does not make the 1% query include the 5% probes; that larger count is a later read of a window that already overlaps the next step.
+Correctness here is zero tolerance: one exception, 5xx, error log, or non-ok outcome fails the scope that saw it. With zero observed errors in `n` requests, the error rate `p` at which a step has a 95% chance of seeing at least one is
 
-There is no hold. A quiet 1% step with zero errors advances. The pinned probes are what put samples on the new version at 1%. Change the step's `dwellMs` or `probe.rps` in the policy when you want the burn check to see more than that.
+```text
+(1 − p) ^ n = 0.05
+p = 1 − 0.05 ^ (1 / n)
+```
+
+That `p` is the minimum detectable error-rate change from a clean baseline. The rule of three, `3 / n`, is the same bound at these sizes.
+
+The checked-in probe schedules `25 × 2 × 40s = 2000` requests a step. The smallest open step is 10%, so the new version's expected count is `2000 × 0.10 = 200`. The old version's smallest expected count is the 25% left at the 75% step, 500. At 100% the old version is not allocated.
+
+| Scope | Expected n | Detectable error rate |
+| --- | --- | --- |
+| New version at 10% | 200 | 1.49% |
+| Floor, `minNewRequests` and `burn.minSamples` | 100 | 2.95% |
+| Old version at the 75% step | 500 | 0.60% |
+| New version at 50% | 1000 | 0.30% |
+| Aggregate, and the new version at 100% | 2000 | 0.15% |
+
+A step with fewer than 100 new-version invocations does not advance. That floor is the 2.95% row. A normal 10% step sees about 200 and can catch a 1.5% regression on the new version. The aggregate, which is what users feel, can catch 0.15% in the same window. Per-version is what keeps a regression on the small arm from being diluted into the aggregate.
+
+The share check is the same `n`. For target proportion `p` and `z = 3`, the band is `p ± z √(p(1−p)/n)`. At 10% and `n = 2000` that is 7.99%..12.01%. At 100%, `p(1−p)` is 0, so the share has to be 100%. Counts come from telemetry fetch invocations, not from the probe's own bookkeeping. `test/fixtures/cd/routed-share.json` is a synthetic 10% window of this shape: 200 of 2000 advances, 1000 of 2000 rolls back, 40 of 400 is `insufficient_data`.
+
+This probe is a scaled model of production. At about 800 requests per second, a 40s dwell already holds 32000 requests and the 10% arm holds 3200, which can see about a 0.09% error rate. Retune `probe.rps`, `burn.minSamples`, and `split.minNewRequests` in the policy. When real traffic is the load, `probe.rps` can go to 0 and the same gates read whoever called the worker. That is a config change.
+
+`samples=` on a ramp line counts fetch invocations (`$metadata.type` `cf-worker-event`, `$workers.eventType` `fetch`), new / old, in this window. `agg=` is the unfiltered count, the share denominator. Each request also writes a `ply.request` log, so the event page is about twice the sample count. The query asks for `limit` 1000 and follows the cursor. On the 2026-11-01 run a page came back short because the index held about 28s of the 40s dwell, not because of a 1000-row cap. The window's `to` is the dwell end plus `60000` ms so the tail is inside the query. The ingest wait is what keeps the next step's probes out of this step's judged window.
 
 At 100% the old version is dropped, so its wall and CPU numbers are the last step whose old version had at least 5 wall samples. That line includes `previous_sample=carried`. If no earlier step had them, 100% still advances when the new version is clean.
 
@@ -297,13 +321,11 @@ Each step prints one line to stdout and appends the same line to `ramp.jsonl` in
 A clean ramp:
 
 ```text
-ramp step=1/7 percent=1 previous=99 samples=8/140 error_rate=0.0000/0.0000 p99_wall_ms=88/74 p99_cpu_ms=12/11 latency=informational decision=advance
-ramp step=2/7 percent=5 previous=95 samples=14/132 error_rate=0.0000/0.0000 p99_wall_ms=90/76 p99_cpu_ms=12/11 latency=informational decision=advance
-ramp step=3/7 percent=10 previous=90 samples=22/118 error_rate=0.0000/0.0085 p99_wall_ms=94/78 p99_cpu_ms=13/12 latency=informational decision=advance
-ramp step=4/7 percent=25 previous=75 samples=40/96 error_rate=0.0000/0.0000 p99_wall_ms=101/80 p99_cpu_ms=14/12 latency=informational decision=advance
-ramp step=5/7 percent=50 previous=50 samples=70/70 error_rate=0.0000/0.0000 p99_wall_ms=110/82 p99_cpu_ms=14/12 latency=informational decision=advance
-ramp step=6/7 percent=75 previous=25 samples=96/28 error_rate=0.0000/0.0000 p99_wall_ms=116/84 p99_cpu_ms=15/13 latency=informational decision=advance
-ramp step=7/7 percent=100 previous=0 samples=120/28 error_rate=0.0000/0.0000 p99_wall_ms=114/84 p99_cpu_ms=15/13 latency=informational decision=advance previous_sample=carried
+ramp step=1/5 percent=10 previous=90 samples=200/1800 error_rate=0.0000/0.0000 routed_share=10.00 target=10 tolerance=7.99..12.01 agg=2000 p99_wall_ms=88/74 p99_cpu_ms=12/11 latency=informational decision=advance
+ramp step=2/5 percent=25 previous=75 samples=500/1500 error_rate=0.0000/0.0000 routed_share=25.00 target=25 tolerance=22.10..27.90 agg=2000 p99_wall_ms=90/76 p99_cpu_ms=12/11 latency=informational decision=advance
+ramp step=3/5 percent=50 previous=50 samples=1000/1000 error_rate=0.0000/0.0000 routed_share=50.00 target=50 tolerance=46.65..53.35 agg=2000 p99_wall_ms=94/78 p99_cpu_ms=13/12 latency=informational decision=advance
+ramp step=4/5 percent=75 previous=25 samples=1500/500 error_rate=0.0000/0.0000 routed_share=75.00 target=75 tolerance=72.10..77.90 agg=2000 p99_wall_ms=101/80 p99_cpu_ms=14/12 latency=informational decision=advance
+ramp step=5/5 percent=100 previous=0 samples=2000/0 error_rate=0.0000/- routed_share=100.00 target=100 tolerance=100.00..100.00 agg=2000 p99_wall_ms=114/84 p99_cpu_ms=15/13 latency=informational decision=advance previous_sample=carried
 cd: PASS ramp 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 ```
 
@@ -311,31 +333,43 @@ How to read a line:
 
 | Field | Meaning |
 | --- | --- |
-| `step=2/7` | Second percentage. 1-based. |
-| `percent=5` `previous=95` | New version's share, and what is left on the old one. At the last step `previous=0`. |
-| `samples=14/132` | Requests in this step's window, new / old. |
-| `error_rate=0.0000/0.0085` | Non-ok rate, new / old, four decimal places. |
+| `step=2/5` | Second percentage. 1-based. The count is the policy's step list. |
+| `percent=25` `previous=75` | Configured new-version share, and what is left on the old one. At the last step `previous=0`. |
+| `samples=500/1500` | Fetch invocations in this step's window, new / old. |
+| `error_rate=0.0000/0.0000` | Non-ok rate, new / old, four decimal places. |
+| `routed_share=25.00` | `100 × new / agg`. Null (`-`) when `agg` is 0. |
+| `target=25` | The step's percent. The same number as `percent`. |
+| `tolerance=22.10..27.90` | The binomial band in percent, `z` standard errors at this `agg`. `-` when `agg` is 0. |
+| `agg=2000` | Fetch invocations in the window, every version. |
 | `p99_wall_ms=90/76` | Wall-time p99 in milliseconds, new / old. `-` means that side had no sample. Omitted when latency mode is `off`. |
 | `p99_cpu_ms=12/11` | CPU p99, new / old. Informational under the checked-in policy, same as wall. |
 | `latency=informational` | The percentiles are recorded. They do not roll back. `gate` would. |
-| `decision=advance` | No hard signal fired. Move to the next percentage. |
-| `decision=rollback` | A hard signal fired. Traffic is being put back on the previous version. |
-| `reason="…"` | Present on rollback, on `harness_fault`, and on an advance that names an informational signal. Relay it with the line. |
-| `previous_sample=carried` | The old-version numbers are from the last step that had at least 5 wall samples, not from a version that is no longer allocated. |
+| `decision=advance` | No hard signal fired, the share is inside the band, and the new version had enough invocations. |
+| `decision=rollback` | A hard signal fired, or the share is outside the band and `onMismatch` is `rollback`. Traffic goes back to the previous version. |
+| `decision=insufficient_data` | The new version had fewer than `minNewRequests` invocations (or the window had none) and `onInsufficient` is `hold`. The split stays. |
+| `decision=hold` | The share is outside the band and `onMismatch` is `hold`. The split stays. The checked-in file rolls back instead. |
+| `reason="…"` | Present on rollback, hold, insufficient evidence, `harness_fault`, and an advance that names an informational signal. Relay it with the line. |
+| `previous_sample=carried` | The old-version p99 is from the last step that had at least 5 wall samples. The sample counts on that line are still this window. |
 
-A large wall shift advances. The 2026-11-01 5% walls (`test/fixtures/cd/ramp-5pct-walls.json`, run `2026-11-01T00-10-02-620Z`) advance. So does a step whose p99 is 27ms against 12ms. An older run can still show `decision=insufficient_data` from the latency compare this policy replaced. That outcome is not produced any more. Relay it: nothing was rolled back.
+A large wall shift advances. The 2026-11-01 5% walls (`test/fixtures/cd/ramp-5pct-walls.json`, run `2026-11-01T00-10-02-620Z`) do not roll back on latency. So does a step whose p99 is 27ms against 12ms. `insufficient_data` now means the new version was not seen enough times. It is not the old latency compare. Relay it: nothing was rolled back, and the split did not advance.
 
 An exception on the new version, even with one request:
 
 ```text
-ramp step=2/7 percent=5 previous=95 samples=1/40 error_rate=1.0000/0.0000 p99_wall_ms=40/70 p99_cpu_ms=8/9 latency=informational decision=rollback reason="1 exception on the new version"
+ramp step=1/5 percent=10 previous=90 samples=1/1999 error_rate=1.0000/0.0000 routed_share=0.05 target=10 tolerance=7.99..12.01 agg=2000 p99_wall_ms=40/70 p99_cpu_ms=8/9 latency=informational decision=rollback reason="1 exception on the new version"
 cd: FAIL ramp: 1 exception on the new version
+```
+
+A 10% step whose telemetry shows about half the traffic on the new version:
+
+```text
+ramp step=1/5 percent=10 previous=90 samples=1000/1000 error_rate=0.0000/0.0000 routed_share=50.00 target=10 tolerance=7.99..12.01 agg=2000 p99_wall_ms=80/80 p99_cpu_ms=12/12 latency=informational decision=rollback reason="routed share 50.00% is outside 7.99..12.01 of target 10% (n=2000)"
 ```
 
 `cf o11y` down stops the ramp as `harness_fault`. It does not roll back and it does not wait:
 
 ```text
-ramp step=3/7 percent=10 previous=90 samples=-/- error_rate=-/- p99_wall_ms=-/- p99_cpu_ms=-/- latency=informational decision=harness_fault reason="telemetry unavailable: …"
+ramp step=1/5 percent=10 previous=90 samples=-/- error_rate=-/- routed_share=- target=10 tolerance=- agg=0 p99_wall_ms=-/- p99_cpu_ms=-/- latency=informational decision=harness_fault reason="telemetry unavailable: …"
 cd: harness_fault ramp: telemetry unavailable: …
 ```
 
@@ -397,7 +431,8 @@ cd: FAIL rollback: rollback to 1aa0bb11-… failed: …
 | `cd: FAIL deploy-canary:` and the line says the canary was left at 0% | Old at 100%, new at 0% | Read the pin failure. Rollback only if you want the 0% slot cleared: `npm run cd -- rollback --to <previous>`. |
 | `cd: FAIL deploy-canary:` after a bad split | Previous at 100% if the rollback landed | Confirm with `cf workers deployments list --worker ply`. |
 | `cd: FAIL smoke:` or `cd: FAIL telemetry:` before any ramp line | Still 0% / 100% | The ramp did not start. The scratch repo name is in the smoke failure. |
-| A ramp line with `decision=advance`, including one that prints `latency=informational` | The next percentage | Relay the line. Wall and CPU time did not roll anything back. An older line that says `insufficient_data` is the same: the next percentage, nothing rolled back. |
+| A ramp line with `decision=advance`, including one that prints `latency=informational` | The next percentage | Relay the line. Wall and CPU time did not roll anything back. |
+| A ramp line with `decision=insufficient_data` or `decision=hold` | The percentage where it stopped | The split was not advanced and was not rolled back. Thin evidence, or a share miss whose policy says hold. Read the reason. |
 | A ramp line with `decision=rollback`, then `cd: FAIL ramp:` | Previous at 100% | Relay the line. The new version is off traffic. |
 | `cd: FAIL ramp:` and the text says rollback failed | **Not** safe | Run `npm run cd -- rollback --to <previous>` and read the deployment list. The id to restore is the one in that sentence. |
 | `cd: FAIL smoke:` or `cd: FAIL telemetry:` after ramp lines that reached `percent=100` | Previous at 100% if rollback landed | Same as a ramp rollback. The live check is what rejected it. |
@@ -424,9 +459,9 @@ budget = 1 − target
 burn   = (bad / total) / budget
 ```
 
-A burn of 1 spends the budget at the planned rate. The ramp fails a step when burn is above **14.4** and that SLO has at least 20 samples in the step window. 14.4 is the SRE workbook fast-burn multiple: on a 30-day budget, 14.4× for one hour spends about 2%. Our SLO window is 28 days. The step still uses 14.4, not a recomputed multiple.
+A burn of 1 spends the budget at the planned rate. The ramp fails a step when burn is above **14.4** and that SLO has at least `burn.minSamples` requests in the step window (100 in the checked-in file). 14.4 is the SRE workbook fast-burn multiple: on a 30-day budget, 14.4× for one hour spends about 2%. Our SLO window is 28 days. The step still uses 14.4, not a recomputed multiple.
 
-Availability on a ramp step treats every 4xx as expected, so client errors leave the denominator. The probe contract and the correctness smoke still fail an unexpected status. One 5xx or one exception fails the step even when the sample is shorter than 20, so the availability burn is the rate view for a window that is already large.
+Availability on a ramp step treats every 4xx as expected, so client errors leave the denominator. The correctness smoke still fails an unexpected status at 0%. One 5xx or one exception fails the ramp step even when the sample is shorter than the floor, on the version that served it and across the worker, so the availability burn is the rate view for a window that is already large.
 
 Correctness is one lifecycle smoke, not a ramp step. While `gates.smoke` is `hard`, any failed step fails the smoke stage (`decision=stop`, canary left at 0%). `informational` records the failure and continues. The burn from the pass/fail counts is stored on the run. It is what a later alert would page on. It is not a second gate inside the ramp.
 
@@ -491,7 +526,7 @@ The event log is the record of the run. Every line is one JSON object:
 
 A decision cannot be written unless `inputs` cites an earlier `observation`. A `Secret` cannot be serialized: `JSON.stringify` throws, and command argv stores `<redacted>` instead of the value. Each Secret's text is removed by exact match from every capture and event. An `art_v` plus a version plus `_` is removed the same way, as a backstop, whatever the version number is.
 
-The ramp does not emit `hold` or `insufficient_data`. Those outcomes stay in the schema so a recorded decision can still say them. `stop` is a gate that leaves traffic where it is (the pinned smoke failure, while smoke is hard). `rollback` is traffic returned to the previous version.
+The ramp emits `insufficient_data` when the new version was not seen enough times and the policy holds, and `hold` when a routed-share miss is configured to hold. The checked-in file rolls a share miss back and holds on thin evidence. `stop` is a gate that leaves traffic where it is (the pinned smoke failure, while smoke is hard). `rollback` is traffic returned to the previous version.
 
 After `run_finished` the run writes `manifest.json` with the sha256 of every other file and then refuses further appends. Do not edit the run directory. A debrief writes beside it:
 
@@ -499,7 +534,7 @@ After `run_finished` the run writes `manifest.json` with the sha256 of every oth
 npm run cd -- debrief ~/.local/state/ply-cd/runs/2026-10-31T21-05-00-123Z
 ```
 
-That prints `debrief: ~/.local/state/ply-cd/runs/2026-10-31T21-05-00-123Z.debrief/debrief.md`. The markdown stands alone: the policy body and its sha256, a timeline, every decision with the rule and the observations it used, every traffic change, three charts (`split.png` is every `state_change`, including the 0% canary, against the share of requests the new version received, `latency.png` wall p99 by version labeled with the run's latency mode, `burn.png` burn per SLO with a line at the policy's fast-burn multiple), and links back to `events.jsonl`, `raw/`, and `captures/`.
+That prints `debrief: ~/.local/state/ply-cd/runs/2026-10-31T21-05-00-123Z.debrief/debrief.md`. The markdown stands alone: the policy body and its sha256, a timeline, every decision with the rule and the observations it used, every traffic change, three charts (`split.png` is every `state_change`, including the 0% canary, against `routedNewShare` from telemetry, `latency.png` wall p99 by version labeled with the run's latency mode, `burn.png` burn per SLO with a line at the policy's fast-burn multiple), and links back to `events.jsonl`, `raw/`, and `captures/`.
 
 ## Later
 

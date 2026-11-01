@@ -1,7 +1,5 @@
 {
   "steps": [
-    { "percent": 1, "dwellMs": 40000 },
-    { "percent": 5, "dwellMs": 40000 },
     { "percent": 10, "dwellMs": 40000 },
     { "percent": 25, "dwellMs": 40000 },
     { "percent": 50, "dwellMs": 40000 },
@@ -11,7 +9,7 @@
   "ingestWaitMs": 20000,
   "warmupMs": 0,
   "probe": {
-    "rps": 2,
+    "rps": 25,
     "calls": [
       { "method": "GET", "path": "/", "auth": false },
       { "method": "GET", "path": "/v1/discover", "auth": true }
@@ -28,6 +26,12 @@
   },
   "burn": {
     "fastBurn": 14.4,
-    "minSamples": 20
+    "minSamples": 100
+  },
+  "split": {
+    "z": 3,
+    "minNewRequests": 100,
+    "onMismatch": "rollback",
+    "onInsufficient": "hold"
   }
 }
