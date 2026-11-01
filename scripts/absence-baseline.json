@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 208,
-    "optional": 379,
-    "chain": 563,
-    "nullish": 628,
-    "total": 1778
+    "word": 203,
+    "optional": 376,
+    "chain": 562,
+    "nullish": 621,
+    "total": 1762
   },
   "files": {
     "cloudflare.config.ts": {
@@ -344,13 +344,6 @@
       "nullish": 4,
       "total": 12
     },
-    "src/flags/operator-entry.ts": {
-      "word": 0,
-      "optional": 1,
-      "chain": 0,
-      "nullish": 1,
-      "total": 2
-    },
     "src/flags/operator.ts": {
       "word": 7,
       "optional": 2,
@@ -386,13 +379,6 @@
       "nullish": 3,
       "total": 41
     },
-    "src/flags/ttl.ts": {
-      "word": 2,
-      "optional": 0,
-      "chain": 0,
-      "nullish": 0,
-      "total": 2
-    },
     "src/gitcache.ts": {
       "word": 4,
       "optional": 8,
@@ -413,20 +399,6 @@
       "chain": 6,
       "nullish": 8,
       "total": 29
-    },
-    "src/pathguard.ts": {
-      "word": 0,
-      "optional": 2,
-      "chain": 0,
-      "nullish": 1,
-      "total": 3
-    },
-    "src/pinned.ts": {
-      "word": 0,
-      "optional": 0,
-      "chain": 1,
-      "nullish": 1,
-      "total": 2
     },
     "src/public.ts": {
       "word": 5,
@@ -511,20 +483,6 @@
       "chain": 1,
       "nullish": 0,
       "total": 6
-    },
-    "src/viewer/identity.ts": {
-      "word": 0,
-      "optional": 0,
-      "chain": 0,
-      "nullish": 4,
-      "total": 4
-    },
-    "src/viewer/limits.ts": {
-      "word": 2,
-      "optional": 0,
-      "chain": 0,
-      "nullish": 0,
-      "total": 2
     },
     "src/viewer/markdown.ts": {
       "word": 10,
@@ -835,11 +793,11 @@
       "total": 4
     },
     "test/viewer.test.ts": {
-      "word": 2,
+      "word": 1,
       "optional": 28,
       "chain": 38,
       "nullish": 31,
-      "total": 99
+      "total": 98
     },
     "test/worker-entrypoints.test.ts": {
       "word": 6,
