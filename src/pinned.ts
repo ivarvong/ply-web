@@ -10,7 +10,9 @@
 // The front door keeps its job: it rate-limits and logs, then asks Pinned for the canonical key
 // /v<CACHE_VERSION>/pinned<path>?<allowed params, sorted>. Pinned rebuilds the public request from that key alone (it
 // reads no header, so no credential can reach it), marks it internal, and runs the same handler. A non-200 is no-store.
+import { captureGroup, header } from './absent.ts';
 import { CACHE_VERSION } from './cache-version.ts';
+import { unwrapOr } from './option.ts';
 import { isPublicRepoName } from './public.ts';
 
 const OID = /^[0-9a-f]{40}$/;
@@ -35,9 +37,10 @@ function sorted(url: URL, allowed: string[]): string | null {
 
 function shortPublicName(pathname: string): string | null {
   const match = /^\/r\/([^/]+)$/.exec(pathname);
-  if (!match?.[1]) return null;
+  const captured = unwrapOr(captureGroup(match, 1), '');
+  if (captured === '') return null;
   let name: string;
-  try { name = decodeURIComponent(match[1]); } catch { return null; }
+  try { name = decodeURIComponent(captured); } catch { return null; }
   return isPublicRepoName(name) ? name : null;
 }
 
@@ -82,7 +85,7 @@ export type PinnedBinding = { fetch(req: Request): Promise<Response> };
 export async function viaPinned(binding: PinnedBinding, key: string): Promise<Response> {
   const res = await binding.fetch(new Request(`https://pinned.internal${key}`, { redirect: 'manual' }));
   const headers = new Headers(res.headers);
-  headers.set('x-ply-pinned-cache', res.headers.get('cf-cache-status') ?? 'NONE');
+  headers.set('x-ply-pinned-cache', unwrapOr(header(res.headers, 'cf-cache-status'), 'NONE'));
   headers.delete('cf-cache-status');
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
