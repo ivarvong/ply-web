@@ -1,10 +1,10 @@
-import { describe, expect, it } from 'vitest';
-import { serveFlags, loadRuleset } from '../../src/flags/cache.ts';
+import { describe, expect, it, vi } from 'vitest';
+import { serveFlags, loadRuleset, rulesetCacheProblems, rulesetRequest, rulesetRequestProblems } from '../../src/flags/cache.ts';
 import { memoryStore } from '../../src/flags/store.ts';
 import { setRollout } from '../../src/flags/api.ts';
-import { ABSENT_REVISION, FLAGS_CACHE_TAG, FLAGS_MAX_AGE_S, FLAGS_SWR_S, cacheControl } from '../../src/flags/ttl.ts';
+import { ABSENT_REVISION, FLAGS_CACHE_URL, FLAGS_MAX_AGE_S, FLAGS_SWR_S, cacheControl } from '../../src/flags/ttl.ts';
 import { handleFlagHttp } from '../../src/flags/http.ts';
-import { isEnabled, usageNote } from '../../src/flags/client.ts';
+import { isEnabled, resolveFlags, usageNote } from '../../src/flags/client.ts';
 
 const env = { FLAGS: { present: true }, FLAGS_MAX_AGE_S: String(FLAGS_MAX_AGE_S), FLAGS_SWR_S: String(FLAGS_SWR_S) };
 
@@ -21,20 +21,60 @@ describe('ruleset cache', () => {
     const response = await serveFlags(new Request('https://flags.internal/config'), env, store);
     expect(response.status).toBe(200);
     expect(response.headers.get('cache-control')).toBe(cacheControl(FLAGS_MAX_AGE_S, FLAGS_SWR_S));
-    expect(response.headers.get('cache-control')).not.toContain('s-maxage');
-    expect(response.headers.get('cache-control')).not.toContain('must-revalidate');
+    expect(rulesetCacheProblems(response.headers)).toEqual([]);
     expect(response.headers.get('etag')).toBe(revision);
-    expect(response.headers.get('cache-tag')).toBe(FLAGS_CACHE_TAG);
     const again = await serveFlags(new Request('https://flags.internal/config', { headers: { 'if-none-match': revision } }), env, store);
     expect(again.status).toBe(304);
+    expect(rulesetCacheProblems(again.headers)).toEqual([]);
     expect(again.headers.get('etag')).toBe(revision);
     expect(await again.text()).toBe('');
   });
 
-  it('does not cache a missing ruleset', async () => {
-    const response = await serveFlags(new Request('https://flags.internal/config'), env, memoryStore());
+  it('caches a missing ruleset under the same contract as a present one', async () => {
+    const response = await serveFlags(rulesetRequest(), env, memoryStore());
     expect(response.status).toBe(404);
-    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(rulesetCacheProblems(response.headers)).toEqual([]);
+    expect(response.headers.get('cache-control')).toBe(cacheControl(FLAGS_MAX_AGE_S, FLAGS_SWR_S));
+    expect(response.headers.has('set-cookie')).toBe(false);
+    expect(response.headers.get('vary')).toBeNull();
+  });
+
+  it('calls FlagsCache with one stable key, and records hit, miss, and stale', async () => {
+    const seen: string[] = [];
+    const { store } = await seeded();
+    for (const status of ['HIT', 'MISS', 'STALE'] as const) {
+      const lines: string[] = [];
+      const spy = vi.spyOn(console, 'log').mockImplementation(line => { lines.push(String(line)); });
+      try {
+        const cache = {
+          async fetch(request: Request) {
+            seen.push(`${request.method} ${request.url}`);
+            expect(rulesetRequestProblems(request)).toEqual([]);
+            expect(request.headers.has('authorization')).toBe(false);
+            expect(request.headers.has('cookie')).toBe(false);
+            const response = await serveFlags(request, env, status === 'MISS' ? memoryStore() : store);
+            expect(rulesetCacheProblems(response.headers)).toEqual([]);
+            response.headers.set('cf-cache-status', status);
+            return response;
+          },
+        };
+        const unit = status === 'HIT' ? 'user-a' : 'user-b';
+        await usageNote(env, { exports: { FlagsCache: cache }, tracing: null }, unit);
+        const resolved = await resolveFlags(
+          { env, cache, tracing: null },
+          { id: unit, attributes: {} },
+          ['ply.usage.note'],
+        );
+        expect(resolved.kind).toBe('ok');
+        if (resolved.kind === 'ok') expect(resolved.cache).toBe(status);
+      } finally {
+        spy.mockRestore();
+      }
+      const parsed = lines.map(line => JSON.parse(line) as { msg?: string; cache_status?: string });
+      expect(parsed.filter(row => row.msg === 'flags.resolve').every(row => row.cache_status === status)).toBe(true);
+      expect(parsed.some(row => row.msg === 'flags.resolve' && row.cache_status === status)).toBe(true);
+    }
+    expect(new Set(seen)).toEqual(new Set([`GET ${FLAGS_CACHE_URL}`]));
   });
 
   it('serves eval as no-store and refuses an HTTP write', async () => {
