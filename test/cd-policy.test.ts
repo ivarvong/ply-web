@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { FAST_BURN, MIN_SAMPLES } from '../scripts/cd/slo.ts'
 import { applyGates, type SmokeJudge } from '../scripts/cd/telemetry.ts'
-import { DEFAULT_POLICY_PATH, loadPolicy, parsePolicy, splitPolicy } from '../scripts/cd/policy.ts'
+import { DEFAULT_MAX_LOSS_RATE, DEFAULT_POLICY_PATH, loadPolicy, parsePolicy, splitPolicy } from '../scripts/cd/policy.ts'
 
 function text(): string {
   return readFileSync(new URL('../scripts/cd/cd.policy.json', import.meta.url), 'utf8')
@@ -147,4 +147,17 @@ test('informational latency does not fail smoke telemetry', () => {
     latency: { mode: 'gate', minSamples: 20, p99Ratio: 2, effectFloorMs: 10 },
   })
   assert.equal(gated.kind, 'worker')
+})
+
+test('telemetry.maxLossRate is validated and defaults when omitted', () => {
+  const base = JSON.parse(text()) as Record<string, unknown>
+  assert.equal(parsePolicy(text()).policy.telemetry.maxLossRate, DEFAULT_MAX_LOSS_RATE)
+  const { telemetry: _omitted, ...without } = base
+  assert.equal(parsePolicy(JSON.stringify(without)).policy.telemetry.maxLossRate, DEFAULT_MAX_LOSS_RATE)
+  const tight = 0.1
+  assert.equal(parsePolicy(JSON.stringify({ ...base, telemetry: { maxLossRate: tight } })).policy.telemetry.maxLossRate, tight)
+  for (const bad of [0, -0.1, 1.5, '0.5', null]) {
+    assert.throws(() => parsePolicy(JSON.stringify({ ...base, telemetry: { maxLossRate: bad } })), /telemetry.maxLossRate: must be a number in \(0, 1\]/)
+  }
+  assert.throws(() => parsePolicy(JSON.stringify({ ...base, telemetry: { maxLoss: 1 } })), /telemetry.maxLoss: unknown field/)
 })

@@ -11,6 +11,8 @@ import { writeJson, writeText } from './run-dir.ts'
 import {
   applyGates,
   judgeSmokeTelemetry,
+  lossLine,
+  telemetryLoss,
   queryFault,
   queryTo,
   serviceFilter,
@@ -137,9 +139,11 @@ export async function stageTelemetry(
       combined.push(event)
     }
     const summary = summarizeTelemetry(opts.version, requests, combined, traces, spans)
-    const judged = judgeSmokeTelemetry({ version: opts.version, requests, summary, ceilings: SMOKE_LATENCY })
+    const { maxLossRate } = config.policy.telemetry
+    const loss = telemetryLoss(requests, summary, maxLossRate)
+    const judged = judgeSmokeTelemetry({ version: opts.version, requests, summary, ceilings: SMOKE_LATENCY, maxLossRate })
     const judge = applyGates(judged, config.policy.gates)
-    const markdown = telemetryMarkdown({ version: opts.version, from, to, judge, summary })
+    const markdown = telemetryMarkdown({ version: opts.version, from, to, judge, summary, loss })
     const stem = opts.live ? 'live-telemetry' : 'telemetry'
     await writeText(opts.runDir, `${stem}.md`, markdown)
     const failures = judge.kind === 'worker'
@@ -155,12 +159,29 @@ export async function stageTelemetry(
       version: opts.version,
       failures,
       line: judge.line,
+      loss,
       from,
       to,
     }
     await writeJson(opts.runDir, `${stem}.json`, verdict)
     const log = activeLog()
     if (log) {
+      await log.observation({
+        measurement: {
+          source: 'telemetry-loss',
+          live: opts.live,
+          count: loss.count,
+          total: loss.total,
+          rate: loss.rate,
+          maxLossRate: loss.maxLossRate,
+          exceeded: loss.exceeded,
+          ids: loss.ids.map(lost => ({ id: lost.id, step: lost.step, log: lost.log, trace: lost.trace })),
+        },
+        query: { logs: telemetryQuery('events', from, to, [serviceFilter(config.worker)]) },
+        from,
+        to,
+        raw: lossLine(loss),
+      })
       const ref = await log.observation({
         measurement: { source: 'smoke-telemetry', pass: judge.kind === 'pass', line: judge.line },
         query: {
