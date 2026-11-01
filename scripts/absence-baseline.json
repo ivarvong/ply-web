@@ -3,9 +3,9 @@
   "counts": {
     "word": 192,
     "optional": 366,
-    "chain": 540,
-    "nullish": 601,
-    "total": 1699
+    "chain": 538,
+    "nullish": 600,
+    "total": 1696
   },
   "files": {
     "cloudflare.config.ts": {
@@ -305,9 +305,9 @@
     "src/flags/cache.ts": {
       "word": 0,
       "optional": 3,
-      "chain": 2,
-      "nullish": 1,
-      "total": 6
+      "chain": 0,
+      "nullish": 0,
+      "total": 3
     },
     "src/flags/client.ts": {
       "word": 4,
