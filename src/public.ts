@@ -5,6 +5,8 @@
 // `${PUBLIC_GIT_ORIGIN}/git/${PUBLIC_NAMESPACE}/<repo>(.git)/info/refs?service=git-upload-pack` or `…/git-upload-pack`.
 // That check runs on the raw URL of every request ply makes and of every redirect hop, because the attaching fetch sits
 // below the redirect-following guards (createGuardedFetch, createViewerFetch) and each hop calls it again.
+import { atIndex, captureGroup, chainGet, fromNullable, mapGet, thrownField } from './absent.ts';
+import { unwrapOr } from './option.ts';
 import { fail } from 'ply';
 import { extractRequestPath, rawPathHasUnsafeSegment } from './pathguard.ts';
 
@@ -46,16 +48,33 @@ export function publicRepoShortName(host: string, repoPath: string): string | nu
 
 export type RepoPresence = true | false | 'unknown';
 
+function thrownText(error: unknown): string {
+  const message = thrownField(error, 'message');
+  return String(message.tag === 'some' ? message.value : error);
+}
+
+// `handle[Symbol.dispose]()` when the stub exposes it. A null handle still throws, matching a property read.
+// A present non-function throws when called. A missing dispose is a no-op.
+function releaseStub(handle: unknown): void {
+  const dispose = (handle as Partial<Disposable>)[Symbol.dispose];
+  const present = fromNullable(dispose);
+  if (present.tag === 'none') return;
+  const fn = present.value as (this: unknown) => void;
+  fn.call(handle);
+}
+
 /** True when the namespace binding has the repo. `unknown` when the binding is missing or errors for another reason. */
-export async function publicRepoExists(binding: ArtifactsNamespace | undefined | null, name: string): Promise<RepoPresence> {
+export async function publicRepoExists(binding: unknown, name: string): Promise<RepoPresence> {
   if (!isPublicRepoName(name)) return false;
-  if (!binding || typeof binding.get !== 'function') return 'unknown';
+  if (binding === null || typeof binding !== 'object') return 'unknown';
+  const get = chainGet(binding, 'get');
+  if (get.tag === 'none' || typeof get.value !== 'function') return 'unknown';
   try {
-    const handle = await binding.get(name);
-    try { handle[Symbol.dispose]?.(); } catch { /* releasing the RPC stub is best effort */ }
+    const handle = await (binding as { get(name: string): Promise<unknown> }).get(name);
+    try { releaseStub(handle); } catch { /* releasing the RPC stub is best effort */ }
     return true;
   } catch (e) {
-    if (/not.?found|does not exist|no such/i.test(String((e as { message?: string })?.message ?? e))) return false;
+    if (/not.?found|does not exist|no such/i.test(thrownText(e))) return false;
     return 'unknown';
   }
 }
@@ -71,15 +90,15 @@ function escapeRegExp(s: string): string {
 }
 
 const NS = escapeRegExp(PUBLIC_NAMESPACE);
-const REPO_PATH = new RegExp(`^/git/${NS}/([^/]+?)(?:\\.git)?$`);
-const ENDPOINT_PATH = new RegExp(`^/git/${NS}/([^/]+?)(?:\\.git)?/(info/refs|git-upload-pack)$`);
+const REPO_PATH = new RegExp(`^/git/${NS}/([^/]+?)(\\.git)?$`);
+const ENDPOINT_PATH = new RegExp(`^/git/${NS}/([^/]+?)(\\.git)?/(info/refs|git-upload-pack)$`);
 
 /** The repo name when `raw` is exactly a public-namespace repo URL on `origin` (no trailing endpoint). */
 export function publicRepoOfRemote(raw: string, origin: string = PUBLIC_GIT_ORIGIN): string | null {
   const path = cleanPath(raw, origin);
   if (path === null) return null;
-  const m = REPO_PATH.exec(path);
-  return m?.[1] && isPublicRepoName(m[1]) ? m[1] : null;
+  const name = captureGroup(REPO_PATH.exec(path), 1);
+  return name.tag === 'some' && isPublicRepoName(name.value) ? name.value : null;
 }
 
 /**
@@ -119,18 +138,20 @@ function cleanPath(raw: string, origin: string): string | null {
 export function publicUploadPackRepo(method: string, raw: string, origin: string = PUBLIC_GIT_ORIGIN): string | null {
   const path = cleanPath(raw, origin);
   if (path === null) return null;
-  const m = ENDPOINT_PATH.exec(path);
-  if (!m?.[1] || !isPublicRepoName(m[1])) return null;
+  const matched = ENDPOINT_PATH.exec(path);
+  const name = captureGroup(matched, 1);
+  if (name.tag === 'none' || !isPublicRepoName(name.value)) return null;
   const query = raw.slice(origin.length + path.length);
   const verb = method.toUpperCase();
-  if (m[2] === 'info/refs') return verb === 'GET' && query === '?service=git-upload-pack' ? m[1] : null;
-  return verb === 'POST' && query === '' ? m[1] : null;
+  const endpoint = captureGroup(matched, 3);
+  if (endpoint.tag === 'some' && endpoint.value === 'info/refs') return verb === 'GET' && query === '?service=git-upload-pack' ? name.value : null;
+  return verb === 'POST' && query === '' ? name.value : null;
 }
 
-/** The subset of the Artifacts Workers binding this module uses. */
+/** The subset of the Artifacts Workers binding this module uses. `expiresAt` and repo `status` are read at runtime. */
 export type ArtifactsNamespace = {
-  get(name: string): Promise<{ createToken(scope: 'read' | 'write', ttl: number): Promise<{ plaintext: string; expiresAt?: string | number | Date }> } & Partial<Disposable>>;
-  list?(opts?: { limit?: number }): Promise<{ repos: { name: string; status?: string }[] }>;
+  get(name: string): Promise<{ createToken(scope: 'read' | 'write', ttl: number): Promise<{ plaintext: string }> } & Partial<Disposable>>;
+  list?(opts: { limit: number }): Promise<{ repos: { name: string }[] }>;
 };
 
 type Cached = { token: string; expiresAtMs: number };
@@ -147,8 +168,13 @@ function expiryMs(expiresAt: unknown, token: string, now: number): number {
   if (typeof expiresAt === 'number') return expiresAt < 1e12 ? expiresAt * MS_PER_SECOND : expiresAt;
   if (typeof expiresAt === 'string' && !Number.isNaN(Date.parse(expiresAt))) return Date.parse(expiresAt);
   // Token format: art_v1_<40 hex>?expires=<unix seconds> (developers.cloudflare.com/artifacts/api/git-protocol).
-  const m = /[?&]expires=(\d+)/.exec(token);
-  return m?.[1] ? Number(m[1]) * MS_PER_SECOND : now + READ_TOKEN_TTL_S * MS_PER_SECOND;
+  const seconds = captureGroup(/[?&]expires=(\d+)/.exec(token), 1);
+  return seconds.tag === 'some' && seconds.value ? Number(seconds.value) * MS_PER_SECOND : now + READ_TOKEN_TTL_S * MS_PER_SECOND;
+}
+
+function presentText(value: unknown): string {
+  const plain = chainGet(value, 'plaintext');
+  return plain.tag === 'some' ? String(plain.value) : '';
 }
 
 /**
@@ -163,19 +189,25 @@ export function createTokenSource(binding: ArtifactsNamespace, now: () => number
     const handle = await binding.get(repo);
     try {
       const minted = await handle.createToken('read', READ_TOKEN_TTL_S);
-      const token = String(minted?.plaintext ?? '');
+      const token = presentText(minted);
       if (token.length < 8) throw fail('upstream_5xx', 'the public namespace did not return a read token');
       const old = cache.get(repo);
       if (old) retired.push(old.token);
       if (retired.length > MAX_CACHED_TOKENS) retired.splice(0, retired.length - MAX_CACHED_TOKENS);
       if (cache.size >= MAX_CACHED_TOKENS && !cache.has(repo)) {
-        const first = cache.keys().next().value;
-        if (first !== undefined) { retired.push(cache.get(first)?.token ?? ''); cache.delete(first); }
+        const next = cache.keys().next();
+        if (!next.done) {
+          const first = next.value;
+          const hit = mapGet(cache, first);
+          retired.push(hit.tag === 'some' ? hit.value.token : '');
+          cache.delete(first);
+        }
       }
-      cache.set(repo, { token, expiresAtMs: expiryMs(minted?.expiresAt, token, now()) });
+      const exp = chainGet(minted, 'expiresAt');
+      cache.set(repo, { token, expiresAtMs: expiryMs(exp.tag === 'some' ? exp.value : null, token, now()) });
       return token;
     } finally {
-      try { handle[Symbol.dispose]?.(); } catch { /* releasing the RPC stub is best effort */ }
+      try { releaseStub(handle); } catch { /* releasing the RPC stub is best effort */ }
     }
   };
   return {
@@ -190,9 +222,10 @@ export function createTokenSource(binding: ArtifactsNamespace, now: () => number
       }
       try { return await p; }
       catch (e) {
-        if ((e as { code?: string })?.code === 'upstream_5xx') throw e;
+        const code = thrownField(e, 'code');
+        if (code.tag === 'some' && code.value === 'upstream_5xx') throw e;
         // binding.get throws when the repo does not exist (developers.cloudflare.com/artifacts/api/workers-binding/#getname).
-        if (/not.?found|does not exist|no such/i.test(String((e as { message?: string })?.message ?? e))) throw fail('not_found', `no repository ${repo} in the public namespace`, { miss: { kind: 'repository' } });
+        if (/not.?found|does not exist|no such/i.test(thrownText(e))) throw fail('not_found', `no repository ${repo} in the public namespace`, { miss: { kind: 'repository' } });
         throw fail('upstream_5xx', 'could not mint a read token for the public namespace');
       }
     },
@@ -200,7 +233,7 @@ export function createTokenSource(binding: ArtifactsNamespace, now: () => number
       const out: string[] = [];
       for (const t of [...[...cache.values()].map(c => c.token), ...retired]) {
         if (!t) continue;
-        const bare = t.split('?')[0] ?? t;
+        const bare = unwrapOr(atIndex(t.split('?'), 0), t);
         out.push(t, bare, btoa(`x-access-token:${t}`), btoa(`x-access-token:${bare}`), encodeURIComponent(t));
       }
       return out;
@@ -211,10 +244,12 @@ export function createTokenSource(binding: ArtifactsNamespace, now: () => number
 // One token source per binding object, so an isolate shares its cached tokens across requests.
 const SOURCES = new WeakMap<object, TokenSource>();
 
-export function tokenSourceFor(binding: ArtifactsNamespace | undefined | null): TokenSource | null {
-  if (!binding || typeof binding !== 'object' || typeof binding.get !== 'function') return null;
+export function tokenSourceFor(binding: unknown): TokenSource | null {
+  if (binding === null || typeof binding !== 'object') return null;
+  const get = chainGet(binding, 'get');
+  if (get.tag === 'none' || typeof get.value !== 'function') return null;
   let source = SOURCES.get(binding);
-  if (!source) { source = createTokenSource(binding); SOURCES.set(binding, source); }
+  if (!source) { source = createTokenSource(binding as ArtifactsNamespace); SOURCES.set(binding, source); }
   return source;
 }
 
@@ -236,12 +271,16 @@ export const EMPTY_PUBLIC_REPOS: PublicRepoList = { names: [], unavailable: fals
  * A missing binding or an empty namespace is an empty list, not a failure.
  * `unavailable` is set only when the upstream `list()` call throws and nothing is cached.
  */
-export async function listPublicRepos(binding: ArtifactsNamespace | undefined | null, now: number = Date.now()): Promise<PublicRepoList> {
-  if (!binding || typeof binding.list !== 'function') return EMPTY_PUBLIC_REPOS;
+export async function listPublicRepos(binding: unknown, now: number = Date.now()): Promise<PublicRepoList> {
+  if (binding === null || typeof binding !== 'object') return EMPTY_PUBLIC_REPOS;
+  const list = chainGet(binding, 'list');
+  if (list.tag === 'none' || typeof list.value !== 'function') return EMPTY_PUBLIC_REPOS;
   if (listed && now - listed.at < LIST_TTL_MS) return { names: listed.names, unavailable: false };
   try {
-    const page = await binding.list({ limit: LIST_LIMIT });
-    const names = (page?.repos ?? []).filter(r => !r.status || r.status === 'ready').map(r => String(r.name)).filter(isPublicRepoName).sort();
+    const page = await (binding as { list(opts: { limit: number }): Promise<unknown> }).list({ limit: LIST_LIMIT });
+    const reposField = chainGet(page, 'repos');
+    const repos = (reposField.tag === 'none' ? [] : reposField.value) as readonly { status: unknown; name: unknown }[];
+    const names = repos.filter(r => !r.status || r.status === 'ready').map(r => String(r.name)).filter(isPublicRepoName).sort();
     listed = { at: now, names };
     return { names, unavailable: false };
   } catch {
@@ -250,12 +289,26 @@ export async function listPublicRepos(binding: ArtifactsNamespace | undefined | 
   }
 }
 
-export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+/** Host fetch. Callers omit the second argument; this alias does not restate that parameter. */
+export type FetchLike = typeof globalThis.fetch;
 
 function requestUrl(input: RequestInfo | URL): string {
   if (typeof input === 'string') return input;
   if (input instanceof URL) return input.href;
   return input.url;
+}
+
+function methodOf(input: RequestInfo | URL, init: RequestInit | null): string {
+  const method = chainGet(init, 'method');
+  if (method.tag === 'some') return method.value as string;
+  return input instanceof Request ? input.method : 'GET';
+}
+
+function headersOf(input: RequestInfo | URL, init: RequestInit | null): Headers {
+  const headers = chainGet(init, 'headers');
+  if (headers.tag === 'some') return new Headers(headers.value as HeadersInit);
+  if (input instanceof Request) return new Headers(input.headers);
+  return new Headers();
 }
 
 /**
@@ -267,13 +320,16 @@ export function withPublicReadCredential(inner: FetchLike, tokens: TokenSource |
   return async (input, init) => {
     if (!tokens) return inner(input, init);
     const url = requestUrl(input);
-    const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
+    const given = fromNullable(init);
+    const initValue = given.tag === 'some' ? given.value : null;
+    const method = methodOf(input, initValue);
     const repo = publicUploadPackRepo(method, url, origin);
     if (repo === null) return inner(input, init);
-    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    const headers = headersOf(input, initValue);
     if (headers.has('authorization')) return inner(input, init);
     headers.set('authorization', `Bearer ${await tokens.readToken(repo)}`);
-    return inner(url, { ...init, method, headers });
+    const next: RequestInit = given.tag === 'some' ? { ...given.value, method, headers } : { method, headers };
+    return inner(url, next);
   };
 }
 
