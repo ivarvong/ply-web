@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 59,
-    "optional": 117,
-    "chain": 182,
-    "nullish": 212,
-    "total": 570
+    "word": 46,
+    "optional": 106,
+    "chain": 157,
+    "nullish": 193,
+    "total": 502
   },
   "files": {
     "cloudflare.config.ts": {
@@ -413,20 +413,6 @@
       "chain": 1,
       "nullish": 3,
       "total": 4
-    },
-    "test/worker-entrypoints.test.ts": {
-      "word": 6,
-      "optional": 11,
-      "chain": 18,
-      "nullish": 2,
-      "total": 37
-    },
-    "test/worker.test.js": {
-      "word": 7,
-      "optional": 0,
-      "chain": 7,
-      "nullish": 17,
-      "total": 31
     },
     "test/write.test.ts": {
       "word": 0,
