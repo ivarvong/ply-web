@@ -1,6 +1,7 @@
 // The /v1 write handlers. Parsing that can fail with bad_request happens before a transport is opened.
 // An unborn HEAD is read only when a call needs the default branch or a not_found might be that empty ref.
 import { fail, mergeBranch, operation, parseCommitId, readCommit, rebaseBranch } from 'ply'
+import { chainGet, fromNullable, recordGet } from '../absent.ts'
 import { type CallOpts } from './call.ts'
 import { createBranch, deleteRef } from './branch.ts'
 import { commitEdit } from './commit.ts'
@@ -24,24 +25,34 @@ async function bornRef(remote: string, opts: CallOpts, field: string): Promise<s
 }
 
 async function requireRef(remote: string, opts: CallOpts, given: unknown, field: string, parse: (value: unknown, name: string) => string = branchRef): Promise<string> {
-  if (given !== undefined && given !== null && given !== '') return parse(given, field)
+  const present = fromNullable(given)
+  if (present.tag === 'some' && present.value !== '') return parse(present.value, field)
   return bornRef(remote, opts, field)
 }
 
 async function clarifyUnborn(remote: string, opts: CallOpts, err: unknown, verb: string): Promise<unknown> {
-  if ((err as { code?: string })?.code !== 'not_found') return err
-  const message = String((err as { message?: string })?.message ?? '')
+  const code = chainGet(err, 'code')
+  if (code.tag !== 'some' || code.value !== 'not_found') return err
+  const message = chainGet(err, 'message')
+  const text = message.tag === 'some' ? String(message.value) : ''
   try {
     const head = await readHeadState(remote, opts, 'head')
-    if (head.kind === 'unborn' && message.includes(head.ref)) return fail('not_found', `ref ${head.ref} is unborn; create a commit before ${verb}`, { miss: { kind: 'head_unborn', target: head.ref } })
+    if (head.kind === 'unborn' && text.includes(head.ref)) return fail('not_found', `ref ${head.ref} is unborn; create a commit before ${verb}`, { miss: { kind: 'head_unborn', target: head.ref } })
   } catch { /* the original not_found names whatever the remote actually rejected */ }
   return err
 }
 
-function textOr(value: unknown, field: string): string | undefined {
-  if (value === undefined || value === null) return undefined
-  if (typeof value !== 'string') throw fail('bad_request', `${field} must be a string`)
-  return value
+function textOr(value: unknown, field: string): string | null {
+  const found = fromNullable(value)
+  if (found.tag === 'none') return null
+  if (typeof found.value !== 'string') throw fail('bad_request', `${field} must be a string`)
+  return found.value
+}
+
+function optionalStamp(raw: Record<string, unknown>, key: string, field: string, now: ReturnType<typeof nowSeconds>) {
+  const found = recordGet(raw, key)
+  if (found.tag === 'none') return null
+  return stamp(found.value, field, now)
 }
 
 export async function handleEdit(remote: string, body: unknown, opts: CallOpts): Promise<{ body: Record<string, unknown> }> {
@@ -63,15 +74,15 @@ export async function handleMerge(remote: string, body: unknown, opts: CallOpts)
   const ref = await requireRef(remote, opts, raw.ref, 'ref')
   const from = refOrCommit(raw.from, 'from')
   const now = nowSeconds()
-  const author = raw.author === undefined ? null : stamp(raw.author, 'author', now)
-  const committer = raw.committer === undefined ? null : stamp(raw.committer, 'committer', now)
+  const author = optionalStamp(raw, 'author', 'author', now)
+  const committer = optionalStamp(raw, 'committer', 'committer', now)
   const message = textOr(raw.message, 'message')
   try {
     const result = await mergeBranch(remote, {
       ref,
       from,
-      author: author ? plyStamp(author) : undefined,
-      committer: committer ? plyStamp(committer) : undefined,
+      ...(author === null ? {} : { author: plyStamp(author) }),
+      ...(committer === null ? {} : { committer: plyStamp(committer) }),
       message,
       fastForwardOnly: !!raw.fastForwardOnly,
       noFastForward: !!raw.noFastForward,
@@ -89,14 +100,14 @@ export async function handleRebase(remote: string, body: unknown, opts: CallOpts
   const onto = await requireRef(remote, opts, raw.onto, 'onto', refOrCommit)
   const now = nowSeconds()
   const committer = stamp(raw.committer, 'committer', now)
-  const author = raw.author === undefined ? null : stamp(raw.author, 'author', now)
-  const message = raw.message === undefined ? null : textOr(raw.message, 'message') ?? null
+  const author = optionalStamp(raw, 'author', 'author', now)
+  const message = textOr(raw.message, 'message')
   try {
     const result = await rebaseBranch(remote, {
       ref,
       onto,
       committer: plyStamp(committer),
-      author: author ? plyStamp(author) : undefined,
+      ...(author === null ? {} : { author: plyStamp(author) }),
       squash: !!raw.squash,
       message,
     }, opts) as Record<string, unknown>
@@ -114,10 +125,11 @@ async function handlePick(remote: string, body: unknown, opts: CallOpts, revert:
   if (!parsed.ok) throw parsed.error
   const commit = parsed.value
   const committer = stamp(raw.committer, 'committer', nowSeconds())
-  if (raw.allowEmpty !== undefined && typeof raw.allowEmpty !== 'boolean') throw fail('bad_request', 'allowEmpty must be true or false')
-  const message = raw.message === undefined || raw.message === null ? null : textOr(raw.message, 'message') ?? null
+  const allowEmpty = recordGet(raw, 'allowEmpty')
+  if (allowEmpty.tag === 'some' && typeof allowEmpty.value !== 'boolean') throw fail('bad_request', 'allowEmpty must be true or false')
+  const message = textOr(raw.message, 'message')
   try {
-    return { body: await pick(remote, opts, { ref, commit, committer, message, allowEmpty: raw.allowEmpty === true, revert }) }
+    return { body: await pick(remote, opts, { ref, commit, committer, message, allowEmpty: allowEmpty.tag === 'some' && allowEmpty.value === true, revert }) }
   } catch (e) {
     throw await clarifyUnborn(remote, opts, e, revert ? 'reverting' : 'cherry-picking')
   }
@@ -134,19 +146,20 @@ const EMPTY_COMMIT = { empty: true, oid: null, tree: null, parents: [], author: 
 /** A born commit is ply's readCommit body, unchanged. An unborn HEAD (or that same branch by name) is the empty-repo body. */
 export async function readCommitOrEmpty(remote: string, ref: string | null, opts: CallOpts): Promise<Record<string, unknown>> {
   try {
-    // The declaration types `ref` as null, which is only the default. A branch name or oid is what readCommit resolves.
+    // A branch name or oid is what readCommit resolves. Omitting ref is ply's default.
     // ply returns `{ empty: true, ref }` for an unborn HEAD. The documented body also carries the null commit fields.
-    const read = await readCommit(remote, { ref } as { ref?: null }, opts)
+    const read = await readCommit(remote, { ref }, opts)
     if ('empty' in read) {
       noteUnbornAdvertised(remote)
       return { ...EMPTY_COMMIT, ref: read.ref }
     }
     return read
   } catch (e) {
-    if ((e as { code?: string })?.code !== 'not_found') throw e
+    const code = chainGet(e, 'code')
+    if (code.tag !== 'some' || code.value !== 'not_found') throw e
     try {
       const head = await readHeadState(remote, opts, 'read_commit')
-      const wanted = ref ?? ''
+      const wanted = ref === null ? '' : ref
       if (head.kind === 'unborn' && (wanted === '' || wanted === 'HEAD' || sameBranch(wanted, head.ref))) return { ...EMPTY_COMMIT, ref: head.ref }
     } catch { /* a missing repository stays the original not_found */ }
     throw e
