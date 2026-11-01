@@ -85,7 +85,7 @@ test('a short clean sample is insufficient evidence and holds', () => {
   assert.equal(applyRamp({ kind: 'ramping', step: 4 }, ready, 5).kind, 'complete')
 })
 
-test('unavailable telemetry is a harness fault and does not roll back', async () => {
+test('unavailable telemetry above 0% is a harness fault and rolls back to previous', async () => {
   const decision = decideRampStep({ kind: 'unavailable', reason: 'telemetry unavailable: cf o11y down' }, twoSteps, 50)
   assert.equal(decision.outcome, 'harness_fault')
   assert.match(decision.reason, /telemetry unavailable/)
@@ -102,8 +102,8 @@ test('unavailable telemetry is a harness fault and does not roll back', async ()
     },
   })
   assert.equal(result.state.kind, 'stopped')
-  if (result.state.kind === 'stopped') assert.equal(result.state.fault, 'harness_fault')
-  assert.equal(rolled, 0)
+  if (result.state.kind === 'stopped' && result.state.fault === 'harness_fault') assert.equal(result.state.traffic, 'rolled_back')
+  assert.equal(rolled, 1)
   assert.match(result.lines[0] ?? '', /decision=harness_fault/)
 })
 
@@ -153,6 +153,7 @@ test('progress line labels latency informational and names a carried baseline', 
     share,
     decision: advance,
     latency: 'informational',
+    probe: { kind: 'none' },
   })
   assert.match(line, /^ramp step=1\/5 percent=50 previous=50 /)
   assert.match(line, /routed_share=50.00 target=50 tolerance=42.50..57.50 agg=400/)
@@ -168,6 +169,7 @@ test('progress line labels latency informational and names a carried baseline', 
     share: routedShare(120, 120, 100, 3),
     decision: advance,
     latency: 'informational',
+    probe: { kind: 'none' },
   })
   assert.equal(
     carried,
@@ -196,26 +198,40 @@ test('at 100% the old side is the last wall sample that met the quantile floor',
   assert.match(result.lines[1] ?? '', /p99_wall_ms=90\/84/)
 })
 
-test('a harness fault during the dwell stops and does not roll back', async () => {
+test('a harness fault during the dwell rolls back and records the loss', async () => {
   let rolled = 0
-  const result = await runRamp(policy([{ percent: 1, dwellMs: 1 }, { percent: 100, dwellMs: 1 }]), {
+  let observed = 0
+  const result = await runRamp(policy([{ percent: 100, dwellMs: 1 }]), {
     now: () => 0,
     sleep: async () => {},
-    dwell: async () => ({ harnessFaults: 1 }),
+    dwell: async () => ({
+      outcomes: [
+        { kind: 'lost', id: '1 GET https://ply.ivar.workers.dev/', reason: 'aborted' },
+      ],
+    }),
     applySplit: async () => null,
-    observe: async () => sample(),
+    observe: async () => {
+      observed += 1
+      return sample()
+    },
     rollback: async () => {
       rolled += 1
       return null
     },
   })
   assert.equal(result.state.kind, 'stopped')
-  if (result.state.kind === 'stopped') {
-    assert.equal(result.state.fault, 'harness_fault')
-    assert.equal(result.state.reason, 'harness fault during probes')
+  if (result.state.kind === 'stopped' && result.state.fault === 'harness_fault') {
+    assert.equal(result.state.traffic, 'rolled_back')
+    assert.match(result.state.reason, /probe loss 1\/1/)
   }
-  assert.equal(rolled, 0)
-  assert.equal(result.lines.length, 0)
+  assert.equal(rolled, 1)
+  assert.equal(observed, 0)
+  const recorded = result.steps[0]
+  if (!recorded) throw new Error('missing probe step')
+  assert.equal(recorded.probeLoss.ids[0], '1 GET https://ply.ivar.workers.dev/')
+  const recordedLine = result.lines[0]
+  if (!recordedLine) throw new Error('missing probe line')
+  assert.match(recordedLine, /probe_loss=1\/1/)
 })
 
 test('a state conflict stops and does not roll back', async () => {

@@ -6,7 +6,7 @@ export type Pass<T> = {
   readonly value: T
 }
 
-export type Fault = 'worker' | 'harness_fault' | 'state_conflict'
+export type Fault = 'worker' | 'harness_fault' | 'state_conflict' | 'insufficient_samples'
 
 export type Fail = {
   readonly kind: 'fail'
@@ -14,7 +14,11 @@ export type Fail = {
   readonly reason: string
   /** The ramp (or a safety check) already moved traffic back to the previous version at 100%. */
   readonly rolledBack: boolean
-  /** `harness_fault` and `state_conflict` leave the split where it is. */
+  /**
+   * `harness_fault` above 0% has already moved traffic: rolled back to `previous`, or held at the
+   * last fully passed split. `state_conflict` does not move traffic. `insufficient_samples` is not a pass
+   * and is not a correctness failure.
+   */
   readonly fault: Fault
 }
 
