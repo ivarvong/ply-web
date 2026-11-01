@@ -62,7 +62,13 @@ ETag: <revision>
 Cache-Tag: flags
 ```
 
-`max-age` and `stale-while-revalidate` are `FLAGS_MAX_AGE_S` and `FLAGS_SWR_S`. There is no `s-maxage` and no `must-revalidate`. A revalidation sends `If-None-Match`. The same revision answers `304` and the cache keeps the body.
+The `ETag` is only on a present ruleset. The 404 for an object that has not been written yet uses the same `Cache-Control` and `Cache-Tag`.
+
+`max-age` and `stale-while-revalidate` are `FLAGS_MAX_AGE_S` and `FLAGS_SWR_S`. There is no `s-maxage`, no `must-revalidate`, and no `proxy-revalidate`: those directives disable stale-while-revalidate. There is no `Set-Cookie` and no `Vary`. A `no-store` answer is a bypass, so Workers Cache runs the entrypoint on every call. That was the empty ruleset: `GET /` consults `ply.usage.note` on purpose (the example gate, default off), and each of those calls read R2. The empty answer now uses the header above, so the next request is a hit until `FlagControl` invalidates the `flags` tag. A store error or an invalid document stays `no-store`.
+
+The call is one `GET` of `https://flags.internal/config`. The cache key is that path and an empty query. The host is not part of the key. The request carries no `Authorization` and no `Cookie`, and it does not vary by unit. `Authorization` bypasses storage unless the response is `public`; this response is `public`, and the header is still omitted. A revalidation sends `If-None-Match`. The same revision answers `304` and the cache keeps the body.
+
+`flags.resolve` and `flags.eval` already record `cache_status` (`HIT`, `MISS`, `STALE`, and the other `Cf-Cache-Status` values) from that response.
 
 After a successful put, `FlagControl` calls `FlagsCache.invalidate()`. That method runs `ctx.cache.invalidate({ tags: ['flags'] })`. Invalidate is scoped to the entrypoint that owns the cache, so the call runs on `FlagsCache`, not on the writer. The next read is a revalidation: one R2 read, then either `304` or a new body.
 

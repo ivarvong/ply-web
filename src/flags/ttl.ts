@@ -1,6 +1,7 @@
 // Named TTLs for the one cached ruleset. cloudflare.config.ts publishes the same numbers as text bindings.
 // max-age is the fresh window. stale-while-revalidate is how long a failed revalidation may still be served.
-// Neither value is an s-maxage, and the response must not say must-revalidate: Workers Cache follows Cache-Control.
+// Neither value is an s-maxage, and the response must not say must-revalidate: those directives
+// disable stale-while-revalidate. An absent ruleset uses this same header. no-store is a bypass.
 
 export const FLAGS_MAX_AGE_S = 5;
 export const FLAGS_SWR_S = 60;
