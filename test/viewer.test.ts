@@ -395,7 +395,7 @@ test('rate and byte caps clamp and fail closed', () => {
   const budget = createBudget(100, 2);
   budget.countSubrequest();
   budget.countSubrequest();
-  assert.equal(budget.canSpend(), false);
+  assert.equal(budget.canSpend(1), false);
   assert.throws(() => budget.countSubrequest(), (err: { code?: string }) => err.code === 'limit_exceeded');
   const bytes = createBudget(4, 16);
   bytes.addBytes(4);

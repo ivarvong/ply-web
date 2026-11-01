@@ -1,6 +1,8 @@
 // Pure tree edits. A `lazy` node is an object the server already has (we send nothing for it). A `dir` is a tree
 // this commit is rebuilding. Empty directories are pruned; git does not store them. The root may be empty.
 import { fail, encodeTree, hashObject } from 'ply';
+import { mapGet } from '../absent.ts';
+import { orNull } from '../option.ts';
 import { MODE_TREE, NOT_FOUND } from './constants.ts';
 import type { BlobMode } from './request.ts';
 
@@ -62,7 +64,7 @@ export function putAt(node: Mem, comps: readonly string[], leaf: Mem, overwrite:
   requireDir(node, path);
   const [name, ...rest] = comps;
   if (!name) throw fail('bad_request', 'path is empty');
-  const prev = node.entries.get(name) ?? null;
+  const prev = orNull(mapGet(node.entries, name));
   if (rest.length === 0) {
     if (prev && isTree(prev)) throw fail('bad_request', `${path} is a directory`);
     if (prev && !overwrite) throw fail('bad_request', `${path} already exists`);
