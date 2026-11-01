@@ -2,6 +2,8 @@
 // only against refs the server already advertised (branch tips, tag tips, peeled tag commits). Anything
 // else is a bad_request that tells the caller to send the full oid.
 
+import { chainGet } from './absent.ts';
+
 /** Shortest abbreviation this API will try. Shorter hex stays a ref name. */
 export const MIN_ABBREV_HEX = 7;
 /** SHA-1 object ids. ply reads only sha1 repositories. */
@@ -13,7 +15,8 @@ const FULL_OID = new RegExp(`^[0-9a-f]{${FULL_OID_HEX}}$`);
 /** Prefixes that name the refs a cheap disambiguation may see. One ls-refs, no object walk. */
 export const ADVERTISED_REF_PREFIXES = ['HEAD', 'refs/heads/', 'refs/tags/'] as const;
 
-export type AdvertisedRef = { oid: string; peeled?: string };
+/** A ref the server already advertised. A peeled commit, when the record has one, is read at the boundary. */
+export type AdvertisedRef = { readonly oid: string };
 
 export type AbbrevMatch =
   | { kind: 'unique'; oid: string }
@@ -37,8 +40,11 @@ export function matchAbbreviatedOid(prefix: string, refs: Iterable<readonly [str
   for (const [, rec] of refs) {
     const oid = rec.oid.toLowerCase();
     if (oid.startsWith(prefix)) hits.add(oid);
-    const peeled = rec.peeled?.toLowerCase();
-    if (peeled && peeled.startsWith(prefix)) hits.add(peeled);
+    const peeled = chainGet(rec, 'peeled');
+    if (peeled.tag === 'some' && typeof peeled.value === 'string' && peeled.value.length > 0) {
+      const lower = peeled.value.toLowerCase();
+      if (lower.startsWith(prefix)) hits.add(lower);
+    }
   }
   if (hits.size === 1) {
     const oid = hits.values().next().value;
