@@ -202,7 +202,7 @@ test('a flag write then an immediate read is EXPIRED and the smoke rule accepts 
   }
   const warm = await cache.fetch(rulesetRequest())
   assert.equal(warm.status, 404)
-  await warm.body?.cancel()
+  if (warm.body) await warm.body.cancel()
   const written = await setRollout(
     store,
     { invalidate: async () => cache.invalidate() },
@@ -221,7 +221,7 @@ test('a flag write then an immediate read is EXPIRED and the smoke rule accepts 
   assert.equal(response.status, HTTP_OK)
   const body: unknown = await response.json()
   assert.ok(body && typeof body === 'object')
-  const listed = body as { cache?: unknown; revision?: unknown }
+  const listed = body as Record<string, unknown>
   assert.equal(listed.cache, 'EXPIRED')
   assert.equal(listed.revision, written.revision)
   const judged = judge({ kind: 'flags-rules' }, response.status, body)
