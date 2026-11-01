@@ -1,6 +1,7 @@
 // Caps for the public viewer. They are not environment-tunable: a mis-set var must not raise them.
 // Rate limits are the exception (tests lower them); even those are clamped.
 import { withLimits } from 'ply';
+import type { Option } from '../option.ts';
 
 export const VIEWER_UA = 'ply-viewer/0.1.0';
 
@@ -52,10 +53,10 @@ export const VIEWER_GIT_LIMITS = withLimits({
 
 export type RateBucket = 'page' | 'pack';
 
-export function rateLimitFor(bucket: RateBucket, raw: string | undefined): number {
+export function rateLimitFor(bucket: RateBucket, raw: Option<string>): number {
   const fallback = bucket === 'pack' ? VIEWER_CAPS.packRatePerMinute : VIEWER_CAPS.ratePerMinute;
-  if (raw === undefined || raw === '') return fallback;
-  const n = Number(raw);
+  if (raw.tag === 'none' || raw.value === '') return fallback;
+  const n = Number(raw.value);
   if (!Number.isInteger(n)) return fallback;
   if (n < 1) return 1;
   if (n > VIEWER_CAPS.rateCeiling) return VIEWER_CAPS.rateCeiling;
