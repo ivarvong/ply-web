@@ -1,5 +1,7 @@
 // p50/p95/p99 of flags.eval by cache status, and the count of resolved variants by flag and revision.
 // Unit id is not a dimension. The same percentile index as scripts/cd/telemetry.ts: floor((n - 1) * p).
+import { atIndex, chainGet, mapGet } from '../absent.ts';
+import { unwrapOr } from '../option.ts';
 
 export type Quantiles = { readonly n: number; readonly p50: number | null; readonly p95: number | null; readonly p99: number | null };
 
@@ -29,16 +31,42 @@ function stringField(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
+function field(value: unknown, key: string): unknown {
+  return unwrapOr(chainGet(value, key), null);
+}
+
+function recordOrEmpty(first: Obj | null, second: Obj | null): Obj {
+  if (first !== null) return first;
+  if (second !== null) return second;
+  return {};
+}
+
+function firstString(...values: readonly unknown[]): string | null {
+  for (const value of values) {
+    const text = stringField(value);
+    if (text !== null) return text;
+  }
+  return null;
+}
+
+function firstPositive(...values: readonly unknown[]): number | null {
+  for (const value of values) {
+    const ms = positiveMs(value);
+    if (ms !== null) return ms;
+  }
+  return null;
+}
+
 function fieldsOf(event: Obj): Obj {
-  const source = record(event.source) ?? {};
-  const attributes = record(event.attributes) ?? record(source.attributes) ?? {};
+  const source = recordOrEmpty(record(event.source), null);
+  const attributes = recordOrEmpty(record(event.attributes), record(field(source, 'attributes')));
   return { ...attributes, ...source, ...event };
 }
 
 export function percentile(values: readonly number[], p: number): number | null {
   const sorted = values.filter(value => Number.isFinite(value)).sort((a, b) => a - b);
   if (sorted.length === 0) return null;
-  return sorted[Math.floor((sorted.length - 1) * p)] ?? null;
+  return unwrapOr(atIndex(sorted, Math.floor((sorted.length - 1) * p)), null);
 }
 
 function quantiles(values: readonly number[]): Quantiles {
@@ -54,11 +82,11 @@ function positiveMs(value: unknown): number | null {
 
 function wallMs(fields: Obj): number | null {
   const workers = record(fields.$workers);
-  return positiveMs(workers?.wallTimeMs) ?? positiveMs(fields.wallTimeMs) ?? positiveMs(fields['$workers.wallTimeMs']);
+  return firstPositive(field(workers, 'wallTimeMs'), fields.wallTimeMs, fields['$workers.wallTimeMs']);
 }
 
 function spanMs(fields: Obj): number | null {
-  return positiveMs(fields.durationMs) ?? positiveMs(fields.durationMS) ?? positiveMs(fields.duration_ms);
+  return firstPositive(fields.durationMs, fields.durationMS, fields.duration_ms);
 }
 
 /**
@@ -67,36 +95,39 @@ function spanMs(fields: Obj): number | null {
  * wallTimeMs, then the span duration, fill that gap.
  */
 function measuredMs(fields: Obj): number | null {
-  return positiveMs(fields.resolve_ms)
-    ?? positiveMs(fields['flags.resolve_ms'])
-    ?? positiveMs(fields.eval_ms)
-    ?? positiveMs(fields['flags.eval_ms'])
-    ?? wallMs(fields)
-    ?? spanMs(fields);
+  return firstPositive(
+    fields.resolve_ms,
+    fields['flags.resolve_ms'],
+    fields.eval_ms,
+    fields['flags.eval_ms'],
+    wallMs(fields),
+    spanMs(fields),
+  );
 }
 type ResolvePoint = { readonly key: string; readonly revision: string; readonly variantKind: string; readonly variantValue: string; readonly reason: string };
 
 function evalPoint(event: Obj): EvalPoint | null {
   const fields = fieldsOf(event);
-  const name = stringField(fields.name) ?? stringField(fields.spanName);
+  const name = firstString(fields.name, fields.spanName);
   const msg = stringField(fields.msg);
   if (msg !== 'flags.eval' && name !== 'flags.eval') return null;
   const resolveMs = measuredMs(fields);
-  const cacheStatus = stringField(fields.cache_status) ?? stringField(fields['flags.cache_status']);
+  const cacheStatus = firstString(fields.cache_status, fields['flags.cache_status']);
   if (resolveMs === null || !cacheStatus) return null;
   return { cacheStatus, resolveMs };
 }
 
 function resolvePoint(event: Obj): ResolvePoint | null {
   const fields = fieldsOf(event);
-  const name = stringField(fields.name) ?? stringField(fields.spanName);
+  const name = firstString(fields.name, fields.spanName);
   const msg = stringField(fields.msg);
   if (msg !== 'flags.resolve' && name !== 'flags.resolve') return null;
-  const key = stringField(fields.key) ?? stringField(fields['flags.key']);
-  const revision = stringField(fields.revision) ?? stringField(fields['flags.revision']) ?? '';
-  const variantKind = stringField(fields.variant_kind) ?? stringField(fields['flags.variant_kind']);
-  const variantValue = stringField(fields.variant_value) ?? stringField(fields['flags.variant_value']);
-  const reason = stringField(fields.reason) ?? stringField(fields['flags.reason']);
+  const key = firstString(fields.key, fields['flags.key']);
+  const revisionText = firstString(fields.revision, fields['flags.revision']);
+  const revision = revisionText === null ? '' : revisionText;
+  const variantKind = firstString(fields.variant_kind, fields['flags.variant_kind']);
+  const variantValue = firstString(fields.variant_value, fields['flags.variant_value']);
+  const reason = firstString(fields.reason, fields['flags.reason']);
   if (!key || !variantKind || variantValue === null || !reason) return null;
   return { key, revision, variantKind, variantValue, reason };
 }
@@ -109,7 +140,7 @@ export function reportFromEvents(events: readonly unknown[]): FlagReport {
     if (!rec) continue;
     const sample = evalPoint(rec);
     if (sample) {
-      const list = durations.get(sample.cacheStatus) ?? [];
+      const list = unwrapOr(mapGet(durations, sample.cacheStatus), []);
       list.push(sample.resolveMs);
       durations.set(sample.cacheStatus, list);
     }
@@ -136,7 +167,7 @@ export const MEASUREMENT =
 
 export function renderReport(report: FlagReport): string {
   const lines = ['cache_status n p50_ms p95_ms p99_ms'];
-  for (const row of report.cache) lines.push([row.cacheStatus, row.n, row.p50 ?? '-', row.p95 ?? '-', row.p99 ?? '-'].join(' '));
+  for (const row of report.cache) lines.push([row.cacheStatus, row.n, quantileCell(row.p50), quantileCell(row.p95), quantileCell(row.p99)].join(' '));
   lines.push('', 'flag revision variant_kind variant_value reason count');
   for (const row of report.variants) {
     lines.push([row.key, row.revision || '-', row.variantKind, row.variantValue, row.reason, row.count].join(' '));
@@ -147,7 +178,11 @@ export function renderReport(report: FlagReport): string {
 export type TelemetryFilter = { readonly key: string; readonly operation: string; readonly type: string; readonly value: string };
 
 /** Workers observability query for one low-cardinality log. The filter set has no unit id. */
-export function flagLogQuery(worker: string, msg: 'flags.eval' | 'flags.resolve', from: number, to: number, offset?: string) {
+function quantileCell(value: number | null): number | string {
+  return value === null ? '-' : value;
+}
+
+export function flagLogQuery(worker: string, msg: 'flags.eval' | 'flags.resolve', from: number, to: number, offset: string | null) {
   const filters: TelemetryFilter[] = [
     { key: '$metadata.service', operation: 'eq', type: 'string', value: worker },
     { key: 'msg', operation: 'eq', type: 'string', value: msg },
