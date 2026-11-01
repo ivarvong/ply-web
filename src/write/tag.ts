@@ -2,7 +2,7 @@
 // Delete uses the same compare-and-swap as a branch delete.
 import { encodeTag, fail, fetchCommit, hashObject, ident, lsRefs, operation, parseCommitId, parseOid, push, resolveCommit, TYPE, ZERO_OID } from 'ply'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
-import { refExists } from './errors.ts'
+import { assertNever, refExists } from './errors.ts'
 import { nowSeconds, stamp, type Stamp } from './identity.ts'
 import { asBody, parseDeleteOid, tagRef } from './request.ts'
 import { writeResult } from './result.ts'
@@ -24,14 +24,20 @@ async function commitOf(t: Transport, target: string): Promise<string> {
     if (!fetched.ok) {
       const error = fetched.error
       if (error.code === 'not_found' && error.miss) {
+        // Tag targets are commits. A not_found from fetchCommit stays 404 with ply's message.
         switch (error.miss.kind) {
-          case 'absent':
-          case 'not_commit':
+          case 'commit':
+          case 'head_absent':
+          case 'head_unborn':
+          case 'is_directory':
+          case 'not_directory':
+          case 'path':
+          case 'ref':
+          case 'repository':
+          case 'submodule':
             throw error
-          default: {
-            const unreachable: never = error.miss
-            throw unreachable
-          }
+          default:
+            return assertNever(error.miss)
         }
       }
       throw error

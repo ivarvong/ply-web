@@ -46,6 +46,13 @@ export function lookup(node: Mem, comps: readonly string[]): Mem | null {
   return cur;
 }
 
+/** Where `comps` sits inside the caller's full `path`. `name` is the component under consideration. */
+function pathPlace(path: string, comps: readonly string[], name: string): { readonly existingPath: string; readonly here: string } {
+  const at = comps.join('/');
+  const existingPath = path === at ? '' : path.slice(0, path.length - at.length - 1);
+  return { existingPath, here: existingPath === '' ? name : `${existingPath}/${name}` };
+}
+
 function requireDir(node: Mem, path: string): asserts node is { kind: 'dir'; entries: ReadonlyMap<string, Mem> } {
   if (node.kind !== 'dir') throw fail('internal', `${path}: tree was not expanded before the edit`);
 }
@@ -73,9 +80,10 @@ export function removeAt(node: Mem, comps: readonly string[], path: string): Mem
   const [name, ...rest] = comps;
   if (!name) throw fail('bad_request', 'path is empty');
   const prev = node.entries.get(name);
-  if (!prev) throw fail('not_found', `${path} not found`);
+  const place = pathPlace(path, comps, name);
+  if (!prev) throw fail('not_found', `${path} not found`, { miss: { kind: 'path', missing: name, existingPath: place.existingPath } });
   if (rest.length === 0) return withEntry(node, name, null);
-  if (prev.kind !== 'dir') throw fail('not_found', `${path} not found`);
+  if (prev.kind !== 'dir') throw fail('not_found', `${path} not found`, { miss: { kind: 'not_directory', path: place.here, mode: prev.mode } });
   const child = removeAt(prev, rest, path);
   if (child.kind === 'dir' && child.entries.size === 0) return withEntry(node, name, null);
   return withEntry(node, name, child);
@@ -87,7 +95,7 @@ export function renameAt(node: Mem, from: readonly string[], to: readonly string
   if (source === dest) throw fail('bad_request', `${source} is already ${dest}`);
   if (dest.startsWith(`${source}/`)) throw fail('bad_request', `cannot rename ${source} into itself`);
   const found = lookup(node, from);
-  if (!found) throw fail('not_found', `${source} not found`);
+  if (!found) throw fail('not_found', `${source} not found`, { miss: { kind: 'path', missing: source, existingPath: '' } });
   if (lookup(node, to)) throw fail('bad_request', `${dest} already exists`);
   return putAt(removeAt(node, from, source), to, found, false, dest);
 }
