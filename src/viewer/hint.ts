@@ -1,4 +1,5 @@
 // The blue banner on an error page. It names the part that failed and only the facts we have for that part.
+import { chainGet } from '../absent.ts'
 import type { BranchInfo, TagInfo } from './model.ts'
 import { VIEWER_CAPS } from './limits.ts'
 
@@ -69,20 +70,24 @@ function isPathCue(value: unknown): value is PathCue {
 
 /** The hint attached by the viewer when it already knows which names or path prefix exist. Anything else is empty. */
 export function hintFromError(err: unknown): ViewerHint {
-  const raw = (err as { viewerHint?: unknown } | null)?.viewerHint
-  if (!raw || typeof raw !== 'object') return EMPTY_HINT
-  const nearbyRaw = (raw as { nearby?: unknown }).nearby
+  const found = chainGet(err, 'viewerHint')
+  if (found.tag === 'none' || typeof found.value !== 'object') return EMPTY_HINT
+  const raw = found.value
+  const nearbyFound = chainGet(raw, 'nearby')
+  const nearbyRaw = nearbyFound.tag === 'some' ? nearbyFound.value : null
   const nearby: NearbyRef[] = []
   if (Array.isArray(nearbyRaw)) {
     for (const item of nearbyRaw) {
       if (nearby.length >= VIEWER_CAPS.hintNearbyRefs) break
       if (!item || typeof item !== 'object') continue
-      const label = (item as { label?: unknown }).label
-      const ref = (item as { ref?: unknown }).ref
-      if (typeof label !== 'string' || typeof ref !== 'string' || label.length === 0 || ref.length === 0) continue
-      nearby.push({ label, ref })
+      const label = chainGet(item, 'label')
+      const ref = chainGet(item, 'ref')
+      if (label.tag === 'none' || ref.tag === 'none') continue
+      if (typeof label.value !== 'string' || typeof ref.value !== 'string' || label.value.length === 0 || ref.value.length === 0) continue
+      nearby.push({ label: label.value, ref: ref.value })
     }
   }
-  const pathRaw = (raw as { path?: unknown }).path
+  const pathFound = chainGet(raw, 'path')
+  const pathRaw = pathFound.tag === 'some' ? pathFound.value : null
   return { nearby, path: isPathCue(pathRaw) ? pathRaw : null }
 }
