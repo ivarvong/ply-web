@@ -1,6 +1,6 @@
 # Continuous deployment
 
-You ship ply-web from a Linux box where `cf` is already logged in. One command uploads the commit you have checked out, smokes it at 0%, then walks traffic from 0% to 100% over about five minutes. If a step goes bad, traffic goes back to the previous version and the command exits. GitHub holds the code and the pull request. It does not deploy.
+You ship ply-web from a Linux box where `cf` is already logged in. One command uploads the commit you have checked out, smokes it at 0%, then walks traffic from 0% to 100%. Each ramp step probes for 40s and then waits 60s so the telemetry tail is ingested. If a step goes bad, traffic goes back to the previous version and the command exits. GitHub holds the code and the pull request. It does not deploy.
 
 ![Operator pipeline. The left column is gate, deploy, smoke, telemetry, ramp, live smoke, live telemetry, done. Failures leave to the right.](img/cd-pipeline.png)
 
@@ -11,7 +11,7 @@ The left column is the only path that raises traffic. An arrow to the right is t
 On the box:
 
 - `cf auth login` already done. The login needs Workers Scripts Edit (versions and deployments; an account token calls this Workers Scripts Write), Workers Observability Read, and Artifacts Edit on the namespace below. It does not need routes, KV, R2, or tail.
-- `npm ci` in this repo. Node must satisfy `package.json` `engines` (`^22.23.0 || ^24.22.0 || >=26.12.0`). `.nvmrc` is `24.22.1`. `npm run cd` runs `scripts/cd.sh`, which uses `PLY_NODE` if you set it, then `/workspace/node-v24.22.1-linux-x64/bin/node` when that image directory is present, then `node` on `PATH`. If none of those satisfy engines, preflight stops and names that search. It does not judge the Worker.
+- `npm ci` in this repo. Node must satisfy `package.json` `engines` (`^22.23.0 || ^24.22.0 || >=26.12.0`). `.nvmrc` is `24.22.1`. `npm run cd` runs `scripts/cd.sh`, which uses `PLY_NODE` if you set it, then `/workspace/node-v24.22.1-linux-x64/bin/node` when that image directory is present, then `node` on `PATH`. If none of those satisfy engines, preflight stops and names that search. It does not judge the Worker. The wrapper prepends the chosen Node's bin directory to `PATH` before exec. `cf` is `#!/usr/bin/env node`, so a v20 `node` left earlier on `PATH` used to make `cf` fail and the run record `harness_fault`.
 - `git config user.name` and `user.email` set only when a bump actually commits. An unchanged pin, and `--no-bump`, do not need them. The bump does not push.
 - A clean work tree. Deploy refuses a dirty one.
 - `HEAD` equal to `origin/main` after `git fetch origin main`. Deploy refuses any other commit (`not-on-origin-main`) and uploads nothing.
@@ -264,7 +264,7 @@ npm run cd -- ramp --version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e \
 
 Without `--verdict`, or with a verdict that is not a pass for that version, the command exits and does not change traffic.
 
-The schedule is `1, 5, 10, 25, 50, 75, 100`. Each step waits `40000` ms. During that wait the ramp probes at `PLY_RAMP_PROBE_RPS` (default 2) **on each version**: `GET /` (the usage text, 200, no bearer) and `GET /v1/discover?remote=…` for the public `ply` mirror with the bearer from `PLY_TOKEN_FILE`. Each call sends `Cloudflare-Workers-Version-Overrides` for the new version and, separately, for the previous one, so both arms are sampled at the probe rate rather than at the traffic split. There is no `/health` route. A non-2xx answer from the **new** version fails the step. A probe that gets no response stops the ramp as `harness_fault` and leaves the current split in place. Before each percentage change the ramp reads the deployment and writes only when it is still the previous step's split. Otherwise it stops with `state_conflict` and does not roll back.
+The schedule is `1, 5, 10, 25, 50, 75, 100`. Each step probes for `40000` ms, then waits `60000` ms (`TELEMETRY_WAIT_MS`, the same ingest budget as the smoke) before it queries. During the probe the ramp calls at `PLY_RAMP_PROBE_RPS` (default 2) **on each version**: `GET /` (the usage text, 200, no bearer) and `GET /v1/discover?remote=…` for the public `ply` mirror with the bearer from `PLY_TOKEN_FILE`. Each call sends `Cloudflare-Workers-Version-Overrides` for the new version and, separately, for the previous one, so both arms are sampled at the probe rate rather than at the traffic split. That is 4 requests per second per arm, about 160 invocations in a 40s dwell. There is no `/health` route. A non-2xx answer from the **new** version fails the step. A probe that gets no response stops the ramp as `harness_fault` and leaves the current split in place. Before each percentage change the ramp reads the deployment and writes only when it is still the previous step's split. Otherwise it stops with `state_conflict` and does not roll back.
 
 Then it reads `cf o11y` for **both** versions over that step's window. Child spans are the events query with `$metadata.type = span`, not the traces view. Span events have no `$workers.scriptVersion.id` and a null `$metadata.requestId`, so they are queried by service and joined on `rayId`, then `traceId`.
 
@@ -277,9 +277,13 @@ The step decision is the new version's SLO burn, not a hand-tuned rate delta. Bu
 | Non-ok Worker outcome on the new version | Any |
 | Probe | A response from the new version that is not 2xx |
 | SLO burn | `bad/total` divided by the error budget is above **14.4**, and that SLO saw at least 20 requests in the window |
-| Latency vs the old version | Both sides have at least 20 wall samples and Mann-Whitney says the new version is slower (one-sided, alpha 0.01). With 5–19 samples on both sides, wall p99 new/old above 2. Equal to 2 still advances |
+| Latency vs the old version | Both sides have at least 20 wall samples, Mann-Whitney says the new version is slower (one-sided, alpha 0.01, tie-corrected variance), **and** p50 or p99 regressed by more than `max(10ms, 50% of the old percentile)`. Significance alone advances. With 5–19 samples on both sides, wall p99 new/old above 2 and that same bar. Equal to 2 still advances |
 | Sample too small for that compare | `decision=insufficient_data`. This is not a pass of the latency SLO. The percentage still advances when the hard checks above are clean |
 | Query failed | `harness_fault`. The split stays. A missing query is not zero errors and is not a rollback |
+
+`samples=` on a ramp line counts fetch invocations (`$metadata.type` `cf-worker-event`, `$workers.eventType` `fetch`), not every event. Each request also writes a `ply.request` log, so the event page is about twice the sample count. The query asks for `limit` 1000 and stops when a page comes back short. On the 2026-11-01 run that page was the whole match: `events.count`, the events array, and the series `_count` sum were the same number, every series bucket had `sampleInterval` 1, and `statistics.abr_level` was 1. The page was short because the index held about 28s of the 40s dwell. Ingest lag observed on 2026-10-31 was 10–30s, and the query used to run at the end of the dwell, so the tail had not landed. The window's `to` is the dwell end plus `60000` ms. A later query of that same window therefore includes the next step: the 1% window covered the following 5% dwell (about 160 + 160 invocations per arm) and the 5% window, queried again after rollback, covered only its own dwell (about 160). The script's about 100 samples per arm were the invocations already ingested, not a 1000-row cap and not a version filter.
+
+The 1% line reported wall p99 237ms on the new version. With 99 samples, p99 is `sorted[floor(98 × 0.99)]`, the second-largest wall. Those two were 405ms and 237ms, the opening cold starts. An all-events query of the full window has about 320 samples, so those two sit above p99 and the steady-state body is about 11ms. The ingest wait above is what puts the dwell's own tail into the live sample before the next step starts. It does not make the 1% query include the 5% probes; that larger count is a later read of a window that already overlaps the next step.
 
 There is no hold. A quiet 1% step with zero errors is `insufficient_data` and the ramp moves to 5%. The pinned probes are what put samples on the new version at 1%. Raise `PLY_RAMP_DWELL_MS` or `PLY_RAMP_PROBE_RPS` when you want the burn and Mann-Whitney checks to see more than that. Do not treat `insufficient_data` as a failure.
 
@@ -434,7 +438,7 @@ Availability on a ramp step treats every 4xx as expected, so client errors leave
 
 Correctness is one lifecycle smoke, not a ramp step. Any failed step fails the smoke stage (`decision=stop`, canary left at 0%). The burn from the pass/fail counts is stored on the run. It is what a later alert would page on. It is not a second gate inside the ramp.
 
-Latency against the old version, when both sides have at least 20 wall samples, is a one-sided Mann-Whitney U test (average ranks on ties). It fails when the new sample is stochastically slower and the upper tail is under 0.01. Between 5 and 19 samples on both sides the compare is wall p99, and a ratio above 2 fails. Fewer than that is `insufficient_data`.
+Latency against the old version, when both sides have at least 20 wall samples, is a one-sided Mann-Whitney U test. Ranks use the average rank on ties, and the variance subtracts the tie term Σ(t³ − t). A significant tail (under 0.01) is a rollback only when p50 or p99 also regressed by more than `max(10ms, 50% of the old percentile)`. The constants are `LATENCY_EFFECT_FLOOR_MS` (10) and `LATENCY_EFFECT_FRACTION` (0.5) in `scripts/cd/slo.ts`. Probe walls are integer milliseconds, so the rank test flags shifts under 1ms. On 2026-11-01 the 5% step's walls were a few milliseconds (p50 2–3ms, p75 5ms). The new arm's p99 was 11ms and its max was 13ms; the old arm's p99 was 12ms and its max was 21ms. Mann-Whitney, with the tie correction, was p=3.23e-3. That shift is inside the bar, so the step advances. A shift of 20ms to 80ms clears the bar and rolls back. Between 5 and 19 samples on both sides the compare is wall p99, a ratio above 2, and the same bar. Fewer than that is `insufficient_data`.
 
 Alerting policy for later, not applied on a ramp step. These are the workbook's 30-day windows:
 
@@ -452,11 +456,19 @@ Every event is appended to the run's `events.jsonl` and to the ledger (`PLY_CD_L
 npm run cd -- report
 ```
 
+A past run stays in the ledger. To mark one as a pipeline false positive, append a note. This does not rewrite earlier lines and does not open the run directory:
+
+```sh
+npm run cd -- annotate 2026-11-01T00-10-02-620Z --false-positive "5% ramp Mann-Whitney flagged a sub-millisecond wall-time shift"
+```
+
+That run's `run_finished` line still says `fault: worker`. `report` then drops it from the deploy count and from the change-failure rate, and prints the reason under `false positives`.
+
 | Metric | Formula |
 | --- | --- |
 | Deployment frequency | deploys / days. A deploy is a `run_finished` that reached 100% (`liveAt` set) and whose `fault` is not `harness_fault`. Aborted runs, held runs, and `harness_fault` runs are counted on their own lines and are not deploys. Days are the span from the first deploy timestamp to the last. One timestamp has no rate. |
 | Lead time | `liveAt − plyMergedAt` on a passing deploy. `liveAt` is when the ramp reached 100%. `plyMergedAt` is the ply commit's committer time from the GitHub API, or null if that fetch fails (the deploy still finishes). Report p50 and p90. |
-| Change failure rate | rollbacks / deploys. A harness fault is not in either number. |
+| Change failure rate | rollbacks / deploys. A harness fault is not in either number. A run annotated as a pipeline false positive is not in either number, and `report` lists it on its own. |
 | Time to restore | `restoredAt − failedAt` for a rolled-back deploy. p50 and p90. |
 | Stage duration | p50 and p90 of each stage's `durationMs`, across runs. Percentile is `sorted[floor((n − 1) · p)]`. |
 
@@ -482,6 +494,7 @@ The event log is the record of the run. Every line is one JSON object:
 | `state_change` | Traffic split before and after, and the deployment id when cf returned one |
 | `request` | One smoke or probe call: method, url, status, version, latency, `cf-ray`, `x-ply-request-id`, `x-artifacts-ray` |
 | `error` | An unexpected failure and a JSON context |
+| `annotation` | Appended to the ledger for a past run: `note` `false_positive` and a one-line `reason`. `npm run cd -- annotate <run-id> --false-positive "reason"` writes it. Earlier lines stay as they were |
 
 A decision cannot be written unless `inputs` cites an earlier `observation`. A `Secret` cannot be serialized: `JSON.stringify` throws, and command argv stores `<redacted>` instead of the value. Each Secret's text is removed by exact match from every capture and event. An `art_v` plus a version plus `_` is removed the same way, as a backstop, whatever the version number is.
 

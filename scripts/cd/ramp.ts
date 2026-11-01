@@ -2,7 +2,7 @@ import { asRecord } from './json.ts'
 import type { ObservationRef } from './log.ts'
 import { percentile, type VersionStats } from './telemetry.ts'
 import { burnMap, judgeStep, QUANTILE_FLOOR, type StepVerdict } from './slo.ts'
-import type { RampSchedule } from './baseline.ts'
+import { TELEMETRY_WAIT_MS, type RampSchedule } from './baseline.ts'
 
 export type { VersionStats } from './telemetry.ts'
 
@@ -174,6 +174,10 @@ export async function runRamp(schedule: RampSchedule, io: RampIo): Promise<RampL
       break
     }
     const to = io.now()
+    // Ingest lag on 2026-10-31 was 10–30s. Querying at the end of the dwell saw only
+    // the first ~27s, so p99 was the second-largest cold start. Wait, then query the
+    // dwell window. The next step has not started, so this wait does not include it.
+    await io.sleep(TELEMETRY_WAIT_MS)
     const observed = await io.observe(from, to, percent)
     if (observed.kind === 'sample' && observed.previous.wallMs.length >= QUANTILE_FLOOR) carried = observed.previous
     let used = observed

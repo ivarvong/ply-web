@@ -1,6 +1,6 @@
 // Every threshold and dwell the operator pipeline uses. The decision functions take these
 // values as arguments; they do not embed numbers of their own. Edit this file to change a gate.
-// A clean ramp is RAMP_PERCENTS.length * RAMP_DWELL_MS = 7 * 40s = 280s, plus the queries.
+// A clean ramp is 7 steps of RAMP_DWELL_MS plus TELEMETRY_WAIT_MS, then the queries.
 
 export const WORKER_DEFAULT = 'ply'
 export const BASE_URL_DEFAULT = 'https://ply.ivar.workers.dev'

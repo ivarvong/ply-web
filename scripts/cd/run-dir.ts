@@ -2,6 +2,9 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { redact } from './redact.ts'
 
+/** Directory name from `toISOString()` with `:` and `.` replaced by `-`. */
+export const RUN_ID = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/
+
 export async function createRunDir(root: string): Promise<string> {
   const name = new Date().toISOString().replace(/[:.]/g, '-')
   const dir = join(root, name)

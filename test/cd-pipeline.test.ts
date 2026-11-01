@@ -64,4 +64,13 @@ test('usage and a bad version exit as argument errors', () => {
   const version = '8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e'
   assert.deepEqual(parseArgs(['smoke', '--version', version]), { kind: 'smoke', version, expectVersion: null })
   assert.equal(parseArgs(['telemetry', '--version', version, '--since', '2026-10-31T21:05:00Z']).kind, 'telemetry')
+  const runId = '2026-11-01T00-10-02-620Z'
+  assert.deepEqual(parseArgs(['annotate', runId, '--false-positive', '5% ramp Mann-Whitney flagged a sub-millisecond wall-time shift']), {
+    kind: 'annotate',
+    runId,
+    reason: '5% ramp Mann-Whitney flagged a sub-millisecond wall-time shift',
+  })
+  assert.equal(parseArgs(['annotate']).kind, 'error')
+  assert.equal(parseArgs(['annotate', 'not-a-run', '--false-positive', 'reason']).kind, 'error')
+  assert.equal(parseArgs(['annotate', runId]).kind, 'error')
 })

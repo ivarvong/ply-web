@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
+import { delimiter, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { NODE_PROBE_MS } from './baseline.ts'
 import { run } from './proc.ts'
@@ -70,6 +71,13 @@ export function binaryNodeVersion(bin: string): string | null {
   if (result.status !== 0) return null
   const line = result.stdout.trim()
   return line.startsWith('v') ? line : null
+}
+
+/** PATH with `nodeBin`'s directory first, so a child `cf` resolves the same Node. */
+export function pathWithNodeBin(nodeBin: string, path: string | undefined): string {
+  const dir = dirname(nodeBin)
+  if (!path) return dir
+  return `${dir}${delimiter}${path}`
 }
 
 /** A different binary when the current one misses engines. Null when the current one is fine or none of the candidates is. */

@@ -93,8 +93,33 @@ export const QUANTILE_FLOOR = 5
 /** Initial. new/old wall p99 above this, on a short sample, rolls back. Equal to it advances. */
 export const QUANTILE_P99_RATIO = 2
 
-/** One-sided Mann-Whitney. Fail when the new version is slower and this tail probability is under alpha. */
+/** One-sided Mann-Whitney. A significant result is not a rollback by itself. */
 export const MANN_WHITNEY_ALPHA = 0.01
+
+/** Wall p50. The effect-size compare names the percentile instead of inlining it. */
+const WALL_P50 = 0.5
+
+/** Wall p99. Same index as telemetry `percentile`: sorted[floor((n - 1) * p)]. */
+const WALL_P99 = 0.99
+
+/**
+ * Absolute half of the latency effect bar, in milliseconds.
+ * Probe walls are integer milliseconds. On 2026-11-01 the 5% step was p50 about 3ms,
+ * and the rank test called a shift under 1ms significant. 10ms is above that grain.
+ */
+export const LATENCY_EFFECT_FLOOR_MS = 10
+
+/**
+ * Relative half of the latency effect bar. The bar is the greater of
+ * LATENCY_EFFECT_FLOOR_MS and this fraction of the old percentile.
+ * 0.5 requires the new p50 or p99 to be more than 50% slower, and also past the floor.
+ */
+export const LATENCY_EFFECT_FRACTION = 0.5
+
+/** The slowdown a latency rollback requires, in milliseconds, given the old percentile. */
+export function latencyEffectBar(baselineMs: number): number {
+  return Math.max(LATENCY_EFFECT_FLOOR_MS, LATENCY_EFFECT_FRACTION * baselineMs)
+}
 
 /**
  * Alerting policy for later. Not applied on a ramp step.
@@ -221,7 +246,9 @@ function normalCdf(z: number): number {
 
 /**
  * One-sided Mann-Whitney: is `newer` stochastically greater than `older`?
- * Ranks are 1-based with the average rank on ties. Null when either side has fewer than 2 points.
+ * Ranks are 1-based with the average rank on ties. The variance subtracts the
+ * tie term Σ(t³ − t), so a run of equal integer milliseconds does not use the
+ * untied normal approximation. Null when either side has fewer than 2 points.
  */
 export function mannWhitneyGreater(newer: readonly number[], older: readonly number[], alpha: number): RankTest | null {
   const n1 = newer.length
@@ -257,10 +284,44 @@ export function mannWhitneyGreater(newer: readonly number[], older: readonly num
   return { rankSum, z, pGreater, slower: z > 0 && pGreater < alpha }
 }
 
-function p99(values: readonly number[]): number | null {
+function wallPercentile(values: readonly number[], p: number): number | null {
   const sorted = values.filter(value => Number.isFinite(value)).slice().sort((a, b) => a - b)
   if (sorted.length === 0) return null
-  return sorted[Math.floor((sorted.length - 1) * 0.99)] ?? null
+  return sorted[Math.floor((sorted.length - 1) * p)] ?? null
+}
+
+type WallMove = {
+  readonly name: 'p50' | 'p99'
+  readonly delta: number
+  readonly bar: number
+}
+
+function wallMoves(newer: readonly number[], older: readonly number[]): readonly WallMove[] {
+  const specs = [
+    ['p50', WALL_P50],
+    ['p99', WALL_P99],
+  ] as const
+  const moves: WallMove[] = []
+  for (const [name, p] of specs) {
+    const next = wallPercentile(newer, p)
+    const previous = wallPercentile(older, p)
+    if (next === null || previous === null) continue
+    moves.push({ name, delta: next - previous, bar: latencyEffectBar(previous) })
+  }
+  return moves
+}
+
+/** The p50/p99 moves that clear the effect bar. Null when neither does. */
+function practicalSlowdown(moves: readonly WallMove[]): string | null {
+  const hit = moves.filter(move => move.delta > move.bar)
+  if (hit.length === 0) return null
+  return hit.map(move => `${move.name} +${move.delta}ms > ${move.bar}ms`).join(', ')
+}
+
+function withinEffect(moves: readonly WallMove[]): string {
+  const seen = moves.map(move => `${move.name} ${move.delta}ms`).join(', ')
+  const prefix = seen ? `${seen} ` : ''
+  return `${prefix}within max(${LATENCY_EFFECT_FLOOR_MS}ms, ${LATENCY_EFFECT_FRACTION} of the old percentile)`
 }
 
 export type LatencyCall =
@@ -268,35 +329,62 @@ export type LatencyCall =
   | { readonly kind: 'not_slower'; readonly reason: string; readonly rule: AppliedRule }
   | { readonly kind: 'slower'; readonly reason: string; readonly rule: AppliedRule }
 
-/** Mann-Whitney when both sides have MIN_SAMPLES. Quantile p99 when both have QUANTILE_FLOOR. Otherwise insufficient. */
+/**
+ * Mann-Whitney when both sides have MIN_SAMPLES, and a p99 ratio when both have
+ * QUANTILE_FLOOR. Either path rolls back only when the slowdown also clears the
+ * effect bar. Otherwise insufficient.
+ */
 export function compareLatency(newer: readonly number[], older: readonly number[]): LatencyCall {
   if (newer.length >= MIN_SAMPLES && older.length >= MIN_SAMPLES) {
     const test = mannWhitneyGreater(newer, older, MANN_WHITNEY_ALPHA)
     const rule = { name: 'mann_whitney_alpha', value: MANN_WHITNEY_ALPHA }
     if (!test) return { kind: 'insufficient_data', reason: 'Mann-Whitney needs two samples on each side', rule }
-    if (test.slower) {
+    const moves = wallMoves(newer, older)
+    const effect = practicalSlowdown(moves)
+    if (test.slower && effect) {
       return {
         kind: 'slower',
-        reason: `new version wall time is slower (Mann-Whitney p=${test.pGreater.toExponential(2)} < ${MANN_WHITNEY_ALPHA})`,
+        reason: `new version wall time is slower (Mann-Whitney p=${test.pGreater.toExponential(2)} < ${MANN_WHITNEY_ALPHA}; ${effect})`,
         rule,
+      }
+    }
+    if (test.slower) {
+      return {
+        kind: 'not_slower',
+        reason: `Mann-Whitney p=${test.pGreater.toExponential(2)} < ${MANN_WHITNEY_ALPHA}; ${withinEffect(moves)}`,
+        rule: { name: 'latency_effect_floor_ms', value: LATENCY_EFFECT_FLOOR_MS },
       }
     }
     return { kind: 'not_slower', reason: `Mann-Whitney p=${test.pGreater.toExponential(2)}`, rule }
   }
   if (newer.length >= QUANTILE_FLOOR && older.length >= QUANTILE_FLOOR) {
-    const next = p99(newer)
-    const previous = p99(older)
+    const next = wallPercentile(newer, WALL_P99)
+    const previous = wallPercentile(older, WALL_P99)
     const rule = { name: 'quantile_p99_ratio', value: QUANTILE_P99_RATIO }
     if (next === null || previous === null) {
       return { kind: 'insufficient_data', reason: 'wall p99 has no sample', rule }
     }
     if (previous === 0 && next === 0) return { kind: 'not_slower', reason: 'wall p99 is 0 on both versions', rule }
+    const delta = next - previous
+    const bar = latencyEffectBar(previous)
     if (previous === 0 && next > 0) {
-      return { kind: 'slower', reason: `wall p99 was 0 on the old version and ${next} on the new`, rule }
+      if (delta > bar) return { kind: 'slower', reason: `wall p99 was 0 on the old version and ${next} on the new`, rule }
+      return {
+        kind: 'not_slower',
+        reason: `wall p99 was 0 on the old version and ${next} on the new; ${withinEffect([{ name: 'p99', delta, bar }])}`,
+        rule: { name: 'latency_effect_floor_ms', value: LATENCY_EFFECT_FLOOR_MS },
+      }
     }
     const ratioValue = next / previous
-    if (ratioValue > QUANTILE_P99_RATIO) {
+    if (ratioValue > QUANTILE_P99_RATIO && delta > bar) {
       return { kind: 'slower', reason: `wall p99 ratio ${ratioValue.toFixed(3)} > ${QUANTILE_P99_RATIO}`, rule }
+    }
+    if (ratioValue > QUANTILE_P99_RATIO) {
+      return {
+        kind: 'not_slower',
+        reason: `wall p99 ratio ${ratioValue.toFixed(3)}; ${withinEffect([{ name: 'p99', delta, bar }])}`,
+        rule: { name: 'latency_effect_floor_ms', value: LATENCY_EFFECT_FLOOR_MS },
+      }
     }
     return { kind: 'not_slower', reason: `wall p99 ratio ${ratioValue.toFixed(3)}`, rule }
   }
@@ -334,7 +422,7 @@ function verdict(
 /**
  * One ramp step for the new version. Any exception, 5xx, non-ok outcome, or failed probe
  * rolls back before the sample floor. Burn is judged only at MIN_SAMPLES. Latency against
- * the old version is Mann-Whitney, or a p99 ratio when the sample is shorter.
+ * the old version is Mann-Whitney plus the effect bar, or a p99 ratio when the sample is shorter.
  */
 export function judgeStep(input: {
   readonly next: StepInput
@@ -391,7 +479,7 @@ export function judgeStep(input: {
   if (latency.kind === 'insufficient_data') return verdict('insufficient_data', latency.reason, [latency.rule], burns)
   return verdict(
     'advance',
-    `within burn ${FAST_BURN} and latency is not slower`,
+    `within burn ${FAST_BURN}; ${latency.reason}`,
     [{ name: 'fast_burn', value: FAST_BURN }, latency.rule],
     burns,
   )

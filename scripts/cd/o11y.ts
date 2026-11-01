@@ -28,6 +28,9 @@ export async function queryCaptured(
     pages.push(stdout)
     const events = unwrapEvents(extractJson(stdout))
     out.push(...events)
+    // A short page is the last page. On 2026-11-01 the ramp pages were short of
+    // TELEMETRY_PAGE because the index held that many rows: the series sum equalled
+    // the page, sampleInterval was 1, and statistics.abr_level was 1.
     if (events.length < TELEMETRY_PAGE) {
       return { events: out, raw: pages.join('\n'), query: first }
     }
