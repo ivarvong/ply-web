@@ -1,5 +1,6 @@
 // R2 compare-and-swap. A lost race returns a conflict and does not apply the caller's bytes.
 // The object's ETag is the revision. There is one key.
+import { captureGroup, chainGet } from '../absent.ts';
 import { murmur3_32 } from './hash.ts';
 import { ABSENT_REVISION, FLAGS_OBJECT_KEY } from './ttl.ts';
 import { diffDocuments, encodeDocument, parseDocumentText } from './document.ts';
@@ -16,21 +17,23 @@ export type FlagStore = {
   put(key: string, body: string, condition: PutCondition): Promise<StoredObject | null>;
 };
 
-export type R2Object = { etag: string; httpEtag?: string; text(): Promise<string> };
-export type R2Put = { etag: string; httpEtag?: string } | null;
+export type R2Object = { etag: string; text(): Promise<string> };
+export type R2Put = { etag: string } | null;
 export type R2BucketLike = {
   get(key: string): Promise<R2Object | null>;
-  put(key: string, value: string, options?: { onlyIf?: { etagMatches: string } | Headers; httpMetadata?: { contentType: string } }): Promise<R2Put>;
+  put(key: string, value: string, options: { onlyIf: { etagMatches: string } | Headers; httpMetadata: { contentType: string } }): Promise<R2Put>;
 };
 
-function quoted(etag: string, httpEtag: string | undefined): string {
-  if (httpEtag && httpEtag.length > 0) return httpEtag;
-  return etag.startsWith('"') ? etag : `"${etag}"`;
+function quoted(object: { readonly etag: string }): string {
+  const httpEtag = chainGet(object, 'httpEtag');
+  if (httpEtag.tag === 'some' && typeof httpEtag.value === 'string' && httpEtag.value.length > 0) return httpEtag.value;
+  return object.etag.startsWith('"') ? object.etag : `"${object.etag}"`;
 }
 
 function unquote(etag: string): string {
-  const match = /^"(.*)"$/.exec(etag);
-  return match?.[1] ?? etag;
+  const inner = captureGroup(/^"(.*)"$/.exec(etag), 1);
+  if (inner.tag === 'none') return etag;
+  return inner.value;
 }
 
 function etagFor(body: string): string {
@@ -63,7 +66,7 @@ export function r2Store(bucket: R2BucketLike): FlagStore {
     async get(key) {
       const object = await bucket.get(key);
       if (!object) return null;
-      return { etag: quoted(object.etag, object.httpEtag), body: await object.text() };
+      return { etag: quoted(object), body: await object.text() };
     },
     async put(key, body, condition) {
       const onlyIf = condition.kind === 'etagMatches'
@@ -71,7 +74,7 @@ export function r2Store(bucket: R2BucketLike): FlagStore {
         : new Headers({ 'if-none-match': '*' });
       const stored = await bucket.put(key, body, { onlyIf, httpMetadata: { contentType: 'application/json' } });
       if (!stored) return null;
-      return { etag: quoted(stored.etag, stored.httpEtag), body };
+      return { etag: quoted(stored), body };
     },
   };
 }

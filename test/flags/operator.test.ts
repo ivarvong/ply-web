@@ -81,12 +81,12 @@ describe('operator http', () => {
 
   it('fails closed when the secret or the binding is missing', async () => {
     const lines: string[] = [];
-    const unconfigured = await handleOperator(request('/config', 'GET', TOKEN), {}, deps(() => 0, lines, []));
+    const unconfigured = await handleOperator(request('/config', 'GET', TOKEN), { FLAG_OPERATOR_TOKEN: null, FLAG_CONTROL: null }, deps(() => 0, lines, []));
     expect(unconfigured.status).toBe(503);
     expect(await unconfigured.json()).toEqual({ kind: 'unavailable', reason: 'FLAG_OPERATOR_TOKEN is not configured' });
     const unbound = await handleOperator(
       request('/rollout', 'POST', TOKEN, JSON.stringify({ flag: 'ply.usage.note', basisPoints: ROLLED_BACK, expected: { kind: 'absent' } })),
-      { FLAG_OPERATOR_TOKEN: TOKEN },
+      { FLAG_OPERATOR_TOKEN: TOKEN, FLAG_CONTROL: null },
       deps(() => 0, lines, []),
     );
     expect(unbound.status).toBe(503);
