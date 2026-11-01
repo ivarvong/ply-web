@@ -177,7 +177,7 @@ export async function stageTelemetry(
           exceeded: loss.exceeded,
           ids: loss.ids.map(lost => ({ id: lost.id, step: lost.step, log: lost.log, trace: lost.trace })),
         },
-        query: { logs: telemetryQuery('events', from, to, [serviceFilter(config.worker)]) },
+        query: { logs: telemetryQuery('events', from, to, [serviceFilter(config.worker)], null) },
         from,
         to,
         raw: lossLine(loss),
@@ -185,8 +185,8 @@ export async function stageTelemetry(
       const ref = await log.observation({
         measurement: { source: 'smoke-telemetry', pass: judge.kind === 'pass', line: judge.line },
         query: {
-          traces: telemetryQuery('traces', from, to, [serviceFilter(config.worker)]),
-          spans: telemetryQuery('events', from, to, [serviceFilter(config.worker), spanTypeFilter()]),
+          traces: telemetryQuery('traces', from, to, [serviceFilter(config.worker)], null),
+          spans: telemetryQuery('events', from, to, [serviceFilter(config.worker), spanTypeFilter()], null),
         },
         from,
         to,

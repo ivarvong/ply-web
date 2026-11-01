@@ -19,7 +19,7 @@ export async function queryCaptured(
 ): Promise<CapturedQuery> {
   const out: unknown[] = []
   const pages: string[] = []
-  let offset: string | undefined
+  let offset: string | null = null
   let first: ReturnType<typeof telemetryQuery> | null = null
   for (let page = 0; page < TELEMETRY_MAX_PAGES; page++) {
     const body = telemetryQuery(view, from, to, filters, offset)
