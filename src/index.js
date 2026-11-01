@@ -42,6 +42,8 @@ import { usageNote } from './flags/client.ts';
 import { handleFlagHttp } from './flags/http.ts';
 import { headerNumber, parseBearer, readHeader } from './http/inbound.ts';
 import { err, ok, runRequest } from './http/machine.ts';
+import { chainGet, dig, envBinding, header, queryParam, recordGet } from './absent.ts';
+import { orElse, unwrapOr } from './option.ts';
 
 export { FlagsCache, FlagControl } from './flags/entry.ts';
 
@@ -215,7 +217,7 @@ export function gitAuth(headers, host) {
     const auth = user ? { token: gt, user } : { bearer: gt };
     return { auth, secrets: [gt, ...(user ? [btoa(`${user}:${gt}`)] : [])] };
   }
-  return { auth: undefined, secrets: [] };
+  return { secrets: [] };
 }
 
 export const scrubber = secrets => {
@@ -258,7 +260,7 @@ function failureMessage(error) {
 async function scrubResponse(res, scrub) {
   const headers = new Headers();
   for (const [k, v] of res.headers) if (k !== 'content-length') headers.set(k, scrub(v));
-  const type = res.headers.get('content-type') ?? '';
+  const type = unwrapOr(header(res.headers, 'content-type'), '');
   if (!res.body || !/^(text\/|application\/json)/.test(type)) return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
   return new Response(scrub(await res.text()), { status: res.status, statusText: res.statusText, headers });
 }
@@ -287,26 +289,57 @@ const NO_STORE = 'no-store';
 const REF_READS = new Set(['/v1/tree', '/v1/read', '/v1/commit']);
 const json = (status, obj, scrub, extra = {}) => new Response(scrub(JSON.stringify(obj)), { status, headers: { 'content-type': 'application/json; charset=utf-8', ...extra, 'cache-control': NO_STORE } });
 
+function ownField(value, key) {
+  if (typeof value !== 'object' || value === null) return recordGet(null, key);
+  return recordGet(value, key);
+}
+
+function copyArray(error, key, limit) {
+  const found = chainGet(error, key);
+  if (found.tag !== 'some' || !Array.isArray(found.value)) return {};
+  return { [key]: limit === null ? found.value : found.value.slice(0, limit) };
+}
+
+function stringOrNull(error, key, allowNull) {
+  const found = ownField(error, key);
+  if (found.tag !== 'some') return {};
+  if (typeof found.value === 'string' || (allowNull && found.value === null)) return { [key]: found.value };
+  return {};
+}
+
 function errorBody(e) {
-  const worker = isWorkerCode(e?.code);
-  const code = worker ? e.code : isPlyCode(e?.code) ? e.code : 'internal';
-  const body = { code, message: String(e?.message ?? e).slice(0, 1000), retry: worker ? WORKER_RETRY[code] : (RETRY[code] ?? 'no') };
-  if (Array.isArray(e?.conflicts)) body.conflicts = e.conflicts.slice(0, 200);
-  if (e?.reasons && typeof e.reasons === 'object') body.reasons = e.reasons;
-  if (Array.isArray(e?.bases)) body.bases = e.bases;
-  if (typeof e?.matches === 'number') body.matches = e.matches;
+  const codeField = chainGet(e, 'code');
+  const codeText = codeField.tag === 'some' && typeof codeField.value === 'string' ? codeField.value : '';
+  const worker = isWorkerCode(codeText);
+  const code = worker ? codeText : isPlyCode(codeText) ? codeText : 'internal';
+  const messageField = chainGet(e, 'message');
+  const retryField = recordGet(worker ? WORKER_RETRY : RETRY, code);
+  const body = {
+    code,
+    message: String(messageField.tag === 'some' ? messageField.value : e).slice(0, 1000),
+    retry: retryField.tag === 'some' ? retryField.value : 'no',
+    ...copyArray(e, 'conflicts', 200),
+  };
+  const reasons = chainGet(e, 'reasons');
+  if (reasons.tag === 'some' && typeof reasons.value === 'object') body.reasons = reasons.value;
+  Object.assign(body, copyArray(e, 'bases', null));
+  const matches = chainGet(e, 'matches');
+  if (matches.tag === 'some' && typeof matches.value === 'number') body.matches = matches.value;
   // A cas_conflict's null is meaningful: expected null = the ref was to be absent; actual null = it is absent.
   const nullable = code === 'cas_conflict';
-  if (typeof e?.expected === 'string' || (nullable && e?.expected === null)) body.expected = e.expected;
-  if (typeof e?.actual === 'string' || (nullable && e?.actual === null)) body.actual = e.actual;
-  if (code === 'push_partial' && Array.isArray(e?.landed)) body.landed = e.landed.slice(0, 200);
-  if (code === 'push_partial' && Array.isArray(e?.rejected)) body.rejected = e.rejected.slice(0, 200);
-  if (typeof e?.oid === 'string') body.oid = e.oid;
-  if (code === 'auth' && e?.status) body.upstreamStatus = e.status;
+  Object.assign(body, stringOrNull(e, 'expected', nullable), stringOrNull(e, 'actual', nullable));
+  if (code === 'push_partial') Object.assign(body, copyArray(e, 'landed', 200), copyArray(e, 'rejected', 200));
+  const oid = chainGet(e, 'oid');
+  if (oid.tag === 'some' && typeof oid.value === 'string') body.oid = oid.value;
+  const status = chainGet(e, 'status');
+  if (code === 'auth' && status.tag === 'some' && status.value) body.upstreamStatus = status.value;
   return body;
 }
 
-const spanView = s => ({ name: s.name, ms: Math.round(s.durationMs * 10) / 10, status: s.status?.code === 2 ? 'error' : 'ok', attrs: s.attrs, events: s.events.filter(e => e.name !== 'exception').slice(0, 32) });
+const spanView = s => {
+  const statusCode = dig(s, ['status', 'code']);
+  return { name: s.name, ms: Math.round(s.durationMs * 10) / 10, status: statusCode.tag === 'some' && statusCode.value === 2 ? 'error' : 'ok', attrs: s.attrs, events: s.events.filter(e => e.name !== 'exception').slice(0, 32) };
+};
 const traceSummary = spans => spans.map(s => `${s.name.replace(/^git\.(upload-pack |receive-pack)/, '$1').replace(/ /g, '_')};dur=${Math.round(s.durationMs)}`).join(', ').slice(0, 4000);
 
 // ---- handlers: (ctx) → { status?, body } | Response ----
@@ -326,18 +359,27 @@ const READS = {
     return { body: { ...info, caps: Object.fromEntries(info.caps) } };
   },
   'GET /v1/tree': async ({ remote, q, opts }) => {
-    const r = await listTree(remote, { ref: q.get('ref') || null, path: q.get('path') ?? '' }, opts);
+    const r = await listTree(remote, { ref: q.get('ref') || null, path: unwrapOr(queryParam(q, 'path'), '') }, opts);
     return { body: { ref: r.ref, commit: r.commit, tree: r.tree, entries: r.entries } };
   },
   'GET /v1/commit': async ({ remote, q, opts }) => ({ body: await readCommitOrEmpty(remote, q.get('ref') || null, opts) }),
   'GET /v1/read': async ({ remote, q, opts, spans, ctx, log }) => {
     let r;
     try { r = await readFile(remote, { ref: q.get('ref') || null, path: q.get('path') }, opts); }
-    catch (e) { if (isDirectoryRead(e)) throw fail('bad_request', directoryReadMessage(String(e.message ?? e))); throw e; }
+    catch (e) {
+      if (isDirectoryRead(e)) {
+        const message = chainGet(e, 'message');
+        throw fail('bad_request', directoryReadMessage(String(message.tag === 'some' ? message.value : e)));
+      }
+      throw e;
+    }
     const fixed = new FixedLengthStream(r.size);
     // a verification failure aborts the body short of its Content-Length: the client sees a truncated response, never a
     // clean one with the wrong bytes. holdLastChunk keeps the final bytes back until the blob verified (src/hold-last.ts).
-    ctx.waitUntil(holdLastChunk(r.stream).pipeTo(fixed.writable).then(() => log({ stream: 'ok' }), e => log({ stream: 'error', stream_code: e?.code ?? 'error' })));
+    ctx.waitUntil(holdLastChunk(r.stream).pipeTo(fixed.writable).then(() => log({ stream: 'ok' }), e => {
+      const code = chainGet(e, 'code');
+      log({ stream: 'error', stream_code: code.tag === 'some' ? code.value : 'error' });
+    }));
     const headers = new Headers({ 'content-type': 'application/octet-stream', 'x-ply-ref': r.ref, 'x-ply-commit': r.commit, 'x-ply-blob': r.blob, 'x-ply-mode': r.mode, 'x-ply-size': String(r.size) });
     const summary = traceSummary(spans());
     if (q.get('trace') === '1' && summary) headers.set('x-ply-trace', summary);
@@ -368,16 +410,16 @@ function classifyViewLoc(env, url) {
   }
 }
 const isPublicViewLoc = env => url => classifyViewLoc(env, url).kind === 'public';
-const pinnedBinding = (env, ctx) => (env.PACK_CACHE === 'off' ? null : ctx?.exports?.Pinned ?? null);
+const pinnedBinding = (env, ctx) => (env.PACK_CACHE === 'off' ? null : unwrapOr(dig(ctx, ['exports', 'Pinned']), null));
 
 const worker = {
   // Cron (cloudflare.config.ts): keep the public-v0 mirrors on their GitHub branch (src/mirror.ts). One log line per mirror.
   async scheduled(controller, env, ctx) {
     if (env.MIRROR_SYNC !== 'on' || !env.PUBLIC_REPOS) return;
     const tokens = tokenSourceFor(env.PUBLIC_REPOS);
-    const scrub = text => scrubSecrets(tokens?.secrets() ?? [])(text);
+    const scrub = text => scrubSecrets(tokens === null ? [] : tokens.secrets())(text);
     const results = await syncAll({ binding: env.PUBLIC_REPOS, tokens });
-    for (const r of results) console.log(scrub(JSON.stringify({ msg: 'ply.mirror', cron: controller?.cron ?? '', scheduledTime: controller?.scheduledTime ?? 0, ...r })));
+    for (const r of results) console.log(scrub(JSON.stringify({ msg: 'ply.mirror', cron: unwrapOr(chainGet(controller, 'cron'), ''), scheduledTime: unwrapOr(chainGet(controller, 'scheduledTime'), 0), ...r })));
     void ctx;
   },
   async fetch(req, env, ctx) {
@@ -388,11 +430,12 @@ const worker = {
     const publicTokens = tokenSourceFor(env.PUBLIC_REPOS);
     const publicScrub = text => (publicTokens ? scrubSecrets(publicTokens.secrets())(text) : String(text));
     let scrub = publicScrub;
-    const record = { msg: 'ply.request', id, method: req.method, path: url.pathname, colo: req.cf?.colo ?? '' };
+    const record = { msg: 'ply.request', id, method: req.method, path: url.pathname, colo: unwrapOr(dig(req, ['cf', 'colo']), '') };
     const log = extra => console.log(scrub(JSON.stringify({ ...record, ...extra })));
     const done = (res, extra = {}) => {
       res.headers.set('x-ply-request-id', id);
-      if (env.VERSION?.id) res.headers.set('x-ply-version', env.VERSION.id);
+      const versionId = dig(env, ['VERSION', 'id']);
+      if (versionId.tag === 'some' && versionId.value) res.headers.set('x-ply-version', versionId.value);
       res.headers.set(BUILD_HEADER, plyBuildValue());
       applySecurityHeaders(res.headers);
       log({ status: res.status, ms: Date.now() - t0, ...extra });
@@ -472,7 +515,7 @@ const worker = {
           try {
             if (parsed.pinKey && parsed.pin) {
               const res = await viaPinned(parsed.pin, parsed.pinKey);
-              return ok(taken(await scrubResponse(res, publicScrub), { viewer: 1, pinned: res.headers.get('x-ply-pinned-cache') ?? '' }));
+              return ok(taken(await scrubResponse(res, publicScrub), { viewer: 1, pinned: unwrapOr(header(res.headers, 'x-ply-pinned-cache'), '') }));
             }
             const res = await handleViewer(req, env, ctx, { requestId: id, note: extra => Object.assign(record, extra), skipRate: isInternal(req) });
             return ok(taken(await scrubResponse(res, publicScrub), { viewer: 1 }));
@@ -485,13 +528,14 @@ const worker = {
         const { key } = parsed;
         if (url.pathname === '/v1/flags' || url.pathname === '/v1/flags/eval') return ok(taken(await handleFlagHttp(req, env, ctx)));
         const writes = env.WRITES === 'on';
-        const handler = READS[key] ?? WRITES[key];
+        const handler = unwrapOr(orElse(recordGet(READS, key), recordGet(WRITES, key)), null);
         if (!handler) return err(jsonOut(Object.keys({ ...READS, ...WRITES }).some(k => k.endsWith(` ${url.pathname}`)) ? 405 : 404, { code: 'not_found', message: `no route ${key}`, retry: 'no' }));
         if (WRITES[key] && !writes) return err(jsonOut(501, { code: 'unsupported', message: 'writes are disabled on this deployment', retry: 'no' }));
         exporter = arrayExporter();
         try {
           const body = WRITES[key] ? await readJson(req) : {};
-          const allow = (env.ALLOW_REMOTE_ORIGINS ?? '').split(',').map(s => s.trim()).filter(Boolean);
+          const allowText = envBinding(env.ALLOW_REMOTE_ORIGINS);
+          const allow = (allowText.tag === 'some' && typeof allowText.value === 'string' ? allowText.value : '').split(',').map(s => s.trim()).filter(Boolean);
           const remoteUrl = checkRemote(WRITES[key] ? body.remote : url.searchParams.get('remote'), allow);
           const remote = remoteUrl.href;
           record.host = remoteUrl.host;
@@ -500,19 +544,20 @@ const worker = {
           // Read-only means read-only: no write reaches the public namespace, whatever bearer or git credential came with it.
           if (WRITES[key] && isPublicNamespaceRemote(remote)) return err(jsonOut(403, { code: 'read_only', message: `the ${PUBLIC_NAMESPACE} namespace is read-only`, retry: 'no' }));
           const cred = gitAuth(req.headers, remoteUrl.hostname);
+          const credential = chainGet(cred, 'auth');
           const callerScrub = scrubber(cred.secrets);
           scrub = text => callerScrub(publicScrub(text));
-          const tracer = new Tracer({ exporter, resource: { 'service.name': 'ply-worker', 'cloudflare.colo': req.cf?.colo ?? '' } });
+          const tracer = new Tracer({ exporter, resource: { 'service.name': 'ply-worker', 'cloudflare.colo': unwrapOr(dig(req, ['cf', 'colo']), '') } });
           // The public read token is attached below the redirect guard, so each hop is re-validated before it is considered,
           // and only when the request carries no credential of its own (a caller's Git-Token or Git-Authorization wins).
           // Under the guard: public, credential-free upload-pack exchanges go to the cache-enabled GitCache entrypoint
           // (Workers Caching); everything else, every credentialed request included, goes straight upstream.
           const direct = withPublicReadCredential(globalThis.fetch.bind(globalThis), publicTokens);
-          const loopback = env.PACK_CACHE === 'off' ? null : () => ctx.exports?.GitCache;
+          const loopback = env.PACK_CACHE === 'off' ? null : () => unwrapOr(chainGet(ctx.exports, 'GitCache'), null);
           rays = createRayLog();
           // Inside the guard, so each hop (including a redirect the guard follows) is one entry.
           const fetchImpl = createGuardedFetch(observeUpstream(createLoopbackFetch(direct, loopback), rays), remoteUrl, allow);
-          const opts = { auth: cred.auth, tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), fetchImpl };
+          const opts = { ...(credential.tag === 'some' ? { auth: credential.value } : {}), tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), fetchImpl };
           if (!WRITES[key] && presentedRef && isAbbreviatedOid(presentedRef.toLowerCase())) {
             const prefix = presentedRef.toLowerCase();
             const cands = refCandidates(prefix);
@@ -534,7 +579,7 @@ const worker = {
             stamp(out.headers);
             return ok(taken(out, statsOf(spans())));
           }
-          const status = out.status ?? 200;
+          const status = unwrapOr(chainGet(out, 'status'), 200);
           const rayHeaders = new Headers();
           stamp(rayHeaders);
           const s = spans();
