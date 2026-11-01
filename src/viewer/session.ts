@@ -323,7 +323,7 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
   const parsed = parseTree(data, VIEWER_GIT_LIMITS);
   const entries = listed(parsed);
   let readme: { name: string; text: string } | { name: string; tooBig: true } | null = null;
-  if (!route.path && budget.canSpend()) {
+  if (!route.path && budget.canSpend(1)) {
     const hit = parsed.find((entry: { name: string; mode: string; oid: string }) => (entry.name === 'README.md' || entry.name === 'README') && entry.mode !== '40000' && entry.mode !== '160000');
     if (hit) {
       try {
