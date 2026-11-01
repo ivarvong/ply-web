@@ -38,6 +38,16 @@ jobs:
           git config --global user.name "ply-web"
           git config --global user.email "ply-web@example.com"
           git config --global commit.gpgsign false
+      - name: Absence gate
+        run: node --experimental-strip-types scripts/absence-gate.ts
+      - name: Absence baseline does not rise
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 --no-tags origin "${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          node --experimental-strip-types scripts/absence-gate.ts --against "origin/${BASE_REF}"
       - run: npm ci
       - run: npm test
       - run: npm run lint
