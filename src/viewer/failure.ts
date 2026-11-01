@@ -1,5 +1,7 @@
 // Which part of a viewer URL failed, and the sentence the error page leads with.
-import { repoIdentity } from './identity.ts';
+import { captureGroup } from '../absent.ts'
+import { unwrapOr } from '../option.ts'
+import { repoIdentity } from './identity.ts'
 
 export type FailurePart = 'repo' | 'ref' | 'path' | 'request';
 
@@ -18,21 +20,25 @@ export function repoLabel(host: string, repoPath: string): string {
   return id.scope ? `${id.scope}/${id.name}` : id.name;
 }
 
+function captured(match: RegExpExecArray | null): string {
+  return unwrapOr(captureGroup(match, 1), '');
+}
+
 function refNamed(message: string, ref: string | null): string {
-  const missing = /^ref (.+) not found/.exec(message);
-  if (missing?.[1]) return missing[1];
-  const abbrev = /^abbreviated oid ([0-9a-f]+)/.exec(message);
-  if (abbrev?.[1]) return abbrev[1];
+  const missing = captured(/^ref (.+) not found/.exec(message));
+  if (missing !== '') return missing;
+  const abbrev = captured(/^abbreviated oid ([0-9a-f]+)/.exec(message));
+  if (abbrev !== '') return abbrev;
   if (ref && ref.length > 0) return ref;
   return 'HEAD';
 }
 
 function pathNamed(message: string, path: string): string {
   if (path) return path;
-  const component = /path component (\S+) not found/.exec(message);
-  if (component?.[1]) return component[1];
-  const directory = /^(\S+) is not a directory/.exec(message);
-  if (directory?.[1]) return directory[1];
+  const component = captured(/path component (\S+) not found/.exec(message));
+  if (component !== '') return component;
+  const directory = captured(/^(\S+) is not a directory/.exec(message));
+  if (directory !== '') return directory;
   return 'that path';
 }
 
