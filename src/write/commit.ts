@@ -4,7 +4,7 @@
 import { fail, editFile, encodeCommit, fetchCommit, fetchObject, hashObject, isLfsPointerPrefix, lsRefs, operation, parseOid, parseTree, push, resolveCommit, TYPE, validatePath, ZERO_OID, KIND, type Oid, type Span } from 'ply'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
 import { MODE_TREE, BLOB_MODES } from './constants.ts'
-import { refExists } from './errors.ts'
+import { assertNever, refExists } from './errors.ts'
 import { readHead } from './head.ts'
 import { plyPerson, type Stamp } from './identity.ts'
 import { sameBranch, type Change, type EditRequest } from './request.ts'
@@ -45,7 +45,7 @@ async function resolveTarget(t: Transport, ref: string | null): Promise<Target> 
     if (head.kind === 'born') return { ref: head.ref, oid: head.oid }
     if (head.kind === 'unborn') return { ref: head.ref, oid: null }
     if (head.kind === 'detached') throw fail('bad_request', 'remote HEAD is detached; pass ref explicitly')
-    throw fail('not_found', 'remote HEAD is absent; pass ref explicitly')
+    throw fail('not_found', 'remote HEAD is absent; pass ref explicitly', { miss: { kind: 'head_absent' } })
   }
   const listed = (await lsRefs(t, [ref])).refs.get(ref)?.oid as string | undefined
   return { ref, oid: listed ? oidOf(listed) : null }
@@ -62,14 +62,20 @@ async function commitOf(t: Transport, oid: string): Promise<{ tree: string; pare
   if (!fetched.ok) {
     const error = fetched.error
     if (error.code === 'not_found' && error.miss) {
+      // A commit id that is missing or not a commit stays 404. The other kinds are the same not_found error.
       switch (error.miss.kind) {
-        case 'absent':
-        case 'not_commit':
+        case 'commit':
+        case 'head_absent':
+        case 'head_unborn':
+        case 'is_directory':
+        case 'not_directory':
+        case 'path':
+        case 'ref':
+        case 'repository':
+        case 'submodule':
           throw error
-        default: {
-          const unreachable: never = error.miss
-          throw unreachable
-        }
+        default:
+          return assertNever(error.miss)
       }
     }
     throw error
@@ -158,7 +164,10 @@ async function applyOne(t: Transport, mem: Mem, change: Change, blobs: Blobs, tr
   if (change.kind === 'delete') return removeAt(mem, comps, path)
   if (change.kind === 'edit') {
     const leaf = lookup(mem, comps)
-    if (!leaf || leaf.kind === 'dir' || !FILE_MODES.has(leaf.mode)) throw fail('not_found', `${path} not found`)
+    if (!leaf) throw fail('not_found', `${path} not found`, { miss: { kind: 'path', missing: path, existingPath: '' } })
+    if (leaf.kind === 'lazy' && leaf.mode === '160000') throw fail('not_found', `${path} not found`, { miss: { kind: 'submodule', path, commit: leaf.oid } })
+    if (leaf.kind === 'lazy' && leaf.mode === MODE_TREE) throw fail('not_found', `${path} not found`, { miss: { kind: 'is_directory', path, tree: leaf.oid } })
+    if (leaf.kind === 'dir' || !FILE_MODES.has(leaf.mode)) throw fail('not_found', `${path} not found`, { miss: { kind: 'path', missing: path, existingPath: '' } })
     const bytes = await blobBytes(t, leaf.oid, blobs)
     rejectPointer(bytes, leaf.oid)
     const replaced = replaceOnce(bytes, text.encode(change.find), text.encode(change.replace))
@@ -214,7 +223,7 @@ export async function commitEdit(remote: string, req: EditRequest, opts: CallOpt
     const creating = target.oid === null
     const edit = singleEdit(req)
     const stream = edit !== null && req.committer === null && req.base.kind !== 'oid' && (target.oid !== null || baseIsOther)
-    if (edit && !stream && creating && !baseIsOther) throw fail('not_found', `ref ${target.ref} is unborn or absent; a root commit needs a create`)
+    if (edit && !stream && creating && !baseIsOther) throw fail('not_found', `ref ${target.ref} is unborn or absent; a root commit needs a create`, { miss: { kind: 'ref', ref: target.ref, candidates: [target.ref] } })
     root.set({ 'git.commit.ref': target.ref, 'git.commit.creating': creating, 'git.commit.base': req.base.kind === 'omit' ? '' : req.base.kind === 'oid' ? req.base.oid : req.base.ref })
     if (stream && edit) {
       try {
