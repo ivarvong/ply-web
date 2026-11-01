@@ -1,0 +1,33 @@
+{
+  "steps": [
+    { "percent": 1, "dwellMs": 40000 },
+    { "percent": 5, "dwellMs": 40000 },
+    { "percent": 10, "dwellMs": 40000 },
+    { "percent": 25, "dwellMs": 40000 },
+    { "percent": 50, "dwellMs": 40000 },
+    { "percent": 75, "dwellMs": 40000 },
+    { "percent": 100, "dwellMs": 40000 }
+  ],
+  "ingestWaitMs": 20000,
+  "warmupMs": 0,
+  "probe": {
+    "rps": 2,
+    "calls": [
+      { "method": "GET", "path": "/", "auth": false },
+      { "method": "GET", "path": "/v1/discover", "auth": true }
+    ]
+  },
+  "gates": {
+    "smoke": "hard",
+    "fivexx": "hard",
+    "exceptions": "hard",
+    "errorLogs": "hard",
+    "nonOk": "hard",
+    "burn": "hard",
+    "latency": { "mode": "informational" }
+  },
+  "burn": {
+    "fastBurn": 14.4,
+    "minSamples": 20
+  }
+}

@@ -9,6 +9,7 @@ import { errorMessage } from './proc.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import { writeJson, writeText } from './run-dir.ts'
 import {
+  applyGates,
   judgeSmokeTelemetry,
   queryFault,
   queryTo,
@@ -136,7 +137,8 @@ export async function stageTelemetry(
       combined.push(event)
     }
     const summary = summarizeTelemetry(opts.version, requests, combined, traces, spans)
-    const judge = judgeSmokeTelemetry({ version: opts.version, requests, summary, ceilings: SMOKE_LATENCY })
+    const judged = judgeSmokeTelemetry({ version: opts.version, requests, summary, ceilings: SMOKE_LATENCY })
+    const judge = applyGates(judged, config.policy.gates)
     const markdown = telemetryMarkdown({ version: opts.version, from, to, judge, summary })
     const stem = opts.live ? 'live-telemetry' : 'telemetry'
     await writeText(opts.runDir, `${stem}.md`, markdown)

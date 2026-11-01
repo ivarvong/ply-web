@@ -136,6 +136,7 @@ export type CdEvent =
   })
   | (Base & { readonly kind: 'error'; readonly payload: { readonly message: string; readonly context: Json } })
   | (Base & { readonly kind: 'annotation'; readonly payload: { readonly note: 'false_positive'; readonly reason: string } })
+  | (Base & { readonly kind: 'policy'; readonly payload: { readonly sha256: string; readonly path: string; readonly body: Json } })
 
 export type RunFacts = {
   versionId: string | null
@@ -363,6 +364,11 @@ function parsePayload(kind: CdEvent['kind'], payload: unknown): CdEvent['payload
     if (!reason.trim()) throw new Error('annotation reason is empty')
     return { note: 'false_positive', reason }
   }
+  if (kind === 'policy') {
+    const sha256 = needString(rec, 'sha256')
+    if (!/^[0-9a-f]{64}$/.test(sha256)) throw new Error('policy sha256 is not 64 hex')
+    return { sha256, path: needString(rec, 'path'), body: jsonValue(rec.body, 'body') }
+  }
   return { message: needString(rec, 'message'), context: jsonValue(rec.context, 'context') }
 }
 
@@ -370,7 +376,7 @@ function parsePayload(kind: CdEvent['kind'], payload: unknown): CdEvent['payload
 export function parseEvent(value: unknown): CdEvent {
   const rec = needRecord(value, 'event')
   const kind = needString(rec, 'kind')
-  const known = ['lifecycle', 'command', 'observation', 'decision', 'state_change', 'request', 'error', 'annotation']
+  const known = ['lifecycle', 'command', 'observation', 'decision', 'state_change', 'request', 'error', 'annotation', 'policy']
   if (!known.includes(kind)) throw new Error(`unknown event kind ${kind}`)
   const ts = needString(rec, 'ts')
   if (!ISO.test(ts)) throw new Error('ts is not an ISO timestamp with a numeric offset')
@@ -584,6 +590,12 @@ export class RunLog {
   async resumed(sha: string): Promise<void> {
     await this.#enqueue(async () => {
       await this.#append('lifecycle', { event: 'resumed', sha }, 'run')
+    })
+  }
+
+  async recordPolicy(input: { readonly sha256: string; readonly path: string; readonly body: Json }): Promise<void> {
+    await this.#enqueue(async () => {
+      await this.#append('policy', { sha256: input.sha256, path: input.path, body: input.body }, 'run')
     })
   }
 
