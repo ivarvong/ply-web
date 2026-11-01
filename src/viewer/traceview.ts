@@ -1,3 +1,4 @@
+import { atIndex, chainGet, fromAbsent, fromNullable } from '../absent.ts';
 import { fromAny } from 'ply';
 import type { AnyValue } from 'ply/otel';
 import type { FilterName, TraceBar, TraceModel } from './model.ts';
@@ -47,29 +48,41 @@ const SHOW = [
   'git.ls_refs.count', 'git.ls_refs.head', 'error.type', 'git.viewer.blob.too_big', 'git.viewer.blob.size',
 ] as const;
 
-function flattenAttrs(list: Kv[] | undefined): Record<string, unknown> {
+function flattenAttrs(list: unknown): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  for (const entry of list ?? []) if (isAnyValue(entry.value)) out[entry.key] = fromAny(entry.value);
+  const present = fromNullable(list);
+  const entries = present.tag === 'none' ? [] : present.value as Kv[];
+  for (const entry of entries) if (isAnyValue(entry.value)) out[entry.key] = fromAny(entry.value);
   return out;
 }
 
 function spansOf(lines: unknown[]): RawSpan[] {
   const spans: RawSpan[] = [];
   for (const line of lines) {
-    const resourceSpans = (line as { resourceSpans?: { scopeSpans?: { spans?: Record<string, unknown>[] }[] }[] }).resourceSpans ?? [];
+    const resourceField = chainGet(line, 'resourceSpans');
+    const resourceSpans = resourceField.tag === 'none' ? [] : resourceField.value as readonly unknown[];
     for (const resource of resourceSpans) {
-      for (const scope of resource.scopeSpans ?? []) {
-        for (const span of scope.spans ?? []) {
-          const start = BigInt(String(span.startTimeUnixNano ?? '0'));
-          const end = BigInt(String(span.endTimeUnixNano ?? start));
-          const status = span.status as { code?: number; message?: string } | undefined;
+      const scopeField = chainGet(resource, 'scopeSpans');
+      const scopes = scopeField.tag === 'none' ? [] : scopeField.value as readonly unknown[];
+      for (const scope of scopes) {
+        const spanField = chainGet(scope, 'spans');
+        const rawSpans = spanField.tag === 'none' ? [] : spanField.value as readonly Record<string, unknown>[];
+        for (const span of rawSpans) {
+          const startText = chainGet(span, 'startTimeUnixNano');
+          const start = BigInt(String(startText.tag === 'some' ? startText.value : '0'));
+          const endText = chainGet(span, 'endTimeUnixNano');
+          const end = BigInt(String(endText.tag === 'some' ? endText.value : start));
+          const status = chainGet(span, 'status');
+          const code = status.tag === 'some' ? chainGet(status.value, 'code') : fromNullable(null);
+          const statusMessage = status.tag === 'some' ? chainGet(status.value, 'message') : fromNullable(null);
+          const name = chainGet(span, 'name');
           spans.push({
-            name: String(span.name ?? ''),
+            name: String(name.tag === 'some' ? name.value : ''),
             startMs: Number(start / 1_000_000n),
             durMs: Math.max(0, Number((end - start) / 1_000_000n)),
-            status: status?.code === 2 ? 'error' : 'ok',
-            message: String(status?.message ?? '').slice(0, 180),
-            attrs: flattenAttrs(span.attributes as Kv[] | undefined),
+            status: code.tag === 'some' && code.value === 2 ? 'error' : 'ok',
+            message: String(statusMessage.tag === 'some' ? statusMessage.value : '').slice(0, 180),
+            attrs: flattenAttrs(span.attributes),
           });
         }
       }
@@ -104,9 +117,9 @@ function filterOf(attrs: Record<string, unknown>): FilterName | null {
 function linesFor(span: RawSpan): string[] {
   const lines: string[] = [];
   for (const key of SHOW) {
-    const value = span.attrs[key];
-    if (value === undefined || value === '' || value === null) continue;
-    lines.push(`${key}=${summarise(value)}`);
+    const value = fromAbsent(span.attrs[key]);
+    if (value.tag === 'none' || value.value === '' || value.value === null) continue;
+    lines.push(`${key}=${summarise(value.value)}`);
   }
   if (span.status === 'error' && span.message) lines.push(`error=${span.message}`);
   return lines;
@@ -138,7 +151,10 @@ export function buildTrace(lines: unknown[], cfRay: string, requestId: string): 
       packFilter: fetch ? filterOf(span.attrs) : null,
     };
   });
-  const start = bars.reduce((min, bar) => Math.min(min, bar.startMs), bars[0]?.startMs ?? 0);
+  const first = atIndex(bars, 0);
+  const firstStart = first.tag === 'some' ? chainGet(first.value, 'startMs') : fromNullable(null);
+  const origin = firstStart.tag === 'some' && typeof firstStart.value === 'number' ? firstStart.value : 0;
+  const start = bars.reduce((min, bar) => Math.min(min, bar.startMs), origin);
   const end = bars.reduce((max, bar) => Math.max(max, bar.startMs + bar.durMs), start);
   return { bars: bars.map(bar => ({ ...bar, startMs: bar.startMs - start })), totalMs: Math.max(0, end - start), cfRay, requestId };
 }
