@@ -2,44 +2,47 @@ import { describe, expect, it } from 'vitest';
 import { applyRollout, applyTargeting, encodeDocument, parseDocumentText } from '../../src/flags/document.ts';
 import { evaluateDocument, evaluateFlag } from '../../src/flags/eval.ts';
 import { bucketOf, inBucket } from '../../src/flags/hash.ts';
-import { EMPTY_DOCUMENT, percentOf, type FlagDocument, type Unit } from '../../src/flags/types.ts';
-import { ROLLOUT_PERCENTS } from '../../src/flags/types.ts';
-import { RAMP_PERCENTS } from '../../scripts/cd/baseline.ts';
+import { BASIS_POINTS } from '../../src/flags/ttl.ts';
+import { EMPTY_DOCUMENT, basisPointsOf, type FlagDocument, type Unit } from '../../src/flags/types.ts';
+import { DEFAULT_POLICY_PATH, loadPolicy } from '../../scripts/cd/policy.ts';
 
 const unit = (id: string, attributes: Record<string, string> = {}): Unit => ({ id, attributes });
 
-function ramp(percent: number): FlagDocument {
-  const edited = applyRollout(EMPTY_DOCUMENT, 'ply.usage.note', percent);
+function ramp(basisPoints: number): FlagDocument {
+  const edited = applyRollout(EMPTY_DOCUMENT, 'ply.usage.note', basisPoints);
   if (edited.kind !== 'ok') throw new Error(edited.reason);
   return edited.document;
 }
 
-describe('rollout schedule', () => {
-  it('uses the CD percent steps', () => {
-    expect([...ROLLOUT_PERCENTS]).toEqual([...RAMP_PERCENTS]);
-  });
-
-  it('walks ramping, then complete, and 0 is rolled back', () => {
-    const at1 = ramp(1).flags[0]!;
-    expect(at1.rollout).toEqual({ kind: 'ramping', step: 0, percents: [...ROLLOUT_PERCENTS] });
-    expect(percentOf(at1.rollout)).toBe(1);
-    const at100 = ramp(100).flags[0]!;
-    expect(at100.rollout.kind).toBe('complete');
-    expect(percentOf(at100.rollout)).toBe(100);
+describe('rollout allocation', () => {
+  it('accepts any basis point from 0 through 10000, including values that are not policy steps', () => {
+    expect(ramp(7).flags[0]!.rollout).toEqual({ kind: 'ramping', basisPoints: 7 });
+    expect(basisPointsOf(ramp(1).flags[0]!.rollout)).toBe(1);
+    expect(ramp(BASIS_POINTS).flags[0]!.rollout).toEqual({ kind: 'complete' });
+    expect(basisPointsOf(ramp(BASIS_POINTS).flags[0]!.rollout)).toBe(BASIS_POINTS);
     const back = applyRollout(ramp(50), 'ply.usage.note', 0);
     if (back.kind !== 'ok') throw new Error(back.reason);
-    expect(back.document.flags[0]!.rollout).toEqual({ kind: 'rolled-back', reason: 'percent 0', percents: [...ROLLOUT_PERCENTS] });
+    expect(back.document.flags[0]!.rollout).toEqual({ kind: 'rolled-back', reason: 'basis points 0' });
+    expect(basisPointsOf(back.document.flags[0]!.rollout)).toBe(0);
+    expect(applyRollout(EMPTY_DOCUMENT, 'ply.usage.note', -1).kind).toBe('invalid');
+    expect(applyRollout(EMPTY_DOCUMENT, 'ply.usage.note', BASIS_POINTS + 1).kind).toBe('invalid');
+    expect(applyRollout(EMPTY_DOCUMENT, 'ply.usage.note', 1.5).kind).toBe('invalid');
   });
 
-  it('rejects a percent that is not a step', () => {
-    const edited = applyRollout(EMPTY_DOCUMENT, 'ply.usage.note', 3);
-    expect(edited.kind).toBe('invalid');
+  it('can apply each step of the checked-in CD policy as basis points', () => {
+    const { policy } = loadPolicy(DEFAULT_POLICY_PATH);
+    expect(policy.steps.length).toBeGreaterThan(0);
+    for (const step of policy.steps) {
+      const basisPoints = step.percent * 100;
+      const flag = ramp(basisPoints).flags[0]!;
+      expect(basisPointsOf(flag.rollout)).toBe(basisPoints);
+    }
   });
 });
 
 describe('evaluation precedence', () => {
   it('is deny, then allow, then rule, then bucket, then default', () => {
-    const base = ramp(100);
+    const base = ramp(BASIS_POINTS);
     const targeted = applyTargeting(base, 'ply.usage.note', {
       allow: ['kept'],
       deny: ['blocked', 'kept'],
@@ -59,19 +62,20 @@ describe('evaluation precedence', () => {
     expect(open.variant).toEqual({ kind: 'boolean', value: true });
   });
 
-  it('keeps a bucketed unit in as the percent grows, and out until it crosses', () => {
+  it('keeps a bucketed unit in as the allocation grows, and out until it crosses', () => {
     const id = 'user-2';
     const bucket = bucketOf('ply.usage.note', 'v1', id);
     let entered = false;
-    for (const percent of [0, ...ROLLOUT_PERCENTS]) {
-      const flag = ramp(percent).flags[0]!;
+    for (let basisPoints = 0; basisPoints <= BASIS_POINTS; basisPoints += 250) {
+      const flag = ramp(basisPoints).flags[0]!;
       const evaluation = evaluateFlag(flag, flag.key, unit(id));
-      const inside = inBucket(bucket, percent);
+      const inside = inBucket(bucket, basisPoints);
       expect(evaluation.bucket).toBe(bucket);
       expect(evaluation.reason === 'bucket').toBe(inside);
       if (entered) expect(inside).toBe(true);
       if (inside) entered = true;
     }
+    expect(entered).toBe(true);
   });
 
   it('round-trips the document and treats a missing flag as default off', () => {

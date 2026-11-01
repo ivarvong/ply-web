@@ -1,11 +1,11 @@
-// Write-to-visible lag. After a successful conditional put, FlagsControl invalidates the one cache tag.
+// Write-to-visible lag. After a successful conditional put, FlagControl invalidates the one cache tag.
 // The next read revalidates and observes the new ETag. Without that invalidate, a fresh hit keeps the old revision
 // until max-age. This module measures both with a model of that cache; it does not talk to the network.
 import { setRollout } from './api.ts';
 import { percentile } from './report.ts';
 import { memoryStore, type InvalidateResult } from './store.ts';
 import { ABSENT_REVISION, FLAGS_MAX_AGE_S, FLAGS_SWR_S } from './ttl.ts';
-import { percentOf, ROLLOUT_PERCENTS } from './types.ts';
+import { basisPointsOf } from './types.ts';
 
 export type CacheView = { readonly revision: string | null; readonly cache: 'HIT' | 'REVALIDATED' | 'MISS' };
 
@@ -58,10 +58,10 @@ export async function measureRounds(rounds: number, now: () => number = () => pe
   await cache.read();
   const samples: PropagationRound[] = [];
   for (let i = 0; i < rounds; i++) {
-    const percent = ROLLOUT_PERCENTS[i % ROLLOUT_PERCENTS.length]!;
+    const basisPoints = i + 1;
     const before = revision;
     const started = now();
-    const written = await setRollout(store, { invalidate: async () => cache.invalidate() }, 'ply.usage.note', percent, revision);
+    const written = await setRollout(store, { invalidate: async () => cache.invalidate() }, 'ply.usage.note', basisPoints, revision);
     if (written.kind !== 'ok') throw new Error(`write failed: ${written.kind}`);
     revision = written.revision;
     let seen = await cache.read();
@@ -82,6 +82,6 @@ export async function measureRounds(rounds: number, now: () => number = () => pe
     p50: percentile(lags, 0.5),
     p95: percentile(lags, 0.95),
     p99: percentile(lags, 0.99),
-    staleWithoutInvalidate: stale.cache === 'HIT' && stale.revision === first.revision && percentOf(second.config.flags[0]!.rollout) === 5,
+    staleWithoutInvalidate: stale.cache === 'HIT' && stale.revision === first.revision && basisPointsOf(second.config.flags[0]!.rollout) === 5,
   };
 }

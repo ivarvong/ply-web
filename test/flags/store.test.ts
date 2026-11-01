@@ -22,14 +22,14 @@ describe('compare-and-swap', () => {
     const next = await setRollout(store, { invalidate: okInvalidate }, 'ply.usage.note', 5, created.revision);
     expect(next.kind).toBe('ok');
     if (next.kind !== 'ok') return;
-    expect(next.config.flags[0]!.rollout).toMatchObject({ kind: 'ramping', step: 1 });
+    expect(next.config.flags[0]!.rollout).toEqual({ kind: 'ramping', basisPoints: 5 });
   });
 
   it('does not write an invalid edit', async () => {
     const store = memoryStore();
     const created = await setRollout(store, { invalidate: okInvalidate }, 'ply.usage.note', 1, ABSENT_REVISION);
     if (created.kind !== 'ok') throw new Error(created.kind);
-    const rejected = await setRollout(store, { invalidate: okInvalidate }, 'ply.usage.note', 7, created.revision);
+    const rejected = await setRollout(store, { invalidate: okInvalidate }, 'ply.usage.note', 10_001, created.revision);
     expect(rejected.kind).toBe('invalid');
     expect(store.snapshot()?.etag).toBe(created.revision);
   });

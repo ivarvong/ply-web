@@ -1,4 +1,4 @@
-// Read and eval over HTTP. Writes are FlagsControl RPC, so PUT/POST of a ruleset is 405.
+// Read and eval over HTTP. Writes are FlagControl RPC, so PUT/POST of a ruleset is 405.
 import { loadRuleset, type FlagCacheEnv, type FlagsCacheBinding } from './cache.ts';
 import { resolveFlags } from './client.ts';
 import { parseUnit } from './document.ts';
@@ -45,7 +45,7 @@ export async function handleFlagHttp(request: Request, env: FlagCacheEnv, ctx: F
   if (url.pathname === '/v1/flags' && request.method === 'GET') return getRules(env, ctx);
   if (url.pathname === '/v1/flags/eval' && request.method === 'POST') return postEval(request, env, ctx);
   if (url.pathname === '/v1/flags' || url.pathname === '/v1/flags/eval') {
-    return json(405, { code: 'unsupported', message: 'flag writes are FlagsControl RPC (setRollout, setTargeting), not HTTP', retry: 'no' });
+    return json(405, { code: 'unsupported', message: 'flag writes are FlagControl RPC (setRollout, setTargeting), not HTTP', retry: 'no' });
   }
   return json(404, { code: 'not_found', message: 'no flag route', retry: 'no' });
 }

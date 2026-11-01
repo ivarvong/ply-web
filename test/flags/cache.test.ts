@@ -53,7 +53,7 @@ describe('ruleset cache', () => {
     const put = await handleFlagHttp(new Request('https://ply.ivar.workers.dev/v1/flags', { method: 'PUT' }), env, ctx);
     expect(put.status).toBe(405);
     const body = await put.json() as { message: string };
-    expect(body.message).toContain('FlagsControl');
+    expect(body.message).toContain('FlagControl');
     const evalResponse = await handleFlagHttp(new Request('https://ply.ivar.workers.dev/v1/flags/eval', {
       method: 'POST',
       body: JSON.stringify({ unit: 'anonymous' }),

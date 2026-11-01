@@ -1,4 +1,4 @@
-// FlagsCache is the cache-enabled entrypoint (one ruleset, one tag). FlagsControl is the RPC write API.
+// FlagsCache is the cache-enabled entrypoint (one ruleset, one tag). FlagControl is the RPC write API.
 // Invalidate runs inside FlagsCache: Workers Cache scopes tags to the entrypoint that calls invalidate.
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { getConfig, setRollout, setTargeting } from './api.ts';
@@ -53,15 +53,15 @@ async function invalidateFrom(ctx: FlagCtx): Promise<InvalidateResult> {
   }
 }
 
-export class FlagsControl extends WorkerEntrypoint<FlagEnv> {
+export class FlagControl extends WorkerEntrypoint<FlagEnv> {
   async getConfig(): Promise<ReadResult> {
     if (!this.env.FLAGS) return { kind: 'unavailable', reason: 'FLAGS binding is not configured' };
     return getConfig(r2Store(this.env.FLAGS));
   }
 
-  async setRollout(flag: string, percent: number, expectedRevision: string): Promise<WriteResult> {
+  async setRollout(flag: string, basisPoints: number, expectedRevision: string): Promise<WriteResult> {
     if (!this.env.FLAGS) return { kind: 'unavailable', reason: 'FLAGS binding is not configured' };
-    return setRollout(r2Store(this.env.FLAGS), { invalidate: () => invalidateFrom(this.ctx as FlagCtx) }, flag, percent, expectedRevision);
+    return setRollout(r2Store(this.env.FLAGS), { invalidate: () => invalidateFrom(this.ctx as FlagCtx) }, flag, basisPoints, expectedRevision);
   }
 
   async setTargeting(flag: string, targeting: Targeting, expectedRevision: string): Promise<WriteResult> {

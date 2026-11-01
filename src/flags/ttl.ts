@@ -11,8 +11,10 @@ export const FLAGS_OBJECT_KEY = 'flags/config.json';
 export const FLAGS_CACHE_PATH = '/config';
 export const FLAGS_CACHE_URL = 'https://flags.internal/config';
 
-/** 10_000 buckets: one percent is 100 buckets, so a CD percent maps onto the hash without rounding. */
+/** 10_000 buckets. One basis point is one bucket, so an allocation needs no rounding. */
 export const BUCKETS = 10_000;
+/** Inclusive top of a rollout: 10_000 basis points is 100% of units. */
+export const BASIS_POINTS = BUCKETS;
 
 /** Salt assigned when setRollout creates a flag. Changing it would rebucket everyone, so it stays put. */
 export const DEFAULT_SALT = 'v1';

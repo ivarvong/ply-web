@@ -1,8 +1,7 @@
 // Parse, validate, and edit the one ruleset. Edits are pure: the caller compare-and-swaps the encoded bytes.
-import { DEFAULT_SALT, MAX_ATTRIBUTES, MAX_DOCUMENT_BYTES, MAX_FLAGS, MAX_RULES, MAX_UNITS } from './ttl.ts';
+import { BASIS_POINTS, DEFAULT_SALT, MAX_ATTRIBUTES, MAX_DOCUMENT_BYTES, MAX_FLAGS, MAX_RULES, MAX_UNITS } from './ttl.ts';
 import {
   EMPTY_DOCUMENT,
-  ROLLOUT_PERCENTS,
   type AttributeRule,
   type DiffEntry,
   type Flag,
@@ -37,17 +36,6 @@ function isObj(value: unknown): value is Obj {
 function exactKeys(value: Obj, allowed: readonly string[]): boolean {
   const keys = Object.keys(value);
   return keys.length === allowed.length && allowed.every(key => keys.includes(key));
-}
-
-function validSchedule(percents: readonly number[]): boolean {
-  if (percents.length < 1 || percents.length > 32) return false;
-  if (percents[percents.length - 1] !== 100) return false;
-  let previous = 0;
-  for (const percent of percents) {
-    if (!Number.isInteger(percent) || percent <= previous || percent > 100) return false;
-    previous = percent;
-  }
-  return true;
 }
 
 function parseVariant(value: unknown): Variant | Invalid {
@@ -97,28 +85,27 @@ function parseRule(value: unknown): AttributeRule | Invalid {
   return { attribute: value.attribute, op: value.op, value: value.value, variant: variant as Variant };
 }
 
+function basisPoint(value: unknown): number | Invalid {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value >= BASIS_POINTS) return invalid(`ramping basisPoints is an integer from 1 to ${BASIS_POINTS - 1}`);
+  return value;
+}
+
 function parseRollout(value: unknown): Rollout | Invalid {
-  if (!isObj(value) || typeof value.kind !== 'string' || !Array.isArray(value.percents)) return invalid('rollout must be an object');
-  const percents: number[] = [];
-  for (const item of value.percents) {
-    if (typeof item !== 'number') return invalid('rollout percents are integers');
-    percents.push(item);
-  }
-  if (!validSchedule(percents)) return invalid('rollout percents must strictly increase and end at 100');
+  if (!isObj(value) || typeof value.kind !== 'string') return invalid('rollout must be an object');
   if (value.kind === 'rolled-back') {
-    if (!exactKeys(value, ['kind', 'reason', 'percents'])) return invalid('rolled-back rollout is {kind, reason, percents}');
+    if (!exactKeys(value, ['kind', 'reason'])) return invalid('rolled-back rollout is {kind, reason}');
     if (typeof value.reason !== 'string' || !ROLLBACK_REASON.test(value.reason)) return invalid('rollback reason must be printable');
-    return { kind: 'rolled-back', reason: value.reason, percents };
+    return { kind: 'rolled-back', reason: value.reason };
   }
   if (value.kind === 'complete') {
-    if (!exactKeys(value, ['kind', 'percents'])) return invalid('complete rollout is {kind, percents}');
-    return { kind: 'complete', percents };
+    if (!exactKeys(value, ['kind'])) return invalid('complete rollout is {kind}');
+    return { kind: 'complete' };
   }
   if (value.kind === 'ramping') {
-    if (!exactKeys(value, ['kind', 'step', 'percents'])) return invalid('ramping rollout is {kind, step, percents}');
-    if (typeof value.step !== 'number' || !Number.isInteger(value.step) || value.step < 0 || value.step >= percents.length) return invalid('rollout step is out of range');
-    if (value.step === percents.length - 1 && percents[value.step] === 100) return invalid('the last step is complete, not ramping');
-    return { kind: 'ramping', step: value.step, percents };
+    if (!exactKeys(value, ['kind', 'basisPoints'])) return invalid('ramping rollout is {kind, basisPoints}');
+    const basisPoints = basisPoint(value.basisPoints);
+    if (typeof basisPoints !== 'number') return basisPoints;
+    return { kind: 'ramping', basisPoints };
   }
   return invalid('rollout kind must be ramping, complete, or rolled-back');
 }
@@ -213,7 +200,7 @@ export function freshFlag(key: string): Flag {
   return {
     key,
     salt: DEFAULT_SALT,
-    rollout: { kind: 'rolled-back', reason: 'created', percents: [...ROLLOUT_PERCENTS] },
+    rollout: { kind: 'rolled-back', reason: 'created' },
     on: { kind: 'boolean', value: true },
     off: { kind: 'boolean', value: false },
     allow: [],
@@ -222,22 +209,20 @@ export function freshFlag(key: string): Flag {
   };
 }
 
-export function applyPercent(rollout: Rollout, percent: number): { readonly kind: 'ok'; readonly rollout: Rollout } | Invalid {
-  if (!Number.isInteger(percent) || percent < 0 || percent > 100) return invalid('percent must be an integer from 0 to 100');
-  if (percent === 0) return { kind: 'ok', rollout: { kind: 'rolled-back', reason: 'percent 0', percents: rollout.percents } };
-  const step = rollout.percents.indexOf(percent);
-  if (step < 0) return invalid(`percent ${percent} is not a step of [${rollout.percents.join(', ')}]`);
-  if (step === rollout.percents.length - 1) return { kind: 'ok', rollout: { kind: 'complete', percents: rollout.percents } };
-  return { kind: 'ok', rollout: { kind: 'ramping', step, percents: rollout.percents } };
+export function applyBasisPoints(basisPoints: number): { readonly kind: 'ok'; readonly rollout: Rollout } | Invalid {
+  if (!Number.isInteger(basisPoints) || basisPoints < 0 || basisPoints > BASIS_POINTS) return invalid(`basis points must be an integer from 0 to ${BASIS_POINTS}`);
+  if (basisPoints === 0) return { kind: 'ok', rollout: { kind: 'rolled-back', reason: 'basis points 0' } };
+  if (basisPoints === BASIS_POINTS) return { kind: 'ok', rollout: { kind: 'complete' } };
+  return { kind: 'ok', rollout: { kind: 'ramping', basisPoints } };
 }
 
 export type Changed = { readonly kind: 'ok'; readonly document: FlagDocument } | Invalid;
 
-export function applyRollout(document: FlagDocument, key: string, percent: number): Changed {
+export function applyRollout(document: FlagDocument, key: string, basisPoints: number): Changed {
   if (!FLAG_KEY.test(key)) return invalid('flag key must match ^[a-z][a-z0-9._-]{0,63}$');
   const existing = document.flags.find(flag => flag.key === key);
   const base = existing ?? freshFlag(key);
-  const applied = applyPercent(base.rollout, percent);
+  const applied = applyBasisPoints(basisPoints);
   if (applied.kind === 'invalid') return applied;
   const next: Flag = { ...base, rollout: applied.rollout };
   const flags = existing ? document.flags.map(flag => flag.key === key ? next : flag) : [...document.flags, next];

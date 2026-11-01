@@ -1,7 +1,7 @@
-// Flag config is one document. A rollout is the CD ramp: a strictly increasing percent schedule and a step index.
-// scripts/cd is not imported here. test/flags/eval.test.ts locks these values to RAMP_PERCENTS.
+// Flag config is one document. A rollout is an allocation in basis points, not a step list.
+// Stepped ramps live in scripts/cd/cd.policy.json. This module does not import that file.
 
-export const ROLLOUT_PERCENTS = [1, 5, 10, 25, 50, 75, 100] as const;
+import { BASIS_POINTS } from './ttl.ts';
 
 export type EnvironmentName = 'production';
 
@@ -21,11 +21,14 @@ export type AttributeRule = {
   readonly variant: Variant;
 };
 
-/** Same shape as the CD ramp state, without the harness-fault arm (that stays in the CD runner). */
+/**
+ * Traffic allocation for one flag. `ramping` is 1..9999 basis points, `complete` is 10000, `rolled-back` is 0.
+ * Which of those values a release walks is the CD policy, not this type.
+ */
 export type Rollout =
-  | { readonly kind: 'ramping'; readonly step: number; readonly percents: readonly number[] }
-  | { readonly kind: 'complete'; readonly percents: readonly number[] }
-  | { readonly kind: 'rolled-back'; readonly reason: string; readonly percents: readonly number[] };
+  | { readonly kind: 'ramping'; readonly basisPoints: number }
+  | { readonly kind: 'complete' }
+  | { readonly kind: 'rolled-back'; readonly reason: string };
 
 export type Flag = {
   readonly key: string;
@@ -84,11 +87,11 @@ export type DiffEntry =
   | { readonly op: 'rollout'; readonly key: string; readonly before: Rollout; readonly after: Rollout }
   | { readonly op: 'targeting'; readonly key: string; readonly before: Targeting; readonly after: Targeting };
 
-export function percentOf(rollout: Rollout): number {
+/** Basis points in force: 0 when rolled back, 10000 when complete, otherwise the ramping allocation. */
+export function basisPointsOf(rollout: Rollout): number {
   if (rollout.kind === 'rolled-back') return 0;
-  if (rollout.kind === 'complete') return 100;
-  const percent = rollout.percents[rollout.step];
-  return typeof percent === 'number' ? percent : 0;
+  if (rollout.kind === 'complete') return BASIS_POINTS;
+  return rollout.basisPoints;
 }
 
 export function variantKind(variant: Variant): Variant['kind'] {

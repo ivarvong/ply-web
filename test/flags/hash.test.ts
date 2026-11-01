@@ -60,25 +60,28 @@ describe('bucketing properties', () => {
     }
   });
 
-  it('is monotonic: a unit inside percent p stays inside every q >= p', () => {
+  it('is monotonic: a unit inside n basis points stays inside every larger allocation', () => {
+    let regressions = 0;
     for (let bucket = 0; bucket < BUCKETS; bucket += 17) {
       let seen = false;
-      for (let percent = 0; percent <= 100; percent++) {
-        const inside = inBucket(bucket, percent);
-        if (seen) expect(inside).toBe(true);
+      for (let basisPoints = 0; basisPoints <= BUCKETS; basisPoints++) {
+        const inside = inBucket(bucket, basisPoints);
+        if (seen && !inside) regressions++;
         if (inside) seen = true;
       }
+      if (!seen) regressions++;
     }
+    expect(regressions).toBe(0);
     expect(inBucket(0, 0)).toBe(false);
-    expect(inBucket(9999, 100)).toBe(true);
-    expect(inBucket(9999, 99)).toBe(false);
+    expect(inBucket(9999, BUCKETS)).toBe(true);
+    expect(inBucket(9999, 9999)).toBe(false);
     expect(inBucket(0, 1)).toBe(true);
   });
 
-  it('puts about half of a fixed sample inside 50%', () => {
+  it('puts about half of a fixed sample inside 5000 basis points', () => {
     let inside = 0;
     const total = 4000;
-    for (let i = 0; i < total; i++) if (inBucket(bucketOf('ply.usage.note', 'v1', `unit-${i}`), 50)) inside++;
+    for (let i = 0; i < total; i++) if (inBucket(bucketOf('ply.usage.note', 'v1', `unit-${i}`), 5_000)) inside++;
     expect(inside / total).toBeGreaterThan(0.45);
     expect(inside / total).toBeLessThan(0.55);
   });

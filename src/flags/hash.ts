@@ -1,5 +1,5 @@
 // MurmurHash3_x86_32 (Austin Appleby, public domain), seed 0. The bucket is this hash mod 10_000.
-// A unit's bucket never changes for a fixed (flag, salt, unit), so raising the percent only adds units.
+// A unit's bucket never changes for a fixed (flag, salt, unit), so raising the allocation only adds units.
 import { BUCKETS } from './ttl.ts';
 
 const C1 = 0xcc9e2d51;
@@ -70,9 +70,9 @@ export function bucketOf(flagKey: string, salt: string, unitId: string): number 
   return murmur3_32(hashMaterial(flagKey, salt, unitId), 0) % BUCKETS;
 }
 
-/** True when the unit is inside `percent` (0–100). Threshold is percent × 100, so the ramp is monotonic. */
-export function inBucket(bucket: number, percent: number): boolean {
-  if (!Number.isInteger(percent) || percent <= 0 || !Number.isInteger(bucket) || bucket < 0 || bucket >= BUCKETS) return false;
-  if (percent >= 100) return true;
-  return bucket < percent * (BUCKETS / 100);
+/** True when the unit is inside `basisPoints` (0–10000). One basis point is one bucket, so raising it only adds units. */
+export function inBucket(bucket: number, basisPoints: number): boolean {
+  if (!Number.isInteger(basisPoints) || basisPoints <= 0 || !Number.isInteger(bucket) || bucket < 0 || bucket >= BUCKETS) return false;
+  if (basisPoints >= BUCKETS) return true;
+  return bucket < basisPoints;
 }

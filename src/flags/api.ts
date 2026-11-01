@@ -19,8 +19,8 @@ export async function getConfig(store: FlagStore): Promise<ReadResult> {
   return readConfig(store);
 }
 
-export async function setRollout(store: FlagStore, invalidator: Invalidator, flag: string, percent: number, expectedRevision: string): Promise<WriteResult> {
-  return commitChange(store, invalidator, expectedRevision, document => applyRollout(document, flag, percent), 'setRollout', flag, writeLog);
+export async function setRollout(store: FlagStore, invalidator: Invalidator, flag: string, basisPoints: number, expectedRevision: string): Promise<WriteResult> {
+  return commitChange(store, invalidator, expectedRevision, document => applyRollout(document, flag, basisPoints), 'setRollout', flag, writeLog);
 }
 
 export async function setTargeting(store: FlagStore, invalidator: Invalidator, flag: string, targeting: Targeting, expectedRevision: string): Promise<WriteResult> {

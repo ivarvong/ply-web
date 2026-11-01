@@ -35,7 +35,7 @@ const entrypoints = {
 	// The one flag ruleset (src/flags/cache.ts). Caching stays off on the default entrypoint, which always runs.
 	FlagsCache: exports.worker({ cache: { enabled: true } }),
 	// RPC writes (src/flags/entry.ts). Not cached: setRollout and setTargeting are not idempotent GETs.
-	FlagsControl: exports.worker({ cache: { enabled: false } }),
+	FlagControl: exports.worker({ cache: { enabled: false } }),
 } as const;
 
 // A binding can only name a class declared live above. src/index.js re-exports it from src/viewer/rate.ts.
@@ -87,10 +87,10 @@ export default defineConfig({
 			FLAGS: bindings.r2({ name: "ply-flags" }),
 			FLAGS_MAX_AGE_S: bindings.text(String(FLAGS_MAX_AGE_S)),
 			FLAGS_SWR_S: bindings.text(String(FLAGS_SWR_S)),
-			// Callers (the CD follow-up) use a service binding to FlagsControl. This one is that binding,
+			// Callers (the CD follow-up) use a service binding to FlagControl. This one is that binding,
 			// aimed at this Worker, so the RPC methods are the write API. Reads of the ruleset go through
 			// ctx.exports.FlagsCache, which is the cached entrypoint.
-			FLAGS_CONTROL: bindings.worker({ worker: WORKER_NAME, exportName: "FlagsControl" }),
+			FLAG_CONTROL: bindings.worker({ worker: WORKER_NAME, exportName: "FlagControl" }),
 		},
 		exports: { ...durableObjects, ...entrypoints },
 	},

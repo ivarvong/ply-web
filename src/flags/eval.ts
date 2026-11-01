@@ -2,7 +2,7 @@
 // Deny wins over allow so a unit on both lists stays off while the percent grows.
 import { bucketOf, inBucket } from './hash.ts';
 import { DEFAULT_SALT } from './ttl.ts';
-import { percentOf, type Flag, type FlagDocument, type FlagEvaluation, type Unit, type Variant } from './types.ts';
+import { basisPointsOf, type Flag, type FlagDocument, type FlagEvaluation, type Unit, type Variant } from './types.ts';
 
 const MISSING_OFF: Variant = { kind: 'boolean', value: false };
 
@@ -22,7 +22,7 @@ export function evaluateFlag(flag: Flag | null, key: string, unit: Unit): FlagEv
   for (const rule of flag.rules) {
     if (matches(rule, unit.attributes)) return { key, variant: rule.variant, reason: 'rule', bucket };
   }
-  if (inBucket(bucket, percentOf(flag.rollout))) return { key, variant: flag.on, reason: 'bucket', bucket };
+  if (inBucket(bucket, basisPointsOf(flag.rollout))) return { key, variant: flag.on, reason: 'bucket', bucket };
   return { key, variant: flag.off, reason: 'default', bucket };
 }
 

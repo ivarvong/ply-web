@@ -41,7 +41,7 @@ import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans
 import { usageNote } from './flags/client.ts';
 import { handleFlagHttp } from './flags/http.ts';
 
-export { FlagsCache, FlagsControl } from './flags/entry.ts';
+export { FlagsCache, FlagControl } from './flags/entry.ts';
 
 export { checkRemote };
 
@@ -156,8 +156,8 @@ Pass oids returned by these responses into later requests. When HEAD is unborn, 
 and branch-from require the missing field (ref, onto, or from) by name. An explicit unborn ref is 404
 "ref refs/heads/main is unborn; create a commit before …".
 
-Feature flags (same bearer as /v1). The ruleset is one R2 object. Writes are not HTTP: FlagsControl.setRollout,
-setTargeting, and getConfig, over the FLAGS_CONTROL service binding. See docs/feature-flags.md.
+Feature flags (same bearer as /v1). The ruleset is one R2 object. Writes are not HTTP: FlagControl.setRollout,
+setTargeting, and getConfig, over the FLAG_CONTROL service binding. See docs/feature-flags.md.
   GET  /v1/flags                         cached ruleset {revision, cache, environment, flags}
   POST /v1/flags/eval  {unit, attributes?, keys?}
                                          {revision, cache, flags:[{key, variant, reason, bucket}]}
