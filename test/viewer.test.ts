@@ -33,6 +33,18 @@ import { compareTagNames, tagsFromRefs } from '../src/viewer/tags.ts';
 import { plyBuildValue } from '../src/version.ts';
 import { LAYOUT } from '../src/viewer/layout.ts';
 import { none, some } from '../src/option.ts';
+
+/** Null and a missing value take the fallback. An empty string and 0 stay. */
+function fill<T>(value: unknown, fallback: T): T {
+  return value === null || value === void 0 ? fallback : value as T;
+}
+
+/** One property. A null receiver and a missing key are holes. A stored null stays null. */
+function slot(receiver: unknown, key: string): unknown {
+  if (receiver === null || receiver === void 0) return void 0;
+  if (typeof receiver !== 'object' && typeof receiver !== 'function') return void 0;
+  return (receiver as Record<string, unknown>)[key];
+}
 import { VIEWER_CAPS, VIEWER_GIT_LIMITS, VIEWER_UA, rateLimitFor } from '../src/viewer/limits.ts';
 import type { Loaded, RateNamespace, TraceModel } from '../src/viewer/model.ts';
 import { renderMarkdown } from '../src/viewer/markdown.ts';
@@ -48,9 +60,9 @@ beforeEach(() => resetQuirks());
 const FIXTURE = fileURLToPath(new URL('./fixtures/viewer/small.pack', import.meta.url));
 const FIXTURE_SHA = 'a86b269e52e69445e10d4c1dd7c5a89b323c0988f1d73b1f0b0c7c1d112f846a';
 
-function treeFixture(over: { message?: string; host?: string; repoPath?: string }): Extract<Loaded, { kind: "tree" }> {
-  const host = over.host ?? 'github.com'
-  const repoPath = over.repoPath ?? 'o/r'
+function treeFixture(over: Partial<{ message: string; host: string; repoPath: string }>): Extract<Loaded, { kind: "tree" }> {
+  const host = fill(over.host, 'github.com')
+  const repoPath = fill(over.repoPath, 'o/r')
   return {
     kind: 'tree',
     header: {
@@ -58,7 +70,7 @@ function treeFixture(over: { message?: string; host?: string; repoPath?: string 
       server: { agent: 'git/2', protocol: 2, objectFormat: 'sha1', caps: ['agent'], fetchFeatures: ['filter'], filterAdvertised: true },
     },
     path: '',
-    commit: { oid: 'a'.repeat(40), tree: 'b'.repeat(40), parents: [], authorName: 'Ada', authorEmail: 'a@b', authorTime: '2020-01-02T03:04:05Z', authorTz: '+0000', message: over.message ?? 'subject', signed: false },
+    commit: { oid: 'a'.repeat(40), tree: 'b'.repeat(40), parents: [], authorName: 'Ada', authorEmail: 'a@b', authorTime: '2020-01-02T03:04:05Z', authorTz: '+0000', message: fill(over.message, 'subject'), signed: false },
     log: [], logStopped: false,
     branches: [{ name: 'refs/heads/main', oid: 'a'.repeat(40), head: true }], branchesTruncated: 0,
     tags: [{ name: 'refs/tags/v1.0.0', oid: 'd'.repeat(40) }], tagsTruncated: 0,
@@ -93,13 +105,13 @@ test('public repo URLs: exact allowlist, case, trailing dot, lookalikes, credent
     'https://ply.ivar.workers.dev/a/b', 'https://other.workers.dev/a/b', 'ftp://github.com/a/b', 'not a url', '',
   ];
   for (const raw of bad) {
-    assert.throws(() => loc(raw), (err: { message?: string }) => {
-      const message = String(err?.message ?? err);
+    assert.throws(() => loc(raw), (err: Partial<{ message: string }>) => {
+      const message = String(fill(slot(err, 'message'), err));
       return message.includes(supported) && !message.includes('super-secret-token') && !message.includes('pw@');
     }, raw);
   }
-  assert.throws(() => loc('https://user:super-secret-token@github.com/octocat/Hello-World'), (err: { message?: string }) => {
-    const message = String(err?.message ?? '');
+  assert.throws(() => loc('https://user:super-secret-token@github.com/octocat/Hello-World'), (err: Partial<{ message: string }>) => {
+    const message = String(fill(slot(err, 'message'), ''));
     return /credentials/.test(message) && message.includes(supported) && !message.includes('super-secret-token');
   });
   const extra = allowlistFromEnv('acct.artifacts.cloudflare.net, *.artifacts.cloudflare.net, https://evil.example, github.com:443, , not a host');
@@ -111,7 +123,7 @@ test('public repo URLs: exact allowlist, case, trailing dot, lookalikes, credent
   assert.equal(allowlistFromEnv('*.artifacts.cloudflare.net').length, ALLOWED_HOSTS.length);
   const art = loc('https://acct.artifacts.cloudflare.net/git/ns/repo.git', extra);
   assert.equal(art.host, 'acct.artifacts.cloudflare.net');
-  assert.throws(() => loc('https://other.artifacts.cloudflare.net/a/b.git', extra), (err: { message?: string }) => /not an allowlisted host/.test(String(err?.message)) && String(err?.message).includes('acct.artifacts.cloudflare.net'));
+  assert.throws(() => loc('https://other.artifacts.cloudflare.net/a/b.git', extra), (err: Partial<{ message: string }>) => /not an allowlisted host/.test(String(slot(err, 'message'))) && String(slot(err, 'message')).includes('acct.artifacts.cloudflare.net'));
   assert.throws(() => loc('https://acct.artifacts.cloudflare.net/a/b.git'), /not an allowlisted host/);
   const repo = loc('https://github.com/octocat/Hello-World');
   assert.equal(assertUpstreamUrl('https://github.com/octocat/Hello-World.git/info/refs?service=git-upload-pack', repo.url, repo.allowedHosts), 'https://github.com/octocat/Hello-World.git/info/refs?service=git-upload-pack');
@@ -148,7 +160,7 @@ test('paste parsing stays inside the allowlist', () => {
   assert.equal(longPublic.kind, 'redirect');
   if (longPublic.kind === 'redirect') assert.equal(longPublic.location, '/r/ply?path=README.md');
   assert.throws(() => parseViewerRoute(new URL('https://ply.example/view?remote=evil.example/a/b'), routeOptsFromEnv({})), /Supported hosts/);
-  assert.throws(() => parseViewerRoute(new URL('https://ply.example/view?remote=' + encodeURIComponent('https://user:super-secret-token@github.com/a/b')), routeOptsFromEnv({})), (err: { message?: string }) => /credentials/.test(String(err?.message)) && !String(err?.message).includes('super-secret-token'));
+  assert.throws(() => parseViewerRoute(new URL('https://ply.example/view?remote=' + encodeURIComponent('https://user:super-secret-token@github.com/a/b')), routeOptsFromEnv({})), (err: Partial<{ message: string }>) => /credentials/.test(String(slot(err, 'message'))) && !String(slot(err, 'message')).includes('super-secret-token'));
   const md = renderMarkdown('# Hi\n\n<script>alert(1)</script>\n\n[x](javascript:alert(1))\n\n[ok](https://github.com/octocat/Hello-World)\n');
   assert.equal(md.includes('<script'), false);
   assert.match(md, /&lt;script&gt;/);
@@ -163,7 +175,7 @@ test('paste parsing stays inside the allowlist', () => {
 test('abbreviated oids, failure copy, tag order, cache headers, and version text', () => {
   const oid = '705bd639' + 'a'.repeat(32);
   const other = '705bd639' + 'b'.repeat(32);
-  const refs = new Map<string, { oid: string; peeled?: string }>([
+  const refs = new Map<string, { oid: string } & Partial<{ peeled: string }>>([
     ['refs/heads/main', { oid }],
     ['refs/heads/other', { oid: other }],
     ['refs/tags/v1', { oid: 'c'.repeat(40), peeled: oid }],
@@ -245,7 +257,7 @@ test('abbreviated oids, failure copy, tag order, cache headers, and version text
   const repos = { names: ['curl', 'deepfile', 'ply', 'ply-web'], unavailable: false };
   const listedHome = String(renderHome(null, 1, repos));
   const listedNamespace = String(renderNamespace(repos, 1));
-  const listMarkup = (html: string) => /<ul class="repo-list">[\s\S]*?<\/ul>/.exec(html)?.[0] ?? '';
+  const listMarkup = (html: string) => fill(slot(/<ul class="repo-list">[\s\S]*?<\/ul>/.exec(html), '0'), '');
   assert.equal(listMarkup(listedHome), listMarkup(listedNamespace));
   assert.match(listMarkup(listedNamespace), /href="\/r\/ply"/);
   assert.equal(listedNamespace.includes('unavailable'), false);
@@ -324,14 +336,14 @@ test('ssr markup uses Kumo classes, prose commits, and a strict CSP', () => {
   const shipped = readFileSync(fileURLToPath(new URL('../node_modules/@cloudflare/kumo/dist/styles/kumo-standalone.css', import.meta.url)), 'utf8')
   const layers = cssNodes(shipped)
   const theme = layers.find(node => node.prelude === '@layer theme')
-  assert.ok(theme?.body && VIEWER_CSS.includes(theme.body))
+  assert.ok(theme != null && theme.body && VIEWER_CSS.includes(theme.body))
   const shippedUtilities = new Set<string>()
   const collect = (body: string) => { for (const node of cssNodes(body)) { if (node.body === null) continue; if (node.prelude.startsWith('@')) collect(node.body); else for (const name of selectorClasses(node.prelude)) shippedUtilities.add(name) } }
-  collect(layers.find(node => node.prelude === '@layer utilities')?.body ?? '')
+  collect(fill(slot(layers.find(node => node.prelude === '@layer utilities'), 'body'), ''))
   for (const name of KUMO_USED) if (name !== 'kumo-input-placeholder') assert.equal(shippedUtilities.has(name), true, `Kumo has no utility ${name}`)
   const keptUtilities = new Set<string>()
   const keptCollect = (body: string) => { for (const node of cssNodes(body)) { if (node.body === null) continue; if (node.prelude.startsWith('@')) keptCollect(node.body); else for (const name of selectorClasses(node.prelude)) keptUtilities.add(name) } }
-  keptCollect(cssNodes(VIEWER_CSS).find(node => node.prelude === '@layer utilities')?.body ?? '')
+  keptCollect(fill(slot(cssNodes(VIEWER_CSS).find(node => node.prelude === '@layer utilities'), 'body'), ''))
   for (const name of KUMO_USED) if (name !== 'kumo-input-placeholder') assert.equal(keptUtilities.has(name), true, `subset dropped ${name}`)
   assert.equal(keptUtilities.has('bg-kumo-badge-teal'), false)
   assert.ok(VIEWER_CSS.length < 80_000, `view.css is ${VIEWER_CSS.length} bytes`)
@@ -397,10 +409,10 @@ test('rate and byte caps clamp and fail closed', () => {
   budget.countSubrequest();
   budget.countSubrequest();
   assert.equal(budget.canSpend(1), false);
-  assert.throws(() => budget.countSubrequest(), (err: { code?: string }) => err.code === 'limit_exceeded');
+  assert.throws(() => budget.countSubrequest(), (err: Partial<{ code: string }>) => err.code === 'limit_exceeded');
   const bytes = createBudget(4, 16);
   bytes.addBytes(4);
-  assert.throws(() => bytes.addBytes(1), (err: { code?: string }) => err.code === 'limit_exceeded');
+  assert.throws(() => bytes.addBytes(1), (err: Partial<{ code: string }>) => err.code === 'limit_exceeded');
 });
 
 test('escapeHtml and the page renderer keep repository text out of HTML', () => {
@@ -480,13 +492,13 @@ test('pack fixture matches git verify-pack; bombs and long chains fail closed', 
   assert.equal(map.thin, false);
   assert.equal(map.maxChain, 1);
   assert.equal(map.trailer, 'a470ee9652a659aa2aea5ad58df2a80594c8cfff');
-  assert.equal(map.objects[0]?.oid, '4ce20682b4778f9086b59216533e2ccff8dbb191');
-  assert.equal(map.objects[1]?.wireType, 'ref_delta');
-  assert.equal(map.objects[1]?.resolvedType, 'commit');
-  assert.equal(map.objects[1]?.baseOffset, null);
-  assert.equal(map.objects[1]?.baseOid, '4ce20682b4778f9086b59216533e2ccff8dbb191');
-  assert.equal(map.objects[1]?.chain, 1);
-  assert.equal(map.objects[1]?.oid, 'f2db53ea00f5d51ab58e1392c78bb99760defebd');
+  assert.equal(slot(map.objects[0], 'oid'), '4ce20682b4778f9086b59216533e2ccff8dbb191');
+  assert.equal(slot(map.objects[1], 'wireType'), 'ref_delta');
+  assert.equal(slot(map.objects[1], 'resolvedType'), 'commit');
+  assert.equal(slot(map.objects[1], 'baseOffset'), null);
+  assert.equal(slot(map.objects[1], 'baseOid'), '4ce20682b4778f9086b59216533e2ccff8dbb191');
+  assert.equal(slot(map.objects[1], 'chain'), 1);
+  assert.equal(slot(map.objects[1], 'oid'), 'f2db53ea00f5d51ab58e1392c78bb99760defebd');
   let cursor = 12;
   for (const obj of map.objects) {
     assert.equal(obj.offset, cursor);
@@ -508,19 +520,19 @@ test('pack fixture matches git verify-pack; bombs and long chains fail closed', 
   new DataView(bomb.buffer).setUint32(4, 2);
   new DataView(bomb.buffer).setUint32(8, 1);
   bomb.set(encodeObjHeader(TYPE.BLOB, 50_000_000), 12);
-  assert.throws(() => parsePack(bomb, { limits: VIEWER_GIT_LIMITS, maxObjects: VIEWER_CAPS.maxPackObjects, maxInflatedTotal: VIEWER_CAPS.maxInflatedTotal }), (err: { code?: string; message?: string }) => err.code === 'limit_exceeded' && /pack object size/.test(err.message ?? ''));
+  assert.throws(() => parsePack(bomb, { limits: VIEWER_GIT_LIMITS, maxObjects: VIEWER_CAPS.maxPackObjects, maxInflatedTotal: VIEWER_CAPS.maxInflatedTotal }), (err: Partial<{ code: string; message: string }>) => err.code === 'limit_exceeded' && /pack object size/.test(fill(err.message, '')));
 
   const tooMany = new Uint8Array(32);
   tooMany.set([0x50, 0x41, 0x43, 0x4b]);
   new DataView(tooMany.buffer).setUint32(4, 2);
   new DataView(tooMany.buffer).setUint32(8, 401);
-  assert.throws(() => parsePack(tooMany, { limits: VIEWER_GIT_LIMITS, maxObjects: VIEWER_CAPS.maxPackObjects, maxInflatedTotal: VIEWER_CAPS.maxInflatedTotal }), (err: { code?: string }) => err.code === 'limit_exceeded');
+  assert.throws(() => parsePack(tooMany, { limits: VIEWER_GIT_LIMITS, maxObjects: VIEWER_CAPS.maxPackObjects, maxInflatedTotal: VIEWER_CAPS.maxInflatedTotal }), (err: Partial<{ code: string }>) => err.code === 'limit_exceeded');
 
   const short = mapPack(await ofsChain(1));
   assert.equal(short.ofsDelta, 1);
   assert.equal(short.maxChain, 1);
-  assert.equal(short.objects[1]?.resolvedType, 'blob');
-  await assert.rejects(async () => mapPack(await ofsChain(33)), (err: { code?: string; message?: string }) => err.code === 'limit_exceeded' && /delta chain depth/.test(err.message ?? ''));
+  assert.equal(slot(short.objects[1], 'resolvedType'), 'blob');
+  await assert.rejects(async () => mapPack(await ofsChain(33)), (err: Partial<{ code: string; message: string }>) => err.code === 'limit_exceeded' && /delta chain depth/.test(fill(err.message, '')));
 });
 
 test('viewer fetch drops credentials, forces the user agent, and refuses a cross-host redirect', async () => {
@@ -534,7 +546,7 @@ test('viewer fetch drops credentials, forces the user agent, and refuses a cross
   const seen: { url: string; authorization: string | null; cookie: string | null; ua: string | null }[] = [];
   const budget = createBudget();
   const fetchImpl = createViewerFetch(async (input, init) => {
-    const h = new Headers(init?.headers);
+    const h = new Headers(slot(init, 'headers') as HeadersInit);
     seen.push({ url: String(input), authorization: h.get('authorization'), cookie: h.get('cookie'), ua: h.get('user-agent') });
     const url = String(input);
     if (url.endsWith('/info/refs?service=git-upload-pack') && !url.includes('.git/')) {
@@ -546,28 +558,28 @@ test('viewer fetch drops credentials, forces the user agent, and refuses a cross
   const ok = await fetchImpl('https://github.com/octocat/Hello-World/info/refs?service=git-upload-pack', { headers: { Authorization: 'Bearer leaked', Cookie: 'session=1' } });
   assert.equal(await ok.text(), 'ok');
   assert.equal(seen.length, 2);
-  assert.equal(seen[1]?.url, 'https://github.com/octocat/Hello-World.git/info/refs?service=git-upload-pack');
+  assert.equal(slot(seen[1], 'url'), 'https://github.com/octocat/Hello-World.git/info/refs?service=git-upload-pack');
   for (const hop of seen) {
     assert.equal(hop.authorization, null);
     assert.equal(hop.cookie, null);
     assert.equal(hop.ua, VIEWER_UA);
   }
-  await assert.rejects(fetchImpl('https://github.com/octocat/Hello-World/info/refs?service=git-upload-pack&x=1'), (err: { code?: string }) => err.code === 'bad_request');
+  await assert.rejects(fetchImpl('https://github.com/octocat/Hello-World/info/refs?service=git-upload-pack&x=1'), (err: Partial<{ code: string }>) => err.code === 'bad_request');
   const cross = createViewerFetch(async (input) => {
     if (String(input).includes('evil.example')) throw new Error('forwarded cross-host');
     return new Response(null, { status: 302, headers: { location: 'https://evil.example/octocat/Hello-World/info/refs?service=git-upload-pack' } });
   }, repo.url, repo.allowedHosts, createBudget(), AbortSignal.timeout(1000));
-  await assert.rejects(cross('https://github.com/octocat/Hello-World/info/refs?service=git-upload-pack'), (err: { code?: string; message?: string }) => err.code === 'bad_request' && /not an allowlisted host/.test(err.message ?? ''));
+  await assert.rejects(cross('https://github.com/octocat/Hello-World/info/refs?service=git-upload-pack'), (err: Partial<{ code: string; message: string }>) => err.code === 'bad_request' && /not an allowlisted host/.test(fill(err.message, '')));
   const otherForge = createViewerFetch(async (input) => {
     if (!String(input).includes('github.com/')) throw new Error(`followed redirect to ${String(input)}`);
     return new Response(null, { status: 302, headers: { location: 'https://gitlab.com/octocat/Hello-World/info/refs?service=git-upload-pack' } });
   }, repo.url, repo.allowedHosts, createBudget(), AbortSignal.timeout(1000));
-  await assert.rejects(otherForge('https://github.com/octocat/Hello-World/info/refs?service=git-upload-pack'), (err: { code?: string; message?: string }) => err.code === 'bad_request' && /cross-host/.test(err.message ?? ''));
+  await assert.rejects(otherForge('https://github.com/octocat/Hello-World/info/refs?service=git-upload-pack'), (err: Partial<{ code: string; message: string }>) => err.code === 'bad_request' && /cross-host/.test(fill(err.message, '')));
   const lookalike = createViewerFetch(async (input) => {
     if (String(input).includes('evil.com')) throw new Error('followed lookalike redirect');
     return new Response(null, { status: 302, headers: { location: 'https://github.com.evil.com/octocat/Hello-World/info/refs?service=git-upload-pack' } });
   }, repo.url, repo.allowedHosts, createBudget(), AbortSignal.timeout(1000));
-  await assert.rejects(lookalike('https://github.com/octocat/Hello-World/info/refs?service=git-upload-pack'), (err: { code?: string; message?: string }) => err.code === 'bad_request' && /not an allowlisted host/.test(err.message ?? ''));
+  await assert.rejects(lookalike('https://github.com/octocat/Hello-World/info/refs?service=git-upload-pack'), (err: Partial<{ code: string; message: string }>) => err.code === 'bad_request' && /not an allowlisted host/.test(fill(err.message, '')));
 });
 
 function fakeRate(): RateNamespace {
@@ -577,7 +589,7 @@ function fakeRate(): RateNamespace {
     get: id => ({
       admit(bucket, now, lim, windowMs) {
         const key = `${String(id)}:${bucket}`;
-        const list = (buckets.get(key) ?? []).filter(ts => ts > now - windowMs);
+        const list = fill(buckets.get(key), [] as number[]).filter(ts => ts > now - windowMs);
         if (list.length >= lim) return { ok: false, remaining: 0, retryAfterMs: 1000 };
         list.push(now);
         buckets.set(key, list);
@@ -633,7 +645,7 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
     const dial = rewriteAllowlisted(srv.url);
     let rayN = 0;
     const fetchImpl: typeof fetch = async (input, init) => {
-      const h = new Headers(init?.headers);
+      const h = new Headers(slot(init, 'headers') as HeadersInit);
       seen.push({ authorization: h.get('authorization'), cookie: h.get('cookie'), gitToken: h.get('git-token'), ua: h.get('user-agent') });
       const res = await dial(input, init);
       const headers = new Headers(res.headers);
@@ -655,15 +667,15 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
     assert.match(html, /ray-test/);
     assert.equal(html.includes('<script>alert'), false);
     assert.match(html, /&lt;script&gt;/);
-    assert.match(page.headers.get('content-security-policy') ?? '', /script-src 'none'/);
-    assert.equal((page.headers.get('content-security-policy') ?? '').includes('unsafe-inline'), false);
-    assert.match(page.headers.get('content-security-policy') ?? '', /style-src 'self'/);
+    assert.match(fill(page.headers.get('content-security-policy'), ''), /script-src 'none'/);
+    assert.equal((fill(page.headers.get('content-security-policy'), '')).includes('unsafe-inline'), false);
+    assert.match(fill(page.headers.get('content-security-policy'), ''), /style-src 'self'/);
     assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
     assert.equal(page.headers.get('cache-control'), 'no-store');
-    const rayHeader = page.headers.get('x-artifacts-ray') ?? '';
+    const rayHeader = fill(page.headers.get('x-artifacts-ray'), '');
     assert.match(rayHeader, /ls-refs=[0-9a-f]{16}-IAD;dur=\d+/);
-    assert.match(page.headers.get('server-timing') ?? '', /ls-refs;dur=\d+/);
-    assert.match(page.headers.get('server-timing') ?? '', /total;dur=\d+/);
+    assert.match(fill(page.headers.get('server-timing'), ''), /ls-refs;dur=\d+/);
+    assert.match(fill(page.headers.get('server-timing'), ''), /total;dur=\d+/);
     for (const secret of ['127.0.0.1', 'viewer-should-ignore', 'git-secret', 'github.com', 'session=secret']) assert.equal(rayHeader.includes(secret), false, secret);
     assert.equal(html.includes('viewer-should-ignore'), false);
     assert.equal(html.includes('git-secret'), false);
@@ -711,7 +723,7 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
     assert.match(fileHtml, /class="code"/);
     const raw = await handleViewer(new Request(`https://ply.ivar.workers.dev${repoPath}?path=README.md&raw=1`), env, {}, { fetchImpl });
     assert.equal(raw.status, 200);
-    assert.match(raw.headers.get('content-type') ?? '', /^text\/plain/);
+    assert.match(fill(raw.headers.get('content-type'), ''), /^text\/plain/);
     assert.equal(await raw.text(), 'hello viewer\n');
     const bin = await handleViewer(new Request(`https://ply.ivar.workers.dev${repoPath}?path=pic.bin&raw=1`), env, {}, { fetchImpl });
     assert.equal(bin.headers.get('content-type'), 'application/octet-stream');
@@ -724,10 +736,10 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
     assert.equal(packHtml.includes('style='), false);
     const css = await handleViewer(new Request('https://ply.ivar.workers.dev/view.css'), env, {});
     assert.equal(css.status, 200);
-    assert.match(css.headers.get('content-type') ?? '', /text\/css/);
+    assert.match(fill(css.headers.get('content-type'), ''), /text\/css/);
     const home = await handleViewer(new Request('https://ply.ivar.workers.dev/view'), env, {});
     assert.equal(home.headers.get('x-ply-trace'), null);
-    assert.match(home.headers.get('x-ply-build') ?? '', /^ply=/);
+    assert.match(fill(home.headers.get('x-ply-build'), ''), /^ply=/);
     const homeHtml = await home.text();
     assert.match(homeHtml, /octocat\/Hello-World/);
     assert.match(homeHtml, /bitbucket\.org/);
@@ -766,7 +778,7 @@ test('viewer reads a local public repo, escapes hostile names, and never forward
 test('a tree:0 rejection is visible, then the blob:none retry, and a denied rate limit does no fetch', async () => {
   const { root, cleanup } = tmpRoot();
   const upstream = await startGitServer(root);
-  const filterOf = (body: Uint8Array) => /filter ([^\n]+)\n/.exec(Buffer.from(body).toString('latin1'))?.[1] ?? null;
+  const filterOf = (body: Uint8Array): string | null => fill(slot(/filter ([^\n]+)\n/.exec(Buffer.from(body).toString('latin1')), '1'), null);
   const proxy = await startProxy(upstream.url, (ctx: { stage: string; reqBody: Uint8Array }) => (
     ctx.stage === 'fetch' && filterOf(ctx.reqBody) && filterOf(ctx.reqBody) !== 'blob:none'
       ? { type: 'status', status: 400, contentType: 'text/plain', body: 'Unsupported Git fetch filter; only blob:none is supported.' }
@@ -786,7 +798,8 @@ test('a tree:0 rejection is visible, then the blob:none retry, and a denied rate
     const dial = rewriteAllowlisted(proxy.url);
     const fetchImpl: typeof fetch = async (input, init) => {
       fetches++;
-      if (init?.body) bodies.push(Buffer.from(init.body as Uint8Array).toString('latin1'));
+      const body = slot(init, 'body');
+      if (body) bodies.push(Buffer.from(body as Uint8Array).toString('latin1'));
       return dial(input, init);
     };
     const env = viewerEnv();
@@ -893,8 +906,12 @@ test('a public GitHub repository renders when the network can reach it', { timeo
     headers: { 'git-protocol': 'version=2', 'user-agent': VIEWER_UA },
     signal: AbortSignal.timeout(8000),
   }).catch(() => null);
-  if (!probe?.ok) {
-    await probe?.body?.cancel().catch(() => {});
+  if (probe === null || !probe.ok) {
+    const body = slot(probe, 'body');
+    if (body !== null && body !== void 0) {
+      const cancel = slot(body, 'cancel');
+      if (cancel !== null && cancel !== void 0) await (cancel as (this: unknown) => Promise<unknown>).call(body).catch(() => {});
+    }
     return t.skip('GitHub is unreachable from this environment');
   }
   await probe.arrayBuffer();
@@ -905,9 +922,9 @@ test('a public GitHub repository renders when the network can reach it', { timeo
   assert.match(html, /Hello-World/);
   assert.match(html, /upload-pack/);
   assert.match(html, /github-ray/);
-  assert.match(res.headers.get('content-security-policy') ?? '', /script-src 'none'/);
-  assert.equal((res.headers.get('content-security-policy') ?? '').includes('unsafe-inline'), false);
-  const want = /[0-9a-f]{40}/.exec(html)?.[0];
+  assert.match(fill(res.headers.get('content-security-policy'), ''), /script-src 'none'/);
+  assert.equal((fill(res.headers.get('content-security-policy'), '')).includes('unsafe-inline'), false);
+  const want = slot(/[0-9a-f]{40}/.exec(html), '0');
   assert.ok(want);
   const pack = await handleViewer(new Request(`https://ply.ivar.workers.dev/view/github.com/octocat/Hello-World?want=${want}&filter=blob:none`), env, {});
   assert.equal(pack.status, 200, await pack.clone().text());
@@ -934,7 +951,7 @@ test('same-repo redirects are resolved by the viewer fetch before ply sees them;
     const hops: { method: string; url: string; status: number }[] = [];
     const redirecting: typeof fetch = async (input, init) => {
       const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
-      const method = init?.method ?? 'GET';
+      const method = fill(slot(init, 'method'), 'GET');
       if (url.pathname.startsWith(`/${name}/`)) {
         hops.push({ method, url: url.href, status: 301 });
         return new Response(null, { status: 301, headers: { location: url.href.replace(`/${name}/`, `/${name}.git/`) } });
@@ -949,8 +966,8 @@ test('same-repo redirects are resolved by the viewer fetch before ply sees them;
     // ply alone: the 301 is a typed http error naming where the server pointed; nothing is followed.
     hops.length = 0;
     const bareTransport = createTransport(`https://github.com/${name}`, { fetchImpl: redirecting, limits: VIEWER_GIT_LIMITS, tracer: new Tracer() });
-    await assert.rejects(lsRefs(bareTransport, ['refs/heads/']), (err: { code?: string; status?: number; location?: string; message?: string }) =>
-      err.code === 'http' && err.status === 301 && err.location === `https://github.com/${name}.git/git-upload-pack` && /does not follow redirects/.test(err.message ?? ''));
+    await assert.rejects(lsRefs(bareTransport, ['refs/heads/']), (err: Partial<{ code: string; status: number; location: string; message: string }>) =>
+      err.code === 'http' && err.status === 301 && err.location === `https://github.com/${name}.git/git-upload-pack` && /does not follow redirects/.test(fill(err.message, '')));
     assert.deepEqual(hops.map(h => h.status), [301]);
 
     // Through createViewerFetch: every request is redirected once and then answered; ply gets the refs.
@@ -958,13 +975,13 @@ test('same-repo redirects are resolved by the viewer fetch before ply sees them;
     const guarded = createViewerFetch(redirecting, loc(`https://github.com/${name}`).url, ALLOWED_HOSTS, createBudget(), AbortSignal.timeout(10_000));
     const t = createTransport(`https://github.com/${name}`, { fetchImpl: guarded, limits: VIEWER_GIT_LIMITS, tracer: new Tracer() });
     const { refs } = await lsRefs(t, ['refs/heads/']);
-    assert.equal(refs.get('refs/heads/main')?.oid, expected);
+    assert.equal(slot(refs.get('refs/heads/main'), 'oid'), expected);
     assert.ok(hops.some(h => h.method === 'POST' && h.status === 301), 'the POST was redirected too');
     for (let i = 0; i < hops.length; i += 2) {
-      assert.equal(hops[i]?.status, 301);
-      assert.equal(hops[i + 1]?.status, 200);
-      assert.equal(hops[i + 1]?.method, hops[i]?.method, 'a redirect keeps the method');
-      assert.equal(hops[i + 1]?.url, hops[i]?.url.replace(`/${name}/`, `/${name}.git/`));
+      assert.equal(slot(hops[i], 'status'), 301);
+      assert.equal(slot(hops[i + 1], 'status'), 200);
+      assert.equal(slot(hops[i + 1], 'method'), slot(hops[i], 'method'), 'a redirect keeps the method');
+      assert.equal(slot(hops[i + 1], 'url'), (slot(hops[i], 'url') as string).replace(`/${name}/`, `/${name}.git/`));
     }
 
     // End to end: /view on the redirecting spelling renders the repository.
@@ -975,7 +992,7 @@ test('same-repo redirects are resolved by the viewer fetch before ply sees them;
     // A redirect loop is cut at the hop cap by the viewer fetch, not handed to ply.
     let loops = 0;
     const loop = createViewerFetch(async () => { loops++; return new Response(null, { status: 302, headers: { location: `https://github.com/${name}/info/refs?service=git-upload-pack` } }); }, loc(`https://github.com/${name}`).url, ALLOWED_HOSTS, createBudget(), AbortSignal.timeout(1000));
-    await assert.rejects(lsRefs(createTransport(`https://github.com/${name}`, { fetchImpl: loop, limits: VIEWER_GIT_LIMITS, tracer: new Tracer() }), ['refs/heads/']), (err: { code?: string; message?: string }) => err.code === 'bad_request' && /too many redirects/.test(err.message ?? ''));
+    await assert.rejects(lsRefs(createTransport(`https://github.com/${name}`, { fetchImpl: loop, limits: VIEWER_GIT_LIMITS, tracer: new Tracer() }), ['refs/heads/']), (err: Partial<{ code: string; message: string }>) => err.code === 'bad_request' && /too many redirects/.test(fill(err.message, '')));
     assert.equal(loops, VIEWER_CAPS.maxRedirects + 1);
   } finally {
     await srv.close();
@@ -1000,7 +1017,8 @@ test('history in one call: on a tree:0 server the page fetches the head and its 
     const calls: { method: string; body: string }[] = [];
     const dial = rewriteAllowlisted(srv.url);
     const fetchImpl: typeof fetch = async (input, init) => {
-      calls.push({ method: init?.method ?? 'GET', body: init?.body instanceof Uint8Array ? Buffer.from(init.body).toString('latin1') : '' });
+      const body = slot(init, 'body');
+      calls.push({ method: fill(slot(init, 'method'), 'GET'), body: body instanceof Uint8Array ? Buffer.from(body).toString('latin1') : '' });
       return dial(input, init);
     };
     const page = await handleViewer(new Request('https://ply.ivar.workers.dev/view/github.com/hist.git'), viewerEnv(), {}, { fetchImpl });
@@ -1056,7 +1074,7 @@ test('stylesheet URL is content-hashed and immutable; HTML is no-store and links
   const home = await handleViewer(new Request('https://ply.ivar.workers.dev/view'), env, {});
   assert.equal(home.headers.get('cache-control'), 'no-store');
   const href = /<link rel="stylesheet" href="(\/view\.([0-9a-f]{12})\.css)"\/>/.exec(await home.text());
-  assert.ok(href?.[1] && href[2], 'hashed stylesheet href');
+  assert.ok(href !== null && href[1] && href[2], 'hashed stylesheet href');
   const sheet = await handleViewer(new Request(`https://ply.ivar.workers.dev${href[1]}`), env, {});
   assert.equal(sheet.status, 200);
   assert.equal(sheet.headers.get('cache-control'), 'public, max-age=31536000, immutable');
@@ -1075,5 +1093,5 @@ test('stylesheet URL is content-hashed and immutable; HTML is no-store and links
   assert.equal(revalidated.status, 304);
   // Icons carry intrinsic sizes, so even an unstyled page never draws a giant SVG.
   const html = String(renderLoaded(treeFixture({}), { bars: [], totalMs: 0, cfRay: 'r', requestId: 'q' }));
-  for (const m of html.matchAll(/<svg class="i [^"]*"([^>]*)>/g)) assert.match(m[1] ?? '', /width="16" height="16"/);
+  for (const m of html.matchAll(/<svg class="i [^"]*"([^>]*)>/g)) assert.match(fill(m[1], ''), /width="16" height="16"/);
 });
