@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { envBinding } from '../absent.ts'
 import { createBudget } from './budget.ts'
 import { viewerCalls, type ViewerCall } from './call.ts'
 import { safeFilename } from './escape.ts'
@@ -39,7 +40,7 @@ export async function admitClient(req: Request, env: ViewerEnv, bucket: RateBuck
   if (!ns) return 'unconfigured'
   try {
     const stub = ns.get(ns.idFromName(await clientKey(req)))
-    return await stub.admit(bucket, now, rateLimitFor(bucket, bucket === 'pack' ? env.VIEWER_PACK_RATE_PER_MIN : env.VIEWER_RATE_PER_MIN), VIEWER_CAPS.rateWindowMs)
+    return await stub.admit(bucket, now, rateLimitFor(bucket, envBinding(bucket === 'pack' ? env.VIEWER_PACK_RATE_PER_MIN : env.VIEWER_RATE_PER_MIN)), VIEWER_CAPS.rateWindowMs)
   } catch {
     return 'unavailable'
   }

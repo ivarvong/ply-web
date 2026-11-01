@@ -1,3 +1,5 @@
+import type { Option } from '../option.ts';
+
 // Named TTLs for the one cached ruleset. cloudflare.config.ts publishes the same numbers as text bindings.
 import { parseFlagKey, parseFlagSalt, type FlagKey, type FlagSalt } from './brand.ts';
 
@@ -56,9 +58,9 @@ export function cacheControl(maxAgeS: number, swrS: number): string {
   return `public, max-age=${maxAgeS}, stale-while-revalidate=${swrS}`;
 }
 
-export function ttlFromEnv(raw: string | undefined, fallback: number): number {
-  if (raw === undefined || raw === '') return fallback;
-  if (!/^[1-9]\d{0,6}$/.test(raw)) return fallback;
-  const n = Number(raw);
+export function ttlFromEnv(raw: Option<string>, fallback: number): number {
+  if (raw.tag === 'none' || raw.value === '') return fallback;
+  if (!/^[1-9]\d{0,6}$/.test(raw.value)) return fallback;
+  const n = Number(raw.value);
   return Number.isSafeInteger(n) ? n : fallback;
 }
