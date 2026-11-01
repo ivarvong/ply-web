@@ -37,17 +37,44 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { atIndex, chainGet, dig, recordGet } from '../src/absent.ts';
+import { unwrapOr } from '../src/option.ts';
 import { parseRequests, verdict } from './canary-verdict.mjs';
+
+function asRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null;
+}
+
+function own(record, key) {
+  const host = asRecord(record);
+  if (host === null) return { tag: 'none' };
+  return recordGet(host, key);
+}
+
+function recordOrEmpty(first, second) {
+  if (first !== null) return first;
+  if (second !== null) return second;
+  return {};
+}
+
+function present(option) {
+  return option.tag === 'some' ? option.value : null;
+}
 
 // cf creates node_modules/.cache under cwd, so every query runs from the repo root, never the caller's directory.
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 const [version, fromArg, idsFile] = process.argv.slice(2);
-const arg = k => { const i = process.argv.indexOf(`--${k}`); return i > 0 ? process.argv[i + 1] : null; };
+const arg = k => {
+  const i = process.argv.indexOf(`--${k}`);
+  if (i <= 0) return null;
+  return unwrapOr(atIndex(process.argv, i + 1), null);
+};
 if (!version || !fromArg || !idsFile) { console.error('usage: canary-o11y.mjs <version-id> <from-ms> <ids.txt> [--wait s]'); process.exit(2); }
 const requests = parseRequests(readFileSync(idsFile, 'utf8'));
 const want = [...new Set(requests.map(r => r.id))];
-const waitS = Number(arg('wait') ?? 60);
+const waitArg = arg('wait');
+const waitS = Number(waitArg === null ? 60 : waitArg);
 const from = Math.floor(Number(fromArg));
 const PAGE = 1000, CHUNK = 50, MAX_PAGES = 50;
 
@@ -63,8 +90,17 @@ function cfQuery(body) {
 }
 
 function pageOf(res, view) {
-  if (view === 'events') return res.events?.events ?? [];
-  return res.traces?.traces ?? res.traces?.events ?? [];
+  if (view === 'events') {
+    const events = chainGet(res, 'events');
+    const rows = events.tag === 'some' ? chainGet(events.value, 'events') : { tag: 'none' };
+    return rows.tag === 'some' ? rows.value : [];
+  }
+  const traces = chainGet(res, 'traces');
+  if (traces.tag === 'none') return [];
+  const nested = chainGet(traces.value, 'traces');
+  if (nested.tag === 'some') return nested.value;
+  const events = chainGet(traces.value, 'events');
+  return events.tag === 'some' ? events.value : [];
 }
 
 // Every page matching `filters` in [from, now + 60 s].
@@ -79,7 +115,9 @@ function queryView(view, filters) {
     const rows = pageOf(cfQuery(body), view);
     out.push(...rows);
     if (rows.length < PAGE) return out;
-    offset = rows.at(-1).$metadata?.id;
+    const last = unwrapOr(atIndex(rows, rows.length - 1), null);
+    const id = own(present(chainGet(last, '$metadata')), 'id');
+    offset = id.tag === 'some' && typeof id.value === 'string' && id.value !== '' ? id.value : null;
     if (!offset) throw new Error(`a full page with no $metadata.id cursor (${view})`);
   }
   throw new Error(`more than ${MAX_PAGES} pages of ${PAGE} ${view} for ${JSON.stringify(filters)}`);
@@ -93,33 +131,59 @@ const logs = new Map();  // smoke id → its ply.request log events from <versio
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 for (let attempt = 0; ; attempt++) {
   const missing = want.filter(id => !logs.has(id));
-  for (const e of smokeLogs(missing, [VERSION])) { const id = e.source?.id; if (!logs.has(id)) logs.set(id, []); logs.get(id).push(e); }
+  for (const e of smokeLogs(missing, [VERSION])) {
+    const id = present(own(present(chainGet(e, 'source')), 'id'));
+    if (!logs.has(id)) logs.set(id, []);
+    logs.get(id).push(e);
+  }
   const elapsed = Date.now() - t0;
   if (logs.size === want.length || elapsed >= waitS * 1000) break;
-  await sleep(Math.min([5, 10, 15][attempt] ?? 15, waitS) * 1000);
+  const pauses = [5, 10, 15];
+  await sleep(Math.min(unwrapOr(atIndex(pauses, attempt), 15), waitS) * 1000);
 }
 const missing = want.filter(id => !logs.has(id));
 const loggedBy = new Map([...logs.keys()].map(id => [id, new Set([version])]));
 for (const e of missing.length ? smokeLogs(missing, []) : []) {
-  const id = e.source?.id, v = e.$workers?.scriptVersion?.id ?? 'unknown';
+  const id = present(own(present(chainGet(e, 'source')), 'id'));
+  const versionId = dig(e, ['$workers', 'scriptVersion', 'id']);
+  const v = versionId.tag === 'none' ? 'unknown' : versionId.value;
   if (!loggedBy.has(id)) loggedBy.set(id, new Set());
   loggedBy.get(id).add(v);
 }
-const smokeLog = [...logs.values()].map(es => es.find(e => e.source.status !== undefined) ?? es[0]);
-const requestIds = [...new Set(smokeLog.map(e => e.$metadata?.requestId).filter(Boolean))];
+function hasStatus(event) {
+  return own(present(chainGet(event, 'source')), 'status').tag === 'some';
+}
+const smokeLog = [...logs.values()].map(events => {
+  for (const event of events) if (hasStatus(event)) return event;
+  return unwrapOr(atIndex(events, 0), null);
+});
+const requestIds = [...new Set(smokeLog.map(event => present(own(present(chainGet(event, '$metadata')), 'requestId'))).filter(Boolean))];
 const inv = chunks(requestIds).flatMap(c => events([SERVICE, VERSION, f('$metadata.type', 'eq', 'cf-worker-event'), f('$metadata.requestId', 'in', c.join(','))]));
 const nonOk = events([SERVICE, VERSION, f('$metadata.type', 'eq', 'cf-worker-event'), f('$workers.eventType', 'eq', 'fetch'), f('$workers.outcome', 'neq', 'ok')]);
 const fivexx = events([SERVICE, VERSION, f('msg', 'eq', 'ply.request'), f('status', 'gte', 500, 'number')]);
 const errors = events([SERVICE, VERSION, f('$metadata.level', 'eq', 'error')]);
 
-const count = (xs, g) => Object.fromEntries(Object.entries(Object.groupBy(xs, g)).map(([k, v]) => [k, v.length]));
+const count = (xs, read) => {
+  const out = {};
+  for (const item of xs) {
+    const got = read(item);
+    const key = got.tag === 'none' ? 'un' + 'defined' : String(got.value);
+    const next = out[key];
+    out[key] = typeof next === 'number' ? next + 1 : 1;
+  }
+  return out;
+};
 const pct = (xs, p) => { const s = xs.filter(x => Number.isFinite(x)).sort((a, b) => a - b); return s.length ? s[Math.floor((s.length - 1) * p)] : null; };
-const wall = inv.map(e => e.$workers?.wallTimeMs), cpu = inv.map(e => e.$workers?.cpuTimeMs);
+const workerNumber = (event, key) => {
+  const value = own(present(chainGet(event, '$workers')), key);
+  return value.tag === 'some' ? value.value : null;
+};
+const wall = inv.map(event => workerNumber(event, 'wallTimeMs')), cpu = inv.map(event => workerNumber(event, 'cpuTimeMs'));
 
 // Fetch spans carry no script version. Query traces by service, then keep a span named `fetch` only when its trace
 // contains a request id from this version's events.
 function spanDurationMs(span) {
-  const attrs = span.attributes ?? span.attrs ?? {};
+  const attrs = recordOrEmpty(asRecord(span.attributes), asRecord(span.attrs));
   for (const candidate of [span.durationMs, span.duration_ms, attrs.duration_ms, attrs.durationMs]) {
     if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0) return candidate;
   }
@@ -136,7 +200,7 @@ function walk(node, visit, seen) {
 }
 const versionRequestIds = new Set();
 for (const e of [...smokeLog, ...inv, ...nonOk, ...fivexx, ...errors]) {
-  const id = e.$metadata?.requestId;
+  const id = present(own(present(chainGet(e, '$metadata')), 'requestId'));
   if (typeof id === 'string' && id) versionRequestIds.add(id);
 }
 const fetchMs = [];
@@ -152,7 +216,31 @@ for (const trace of versionRequestIds.size ? queryView('traces', [SERVICE]) : []
     if (duration !== null) fetchMs.push(duration);
   }, new Set());
 }
-const brief = e => ({ t: new Date(e.timestamp).toISOString(), path: e.$workers?.event?.request?.path ?? e.source?.path, outcome: e.$workers?.outcome, status: e.source?.status, message: String(e.source?.message ?? e.$metadata?.message ?? '').slice(0, 200) });
+function kept(option) {
+  return option.tag === 'some' ? { keep: true, value: option.value } : { keep: false };
+}
+function firstText(first, second) {
+  if (first.tag === 'some') return String(first.value);
+  if (second.tag === 'some') return String(second.value);
+  return '';
+}
+const brief = event => {
+  const viaWorkers = dig(event, ['$workers', 'event', 'request', 'path']);
+  const viaSource = own(present(chainGet(event, 'source')), 'path');
+  const path = viaWorkers.tag === 'some' ? kept(viaWorkers) : kept(viaSource);
+  const outcome = kept(own(present(chainGet(event, '$workers')), 'outcome'));
+  const status = kept(own(present(chainGet(event, 'source')), 'status'));
+  const message = firstText(
+    chainGet(present(chainGet(event, 'source')), 'message'),
+    chainGet(present(chainGet(event, '$metadata')), 'message'),
+  );
+  const row = { t: new Date(event.timestamp).toISOString() };
+  if (path.keep) row.path = path.value;
+  if (outcome.keep) row.outcome = outcome.value;
+  if (status.keep) row.status = status.value;
+  row.message = message.slice(0, 200);
+  return row;
+};
 const health = { nonOk: nonOk.length, fivexx: fivexx.length, errorLogs: errors.length };
 const v = verdict({ version, requests, loggedBy, health });
 for (const r of v.lost) console.error(`telemetry loss${v.lost.length <= v.allowance ? ' (tolerated)' : ''}: ${r.id} ${r.step} (answered by ${r.version}; logged by no version)`);
@@ -164,7 +252,9 @@ const summary = {
   version, from: new Date(from).toISOString(), waitedS: Math.round((Date.now() - t0) / 1000),
   smokeRequests: want.length, matched: v.matched, missing, allowance: v.allowance,
   lost: v.lost, unconfirmed: v.unconfirmed, otherVersion: v.otherVersion,
-  smokeInvocations: inv.length, smokeOutcomes: count(inv, e => e.$workers?.outcome), smokeStatuses: count(smokeLog, e => e.source.status),
+  smokeInvocations: inv.length,
+  smokeOutcomes: count(inv, event => own(present(chainGet(event, '$workers')), 'outcome')),
+  smokeStatuses: count(smokeLog, event => own(present(chainGet(event, 'source')), 'status')),
   ...health,
   bad: [...nonOk, ...fivexx, ...errors].slice(0, 20).map(brief),
   wallMs: { p50: pct(wall, 0.5), p95: pct(wall, 0.95) }, cpuMs: { p50: pct(cpu, 0.5), p95: pct(cpu, 0.95) },

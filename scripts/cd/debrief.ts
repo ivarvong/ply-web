@@ -1,6 +1,8 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, relative } from 'node:path'
-import { chartPng, type ChartSeries } from './charts.ts'
+import { atIndex, chainGet, mapGet } from '../../src/absent.ts'
+import { unwrapOr } from '../../src/option.ts'
+import { chartPng, type ChartSeries, type Rgb } from './charts.ts'
 import { readEvents, type CdEvent } from './log.ts'
 import { FAST_BURN } from './slo.ts'
 
@@ -15,6 +17,52 @@ function measurement(event: CdEvent): Measurement | null {
 
 function num(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function field(value: unknown, key: string): unknown {
+  return unwrapOr(chainGet(value, key), null)
+}
+
+function textOrDash(value: string | null): string {
+  return value === null ? '-' : value
+}
+
+function numCell(value: unknown): number | string {
+  const parsed = num(value)
+  return parsed === null ? '-' : parsed
+}
+
+function firstNum(...values: readonly unknown[]): number | null {
+  for (const value of values) {
+    const parsed = num(value)
+    if (parsed !== null) return parsed
+  }
+  return null
+}
+
+function numOrZero(...values: readonly unknown[]): number {
+  const parsed = firstNum(...values)
+  return parsed === null ? 0 : parsed
+}
+
+function labelOf(labels: readonly string[], index: number): string {
+  return unwrapOr(atIndex(labels, index), '')
+}
+
+function findShare<T>(items: readonly T[], keep: (item: T) => boolean): T | null {
+  for (const item of items) {
+    if (keep(item)) return item
+  }
+  return null
+}
+
+const BURN_FALLBACK: Rgb = [15, 23, 42]
+
+function burnAt(step: object, name: string): number {
+  if (!('burns' in step)) return 0
+  const value = chainGet(burnsOf(step.burns), name)
+  if (value.tag === 'none' || typeof value.value !== 'number') return 0
+  return value.value
 }
 
 function burnsOf(value: unknown): { readonly [slo: string]: number | null } {
@@ -34,7 +82,8 @@ function summarize(event: CdEvent): string {
   }
   if (event.kind === 'command') return `${event.payload.argv.join(' ')} exit ${event.payload.exitCode}`.slice(0, 120)
   if (event.kind === 'observation') {
-    const source = measurement(event)?.source
+    const measured = measurement(event)
+    const source = measured === null ? null : field(measured, 'source')
     return typeof source === 'string' ? source : 'measurement'
   }
   if (event.kind === 'decision') return `${event.payload.outcome}: ${event.payload.reason}`
@@ -42,7 +91,7 @@ function summarize(event: CdEvent): string {
     const after = event.payload.after.map(share => `${share.percentage}% ${share.versionId.slice(0, 8)}`).join(', ')
     return `traffic → ${after || 'empty'}`
   }
-  if (event.kind === 'request') return `${event.payload.method} ${event.payload.status} ${event.payload.version ?? '-'} ${event.payload.latencyMs}ms`
+  if (event.kind === 'request') return `${event.payload.method} ${event.payload.status} ${textOrDash(event.payload.version)} ${event.payload.latencyMs}ms`
   if (event.kind === 'annotation') return `${event.payload.note}: ${event.payload.reason}`
   if (event.kind === 'policy') return `policy ${event.payload.sha256.slice(0, 12)}`
   return event.payload.message
@@ -54,13 +103,13 @@ function link(fromDir: string, file: string): string {
 
 /** Informational: smoke ids telemetry never returned, per telemetry stage. Fails the run only when `exceeded`. */
 export function telemetryLossSection(events: readonly CdEvent[]): string[] {
-  const losses = events.map(measurement).filter((value): value is Measurement => value?.source === 'telemetry-loss')
+  const losses = events.map(measurement).filter((value): value is Measurement => value !== null && field(value, 'source') === 'telemetry-loss')
   if (losses.length === 0) return []
   const lines = ['## Telemetry loss', '', '| stage | missing | total | rate | max | exceeded |', '| --- | --- | --- | --- | --- | --- |']
   for (const loss of losses) {
     const rate = num(loss.rate)
     const max = num(loss.maxLossRate)
-    lines.push(`| ${loss.live === true ? 'live' : 'pinned'} | ${num(loss.count) ?? '-'} | ${num(loss.total) ?? '-'} | ${rate === null ? '-' : `${(rate * 100).toFixed(1)}%`} | ${max === null ? '-' : `${(max * 100).toFixed(1)}%`} | ${loss.exceeded === true ? 'yes' : 'no'} |`)
+    lines.push(`| ${loss.live === true ? 'live' : 'pinned'} | ${numCell(loss.count)} | ${numCell(loss.total)} | ${rate === null ? '-' : `${(rate * 100).toFixed(1)}%`} | ${max === null ? '-' : `${(max * 100).toFixed(1)}%`} | ${loss.exceeded === true ? 'yes' : 'no'} |`)
   }
   lines.push('')
   for (const loss of losses) {
@@ -90,16 +139,17 @@ export function canarySplit(events: readonly CdEvent[]): { readonly percent: num
   const seenAt = new Map<number, number>()
   for (const step of rampSteps(events)) {
     const percent = num(step.percent)
-    const seen = num(step.routedNewShare) ?? num(step.observedPercent)
+    const seen = firstNum(step.routedNewShare, step.observedPercent)
     if (percent !== null && seen !== null) seenAt.set(percent, seen)
   }
   return changes.flatMap(event => {
     if (event.kind !== 'state_change') return []
-    const share = canary
-      ? event.payload.after.find(item => item.versionId === canary)
-      : event.payload.after.find(item => item.percentage !== 100) ?? event.payload.after[0]
-    const percent = share?.percentage ?? 0
-    return [{ percent, seen: seenAt.get(percent) ?? 0 }]
+    const matched = canary === null ? null : findShare(event.payload.after, item => item.versionId === canary)
+    const other = findShare(event.payload.after, item => item.percentage !== 100)
+    const first = unwrapOr(atIndex(event.payload.after, 0), null)
+    const share = canary === null ? (other === null ? first : other) : matched
+    const percent = share === null ? 0 : share.percentage
+    return [{ percent, seen: unwrapOr(mapGet(seenAt, percent), 0) }]
   })
 }
 
@@ -112,8 +162,9 @@ function policyBurn(events: readonly CdEvent[]): number {
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index]
     if (!event || event.kind !== 'policy') continue
-    const burn = jsonObject(jsonObject(event.payload.body)?.burn)
-    const fast = burn?.fastBurn
+    const body = jsonObject(event.payload.body)
+    const burn = jsonObject(body === null ? null : field(body, 'burn'))
+    const fast = burn === null ? null : field(burn, 'fastBurn')
     if (typeof fast === 'number') return fast
   }
   return FAST_BURN
@@ -123,8 +174,11 @@ function latencyMode(events: readonly CdEvent[]): string | null {
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index]
     if (!event || event.kind !== 'policy') continue
-    const latency = jsonObject(jsonObject(jsonObject(event.payload.body)?.gates)?.latency)
-    return typeof latency?.mode === 'string' ? latency.mode : null
+    const body = jsonObject(event.payload.body)
+    const gates = jsonObject(body === null ? null : field(body, 'gates'))
+    const latency = jsonObject(gates === null ? null : field(gates, 'latency'))
+    const mode = latency === null ? null : field(latency, 'mode')
+    return typeof mode === 'string' ? mode : null
   }
   return null
 }
@@ -132,7 +186,7 @@ function latencyMode(events: readonly CdEvent[]): string | null {
 function rampSteps(events: readonly CdEvent[]): Measurement[] {
   return events.flatMap(event => {
     const value = measurement(event)
-    return value?.source === 'ramp-step' ? [value] : []
+    return value !== null && field(value, 'source') === 'ramp-step' ? [value] : []
   })
 }
 
@@ -146,11 +200,12 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
   const bySeq = new Map(events.map(event => [event.seq, event]))
   const started = events.find(event => event.kind === 'lifecycle' && event.payload.event === 'run_started')
   const finished = events.find(event => event.kind === 'lifecycle' && event.payload.event === 'run_finished')
-  const lines: string[] = [`# Debrief ${events[0]?.run_id ?? basename(runDir)}`, '']
+  const firstEvent = unwrapOr(atIndex(events, 0), null)
+  const lines: string[] = [`# Debrief ${firstEvent === null ? basename(runDir) : firstEvent.run_id}`, '']
   if (started && started.kind === 'lifecycle' && started.payload.event === 'run_started') {
     const payload = started.payload
     const pair = payload.release ? ` Release \`${payload.release.ply}+${payload.release.web}\`.` : ''
-    lines.push(`${payload.host} ran ply \`${payload.plySha ?? '-'}\` on ply-web \`${payload.plyWebSha}\`.${pair}`)
+    lines.push(`${payload.host} ran ply \`${textOrDash(payload.plySha)}\` on ply-web \`${payload.plyWebSha}\`.${pair}`)
     lines.push('')
     lines.push(`Tools: node ${payload.tools.node}, ${payload.tools.cf}, ${payload.tools.git}.`)
     lines.push('')
@@ -170,9 +225,9 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
     const payload = finished.payload
     lines.push(`Verdict **${payload.verdict}**${payload.reason ? `: ${payload.reason}` : ''}.`)
     lines.push('')
-    lines.push(`Version ${payload.versionId ?? '-'}. Rolled back: ${payload.rolledBack ? 'yes' : 'no'}${payload.rollbackReason ? ` (${payload.rollbackReason})` : ''}.`)
+    lines.push(`Version ${textOrDash(payload.versionId)}. Rolled back: ${payload.rolledBack ? 'yes' : 'no'}${payload.rollbackReason ? ` (${payload.rollbackReason})` : ''}.`)
     lines.push('')
-    lines.push(`Smoke ${payload.smoke.passed} passed, ${payload.smoke.failed} failed. Live at ${payload.liveAt ?? '-'}.`)
+    lines.push(`Smoke ${payload.smoke.passed} passed, ${payload.smoke.failed} failed. Live at ${textOrDash(payload.liveAt)}.`)
     lines.push('')
     if (payload.plyMergedAt) lines.push(`ply merged at ${payload.plyMergedAt}.`, '')
   }
@@ -203,10 +258,13 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
   for (const event of changes) {
     if (event.kind !== 'state_change') continue
     const show = (shares: readonly { versionId: string; percentage: number }[]) => shares.map(share => `${share.percentage}% ${share.versionId}`).join(', ') || '-'
-    lines.push(`| ${event.seq} | ${show(event.payload.before)} | ${show(event.payload.after)} | ${event.payload.deploymentId ?? '-'} |`)
+    lines.push(`| ${event.seq} | ${show(event.payload.before)} | ${show(event.payload.after)} | ${textOrDash(event.payload.deploymentId)} |`)
   }
   const steps = rampSteps(events)
-  const labels = steps.map((step, index) => String(num(step.percent) ?? index + 1))
+  const labels = steps.map((step, index) => {
+    const percent = num(step.percent)
+    return String(percent === null ? index + 1 : percent)
+  })
   const splitPoints = canarySplit(events)
   const split: ChartSeries[] = splitPoints.length > 0
     ? [
@@ -214,23 +272,27 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
       { name: 'seen', rgb: [15, 118, 110], points: splitPoints.map(point => ({ x: String(point.percent), y: point.seen })) },
     ]
     : [
-      { name: 'cfg', rgb: [194, 65, 12], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.percent) ?? 0 })) },
-      { name: 'seen', rgb: [15, 118, 110], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.routedNewShare) ?? num(step.observedPercent) ?? 0 })) },
+      { name: 'cfg', rgb: [194, 65, 12], points: steps.map((step, index) => ({ x: labelOf(labels, index), y: numOrZero(step.percent) })) },
+      { name: 'seen', rgb: [15, 118, 110], points: steps.map((step, index) => ({ x: labelOf(labels, index), y: numOrZero(step.routedNewShare, step.observedPercent) })) },
     ]
   const latency: ChartSeries[] = [
-    { name: 'new', rgb: [194, 65, 12], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.nextWallP99) ?? 0 })) },
-    { name: 'old', rgb: [29, 78, 216], points: steps.map((step, index) => ({ x: labels[index] ?? '', y: num(step.previousWallP99) ?? 0 })) },
+    { name: 'new', rgb: [194, 65, 12], points: steps.map((step, index) => ({ x: labelOf(labels, index), y: numOrZero(step.nextWallP99) })) },
+    { name: 'old', rgb: [29, 78, 216], points: steps.map((step, index) => ({ x: labelOf(labels, index), y: numOrZero(step.previousWallP99) })) },
   ]
   const finishedSteps = finished && finished.kind === 'lifecycle' && finished.payload.event === 'run_finished' ? finished.payload.steps : []
-  const burnLabels = (finishedSteps.length ? finishedSteps : steps).map((step, index) => String(num('percent' in step ? step.percent : step.percent) ?? index + 1))
+  const burnSource = finishedSteps.length ? finishedSteps : steps
+  const burnLabels = burnSource.map((step, index) => {
+    const percent = num(step.percent)
+    return String(percent === null ? index + 1 : percent)
+  })
   const burnNames = ['availability', 'read_latency', 'write_latency', 'correctness'] as const
   const burnColors = [[185, 28, 28], [194, 65, 12], [180, 83, 9], [21, 128, 61]] as const
   const burn: ChartSeries[] = burnNames.map((name, index) => ({
     name: name === 'read_latency' ? 'read' : name === 'write_latency' ? 'write' : name === 'availability' ? 'avail' : 'correct',
-    rgb: burnColors[index] ?? [15, 23, 42],
-    points: (finishedSteps.length ? finishedSteps : steps).map((step, stepIndex) => ({
-      x: burnLabels[stepIndex] ?? '',
-      y: burnsOf('burns' in step ? step.burns : undefined)[name] ?? 0,
+    rgb: unwrapOr(atIndex(burnColors, index), BURN_FALLBACK),
+    points: burnSource.map((step, stepIndex) => ({
+      x: labelOf(burnLabels, stepIndex),
+      y: burnAt(step, name),
     })),
   }))
   const fastBurn = policyBurn(events)

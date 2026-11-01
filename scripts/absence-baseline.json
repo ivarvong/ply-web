@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 108,
+    "word": 106,
     "optional": 303,
-    "chain": 353,
-    "nullish": 386,
-    "total": 1150
+    "chain": 322,
+    "nullish": 348,
+    "total": 1079
   },
   "files": {
     "cloudflare.config.ts": {
@@ -14,13 +14,6 @@
       "chain": 0,
       "nullish": 0,
       "total": 2
-    },
-    "scripts/canary-o11y.mjs": {
-      "word": 1,
-      "optional": 0,
-      "chain": 21,
-      "nullish": 12,
-      "total": 34
     },
     "scripts/canary-verdict.mjs": {
       "word": 0,
@@ -63,13 +56,6 @@
       "chain": 0,
       "nullish": 3,
       "total": 3
-    },
-    "scripts/cd/debrief.ts": {
-      "word": 1,
-      "optional": 0,
-      "chain": 10,
-      "nullish": 26,
-      "total": 37
     },
     "scripts/cd/deploy-plan.ts": {
       "word": 0,
