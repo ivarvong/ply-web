@@ -418,7 +418,7 @@ const worker = {
     if (env.MIRROR_SYNC !== 'on' || !env.PUBLIC_REPOS) return;
     const tokens = tokenSourceFor(env.PUBLIC_REPOS);
     const scrub = text => scrubSecrets(tokens === null ? [] : tokens.secrets())(text);
-    const results = await syncAll({ binding: env.PUBLIC_REPOS, tokens });
+    const results = await syncAll({ binding: env.PUBLIC_REPOS, tokens, fetchImpl: null, origin: null });
     for (const r of results) console.log(scrub(JSON.stringify({ msg: 'ply.mirror', cron: unwrapOr(chainGet(controller, 'cron'), ''), scheduledTime: unwrapOr(chainGet(controller, 'scheduledTime'), 0), ...r })));
     void ctx;
   },
