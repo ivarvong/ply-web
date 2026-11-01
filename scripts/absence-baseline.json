@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 139,
-    "optional": 347,
-    "chain": 487,
-    "nullish": 552,
-    "total": 1525
+    "word": 131,
+    "optional": 337,
+    "chain": 477,
+    "nullish": 498,
+    "total": 1443
   },
   "files": {
     "cloudflare.config.ts": {
@@ -420,13 +420,6 @@
       "chain": 2,
       "nullish": 3,
       "total": 7
-    },
-    "src/viewer/markdown.ts": {
-      "word": 8,
-      "optional": 10,
-      "chain": 10,
-      "nullish": 54,
-      "total": 82
     },
     "src/viewer/model.ts": {
       "word": 0,
