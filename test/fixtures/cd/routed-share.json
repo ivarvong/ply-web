@@ -1,0 +1,7 @@
+{
+  "note": "Synthetic invocation counts for an unpinned 10% step. Not a recorded run. n=2000 is the checked-in probe (25 ticks/s, two calls, 40s).",
+  "targetPercent": 10,
+  "within": { "newRequests": 200, "total": 2000 },
+  "mismatch": { "newRequests": 1000, "total": 2000 },
+  "thin": { "newRequests": 40, "total": 400 }
+}

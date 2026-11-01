@@ -25,11 +25,15 @@ test('the checked-in policy is the correctness ramp', () => {
   assert.equal(loaded.policy.gates.burn, 'hard')
   assert.equal(loaded.policy.ingestWaitMs, 20_000)
   assert.equal(loaded.policy.warmupMs, 0)
-  assert.equal(loaded.policy.probe.rps, 2)
+  assert.equal(loaded.policy.probe.rps, 25)
   assert.deepEqual(loaded.policy.probe.calls.map(call => call.path), ['/', '/v1/discover'])
-  assert.deepEqual(loaded.policy.steps.map(step => step.percent), [1, 5, 10, 25, 50, 75, 100])
+  assert.deepEqual(loaded.policy.steps.map(step => step.percent), [10, 25, 50, 75, 100])
   assert.equal(loaded.policy.burn.fastBurn, FAST_BURN)
   assert.equal(loaded.policy.burn.minSamples, MIN_SAMPLES)
+  assert.equal(loaded.policy.split.z, 3)
+  assert.equal(loaded.policy.split.minNewRequests, MIN_SAMPLES)
+  assert.equal(loaded.policy.split.onMismatch, 'rollback')
+  assert.equal(loaded.policy.split.onInsufficient, 'hold')
   assert.equal(loaded.policy.steps.every(step => step.dwellMs === 40_000), true)
 })
 
@@ -48,6 +52,32 @@ test('a policy that cannot be run is rejected', () => {
   extra.region = 'iad'
   assert.throws(() => parsePolicy(JSON.stringify(extra)), /unknown field/)
   assert.throws(() => parsePolicy('{'), /not JSON/)
+  const mismatch = raw()
+  mismatch.split = { ...(mismatch.split as Record<string, unknown>), onMismatch: 'advance' }
+  assert.throws(() => parsePolicy(JSON.stringify(mismatch)), /hold or rollback/)
+  const thin = raw()
+  thin.split = { ...(thin.split as Record<string, unknown>), minNewRequests: 0 }
+  assert.throws(() => parsePolicy(JSON.stringify(thin)), /minNewRequests/)
+  const zee = raw()
+  zee.split = { ...(zee.split as Record<string, unknown>), z: 0 }
+  assert.throws(() => parsePolicy(JSON.stringify(zee)), /split\.z/)
+})
+
+test('the checked-in probe can see a correctness regression on the smallest step', () => {
+  const loaded = loadPolicy(DEFAULT_POLICY_PATH).policy
+  const dwellS = loaded.steps[0]?.dwellMs ?? 0
+  const requests = loaded.probe.rps * loaded.probe.calls.length * (dwellS / 1000)
+  const open = loaded.steps.map(step => step.percent).filter(percent => percent < 100)
+  const smallest = Math.min(...open)
+  const expectedNew = requests * (smallest / 100)
+  assert.equal(requests, 2000)
+  assert.equal(smallest, 10)
+  assert.equal(expectedNew, 200)
+  assert.ok(expectedNew >= loaded.split.minNewRequests)
+  const atFloor = 1 - 0.05 ** (1 / loaded.split.minNewRequests)
+  const atExpected = 1 - 0.05 ** (1 / expectedNew)
+  assert.ok(Math.abs(atFloor - 0.0295) < 0.001)
+  assert.ok(Math.abs(atExpected - 0.0149) < 0.001)
 })
 
 test('latency=gate with thresholds is a policy, and warm-up may be omitted', () => {

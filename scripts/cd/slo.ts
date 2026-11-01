@@ -2,10 +2,11 @@
  * SLO definitions and the ramp's burn-rate math. Numbers live here, not at the call site.
  *
  * Burn rate is the observed bad fraction divided by the error-budget fraction (1 − target).
- * The ramp fails a step when that rate is above FAST_BURN and the window has MIN_SAMPLES,
- * or when the new version has any exception, 5xx, non-ok outcome, or failed probe.
- * Which of those signals actually stops a step comes from the rollout policy.
- * Wall time is a gate only when that policy says `latency.mode` is `gate`.
+ * The ramp fails a step when that rate is above the policy's fast burn and the window
+ * has the policy's sample floor, or when a version (or the whole worker) has any
+ * exception, 5xx, error log, or non-ok outcome. Which of those signals actually
+ * stops a step comes from the rollout policy. Wall time is a gate only when that
+ * policy says `latency.mode` is `gate`. The routed share is a separate check.
  * The multi-window table is the alerting policy for later; the step window uses only
  * the fast-burn multiple.
  */
@@ -94,7 +95,7 @@ export const FAST_BURN = 14.4
  * A ramp reads the policy. This export is the chart fallback for a run that
  * recorded no policy event, and the lock that the file did not drift.
  */
-export const MIN_SAMPLES = 20
+export const MIN_SAMPLES = 100
 
 /**
  * At 100% the old version is no longer allocated. The wall and CPU numbers on
@@ -139,7 +140,7 @@ export type AppliedRule = {
 }
 
 export type StepVerdict = {
-  readonly outcome: 'advance' | 'rollback'
+  readonly outcome: 'advance' | 'rollback' | 'hold' | 'insufficient_data'
   readonly reason: string
   readonly rules: readonly [AppliedRule, ...AppliedRule[]]
   readonly burns: BurnMap
@@ -208,12 +209,43 @@ export function burnMap(requests: readonly V1Request[], correctness: SloCount | 
 
 export type StepInput = {
   readonly requests: number
+  /** Fetch invocations. The routed share uses this, not `requests`, which falls back to logs. */
+  readonly invocations: number
   readonly exceptions: number
   readonly errors: number
   readonly fivexx: number
   readonly errorLogs: number
   readonly wallMs: readonly number[]
   readonly v1: readonly V1Request[]
+}
+
+export type RoutedShare = {
+  readonly n: number
+  readonly newRequests: number
+  readonly share: number | null
+  readonly low: number | null
+  readonly high: number | null
+  readonly kind: 'untested' | 'match' | 'mismatch'
+}
+
+/**
+ * Binomial band around the target percent. Width is `z` standard errors at this n.
+ * `untested` is n = 0. `mismatch` is a share outside the band, or a new count that
+ * is not a fraction of the aggregate.
+ */
+export function routedShare(newRequests: number, total: number, targetPercent: number, z: number): RoutedShare {
+  if (!(total > 0) || newRequests < 0 || newRequests > total) {
+    const kind = total >= 0 && newRequests > total ? 'mismatch' : 'untested'
+    return { n: Math.max(0, total), newRequests, share: null, low: null, high: null, kind }
+  }
+  const p = targetPercent / 100
+  const se = Math.sqrt((p * (1 - p)) / total)
+  const margin = z * se
+  const low = Math.max(0, p - margin)
+  const high = Math.min(1, p + margin)
+  const share = newRequests / total
+  const kind = share < low || share > high ? 'mismatch' : 'match'
+  return { n: total, newRequests, share, low, high, kind }
 }
 
 function rulesOf(list: readonly AppliedRule[]): readonly [AppliedRule, ...AppliedRule[]] {
@@ -246,10 +278,14 @@ function consider(mode: 'hard' | 'informational', breach: Breach | null, hard: B
   else notes.push(breach.reason)
 }
 
-function countBreach(count: number, noun: string, rule: string): Breach | null {
+function countBreach(count: number, noun: string, rule: string, scope: string): Breach | null {
   if (count <= 0) return null
   const word = count === 1 ? noun : `${noun}s`
-  return { reason: `${count} ${word} on the new version`, rule: { name: rule, value: 0 } }
+  return { reason: `${count} ${word} ${scope}`, rule: { name: rule, value: 0 } }
+}
+
+function points(fraction: number): string {
+  return (fraction * 100).toFixed(2)
 }
 
 /**
@@ -279,40 +315,43 @@ function latencyBreach(newer: readonly number[], older: readonly number[], polic
   return null
 }
 
+const SCOPES = [
+  { id: 'new', scope: 'on the new version', pick: (input: { readonly next: StepInput }) => input.next },
+  { id: 'old', scope: 'on the old version', pick: (input: { readonly previous: StepInput }) => input.previous },
+  { id: 'aggregate', scope: 'across the worker', pick: (input: { readonly aggregate: StepInput }) => input.aggregate },
+] as const
+
 /**
- * One ramp step. Each signal is hard or informational according to the policy.
- * Latency rolls back only when the policy's mode is gate and its thresholds clear.
+ * One ramp step. Correctness and burn are judged per version and across the worker.
+ * The routed share uses telemetry invocation counts. Too few new-version requests is
+ * `insufficient_data` or an advance, per the policy. A share outside the binomial
+ * band holds or rolls back, per the policy. Latency rolls back only in `gate` mode.
  */
 export function judgeStep(input: {
   readonly next: StepInput
   readonly previous: StepInput
-  readonly probeFailures: number
+  readonly aggregate: StepInput
+  readonly targetPercent: number
   readonly policy: RolloutPolicy
 }): StepVerdict {
   const burns = burnMap(input.next.v1)
   const hard: Breach[] = []
   const notes: string[] = []
   const gates = input.policy.gates
-  consider(
-    gates.smoke,
-    input.probeFailures > 0
-      ? { reason: `${input.probeFailures} probe responses from the new version were not 2xx`, rule: { name: 'probe_contract', value: 0 } }
-      : null,
-    hard,
-    notes,
-  )
-  consider(gates.exceptions, countBreach(input.next.exceptions, 'exception', 'max_new_exceptions'), hard, notes)
-  consider(gates.fivexx, countBreach(input.next.fivexx, '5xx response', 'max_new_5xx'), hard, notes)
-  consider(gates.errorLogs, countBreach(input.next.errorLogs, 'error log', 'max_new_error_logs'), hard, notes)
-  consider(gates.nonOk, countBreach(input.next.errors, 'non-ok outcome', 'max_new_errors'), hard, notes)
-  if (gates.burn === 'hard' || gates.burn === 'informational') {
+  for (const scope of SCOPES) {
+    const side = scope.pick(input)
+    consider(gates.exceptions, countBreach(side.exceptions, 'exception', `max_${scope.id}_exceptions`, scope.scope), hard, notes)
+    consider(gates.fivexx, countBreach(side.fivexx, '5xx response', `max_${scope.id}_5xx`, scope.scope), hard, notes)
+    consider(gates.errorLogs, countBreach(side.errorLogs, 'error log', `max_${scope.id}_error_logs`, scope.scope), hard, notes)
+    consider(gates.nonOk, countBreach(side.errors, 'non-ok outcome', `max_${scope.id}_errors`, scope.scope), hard, notes)
+    if (gates.burn !== 'hard' && gates.burn !== 'informational') continue
     for (const slo of [AVAILABILITY, READ_LATENCY, WRITE_LATENCY]) {
-      const count = countSlo(slo, input.next.v1)
+      const count = countSlo(slo, side.v1)
       if (count.total < input.policy.burn.minSamples || count.burn === null || count.burn <= input.policy.burn.fastBurn) continue
       consider(
         gates.burn,
         {
-          reason: `${slo.id} burn ${count.burn.toFixed(2)} > ${input.policy.burn.fastBurn}`,
+          reason: `${slo.id} burn ${count.burn.toFixed(2)} > ${input.policy.burn.fastBurn} ${scope.scope}`,
           rule: { name: 'fast_burn', value: input.policy.burn.fastBurn },
         },
         hard,
@@ -323,8 +362,25 @@ export function judgeStep(input: {
   consider(gates.latency.mode === 'gate' ? 'hard' : 'informational', latencyBreach(input.next.wallMs, input.previous.wallMs, input.policy), hard, notes)
   const first = hard[0]
   if (first) return verdict('rollback', first.reason, [first.rule], burns)
+  const noted = notes.length === 0 ? '' : `; informational: ${notes.join('; ')}`
+  const routed = routedShare(input.next.invocations, input.aggregate.invocations, input.targetPercent, input.policy.split.z)
+  if (routed.kind === 'mismatch') {
+    const where = routed.share === null
+      ? 'new-version requests are not a fraction of the aggregate'
+      : `routed share ${points(routed.share)}% is outside ${points(routed.low ?? 0)}..${points(routed.high ?? 0)} of target ${input.targetPercent}% (n=${routed.n})`
+    const outcome = input.policy.split.onMismatch === 'rollback' ? 'rollback' : 'hold'
+    return verdict(outcome, where, [{ name: 'routed_share', value: input.policy.split.z }], burns)
+  }
+  if (routed.kind === 'untested' || routed.newRequests < input.policy.split.minNewRequests) {
+    const reason = routed.kind === 'untested'
+      ? `insufficient evidence: 0 requests in the window${noted}`
+      : `insufficient evidence: ${routed.newRequests} new-version requests < ${input.policy.split.minNewRequests}${noted}`
+    const rule = { name: 'min_new_requests', value: input.policy.split.minNewRequests }
+    if (input.policy.split.onInsufficient === 'hold') return verdict('insufficient_data', reason, [rule], burns)
+    return verdict('advance', reason, [rule], burns)
+  }
   const reason = notes.length === 0
     ? `within burn ${input.policy.burn.fastBurn}`
-    : `within burn ${input.policy.burn.fastBurn}; informational: ${notes.join('; ')}`
+    : `within burn ${input.policy.burn.fastBurn}${noted}`
   return verdict('advance', reason, [{ name: 'fast_burn', value: input.policy.burn.fastBurn }], burns)
 }
