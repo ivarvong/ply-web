@@ -66,7 +66,51 @@ export type Unit = {
   readonly attributes: Readonly<Record<string, string>>;
 };
 
-export type CacheStatus = 'HIT' | 'MISS' | 'UPDATING' | 'REVALIDATED' | 'EXPIRED' | 'STALE' | 'BYPASS' | 'NONE';
+/**
+ * `CF-Cache-Status` tokens documented by the Cache API.
+ * https://developers.cloudflare.com/cache/concepts/cache-responses/
+ * Workers Cache reports the same set.
+ * `NONE` and `UNKNOWN` are the two tokens of the documented NONE/UNKNOWN status.
+ */
+export const CACHE_STATUSES = [
+  'HIT',
+  'MISS',
+  'EXPIRED',
+  'STALE',
+  'BYPASS',
+  'REVALIDATED',
+  'UPDATING',
+  'DYNAMIC',
+  'NONE',
+  'UNKNOWN',
+] as const;
+
+export type CacheStatus = (typeof CACHE_STATUSES)[number];
+
+export type ParsedCacheStatus =
+  | { readonly kind: 'known'; readonly status: CacheStatus }
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'unrecognized'; readonly value: string };
+
+/** A header or JSON field. Absence is a missing token. Anything outside {@link CACHE_STATUSES} stays unrecognized. */
+export function parseCacheStatus(value: string | null): ParsedCacheStatus {
+  if (value === null || value.length === 0) return { kind: 'absent' };
+  switch (value) {
+    case 'HIT':
+    case 'MISS':
+    case 'EXPIRED':
+    case 'STALE':
+    case 'BYPASS':
+    case 'REVALIDATED':
+    case 'UPDATING':
+    case 'DYNAMIC':
+    case 'NONE':
+    case 'UNKNOWN':
+      return { kind: 'known', status: value };
+    default:
+      return { kind: 'unrecognized', value };
+  }
+}
 
 export type Invalid = { readonly kind: 'invalid'; readonly reason: string };
 

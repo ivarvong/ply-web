@@ -115,7 +115,7 @@ Each evaluation emits a `flags.eval` span and a `flags.resolve` child per flag. 
 
 | attribute | where |
 |---|---|
-| `flags.cache_status` | eval span. `HIT`, `UPDATING`, `REVALIDATED`, `EXPIRED`, `MISS`, plus `STALE`, `BYPASS`, `NONE` when the platform says so |
+| `flags.cache_status` | eval span. The Cache API set: `HIT`, `MISS`, `EXPIRED`, `STALE`, `BYPASS`, `REVALIDATED`, `UPDATING`, `DYNAMIC`, `NONE`, `UNKNOWN`. A header token outside that set is recorded as `UNKNOWN` |
 | `flags.revision` | both |
 | `flags.eval_ms` | eval span, pure evaluation. On Workers this stays 0: the clock does not move until the isolate yields |
 | `flags.resolve_ms` | eval span and the `flags.eval` / `flags.resolve` logs. Wall time of the awaited FlagsCache read. A hit is the cache lookup. A miss, stale, or revalidation includes the R2 read inside that await |
@@ -128,7 +128,7 @@ The same low-cardinality fields are logged as `flags.eval` and `flags.resolve`. 
 
 `flags.eval` is opened before the FlagsCache await and ended after it, so the platform span duration includes that yield. The `flags.resolve` children are opened after the await. Their platform duration stays near 0. The number to aggregate is the `resolve_ms` attribute and log field.
 
-Smoke accepts `GET /v1/flags` cache status `HIT`, `MISS`, `STALE`, or `UPDATING`. `REVALIDATED` and `EXPIRED` are real platform statuses and would fail that check.
+Smoke accepts a cached ruleset read on `GET /v1/flags`: `HIT`, `MISS`, `STALE`, `UPDATING`, `EXPIRED`, or `REVALIDATED`. `EXPIRED` is the first read after a flag write invalidates the tag and the entrypoint answers 200 with a new body. `REVALIDATED` is that read when the entrypoint answers 304. `BYPASS`, `DYNAMIC`, `NONE`, and `UNKNOWN` fail the check, and so does any token outside the Cache API set.
 
 ## CD follow-up
 
