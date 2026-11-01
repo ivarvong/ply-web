@@ -7,6 +7,8 @@
 // The standalone sheet is 142 KB, 113 KB of it utilities for every Kumo component. The viewer server-renders Kumo's
 // component class strings from kumo-classes.ts, so only those utilities are kept (kumoSubset). The theme, base and
 // keyframe layers are kept whole; the selection is per utility class, so nothing a used class needs is lost.
+import { captureGroup } from '../absent.ts'
+import { unwrapOr } from '../option.ts'
 import * as KUMO from './kumo-classes.ts'
 import { KUMO_STANDALONE_CSS } from './kumo-standalone.ts'
 import { LAYOUT, RADIUS, SPACE } from './layout.ts'
@@ -62,7 +64,7 @@ export function cssNodes(css: string): CssNode[] {
 
 /** Class names a selector mentions, unescaped (`.h-6\.5` → `h-6.5`). */
 export function selectorClasses(selector: string): string[] {
-  return [...selector.matchAll(/\.((?:\\.|[\w-])+)/g)].map(m => (m[1] ?? '').replace(/\\(.)/g, '$1'))
+  return [...selector.matchAll(/\.((\\.|[\w-])+)/g)].map(m => unwrapOr(captureGroup(m, 1), '').replace(/\\(.)/g, '$1'))
 }
 
 function serialise(nodes: readonly CssNode[]): string {

@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 212,
-    "optional": 381,
+    "word": 208,
+    "optional": 379,
     "chain": 563,
-    "nullish": 632,
-    "total": 1788
+    "nullish": 628,
+    "total": 1778
   },
   "files": {
     "cloudflare.config.ts": {
@@ -351,13 +351,6 @@
       "nullish": 1,
       "total": 2
     },
-    "src/flags/operator-names.ts": {
-      "word": 1,
-      "optional": 0,
-      "chain": 0,
-      "nullish": 0,
-      "total": 1
-    },
     "src/flags/operator.ts": {
       "word": 7,
       "optional": 2,
@@ -399,13 +392,6 @@
       "chain": 0,
       "nullish": 0,
       "total": 2
-    },
-    "src/gitcache-entry.ts": {
-      "word": 1,
-      "optional": 0,
-      "chain": 0,
-      "nullish": 0,
-      "total": 1
     },
     "src/gitcache.ts": {
       "word": 4,
@@ -484,33 +470,12 @@
       "nullish": 4,
       "total": 23
     },
-    "src/viewer/budget.ts": {
-      "word": 0,
-      "optional": 1,
-      "chain": 0,
-      "nullish": 0,
-      "total": 1
-    },
     "src/viewer/call.ts": {
       "word": 1,
       "optional": 14,
       "chain": 0,
       "nullish": 0,
       "total": 15
-    },
-    "src/viewer/cloudflare-workers.d.ts": {
-      "word": 1,
-      "optional": 0,
-      "chain": 0,
-      "nullish": 0,
-      "total": 1
-    },
-    "src/viewer/escape.ts": {
-      "word": 0,
-      "optional": 0,
-      "chain": 0,
-      "nullish": 1,
-      "total": 1
     },
     "src/viewer/failure.ts": {
       "word": 0,
@@ -603,13 +568,6 @@
       "nullish": 0,
       "total": 15
     },
-    "src/viewer/rate.ts": {
-      "word": 0,
-      "optional": 0,
-      "chain": 0,
-      "nullish": 1,
-      "total": 1
-    },
     "src/viewer/route.ts": {
       "word": 10,
       "optional": 1,
@@ -630,13 +588,6 @@
       "chain": 5,
       "nullish": 19,
       "total": 32
-    },
-    "src/viewer/styles.ts": {
-      "word": 0,
-      "optional": 1,
-      "chain": 0,
-      "nullish": 1,
-      "total": 2
     },
     "src/viewer/tags.ts": {
       "word": 4,
@@ -687,13 +638,6 @@
       "nullish": 4,
       "total": 24
     },
-    "src/write/head.ts": {
-      "word": 1,
-      "optional": 0,
-      "chain": 0,
-      "nullish": 0,
-      "total": 1
-    },
     "src/write/identity.ts": {
       "word": 1,
       "optional": 4,
@@ -728,13 +672,6 @@
       "chain": 3,
       "nullish": 2,
       "total": 12
-    },
-    "src/write/tree.ts": {
-      "word": 0,
-      "optional": 0,
-      "chain": 0,
-      "nullish": 1,
-      "total": 1
     },
     "test/cd-flags-smoke.test.ts": {
       "word": 0,
