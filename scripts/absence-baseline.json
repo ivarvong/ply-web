@@ -1,11 +1,11 @@
 {
   "boundary": "src/absent.ts",
   "counts": {
-    "word": 190,
-    "optional": 361,
-    "chain": 537,
-    "nullish": 585,
-    "total": 1673
+    "word": 154,
+    "optional": 353,
+    "chain": 534,
+    "nullish": 581,
+    "total": 1622
   },
   "files": {
     "cloudflare.config.ts": {
@@ -519,27 +519,6 @@
       "nullish": 7,
       "total": 18
     },
-    "src/write/handle.ts": {
-      "word": 13,
-      "optional": 4,
-      "chain": 3,
-      "nullish": 4,
-      "total": 24
-    },
-    "src/write/identity.ts": {
-      "word": 1,
-      "optional": 4,
-      "chain": 0,
-      "nullish": 0,
-      "total": 5
-    },
-    "src/write/request.ts": {
-      "word": 21,
-      "optional": 0,
-      "chain": 0,
-      "nullish": 0,
-      "total": 21
-    },
     "src/write/tag.ts": {
       "word": 6,
       "optional": 1,
@@ -730,11 +709,11 @@
       "total": 31
     },
     "test/write.test.ts": {
-      "word": 1,
+      "word": 0,
       "optional": 2,
       "chain": 14,
       "nullish": 1,
-      "total": 18
+      "total": 17
     },
     "vite.config.ts": {
       "word": 0,

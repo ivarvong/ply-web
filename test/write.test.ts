@@ -17,9 +17,16 @@ const code = (fn: () => unknown) => {
   try { fn() } catch (e) { return (e as { code?: string; message?: string }) }
   return null
 }
+const errCode = (err: ReturnType<typeof code>): string => {
+  if (err === null) return ''
+  return typeof err.code === 'string' ? err.code : ''
+}
 
 test('parseBase rejects the zero oid and accepts a commit id or a branch', () => {
-  assert.deepEqual(parseBase(undefined), { kind: 'omit' })
+  const missing: Record<string, unknown> = {}
+  assert.deepEqual(parseBase(missing.base), { kind: 'omit' })
+  assert.deepEqual(parseBase(null), { kind: 'omit' })
+  assert.deepEqual(parseBase(''), { kind: 'omit' })
   assert.equal(parseBase('main').kind, 'ref')
   const oid = 'a'.repeat(40)
   assert.deepEqual(parseBase(oid), { kind: 'oid', oid })
@@ -34,6 +41,23 @@ test('parseEdit: empty find creates, delete and rename, changes xor path', () =>
   const author = { name: 'w', email: 'w@x' }
   const created = parseEdit(asBody({ path: 'a.txt', content: 'hi', author, message: 'm' }), now)
   assert.deepEqual(created.changes, [{ kind: 'create', path: 'a.txt', content: 'hi', mode: MODE_BLOB }])
+  assert.equal(created.committer, null)
+  assert.equal(created.ref, null)
+  assert.equal(created.base.kind, 'omit')
+  const bareEdit = parseEdit(asBody({ path: 'a.txt', find: 'hi', author, message: 'm' }), now)
+  assert.deepEqual(bareEdit.changes, [{ kind: 'edit', path: 'a.txt', find: 'hi', replace: '' }])
+  const renamedFrom = parseEdit(asBody({ author, message: 'm', changes: [{ op: 'rename', from: 'a.txt', to: 'b.txt' }] }), now)
+  assert.deepEqual(renamedFrom.changes, [{ kind: 'rename', from: 'a.txt', to: 'b.txt' }])
+  const renamedPath = parseEdit(asBody({ author, message: 'm', changes: [{ op: 'rename', path: 'a.txt', from: 'c.txt', to: 'b.txt' }] }), now)
+  assert.deepEqual(renamedPath.changes, [{ kind: 'rename', from: 'a.txt', to: 'b.txt' }])
+  const bad = (body: Record<string, unknown>) => errCode(code(() => parseEdit(asBody(body), now)))
+  assert.equal(bad({ path: 'a.txt', delete: false, author, message: 'm' }), 'bad_request')
+  assert.equal(bad({ path: 'a.txt', find: null, author, message: 'm' }), 'bad_request')
+  assert.equal(bad({ path: 'a.txt', content: null, author, message: 'm' }), 'bad_request')
+  assert.equal(bad({ path: 'a.txt', content: 'hi', mode: '', author, message: 'm' }), 'bad_request')
+  assert.equal(bad({ path: 'a.txt', content: 'hi', author, committer: null, message: 'm' }), 'bad_request')
+  assert.equal(bad({ changes: null, author, message: 'm' }), 'bad_request')
+  assert.equal(bad({ author, message: 'm', changes: [{ op: 'rename', path: null, from: 'a.txt', to: 'b.txt' }] }), 'bad_request')
   const edited = parseEdit(asBody({ path: 'a.txt', find: 'hi', replace: 'yo', author, message: 'm' }), now)
   assert.equal(edited.changes[0]?.kind, 'edit')
   const deleted = parseEdit(asBody({ path: 'a.txt', delete: true, author, message: 'm' }), now)
@@ -57,6 +81,11 @@ test('timezone offsets and unix seconds', () => {
   assert.equal(code(() => parseTime(-1, 'time'))?.code, 'bad_request')
   const utc = stamp({ name: 'w', email: 'w@x', time: 1700000000 }, 'author', now)
   assert.equal(utc.line, 'w <w@x> 1700000000 +0000')
+  const omitted = stamp({ name: 'w', email: 'w@x' }, 'author', now)
+  assert.equal(omitted.time, now)
+  assert.equal(omitted.tz, '+0000')
+  assert.equal(errCode(code(() => stamp({ name: 'w', email: 'w@x', time: null }, 'author', now))), 'bad_request')
+  assert.equal(errCode(code(() => stamp({ name: 'w', email: 'w@x', tz: null }, 'author', now))), 'bad_request')
 })
 
 test('tree edits prune empty directories and refuse a rename into itself', () => {
