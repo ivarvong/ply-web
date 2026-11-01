@@ -13,6 +13,24 @@ import { copyCfBundle } from './cf-bundle.js';
 import { git, gitBuf, tmpRoot, makeBareRepo, startGitServer, commitFiles } from './server.js';
 import { startProxy } from './proxy.js';
 
+/** Null and a missing value take the fallback. An empty string and 0 stay. */
+function fill(value, fallback) {
+  return value === null || value === void 0 ? fallback : value;
+}
+
+/** One property. A null receiver and a missing key are holes. A stored null stays null. */
+function slot(receiver, key) {
+  if (receiver === null || receiver === void 0) return void 0;
+  if (typeof receiver !== 'object' && typeof receiver !== 'function') return void 0;
+  return receiver[key];
+}
+
+function closeServer(s, done) {
+  const closeAll = s.closeAllConnections;
+  if (closeAll != null) closeAll.call(s);
+  s.close(done);
+}
+
 const WORKERD = [process.env.WORKERD, fileURLToPath(new URL('../node_modules/.bin/workerd', import.meta.url))].filter(Boolean).find(p => existsSync(p));
 const skip = !WORKERD && 'workerd not installed';
 const PORT = 18900 + (process.pid % 50), PORT_RO = PORT + 50;
@@ -32,12 +50,12 @@ function authProxy(upstream) {
     const u = http.request({ host: up.hostname, port: up.port, path: req.url, method: req.method, headers: { ...req.headers, host: up.host } }, r => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
     req.pipe(u);
   });
-  return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({ url: `http://127.0.0.1:${s.address().port}`, close: () => new Promise(r => { s.closeAllConnections?.(); s.close(r); }) })));
+  return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({ url: `http://127.0.0.1:${s.address().port}`, close: () => new Promise(r => { closeServer(s, r); }) })));
 }
 // a hostile host that echoes the credential back in a 500 body
 function echoServer() {
-  const s = http.createServer((req, res) => { res.writeHead(500, { 'content-type': 'text/plain' }); res.end(`echo ${req.headers.authorization} ${Buffer.from(String(req.headers.authorization).split(' ')[1] ?? '', 'base64').toString()}`); });
-  return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({ url: `http://127.0.0.1:${s.address().port}`, close: () => new Promise(r => { s.closeAllConnections?.(); s.close(r); }) })));
+  const s = http.createServer((req, res) => { res.writeHead(500, { 'content-type': 'text/plain' }); res.end(`echo ${req.headers.authorization} ${Buffer.from(fill(String(req.headers.authorization).split(' ')[1], ''), 'base64').toString()}`); });
+  return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({ url: `http://127.0.0.1:${s.address().port}`, close: () => new Promise(r => { closeServer(s, r); }) })));
 }
 
 // A host that has moved repositories: `/moved/<p>` 307s to `/<p>` (same origin, relative Location), `/away/<p>` 307s to
@@ -56,7 +74,7 @@ function redirector(upstream) {
     const u = http.request({ host: up.hostname, port: up.port, path: req.url, method: req.method, headers: { ...req.headers, host: up.host } }, r => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
     req.pipe(u);
   });
-  return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({ url: `http://127.0.0.1:${s.address().port}`, hits, close: () => new Promise(r => { s.closeAllConnections?.(); s.close(r); }) })));
+  return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({ url: `http://127.0.0.1:${s.address().port}`, hits, close: () => new Promise(r => { closeServer(s, r); }) })));
 }
 
 // git http-backend with a cf-ray on every response. `beforeReceive` runs before a receive-pack POST is forwarded,
@@ -72,13 +90,13 @@ function rayProxy(upstream) {
     req.on('end', () => {
       const body = Buffer.concat(chunks);
       const ray = `${(++n).toString(16).padStart(16, '0')}-IAD`;
-      const path = req.url ?? '';
-      const hit = { ray, method: req.method ?? 'GET', path, head: body.subarray(0, 64).toString('latin1'), hook: 'skip' };
+      const path = fill(req.url, '');
+      const hit = { ray, method: fill(req.method, 'GET'), path, head: body.subarray(0, 64).toString('latin1'), hook: 'skip' };
       seen.push(hit);
       const forward = () => {
         const u = http.request({ host: up.hostname, port: up.port, path: req.url, method: req.method, headers: { ...req.headers, host: up.host } }, r => {
           const headers = { ...r.headers, 'cf-ray': ray };
-          res.writeHead(r.statusCode ?? 502, headers);
+          res.writeHead(fill(r.statusCode, 502), headers);
           r.pipe(res);
         });
         u.on('error', () => { if (!res.headersSent) { res.writeHead(502, { 'cf-ray': ray, 'content-type': 'text/plain' }); res.end('upstream'); } });
@@ -98,7 +116,7 @@ function rayProxy(upstream) {
   return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({
     url: `http://127.0.0.1:${s.address().port}`, seen,
     setBeforeReceive(fn) { beforeReceive = fn; },
-    close: () => new Promise(r => { s.closeAllConnections?.(); s.close(r); }),
+    close: () => new Promise(r => { closeServer(s, r); }),
   })));
 }
 
@@ -109,7 +127,7 @@ before(async () => {
   authSrv = await authProxy(srv.url);
   echoSrv = await echoServer();
   redirSrv = await redirector(srv.url);
-  const filterOf = b => /filter ([^\n]+)\n/.exec(Buffer.from(b).toString('latin1'))?.[1] ?? null;
+  const filterOf = b => fill(slot(/filter ([^\n]+)\n/.exec(Buffer.from(b).toString('latin1')), '1'), null);
   artProxy = await startProxy(srv.url, ctx => (ctx.stage === 'fetch' && filterOf(ctx.reqBody) && filterOf(ctx.reqBody) !== 'blob:none' ? { type: 'status', status: 400, contentType: 'text/plain', body: 'Unsupported Git fetch filter; only blob:none is supported.' } : { type: 'pass' }));
   raySrv = await rayProxy(srv.url);
   const out = join(root, 'wk'); mkdirSync(out, { recursive: true });
@@ -129,8 +147,8 @@ const config :Workerd.Config = (
 });
 after(async () => { if (!WORKERD) return; proc.kill(); await Promise.all([srv.close(), authSrv.close(), echoSrv.close(), artProxy.close(), redirSrv.close(), raySrv.close()]); cleanup(); });
 
-const W = (path, { method = 'GET', body, headers = {}, port = PORT, auth = true } = {}) => fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { ...(auth ? { authorization: `Bearer ${PLY}` } : {}), ...(body ? { 'content-type': 'application/json' } : {}), ...headers }, body: body ? JSON.stringify(body) : undefined });
-const qs = o => new URLSearchParams(Object.entries(o).filter(([, v]) => v !== undefined)).toString();
+const W = (path, { method = 'GET', body, headers = {}, port = PORT, auth = true } = {}) => fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { ...(auth ? { authorization: `Bearer ${PLY}` } : {}), ...(body ? { 'content-type': 'application/json' } : {}), ...headers }, body: body ? JSON.stringify(body) : void 0 });
+const qs = o => new URLSearchParams(Object.entries(o).filter(([, v]) => v !== void 0)).toString();
 let n = 0;
 function repo(files, host = () => srv.url) {
   const name = `r${n++}`; const bare = makeBareRepo(root, name); const work = join(root, `w${name}`); mkdirSync(work); git(work, ['init', '-q', '-b', 'main']);
@@ -144,7 +162,7 @@ test('GET / is public usage text; everything else needs the PLY bearer (missing 
     for (const headers of [{}, { authorization: `Bearer ${PLY}x` }, { authorization: `Bearer ${PLY.slice(0, -1)}` }, { authorization: `Basic ${btoa(`x:${PLY}`)}` }]) {
       const r = await W(`${p}?remote=${encodeURIComponent(srv.url + '/x.git')}`, { method: m, headers, auth: false });
       assert.equal(r.status, 401, `${m} ${p} ${JSON.stringify(headers)}`); assert.equal((await r.json()).code, 'unauthorized');
-      assert.match(r.headers.get('www-authenticate') ?? '', /Bearer/);
+      assert.match(fill(r.headers.get('www-authenticate'), ''), /Bearer/);
     }
   }
   assert.equal((await W('/nope')).status, 404);
@@ -154,7 +172,7 @@ test('GET / is public usage text; everything else needs the PLY bearer (missing 
 function assertSecurityHeaders(headers, where) {
   assert.equal(headers.get('x-content-type-options'), 'nosniff', where);
   assert.equal(headers.get('referrer-policy'), 'no-referrer', where);
-  const csp = headers.get('content-security-policy') ?? '';
+  const csp = fill(headers.get('content-security-policy'), '');
   assert.match(csp, /frame-ancestors 'none'/, where);
   assert.match(csp, /script-src 'none'/, where);
   assert.equal(csp.includes('unsafe-inline'), false, where);
@@ -175,7 +193,7 @@ test('security headers are set on every route', { skip }, async () => {
     ['POST', '/view', false],
   ];
   for (const [method, path, auth] of routes) {
-    const res = await W(path, { method, auth, body: method === 'POST' && path === '/v1/edit' ? { remote: 'https://127.0.0.1/x.git' } : undefined });
+    const res = await W(path, { method, auth, body: method === 'POST' && path === '/v1/edit' ? { remote: 'https://127.0.0.1/x.git' } : void 0 });
     assertSecurityHeaders(res.headers, `${method} ${path}`);
     await res.arrayBuffer();
   }
@@ -249,7 +267,7 @@ test('GET /v1/commit equals git log / cat-file (HEAD, short, full, tag, oid, mer
     return { oid, tree, parents: parents ? parents.split(' ') : [], author: id(an, ae, ad), committer: id(cn, ce, cd), message: raw.slice(raw.indexOf('\n\n') + 2), signed: false };
   };
   const side = git(r.bare, ['rev-parse', 'side']).trim();
-  for (const [ref, spec, name] of [[undefined, 'main', 'refs/heads/main'], ['main', 'main', 'refs/heads/main'], ['refs/heads/side', 'side', 'refs/heads/side'], ['v1', 'v1^{commit}', 'refs/tags/v1'], [side, side, side]]) {
+  for (const [ref, spec, name] of [[void 0, 'main', 'refs/heads/main'], ['main', 'main', 'refs/heads/main'], ['refs/heads/side', 'side', 'refs/heads/side'], ['v1', 'v1^{commit}', 'refs/tags/v1'], [side, side, side]]) {
     const res = await W(`/v1/commit?${qs({ remote: r.remote, ref })}`);
     const b = await res.json();
     assert.equal(res.status, 200, JSON.stringify(b)); assert.match(res.headers.get('content-type'), /application\/json/);
@@ -290,8 +308,8 @@ test('GET /v1/commit equals git log / cat-file (HEAD, short, full, tag, oid, mer
   assert.match(usageText, /entries:\[\{name, mode, oid, type\}\]/);
   assert.match(usageText, /GET \/view/);
   assert.match(usageText, /GET \/r\/<name>/);
-  assert.match(usage.headers.get('x-ply-build') ?? '', /^ply=[0-9a-f]{40} ply-web=[0-9a-f]{40}$/);
-  assert.doesNotMatch(usage.headers.get('x-ply-version') ?? '', /ply=/, 'x-ply-version stays the Workers version id');
+  assert.match(fill(usage.headers.get('x-ply-build'), ''), /^ply=[0-9a-f]{40} ply-web=[0-9a-f]{40}$/);
+  assert.doesNotMatch(fill(usage.headers.get('x-ply-version'), ''), /ply=/, 'x-ply-version stays the Workers version id');
   const s = await (await W(`/v1/commit?${qs({ remote: r.remote, ref: 'side' })}`)).json();
   assert.deepEqual(s.author, { name: 'Zoë Ångström', email: 'z@ë.x', time: '2023-11-14T22:13:20Z', epoch: 1700000000, tz: '+0530' }); assert.equal(s.message, 'side: Zoë\n\nline two\nline three\n');
   for (const [ref, status, code] of [['nope', 404, 'not_found'], ['f'.repeat(40), 404, 'not_found'], [git(r.bare, ['rev-parse', 'main:f.txt']).trim(), 404, 'not_found'], ['a..b', 400, 'bad_request']]) {
@@ -341,11 +359,11 @@ test('empty repo lifecycle: first commit through history, with no git seeding', 
   // ply's readCommit resolves an unborn HEAD itself: one discover, then the unborn ls-refs. No git.head span (that is the Worker's own HEAD read).
   assert.equal(coldTrace.filter(s => s.name === 'git.upload-pack discover').length, 1, JSON.stringify(coldTrace.map(s => s.name)));
   assert.equal(coldTrace.some(s => s.name === 'git.head'), false);
-  const coldLs = (emptyRes.headers.get('x-artifacts-ray') ?? '').split(', ').filter(part => part.startsWith('ls-refs=')).length;
-  assert.match(emptyRes.headers.get('x-ply-request-id') ?? '', /\S/);
-  assert.match(emptyRes.headers.get('x-ply-build') ?? '', /^ply=[0-9a-f]{40} ply-web=[0-9a-f]{40}$/);
-  assert.match(emptyRes.headers.get('server-timing') ?? '', /ls-refs;dur=\d+/);
-  assert.match(emptyRes.headers.get('server-timing') ?? '', /total;dur=\d+/);
+  const coldLs = (fill(emptyRes.headers.get('x-artifacts-ray'), '')).split(', ').filter(part => part.startsWith('ls-refs=')).length;
+  assert.match(fill(emptyRes.headers.get('x-ply-request-id'), ''), /\S/);
+  assert.match(fill(emptyRes.headers.get('x-ply-build'), ''), /^ply=[0-9a-f]{40} ply-web=[0-9a-f]{40}$/);
+  assert.match(fill(emptyRes.headers.get('server-timing'), ''), /ls-refs;dur=\d+/);
+  assert.match(fill(emptyRes.headers.get('server-timing'), ''), /total;dur=\d+/);
   const warmRes = await W(`/v1/commit?${qs({ remote, ref: 'main', trace: '1' })}`);
   const warmBody = await warmRes.json();
   const { trace: warmTrace, ...warm } = warmBody;
@@ -353,10 +371,10 @@ test('empty repo lifecycle: first commit through history, with no git seeding', 
   // ply does not share the Worker's advertisement cache, so this read discovers again. The Worker records the bit for later HEAD reads.
   assert.equal(warmTrace.filter(s => s.name === 'git.upload-pack discover').length, 1, JSON.stringify(warmTrace.map(s => s.name)));
   assert.equal(warmTrace.some(s => s.name === 'git.head'), false);
-  const warmLs = (warmRes.headers.get('x-artifacts-ray') ?? '').split(', ').filter(part => part.startsWith('ls-refs=')).length;
+  const warmLs = (fill(warmRes.headers.get('x-artifacts-ray'), '')).split(', ').filter(part => part.startsWith('ls-refs=')).length;
   assert.equal(coldLs, warmLs, `cold ${emptyRes.headers.get('x-artifacts-ray')} warm ${warmRes.headers.get('x-artifacts-ray')}`);
   assert.notEqual(warmRes.headers.get('x-ply-request-id'), emptyRes.headers.get('x-ply-request-id'));
-  assert.match(warmRes.headers.get('server-timing') ?? '', /total;dur=\d+/);
+  assert.match(fill(warmRes.headers.get('server-timing'), ''), /total;dur=\d+/);
   assert.equal((await W(`/v1/commit?${qs({ remote, ref: 'nope' })}`)).status, 404);
   const refs = await (await W(`/v1/refs?${qs({ remote })}`)).json();
   assert.equal(refs.head, null); assert.equal(refs.empty, true); assert.equal(refs.unborn, 'refs/heads/main');
@@ -383,7 +401,7 @@ test('empty repo lifecycle: first commit through history, with no git seeding', 
   const c0 = x.body.oid;
   assert.equal(x.body.newCommit, c0);
   assert.equal(git(bare, ['rev-parse', 'main']).trim(), c0);
-  assert.ok(x.body.trace.some(s => s.name === 'git.commit' || s.name === 'git.head'), JSON.stringify(x.body.trace?.map(s => s.name)));
+  assert.ok(x.body.trace.some(s => s.name === 'git.commit' || s.name === 'git.head'), JSON.stringify(x.body.trace == null ? void 0 : x.body.trace.map(s => s.name)));
   assert.equal(x.body.trace.filter(s => s.name === 'git.upload-pack discover').length, 0, 'HEAD capability was cached by the commit reads');
   const raw0 = gitBuf(bare, ['cat-file', 'commit', c0]).toString();
   assert.equal(raw0.split('\n').some(l => l.startsWith('parent ')), false);
@@ -393,9 +411,9 @@ test('empty repo lifecycle: first commit through history, with no git seeding', 
   assert.match(git(bare, ['ls-tree', '-r', c0]), /120000 blob [0-9a-f]{40}\tlink/);
   assert.equal(gitBuf(bare, ['cat-file', '-p', `${c0}:link`]).toString(), 'README.md');
   const born = await (await W(`/v1/commit?${qs({ remote })}`)).json();
-  assert.equal(born.oid, c0); assert.equal(born.parents.length, 0); assert.equal(born.author.tz, '+0530'); assert.equal(born.author.epoch, 1700000000); assert.equal(born.empty, undefined);
+  assert.equal(born.oid, c0); assert.equal(born.parents.length, 0); assert.equal(born.author.tz, '+0530'); assert.equal(born.author.epoch, 1700000000); assert.equal(born.empty, void 0);
   const bornRefs = await (await W(`/v1/refs?${qs({ remote })}`)).json();
-  assert.equal(bornRefs.head, 'refs/heads/main'); assert.equal(bornRefs.refs['refs/heads/main'], c0); assert.equal(bornRefs.empty, undefined);
+  assert.equal(bornRefs.head, 'refs/heads/main'); assert.equal(bornRefs.refs['refs/heads/main'], c0); assert.equal(bornRefs.empty, void 0);
   x = await post('/v1/edit', { message: 'second', author: { ...A, time: 1700000100 }, committer: { name: 'c', email: 'c@x', tz: '-0800', time: 1700000100 }, changes: [
     { op: 'edit', path: 'src/a.txt', find: 'v1', replace: 'v2' },
     { op: 'delete', path: 'src/keep.txt' },
@@ -607,7 +625,7 @@ test('writes equal git: edit, branch create/delete, merge, rebase, cherry-pick, 
   // bad input
   x = await post('/v1/edit', { path: 'f.txt', find: 'a', replace: 'b', message: 'no author' }); assert.equal(x.status, 400);
   x = await post('/v1/cherry-pick', { commit: 'nothex', committer: A }); assert.equal(x.status, 400);
-  const raw = await W('/v1/edit', { method: 'POST', body: undefined, headers: { 'content-type': 'application/json' } }); assert.equal(raw.status, 400);
+  const raw = await W('/v1/edit', { method: 'POST', body: void 0, headers: { 'content-type': 'application/json' } }); assert.equal(raw.status, 400);
   // an oversized declared body is refused from its Content-Length, before it is read
   const huge = await new Promise((ok, no) => { const q = http.request({ host: '127.0.0.1', port: PORT, path: '/v1/edit', method: 'POST', headers: { authorization: `Bearer ${PLY}`, 'content-length': String((1 << 20) + 10) } }, res => { res.resume(); ok(res.statusCode); }); q.on('error', no); q.write('{'); });
   assert.equal(huge, 413);
@@ -665,7 +683,7 @@ test('redirects: same-origin hops followed by the Worker (reads and a push), cro
   let res = await W(`/v1/refs?${qs({ remote: moved })}`, { headers: H });
   let body = await res.json();
   assert.equal(res.status, 200, JSON.stringify(body)); assert.equal(body.refs['refs/heads/main'], r.head);
-  assert.deepEqual(redirSrv.hits.map(h => [h.method, h.path.replace(/\?.*/, '')]), [['POST', `/moved/${r.name}.git/git-upload-pack`], ['POST', `/${r.name}.git/git-upload-pack`]]);
+  assert.deepEqual(redirSrv.hits.map(h => [h.method, h.path.split('?')[0]]), [['POST', `/moved/${r.name}.git/git-upload-pack`], ['POST', `/${r.name}.git/git-upload-pack`]]);
   assert.ok(redirSrv.hits.every(h => h.auth), 'the same-origin hop keeps the credential');
   res = await W(`/v1/read?${qs({ remote: moved, path: 'f.txt' })}`, { headers: H });
   assert.equal(res.status, 200); assert.equal(await res.text(), 'one MARK\n');
@@ -734,7 +752,7 @@ function assertRaysMatch(header, hits, timing) {
   assert.deepEqual(parsed.entries.map(e => ({ phase: e.phase, ray: e.ray })), want, header);
   assert.equal(parsed.overflow, null);
   assert.equal(header.includes('/'), false, header);
-  const st = timing ?? '';
+  const st = fill(timing, '');
   for (const phase of new Set(parsed.entries.map(e => e.phase))) assert.match(st, new RegExp(`${phase};dur=\\d+`));
   assert.match(st, /total;dur=\d+/);
   return parsed;
