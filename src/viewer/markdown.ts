@@ -4,8 +4,21 @@
 // come from fixed sets in safehtml.ts; a link becomes an anchor only when its URL passes classifyHref (or a
 // repository-relative path that the caller resolves to a viewer URL). Raw HTML is shown as text. Images are links, not
 // <img>: the viewer's CSP is img-src 'none', and a README must not make visitors' browsers fetch third-party pixels.
-import { atIndex } from '../absent.ts';
+import { atIndex, captureGroup, mapGet, recordGet, textAt } from '../absent.ts';
+import { find, unwrapOr } from '../option.ts';
 import { anchor, concatHtml, escapeHtml, heading, orderedList, tag, voidTag, type MdClass, type SafeHtml } from './safehtml.ts';
+
+function chAt(text: string, index: number): string {
+  return unwrapOr(textAt(text, index), '');
+}
+
+function lineAt(lines: readonly string[], index: number): string {
+  return unwrapOr(atIndex(lines, index), '');
+}
+
+function group(match: RegExpMatchArray | null, index: number, fallback = ''): string {
+  return unwrapOr(captureGroup(match, index), fallback);
+}
 
 const NAMED: Record<string, string> = {
   quot: '"', amp: '&', lt: '<', gt: '>', apos: "'", colon: ':', tab: '\t', newline: '\n',
@@ -23,7 +36,7 @@ function decodeEntities(value: string): string {
       if (!Number.isFinite(cp) || cp < 0 || cp > 0x10ffff) return all;
       return String.fromCodePoint(cp);
     }
-    return NAMED[body.toLowerCase()] ?? all;
+    return unwrapOr(recordGet(NAMED, body.toLowerCase()), all);
   });
 }
 
@@ -31,7 +44,7 @@ function obscured(value: string): boolean {
   // oxlint-disable-next-line no-control-regex -- controls and whitespace are scheme-obfuscation, not a URL
   if (/[\u0000-\u001f\u007f\s<>"'`\\]/.test(value)) return true;
   if (/[\u200b-\u200f\u202a-\u202e\ufeff]/.test(value)) return true;
-  if (/%(?:0[0-9a-f]|1[0-9a-f]|7f)/i.test(value)) return true;
+  if (/%0[0-9a-f]|%1[0-9a-f]|%7f/i.test(value)) return true;
   return false;
 }
 
@@ -76,10 +89,12 @@ export type MarkdownOptions = {
    * Resolve a repository-relative link (`docs/x.md`, `./a.png`, `../b`) to a viewer URL. The path is already joined
    * and normalised against the document's directory; null leaves the link as text. `image` asks for raw bytes.
    */
-  resolve?: (path: string, kind: 'link' | 'image') => string | null;
-  /** The document's directory inside the repository ('' for the root). */
-  base?: string;
+  readonly resolve: ((path: string, kind: 'link' | 'image') => string | null) | null;
+  /** The document's directory inside the repository. Empty for the root. */
+  readonly base: string;
 };
+
+const ROOT_OPTIONS: MarkdownOptions = { resolve: null, base: '' };
 
 type Ctx = { opts: MarkdownOptions; refs: Map<string, string>; slugs: Map<string, number> };
 
@@ -103,12 +118,12 @@ function hrefFor(raw: string, kind: 'link' | 'image', ctx: Ctx): string | null {
   const safe = classifyHref(dest);
   if (!safe) return null;
   const relative = !dest.startsWith('#') && !dest.startsWith('/') && !/^[a-z][a-z0-9+.-]*:/i.test(dest);
-  if (!relative || !ctx.opts.resolve) return safe;
+  if (!relative || ctx.opts.resolve === null) return safe;
   const hash = dest.indexOf('#');
-  const pathPart = (hash === -1 ? dest : dest.slice(0, hash)).split('?')[0] ?? '';
+  const pathPart = unwrapOr(atIndex((hash === -1 ? dest : dest.slice(0, hash)).split('?'), 0), '');
   let decoded: string;
   try { decoded = decodeURIComponent(pathPart); } catch { return null; }
-  const joined = joinRepoPath(ctx.opts.base ?? '', decoded);
+  const joined = joinRepoPath(ctx.opts.base, decoded);
   if (joined === null) return null;
   const resolved = ctx.opts.resolve(joined, kind);
   if (!resolved) return null;
@@ -189,8 +204,8 @@ function refKey(label: string): string {
 
 // ── inline ───────────────────────────────────────────────────────────────────────────────────────────────────────
 
-function isWordChar(ch: string | undefined): boolean {
-  return !!ch && /[\p{L}\p{N}]/u.test(ch);
+function isWordChar(ch: string): boolean {
+  return ch !== '' && /[\p{L}\p{N}]/u.test(ch);
 }
 
 function findCloser(src: string, from: number, delim: string): number {
@@ -199,9 +214,9 @@ function findCloser(src: string, from: number, delim: string): number {
     const ch = src[i];
     if (ch === '\\') { i++; continue; }
     if (ch === '`') { const end = codeSpanEnd(src, i); if (end > 0) { i = end - 1; continue; } }
-    if (src.startsWith(delim, i) && i > from && !/\s/.test(src[i - 1] ?? ' ')) {
+    if (src.startsWith(delim, i) && i > from && !/\s/.test(unwrapOr(textAt(src, i - 1), ' '))) {
       if (delim.length === 1 && src[i + 1] === delim) { i++; continue; }
-      if (delim[0] === '_' && isWordChar(src[i + delim.length])) continue;
+      if (delim[0] === '_' && isWordChar(chAt(src, i + delim.length))) continue;
       return i;
     }
   }
@@ -214,9 +229,9 @@ function inline(src: string, ctx: Ctx, inLink = false, depth = 0): SafeHtml {
   const flush = () => { if (text) { out.push(escapeHtml(text)); text = ''; } };
   let i = 0;
   while (i < src.length) {
-    const ch = src[i] ?? '';
+    const ch = chAt(src, i);
     const rest = src.slice(i);
-    if (ch === '\\' && PUNCT.test(src[i + 1] ?? '')) { text += src[i + 1]; i += 2; continue; }
+    if (ch === '\\' && PUNCT.test(chAt(src, i + 1))) { text += src[i + 1]; i += 2; continue; }
     if (ch === '\\' && src[i + 1] === '\n') { flush(); out.push(voidTag('br')); i += 2; continue; }
     if (ch === '\n') {
       const hard = / {2,}$/.test(text);
@@ -259,12 +274,12 @@ function inline(src: string, ctx: Ctx, inLink = false, depth = 0): SafeHtml {
           const refClose = src.indexOf(']', close + 2);
           if (refClose !== -1) {
             const key = refKey(src.slice(close + 2, refClose) || label);
-            const hit = ctx.refs.get(key);
-            if (hit !== undefined) { dest = hit; end = refClose + 1; }
+            const hit = mapGet(ctx.refs, key);
+            if (hit.tag === 'some') { dest = hit.value; end = refClose + 1; }
           }
         } else {
-          const hit = ctx.refs.get(refKey(label));
-          if (hit !== undefined) dest = hit;
+          const hit = mapGet(ctx.refs, refKey(label));
+          if (hit.tag === 'some') dest = hit.value;
         }
         if (dest !== null) {
           flush();
@@ -282,21 +297,26 @@ function inline(src: string, ctx: Ctx, inLink = false, depth = 0): SafeHtml {
       }
     }
     if (ch === '<' && !inLink) {
-      const auto = /^<((?:https?|mailto):[^\s<>]+)>/i.exec(rest);
-      if (auto?.[1]) {
-        const href = classifyHref(auto[1]);
+      const auto = /^<(https:[^\s<>]+|http:[^\s<>]+|mailto:[^\s<>]+)>/i.exec(rest);
+      const autoUrl = captureGroup(auto, 1);
+      if (autoUrl.tag === 'some' && autoUrl.value !== '') {
+        const href = classifyHref(autoUrl.value);
         flush();
-        out.push(href ? anchor(href, escapeHtml(auto[1])) : escapeHtml(auto[0]));
-        i += auto[0].length;
+        out.push(href ? anchor(href, escapeHtml(autoUrl.value)) : escapeHtml(group(auto, 0)));
+        i += group(auto, 0).length;
         continue;
       }
     }
-    if ((ch === 'h' || ch === 'H') && !inLink && !isWordChar(src[i - 1])) {
-      const bare = /^https?:\/\/[^\s<>"'`]+/i.exec(rest);
+    if ((ch === 'h' || ch === 'H') && !inLink && !isWordChar(chAt(src, i - 1))) {
+      const bare = /^https:\/\/[^\s<>"'`]+|^http:\/\/[^\s<>"'`]+/i.exec(rest);
       if (bare) {
         let url = bare[0];
         while (/[.,:;!?)\]*_~]$/.test(url)) {
-          if (url.endsWith(')') && (url.match(/\(/g)?.length ?? 0) >= (url.match(/\)/g)?.length ?? 0)) break;
+          const opens = url.match(/\(/g);
+          const closes = url.match(/\)/g);
+          const openCount = opens === null ? 0 : opens.length;
+          const closeCount = closes === null ? 0 : closes.length;
+          if (url.endsWith(')') && openCount >= closeCount) break;
           url = url.slice(0, -1);
         }
         const href = classifyHref(url);
@@ -312,7 +332,7 @@ function inline(src: string, ctx: Ctx, inLink = false, depth = 0): SafeHtml {
       const two = src[i + 1] === ch;
       if (ch === '~' && !two) { text += ch; i++; continue; }
       const delim = two ? ch + ch : ch;
-      const leftOk = !/\s/.test(src[i + delim.length] ?? ' ') && !(ch === '_' && isWordChar(src[i - 1]));
+      const leftOk = !/\s/.test(unwrapOr(textAt(src, i + delim.length), ' ')) && !(ch === '_' && isWordChar(chAt(src, i - 1)));
       if (leftOk) {
         const close = findCloser(src, i + delim.length, delim);
         if (close > i + delim.length - 1) {
@@ -340,19 +360,19 @@ function inline(src: string, ctx: Ctx, inLink = false, depth = 0): SafeHtml {
 // ── blocks ───────────────────────────────────────────────────────────────────────────────────────────────────────
 
 const FENCE = /^( {0,3})(`{3,}|~{3,})\s*([^`\s]*)[^`]*$/;
-const ATX = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/;
-const HR = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
+const ATX = /^ {0,3}(#{1,6})([ \t]+(.*?))?([ \t]+#+)?[ \t]*$/;
+const HR = /^ {0,3}([-*_])([ \t]*\1){2,}[ \t]*$/;
 const QUOTE = /^ {0,3}> ?(.*)$/;
 const LIST = /^( {0,12})([-*+]|\d{1,9}[.)])([ \t]+(.*))?$/;
 const DELIM_ROW = /^ {0,3}\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/;
 const SETEXT = /^ {0,3}(=+|-+)[ \t]*$/;
-const REF_DEF = /^ {0,3}\[([^\]]{1,200})\]:[ \t]*<?([^\s>]+)>?(?:[ \t]+(?:"[^"]*"|'[^']*'|\([^)]*\)))?[ \t]*$/;
+const REF_DEF = /^ {0,3}\[([^\]]{1,200})\]:[ \t]*<?([^\s>]+)>?([ \t]+"[^"]*"|[ \t]+'[^']*'|[ \t]+\([^)]*\))?[ \t]*$/;
 
 function slugify(text: string, ctx: Ctx): string {
   const base = text.toLowerCase().replace(/<[^>]*>/g, '').replace(/[^\p{L}\p{N}\s-]/gu, '').trim().replace(/\s/g, '-')
     .normalize('NFKD').replace(/[^a-z0-9-]/g, '').slice(0, 64);
   if (!base) return '';
-  const seen = ctx.slugs.get(base) ?? 0;
+  const seen = unwrapOr(mapGet(ctx.slugs, base), 0);
   ctx.slugs.set(base, seen + 1);
   return seen ? `${base}-${seen}` : base;
 }
@@ -394,10 +414,12 @@ function alignOf(cell: string): MdClass | null {
 function startsBlock(line: string, inParagraph: boolean): boolean {
   if (FENCE.test(line) || ATX.test(line) || HR.test(line) || QUOTE.test(line)) return true;
   const item = LIST.exec(line);
-  if (item && item[4] !== undefined && item[4].trim() !== '') {
+  const itemText = captureGroup(item, 4);
+  if (itemText.tag === 'some' && itemText.value.trim() !== '') {
     // A paragraph is only interrupted by a bullet or by an ordered list that starts at 1 (CommonMark).
     if (!inParagraph) return true;
-    return /^[-*+]$/.test(item[2] ?? '') || /^1[.)]$/.test(item[2] ?? '');
+    const marker = group(item, 2);
+    return /^[-*+]$/.test(marker) || /^1[.)]$/.test(marker);
   }
   return /^ {0,3}<!--/.test(line);
 }
@@ -430,44 +452,49 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
   const out: SafeHtml[] = [];
   let i = 0;
   while (i < lines.length) {
-    const line = lines[i] ?? '';
+    const line = lineAt(lines, i);
     if (!line.trim()) { i++; continue; }
 
     const fence = FENCE.exec(line);
     if (fence) {
-      const indent = fence[1]?.length ?? 0;
-      const marker = fence[2] ?? '```';
+      const indent = group(fence, 1).length;
+      const marker = group(fence, 2, '```');
       const body: string[] = [];
       i++;
       while (i < lines.length) {
-        const l = lines[i] ?? '';
+        const l = lineAt(lines, i);
         const closing = new RegExp(`^ {0,3}${marker[0] === '`' ? '`' : '~'}{${marker.length},}[ \\t]*$`);
         if (closing.test(l)) { i++; break; }
         body.push(dedent(l, indent));
         i++;
       }
-      out.push(codeBlock(fence[3] ?? '', body.join('\n')));
+      out.push(codeBlock(group(fence, 3), body.join('\n')));
       continue;
     }
 
     if (indentOf(line) >= 4) {
       const body: string[] = [];
-      while (i < lines.length && (indentOf(lines[i] ?? '') >= 4 || !(lines[i] ?? '').trim())) { body.push(dedent(lines[i] ?? '', 4)); i++; }
-      while (body.length && !body[body.length - 1]?.trim()) body.pop();
+      while (i < lines.length && (indentOf(lineAt(lines, i)) >= 4 || !lineAt(lines, i).trim())) { body.push(dedent(lineAt(lines, i), 4)); i++; }
+      while (body.length > 0) {
+        const last = atIndex(body, body.length - 1);
+        if (last.tag === 'none' || last.value.trim() !== '') break;
+        body.pop();
+      }
       out.push(codeBlock('', body.join('\n')));
       continue;
     }
 
     if (/^ {0,3}<!--/.test(line)) {
-      while (i < lines.length && !(lines[i] ?? '').includes('-->')) i++;
+      while (i < lines.length && !lineAt(lines, i).includes('-->')) i++;
       i++;
       continue;
     }
 
     const atx = ATX.exec(line);
     if (atx) {
-      const level = Math.min(6, (atx[1]?.length ?? 1) + 1) as 2 | 3 | 4 | 5 | 6;
-      const text = atx[2] ?? '';
+      const hashes = captureGroup(atx, 1);
+      const level = Math.min(6, (hashes.tag === 'none' ? 1 : hashes.value.length) + 1) as 2 | 3 | 4 | 5 | 6;
+      const text = group(atx, 3);
       out.push(heading(level, slugify(headingText(text), ctx), inline(text, ctx)));
       i++;
       continue;
@@ -478,9 +505,9 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
     if (QUOTE.test(line)) {
       const inner: string[] = [];
       while (i < lines.length) {
-        const l = lines[i] ?? '';
+        const l = lineAt(lines, i);
         const q = QUOTE.exec(l);
-        if (q) { inner.push(q[1] ?? ''); i++; continue; }
+        if (q) { inner.push(group(q, 1)); i++; continue; }
         if (!l.trim() || startsBlock(l, true)) break;
         inner.push(l);
         i++;
@@ -489,7 +516,7 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
       continue;
     }
 
-    const next = lines[i + 1] ?? '';
+    const next = lineAt(lines, i + 1);
     if (line.includes('|') && DELIM_ROW.test(next) && next.includes('-')) {
       const head = splitRow(line);
       const aligns = splitRow(next).map(alignOf);
@@ -499,13 +526,13 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
           Array.from({ length: cols }, (_, c) => {
             const align = atIndex(aligns, c);
             const cls = align.tag === 'some' ? align.value : null;
-            return tag(cell, inline(cells[c] ?? '', ctx), cls);
+            return tag(cell, inline(unwrapOr(atIndex(cells, c), ''), ctx), cls);
           }),
         ), null);
         const body: SafeHtml[] = [];
         i += 2;
         while (i < lines.length) {
-          const l = lines[i] ?? '';
+          const l = lineAt(lines, i);
           if (!l.trim() || (!l.includes('|') && startsBlock(l, true))) break;
           body.push(row(splitRow(l), 'td'));
           i++;
@@ -517,25 +544,30 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
     }
 
     const item = LIST.exec(line);
-    if (item && item[4] !== undefined && item[4].trim() !== '' && depth < MAX_DEPTH) {
-      const ordered = /\d/.test(item[2] ?? '');
-      const bullet = ordered ? (item[2] ?? '').slice(-1) : item[2];
+    const itemBody = captureGroup(item, 4);
+    if (itemBody.tag === 'some' && itemBody.value.trim() !== '' && depth < MAX_DEPTH) {
+      const itemMarker = group(item, 2);
+      const ordered = /\d/.test(itemMarker);
+      const bullet = ordered ? itemMarker.slice(-1) : itemMarker;
       const items: string[][] = [];
       let looseList = false;
       while (i < lines.length) {
-        const m = LIST.exec(lines[i] ?? '');
-        if (!m || m[4] === undefined || !(m[4] ?? '').trim()) break;
-        const sameKind = ordered ? /\d/.test(m[2] ?? '') && (m[2] ?? '').endsWith(bullet ?? '.') : m[2] === bullet;
-        if (!sameKind || indentOf(m[1] ?? '') > indentOf(item[1] ?? '') + 3) break;
-        const contentIndent = (m[1]?.length ?? 0) + (m[2]?.length ?? 0) + Math.min(4, Math.max(1, ((m[3] ?? ' ').length - (m[4] ?? '').length)));
-        const body = [m[4] ?? ''];
+        const m = LIST.exec(lineAt(lines, i));
+        const mBody = captureGroup(m, 4);
+        if (m === null || mBody.tag === 'none' || mBody.value.trim() === '') break;
+        const mMarker = group(m, 2);
+        const sameKind = ordered ? /\d/.test(mMarker) && mMarker.endsWith(bullet) : mMarker === bullet;
+        if (!sameKind || indentOf(group(m, 1)) > indentOf(group(item, 1)) + 3) break;
+        const spacer = group(m, 3, ' ');
+        const contentIndent = group(m, 1).length + mMarker.length + Math.min(4, Math.max(1, spacer.length - mBody.value.length));
+        const body = [mBody.value];
         i++;
         let sawBlank = false;
         while (i < lines.length) {
-          const l = lines[i] ?? '';
+          const l = lineAt(lines, i);
           if (!l.trim()) {
-            const after = lines.slice(i + 1).find(x => x.trim());
-            if (after !== undefined && indentOf(after) >= contentIndent) { body.push(''); sawBlank = true; i++; continue; }
+            const after = find(lines.slice(i + 1), (row) => row.trim() !== '');
+            if (after.tag === 'some' && indentOf(after.value) >= contentIndent) { body.push(''); sawBlank = true; i++; continue; }
             break;
           }
           if (indentOf(l) >= contentIndent) { body.push(dedent(l, contentIndent)); i++; continue; }
@@ -545,18 +577,19 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
         }
         if (sawBlank) looseList = true;
         items.push(body);
-        if (i < lines.length && !(lines[i] ?? '').trim()) {
-          const after = lines.slice(i).find(x => x.trim());
-          const am = after !== undefined ? LIST.exec(after) : null;
-          const amKind = am ? (ordered ? /\d/.test(am[2] ?? '') && (am[2] ?? '').endsWith(bullet ?? '.') : am[2] === bullet) : false;
-          if (am && amKind && indentOf(am[1] ?? '') <= indentOf(item[1] ?? '') + 3) {
+        if (i < lines.length && !lineAt(lines, i).trim()) {
+          const after = find(lines.slice(i), (row) => row.trim() !== '');
+          const am = after.tag === 'some' ? LIST.exec(after.value) : null;
+          const amMarker = group(am, 2);
+          const amKind = am !== null && (ordered ? /\d/.test(amMarker) && amMarker.endsWith(bullet) : amMarker === bullet);
+          if (am !== null && amKind && indentOf(group(am, 1)) <= indentOf(group(item, 1)) + 3) {
             looseList = true;
-            while (i < lines.length && !(lines[i] ?? '').trim()) i++;
+            while (i < lines.length && !lineAt(lines, i).trim()) i++;
           }
         }
       }
       const lis = items.map(body => {
-        const first = body[0] ?? '';
+        const first = unwrapOr(atIndex(body, 0), '');
         const task = /^\[([ xX])\][ \t]+/.exec(first);
         if (task) body[0] = first.slice(task[0].length);
         const content = renderBlocks(body, ctx, depth + 1, !looseList);
@@ -564,14 +597,14 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
         const box = tag('span', escapeHtml(task[1] === ' ' ? '' : '✓'), task[1] === ' ' ? 'task' : 'task done');
         return tag('li', concatHtml([box, content]), 'task-item');
       });
-      const start = ordered ? Number.parseInt(item[2] ?? '1', 10) : 1;
+      const start = ordered ? Number.parseInt(group(item, 2, '1'), 10) : 1;
       out.push(ordered ? orderedList(start, concatHtml(lis)) : tag('ul', concatHtml(lis), null));
       continue;
     }
 
     const para: string[] = [];
     while (i < lines.length) {
-      const l = lines[i] ?? '';
+      const l = lineAt(lines, i);
       if (!l.trim()) break;
       if (para.length && SETEXT.test(l)) {
         const level = (l.trim()[0] === '=' ? 2 : 3) as 2 | 3;
@@ -582,7 +615,7 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
         break;
       }
       if (para.length && startsBlock(l, true)) break;
-      if (para.length && line.includes('|') && DELIM_ROW.test(lines[i + 1] ?? '')) break;
+      if (para.length && line.includes('|') && DELIM_ROW.test(lineAt(lines, i + 1))) break;
       para.push(l.replace(/^ {1,3}/, ''));
       i++;
     }
@@ -595,12 +628,13 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
 }
 
 function stripFrontMatter(lines: string[]): string[] {
-  if (lines[0]?.trim() !== '---') return lines;
+  const first = atIndex(lines, 0);
+  if (first.tag === 'none' || first.value.trim() !== '---') return lines;
   const end = lines.findIndex((l, n) => n > 0 && (l.trim() === '---' || l.trim() === '...'));
   return end > 0 ? lines.slice(end + 1) : lines;
 }
 
-export function renderMarkdown(source: string, opts: MarkdownOptions = {}): SafeHtml {
+export function renderMarkdown(source: string, opts: MarkdownOptions = ROOT_OPTIONS): SafeHtml {
   const ctx: Ctx = { opts, refs: new Map(), slugs: new Map() };
   const lines: string[] = [];
   let inFence = false;
@@ -608,9 +642,11 @@ export function renderMarkdown(source: string, opts: MarkdownOptions = {}): Safe
     if (FENCE.test(line) && !inFence) inFence = true;
     else if (inFence && /^ {0,3}(`{3,}|~{3,})[ \t]*$/.test(line)) inFence = false;
     const def = inFence ? null : REF_DEF.exec(line);
-    if (def?.[1] && def[2]) {
-      const key = refKey(def[1]);
-      if (!ctx.refs.has(key)) ctx.refs.set(key, def[2]);
+    const label = captureGroup(def, 1);
+    const dest = captureGroup(def, 2);
+    if (label.tag === 'some' && label.value !== '' && dest.tag === 'some' && dest.value !== '') {
+      const key = refKey(label.value);
+      if (!ctx.refs.has(key)) ctx.refs.set(key, dest.value);
       continue;
     }
     lines.push(line);

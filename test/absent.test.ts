@@ -23,6 +23,7 @@ import {
   recordGet,
   requestHeader,
   requestQuery,
+  textAt,
   thrownField,
   writeSpanAttribute,
 } from "../src/absent.ts";
@@ -68,6 +69,9 @@ test("atIndex and capture groups treat a hole as none", () => {
   assert.deepEqual(atIndex(["a"], 0), some("a"));
   assert.deepEqual(atIndex(["a"], -1), none());
   assert.deepEqual(atIndex(["a"], 1.5), none());
+  assert.deepEqual(textAt("ab", 1), some("b"));
+  assert.deepEqual(textAt("ab", 2), none());
+  assert.deepEqual(textAt("ab", -1), none());
   const match = /^(\d+)|([a-z]+)$/.exec("ab");
   assert.deepEqual(captureGroup(match, 1), none());
   assert.deepEqual(captureGroup(match, 2), some("ab"));

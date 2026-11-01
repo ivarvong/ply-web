@@ -83,6 +83,12 @@ export function atIndex<T>(items: readonly T[], index: number): Option<Exclude<T
   return fromAbsent(items[index]);
 }
 
+/** One character. Out of range is none. A string has no holes, so an in-range index is present. */
+export function textAt(text: string, index: number): Option<string> {
+  if (!Number.isInteger(index) || index < 0 || index >= text.length) return none();
+  return some(text[index]);
+}
+
 export function captureGroup(match: RegExpMatchArray | RegExpExecArray | null, index: number): Option<string> {
   if (match === null) return none();
   return atIndex(match, index);
