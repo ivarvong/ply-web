@@ -1,5 +1,6 @@
 // Minimal types for the Workers runtime modules this viewer imports. tsconfig.json does not load the generated
 // runtime types (`cf workers types`); these declarations cover only what rate.ts touches.
+// A missing storage value is the global PlatformAbsent brand from src/absent.ts. The host still returns its own hole.
 declare module 'cloudflare:workers' {
   export abstract class WorkerEntrypoint<Env = unknown> {
     ctx: unknown;
@@ -17,7 +18,7 @@ declare module 'cloudflare:workers' {
     blockConcurrencyWhile<T>(fn: () => Promise<T>): Promise<T>;
   }
   export interface DurableObjectStorage {
-    get<T>(key: string): Promise<T | undefined>;
+    get<T>(key: string): Promise<T | PlatformAbsent>;
     put<T>(key: string, value: T): Promise<void>;
     sql: SqlStorage;
   }

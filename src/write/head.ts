@@ -7,6 +7,7 @@
 // ls-refs. The first is discover + ls-refs. Sending `unborn` without that check would be this module speaking the
 // protocol, which is the code this adapter replaced.
 import { discover, KIND, lsRefs, parseOid, type Oid, type Span } from 'ply';
+import { mapGet } from '../absent.ts';
 import { type GitTransport } from './call.ts';
 
 export type HeadState =
@@ -50,8 +51,8 @@ export function noteUnbornAdvertised(url: string): void {
 /** ply's `lsRefsUnborn` for this origin: one discover per isolate, then the cached bit. */
 async function lsRefsUnbornOf(t: GitTransport): Promise<{ readonly advertised: boolean; readonly source: DiscoverSource }> {
   const origin = new URL(t.url).origin;
-  const known = unbornAdvertised.get(origin);
-  if (known !== undefined) return { advertised: known, source: DISCOVER_CACHED };
+  const known = mapGet(unbornAdvertised, origin);
+  if (known.tag === 'some') return { advertised: known.value, source: DISCOVER_CACHED };
   let flight = unbornInflight.get(origin);
   if (!flight) {
     flight = discover(t).then(info => rememberUnborn(origin, info.lsRefsUnborn)).finally(() => { unbornInflight.delete(origin); });
