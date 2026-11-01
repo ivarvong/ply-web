@@ -40,6 +40,7 @@ import { holdLastChunk } from './hold-last.ts';
 import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from './rays.ts';
 import { usageNote } from './flags/client.ts';
 import { handleFlagHttp } from './flags/http.ts';
+import { err, ok, runRequest } from './http/machine.ts';
 
 export { FlagsCache, FlagControl } from './flags/entry.ts';
 
@@ -191,12 +192,21 @@ Public namespace (read-only, no token):  GET /r  and  GET /r/  list ${PUBLIC_NAM
 // checkRemote lives in remote.ts. It returns an AllowedRemote; createGuardedFetch will not take a bare string.
 
 // Pure: the git credential from the request headers, as ply's `auth`, plus every string form to scrub.
+// Basic payload is either text or opaque. Opaque is forwarded as the header, with nothing decoded to scrub.
+function decodeBasic(payload) {
+  try { return { kind: 'text', value: atob(payload) }; }
+  catch { return { kind: 'opaque' }; }
+}
+
 export function gitAuth(headers, host) {
   const ga = headers.get('git-authorization'), gt = headers.get('git-token');
   if (ga && gt) throw fail('bad_request', 'send Git-Authorization or Git-Token, not both');
   if (ga) {
     const secrets = [ga, ga.replace(/^\S+\s+/, '')];
-    if (/^basic\s/i.test(ga)) { try { const d = atob(ga.replace(/^basic\s+/i, '')); secrets.push(d, d.slice(d.indexOf(':') + 1)); } catch { /* not base64: forwarded as is */ } }
+    if (/^basic\s/i.test(ga)) {
+      const decoded = decodeBasic(ga.replace(/^basic\s+/i, ''));
+      if (decoded.kind === 'text') secrets.push(decoded.value, decoded.value.slice(decoded.value.indexOf(':') + 1));
+    }
     return { auth: { header: ga }, secrets };
   }
   if (gt) {
@@ -213,9 +223,33 @@ export const scrubber = secrets => {
 };
 
 // True when `raw` passes the /v1 remote rules and is exactly one repo directly under the public namespace.
+function classifyPublicRemote(raw) {
+  if (typeof raw !== 'string' || !raw) return { kind: 'absent' };
+  try {
+    const href = checkRemote(raw).href;
+    return publicRepoOfRemote(href) !== null ? { kind: 'public' } : { kind: 'other' };
+  } catch (error) {
+    return { kind: 'rejected', name: error instanceof Error && error.name ? error.name : 'Error' };
+  }
+}
+
 function isPublicReadRemote(raw) {
-  if (typeof raw !== 'string' || !raw) return false;
-  try { return publicRepoOfRemote(checkRemote(raw).href) !== null; } catch { return false; }
+  return classifyPublicRemote(raw).kind === 'public';
+}
+
+function recordField(value, key) {
+  if (!value || typeof value !== 'object' || !(key in value)) return null;
+  return value[key];
+}
+
+function knownFailure(error) {
+  const code = recordField(error, 'code');
+  return typeof code === 'string' && (isPlyCode(code) || isWorkerCode(code));
+}
+
+function failureMessage(error) {
+  const message = recordField(error, 'message');
+  return (typeof message === 'string' ? message : String(error)).slice(0, 500);
 }
 
 // Viewer responses are HTML or text and at most a few hundred KiB. Each text body and each header passes the public
@@ -303,10 +337,10 @@ const READS = {
     // a verification failure aborts the body short of its Content-Length: the client sees a truncated response, never a
     // clean one with the wrong bytes. holdLastChunk keeps the final bytes back until the blob verified (src/hold-last.ts).
     ctx.waitUntil(holdLastChunk(r.stream).pipeTo(fixed.writable).then(() => log({ stream: 'ok' }), e => log({ stream: 'error', stream_code: e?.code ?? 'error' })));
-    const headers = { 'content-type': 'application/octet-stream', 'x-ply-ref': r.ref, 'x-ply-commit': r.commit, 'x-ply-blob': r.blob, 'x-ply-mode': r.mode, 'x-ply-size': String(r.size) };
+    const headers = new Headers({ 'content-type': 'application/octet-stream', 'x-ply-ref': r.ref, 'x-ply-commit': r.commit, 'x-ply-blob': r.blob, 'x-ply-mode': r.mode, 'x-ply-size': String(r.size) });
     const summary = traceSummary(spans());
-    if (q.get('trace') === '1' && summary) headers['x-ply-trace'] = summary;
-    return new Response(fixed.readable, { status: 200, headers });
+    if (q.get('trace') === '1' && summary) headers.set('x-ply-trace', summary);
+    return { stream: fixed.readable, headers };
   },
 };
 
@@ -324,9 +358,15 @@ const WRITES = {
 
 // A viewer URL whose repo is public by construction: public-v0 or a built-in forge (never a VIEWER_EXTRA_HOSTS host).
 const PINNABLE_HOSTS = new Set([...ALLOWED_HOSTS, PUBLIC_GIT_HOST]);
-const isPublicViewLoc = env => url => {
-  try { const r = parseViewerRoute(url, routeOptsFromEnv(env)); return r.kind === 'repo' && !r.pack && PINNABLE_HOSTS.has(r.loc.host); } catch { return false; }
-};
+function classifyViewLoc(env, url) {
+  try {
+    const r = parseViewerRoute(url, routeOptsFromEnv(env));
+    return r.kind === 'repo' && !r.pack && PINNABLE_HOSTS.has(r.loc.host) ? { kind: 'public' } : { kind: 'other' };
+  } catch (error) {
+    return { kind: 'rejected', name: error instanceof Error && error.name ? error.name : 'Error' };
+  }
+}
+const isPublicViewLoc = env => url => classifyViewLoc(env, url).kind === 'public';
 const pinnedBinding = (env, ctx) => (env.PACK_CACHE === 'off' ? null : ctx?.exports?.Pinned ?? null);
 
 const worker = {
@@ -357,142 +397,180 @@ const worker = {
       log({ status: res.status, ms: Date.now() - t0, ...extra });
       return res;
     };
-    if (req.method === 'GET' && url.pathname === '/') {
-      // ply.usage.note is off unless the flag ruleset says otherwise. A missing binding leaves this text unchanged.
-      let body = USAGE;
-      try {
-        const note = await usageNote(env, ctx, req.headers.get('x-ply-unit'));
-        if (note) body = `${USAGE}\n${note}\n`;
-      } catch { /* a flag outage does not change GET / */ }
-      return done(new Response(body, { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } }));
-    }
-    // Public viewer, including the public-namespace index (/r) and short repo URLs (/r/<name>).
-    // Before the token gate, and it never reads Authorization / Git-Token / Cookie.
-    if (url.pathname === '/view.css' || /^\/view\.[0-9a-f]{12}\.css$/.test(url.pathname) || url.pathname === '/view' || url.pathname.startsWith('/view/') || url.pathname === '/r' || url.pathname.startsWith('/r/')) {
-      if (url.pathname.includes('@') || url.pathname.toLowerCase().includes('%40')) record.path = '/view/redacted';
-      // A raw file at a pinned commit is cached whole (src/pinned.ts): rate-limit here, then ask Pinned.
-      const pinKey = isInternal(req) ? null : pinnedViewKey(url, req.method, isPublicViewLoc(env));
-      const pin = pinKey ? pinnedBinding(env, ctx) : null;
-      if (pinKey && pin) {
-        const decision = await admitClient(req, env, 'page', Date.now());
-        if (decision === 'unconfigured' || decision === 'unavailable') return done(new Response('rate limiter unavailable\n', { status: 503, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } }), { viewer: 1 });
-        if (!decision.ok) { const ra = String(Math.max(1, Math.ceil(decision.retryAfterMs / MS_PER_SECOND))); return done(new Response(`Too many viewer requests. Retry after ${ra}s.\n`, { status: 429, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'retry-after': ra } }), { viewer: 1, code: 'rate_limited' }); }
-        const res = await viaPinned(pin, pinKey);
-        return done(await scrubResponse(res, publicScrub), { viewer: 1, pinned: res.headers.get('x-ply-pinned-cache') ?? '' });
-      }
-      try {
-        const res = await handleViewer(req, env, ctx, { requestId: id, note: extra => Object.assign(record, extra), skipRate: isInternal(req) });
-        return done(await scrubResponse(res, publicScrub), { viewer: 1 });
-      } catch (e) {
-        const code = isPlyCode(e?.code) ? e.code : 'internal';
-        const message = code === 'internal' ? 'The viewer hit an internal error.' : String(e?.message ?? e).slice(0, 500);
-        const res = new Response(viewerErrorDocument(code, message), { status: statusOf({ code }), headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
-        return done(res, { viewer: 1, code });
-      }
-    }
-    const key = `${req.method} ${url.pathname}`;
-    // Public mode: a read endpoint, no Authorization header at all, and a remote that is exactly one public-namespace
-    // repo. No PLY_TOKEN, no caller git credential, the viewer's per-client rate limit (page bucket).
-    const publicRead = !req.headers.has('authorization') && !!READS[key] && isPublicReadRemote(url.searchParams.get('remote'));
-    if (publicRead) {
-      record.public = 1;
-      if (req.headers.has('git-token') || req.headers.has('git-authorization')) return done(json(400, { code: 'bad_request', message: `the ${PUBLIC_NAMESPACE} namespace is read without git credentials; send none, or send Authorization: Bearer <PLY_TOKEN>`, retry: 'no' }, scrub));
-      // An internal request (Pinned filling the cache) was rate-limited at the front door already.
-      const decision = isInternal(req) ? { ok: true, retryAfterMs: 0 } : await admitClient(req, env, 'page', Date.now());
-      if (decision === 'unconfigured' || decision === 'unavailable') return done(json(503, { code: 'unavailable', message: 'the rate limiter is unavailable', retry: 'yes' }, scrub));
-      if (!decision.ok) {
-        const retryAfter = String(Math.max(1, Math.ceil(decision.retryAfterMs / MS_PER_SECOND)));
-        return done(json(429, { code: 'rate_limited', message: `too many requests; retry after ${retryAfter}s`, retry: 'yes' }, scrub, { 'retry-after': retryAfter }));
-      }
-    } else {
-      // gate
-      const token = env.PLY_TOKEN;
-      if (!token) return done(json(500, { code: 'internal', message: 'PLY_TOKEN is not configured', retry: 'no' }, scrub));
-      const presented = /^Bearer\s+(.+)$/i.exec(req.headers.get('authorization') ?? '')?.[1] ?? '';
-      if (!presented || !(await timingSafeTokenEqual(presented, token))) return done(json(401, { code: 'unauthorized', message: 'Authorization: Bearer <PLY_TOKEN> required', retry: 'no' }, scrub, { 'www-authenticate': 'Bearer realm="ply"' }));
-    }
-    if (url.pathname === '/v1/flags' || url.pathname === '/v1/flags/eval') {
-      try { return done(await handleFlagHttp(req, env, ctx)); }
-      catch (e) {
-        const payload = errorBody(e);
-        return done(json(statusOf(e), payload, scrub), { code: payload.code });
-      }
-    }
-    const writes = env.WRITES === 'on';
-    const handler = READS[key] ?? WRITES[key];
-    if (!handler) return done(json(Object.keys({ ...READS, ...WRITES }).some(k => k.endsWith(` ${url.pathname}`)) ? 405 : 404, { code: 'not_found', message: `no route ${key}`, retry: 'no' }, scrub));
-    if (WRITES[key] && !writes) return done(json(501, { code: 'unsupported', message: 'writes are disabled on this deployment', retry: 'no' }, scrub));
-    const exporter = arrayExporter();
-    const spans = () => exporter.lines.flatMap(flattenLine);
+    let surface = 'api';
     let rays = null;
-    const attachRays = res => {
-      if (!rays) return res;
+    let exporter = null;
+    const spans = () => (exporter ? exporter.lines.flatMap(flattenLine) : []);
+    const statsOf = s => ({ spans: s.length, rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length, wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length, cache_hits: s.filter(x => x.attrs['git.response.cache'] === 'HIT').length });
+    const stamp = headers => {
+      if (!rays || !exporter) return;
       const report = rays.report();
       stampUpstreamSpans(exporter.lines, report);
-      applyUpstreamHeaders(res.headers, report, Date.now() - t0);
-      return res;
+      applyUpstreamHeaders(headers, report, Date.now() - t0);
     };
-    try {
-      const body = WRITES[key] ? await readJson(req) : {};
-      const allow = (env.ALLOW_REMOTE_ORIGINS ?? '').split(',').map(s => s.trim()).filter(Boolean);
-      const remoteUrl = checkRemote(WRITES[key] ? body.remote : url.searchParams.get('remote'), allow);
-      const remote = remoteUrl.href;
-      record.host = remoteUrl.host;
-      // Only tree/read/commit take ref; refs and discover ignore it, so it must not cost them an ls-refs.
-      const presentedRef = REF_READS.has(url.pathname) && !WRITES[key] ? url.searchParams.get('ref') : null;
-      // Read-only means read-only: no write reaches the public namespace, whatever bearer or git credential came with it.
-      if (WRITES[key] && isPublicNamespaceRemote(remote)) return done(json(403, { code: 'read_only', message: `the ${PUBLIC_NAMESPACE} namespace is read-only`, retry: 'no' }, scrub));
-      const cred = gitAuth(req.headers, remoteUrl.hostname);
-      const callerScrub = scrubber(cred.secrets);
-      scrub = text => callerScrub(publicScrub(text));
-      const tracer = new Tracer({ exporter, resource: { 'service.name': 'ply-worker', 'cloudflare.colo': req.cf?.colo ?? '' } });
-      // The public read token is attached below the redirect guard, so each hop is re-validated before it is considered,
-      // and only when the request carries no credential of its own (a caller's Git-Token or Git-Authorization wins).
-      // Under the guard: public, credential-free upload-pack exchanges go to the cache-enabled GitCache entrypoint
-      // (Workers Caching); everything else, every credentialed request included, goes straight upstream.
-      const direct = withPublicReadCredential(globalThis.fetch.bind(globalThis), publicTokens);
-      const loopback = env.PACK_CACHE === 'off' ? null : () => ctx.exports?.GitCache;
-      rays = createRayLog();
-      // Inside the guard, so each hop (including a redirect the guard follows) is one entry.
-      const fetchImpl = createGuardedFetch(observeUpstream(createLoopbackFetch(direct, loopback), rays), remoteUrl, allow);
-      const opts = { auth: cred.auth, tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), fetchImpl };
-      if (!WRITES[key] && presentedRef && isAbbreviatedOid(presentedRef.toLowerCase())) {
-        const prefix = presentedRef.toLowerCase();
-        const cands = refCandidates(prefix);
-        const { refs } = await lsRefs(createTransport(remote, opts), [...new Set([...cands, ...ADVERTISED_REF_PREFIXES])]);
-        if (!cands.some(name => refs.has(name))) {
-          const match = matchAbbreviatedOid(prefix, refs);
-          if (match.kind !== 'unique') throw fail('bad_request', match.message);
-          url.searchParams.set('ref', match.oid);
+    const jsonOut = (status, obj, headers = {}, extra = {}) => ({ kind: 'json', status, obj, headers, log: extra });
+    const rawOut = (status, body, headers, extra = {}, statusText = '') => ({ kind: 'raw', status, body, headers, log: extra, statusText });
+    const taken = (res, extra) => rawOut(res.status, res.body, res.headers, extra, res.statusText);
+    const viewerPath = url.pathname === '/view.css' || /^\/view\.[0-9a-f]{12}\.css$/.test(url.pathname) || url.pathname === '/view' || url.pathname.startsWith('/view/') || url.pathname === '/r' || url.pathname.startsWith('/r/');
+    return runRequest({
+      parse: () => {
+        if (req.method === 'GET' && url.pathname === '/') { surface = 'usage'; return ok({ kind: 'usage' }); }
+        // Public viewer, including the public-namespace index (/r) and short repo URLs (/r/<name>).
+        // Before the token gate, and it never reads Authorization / Git-Token / Cookie.
+        if (viewerPath) {
+          surface = 'viewer';
+          if (url.pathname.includes('@') || url.pathname.toLowerCase().includes('%40')) record.path = '/view/redacted';
+          const pinKey = isInternal(req) ? null : pinnedViewKey(url, req.method, isPublicViewLoc(env));
+          const pin = pinKey ? pinnedBinding(env, ctx) : null;
+          return ok({ kind: 'viewer', pinKey, pin });
         }
+        surface = 'api';
+        const key = `${req.method} ${url.pathname}`;
+        const publicRead = !req.headers.has('authorization') && !!READS[key] && isPublicReadRemote(url.searchParams.get('remote'));
+        return ok({ kind: 'api', key, publicRead });
+      },
+      authorize: async parsed => {
+        if (parsed.kind === 'usage') return ok(parsed);
+        if (parsed.kind === 'viewer') {
+          if (!(parsed.pinKey && parsed.pin)) return ok(parsed);
+          const decision = await admitClient(req, env, 'page', Date.now());
+          if (decision === 'unconfigured' || decision === 'unavailable') return err(rawOut(503, 'rate limiter unavailable\n', new Headers({ 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }), { viewer: 1 }));
+          if (!decision.ok) {
+            const ra = String(Math.max(1, Math.ceil(decision.retryAfterMs / MS_PER_SECOND)));
+            return err(rawOut(429, `Too many viewer requests. Retry after ${ra}s.\n`, new Headers({ 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'retry-after': ra }), { viewer: 1, code: 'rate_limited' }));
+          }
+          return ok(parsed);
+        }
+        if (parsed.publicRead) {
+          record.public = 1;
+          if (req.headers.has('git-token') || req.headers.has('git-authorization')) return err(jsonOut(400, { code: 'bad_request', message: `the ${PUBLIC_NAMESPACE} namespace is read without git credentials; send none, or send Authorization: Bearer <PLY_TOKEN>`, retry: 'no' }));
+          // An internal request (Pinned filling the cache) was rate-limited at the front door already.
+          const decision = isInternal(req) ? { ok: true, retryAfterMs: 0 } : await admitClient(req, env, 'page', Date.now());
+          if (decision === 'unconfigured' || decision === 'unavailable') return err(jsonOut(503, { code: 'unavailable', message: 'the rate limiter is unavailable', retry: 'yes' }));
+          if (!decision.ok) {
+            const retryAfter = String(Math.max(1, Math.ceil(decision.retryAfterMs / MS_PER_SECOND)));
+            return err(jsonOut(429, { code: 'rate_limited', message: `too many requests; retry after ${retryAfter}s`, retry: 'yes' }, { 'retry-after': retryAfter }));
+          }
+          return ok(parsed);
+        }
+        const token = env.PLY_TOKEN;
+        if (!token) return err(jsonOut(500, { code: 'internal', message: 'PLY_TOKEN is not configured', retry: 'no' }));
+        const presented = /^Bearer\s+(.+)$/i.exec(req.headers.get('authorization') ?? '')?.[1] ?? '';
+        if (!presented || !(await timingSafeTokenEqual(presented, token))) return err(jsonOut(401, { code: 'unauthorized', message: 'Authorization: Bearer <PLY_TOKEN> required', retry: 'no' }, { 'www-authenticate': 'Bearer realm="ply"' }));
+        return ok(parsed);
+      },
+      execute: async parsed => {
+        if (parsed.kind === 'usage') {
+          // ply.usage.note is off unless the flag ruleset says otherwise. A missing binding leaves this text unchanged.
+          let body = USAGE;
+          const note = await usageNote(env, ctx, req.headers.get('x-ply-unit'));
+          if (note) body = `${USAGE}\n${note}\n`;
+          return ok(rawOut(200, body, new Headers({ 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })));
+        }
+        if (parsed.kind === 'viewer') {
+          try {
+            if (parsed.pinKey && parsed.pin) {
+              const res = await viaPinned(parsed.pin, parsed.pinKey);
+              return ok(taken(await scrubResponse(res, publicScrub), { viewer: 1, pinned: res.headers.get('x-ply-pinned-cache') ?? '' }));
+            }
+            const res = await handleViewer(req, env, ctx, { requestId: id, note: extra => Object.assign(record, extra), skipRate: isInternal(req) });
+            return ok(taken(await scrubResponse(res, publicScrub), { viewer: 1 }));
+          } catch (e) {
+            if (!knownFailure(e)) throw e;
+            const code = recordField(e, 'code');
+            return err(rawOut(statusOf({ code }), viewerErrorDocument(code, failureMessage(e)), new Headers({ 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }), { viewer: 1, code }));
+          }
+        }
+        const { key } = parsed;
+        if (url.pathname === '/v1/flags' || url.pathname === '/v1/flags/eval') return ok(taken(await handleFlagHttp(req, env, ctx)));
+        const writes = env.WRITES === 'on';
+        const handler = READS[key] ?? WRITES[key];
+        if (!handler) return err(jsonOut(Object.keys({ ...READS, ...WRITES }).some(k => k.endsWith(` ${url.pathname}`)) ? 405 : 404, { code: 'not_found', message: `no route ${key}`, retry: 'no' }));
+        if (WRITES[key] && !writes) return err(jsonOut(501, { code: 'unsupported', message: 'writes are disabled on this deployment', retry: 'no' }));
+        exporter = arrayExporter();
+        try {
+          const body = WRITES[key] ? await readJson(req) : {};
+          const allow = (env.ALLOW_REMOTE_ORIGINS ?? '').split(',').map(s => s.trim()).filter(Boolean);
+          const remoteUrl = checkRemote(WRITES[key] ? body.remote : url.searchParams.get('remote'), allow);
+          const remote = remoteUrl.href;
+          record.host = remoteUrl.host;
+          // Only tree/read/commit take ref; refs and discover ignore it, so it must not cost them an ls-refs.
+          const presentedRef = REF_READS.has(url.pathname) && !WRITES[key] ? url.searchParams.get('ref') : null;
+          // Read-only means read-only: no write reaches the public namespace, whatever bearer or git credential came with it.
+          if (WRITES[key] && isPublicNamespaceRemote(remote)) return err(jsonOut(403, { code: 'read_only', message: `the ${PUBLIC_NAMESPACE} namespace is read-only`, retry: 'no' }));
+          const cred = gitAuth(req.headers, remoteUrl.hostname);
+          const callerScrub = scrubber(cred.secrets);
+          scrub = text => callerScrub(publicScrub(text));
+          const tracer = new Tracer({ exporter, resource: { 'service.name': 'ply-worker', 'cloudflare.colo': req.cf?.colo ?? '' } });
+          // The public read token is attached below the redirect guard, so each hop is re-validated before it is considered,
+          // and only when the request carries no credential of its own (a caller's Git-Token or Git-Authorization wins).
+          // Under the guard: public, credential-free upload-pack exchanges go to the cache-enabled GitCache entrypoint
+          // (Workers Caching); everything else, every credentialed request included, goes straight upstream.
+          const direct = withPublicReadCredential(globalThis.fetch.bind(globalThis), publicTokens);
+          const loopback = env.PACK_CACHE === 'off' ? null : () => ctx.exports?.GitCache;
+          rays = createRayLog();
+          // Inside the guard, so each hop (including a redirect the guard follows) is one entry.
+          const fetchImpl = createGuardedFetch(observeUpstream(createLoopbackFetch(direct, loopback), rays), remoteUrl, allow);
+          const opts = { auth: cred.auth, tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), fetchImpl };
+          if (!WRITES[key] && presentedRef && isAbbreviatedOid(presentedRef.toLowerCase())) {
+            const prefix = presentedRef.toLowerCase();
+            const cands = refCandidates(prefix);
+            const { refs } = await lsRefs(createTransport(remote, opts), [...new Set([...cands, ...ADVERTISED_REF_PREFIXES])]);
+            if (!cands.some(name => refs.has(name))) {
+              const match = matchAbbreviatedOid(prefix, refs);
+              if (match.kind !== 'unique') throw fail('bad_request', match.message);
+              url.searchParams.set('ref', match.oid);
+            }
+          }
+          const out = await handler({ remote, q: url.searchParams, body, opts, spans, ctx, log });
+          if (out && typeof out === 'object' && 'stream' in out) {
+            out.headers.set('cache-control', NO_STORE);
+            stamp(out.headers);
+            return ok(rawOut(200, out.stream, out.headers, statsOf(spans())));
+          }
+          if (out instanceof Response) {
+            out.headers.set('cache-control', NO_STORE);
+            stamp(out.headers);
+            return ok(taken(out, statsOf(spans())));
+          }
+          const status = out.status ?? 200;
+          const rayHeaders = new Headers();
+          stamp(rayHeaders);
+          const s = spans();
+          const extra = Object.fromEntries(rayHeaders);
+          const stats = statsOf(s);
+          if (url.searchParams.get('trace') === '1') return ok(jsonOut(status, { ...out.body, trace: s.map(spanView) }, extra, stats));
+          return ok(jsonOut(status, out.body, extra, stats));
+        } catch (e) {
+          if (knownFailure(e)) return err({ kind: 'ply', error: e });
+          throw e;
+        }
+      },
+    }, result => {
+      if (!result.ok && result.error.kind === 'unexpected') {
+        const failure = result.error;
+        if (surface === 'viewer') {
+          const res = new Response(viewerErrorDocument('internal', 'The viewer hit an internal error.'), { status: 500, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-ply-error-kind': failure.kind } });
+          return done(res, { viewer: 1, code: 'internal', error_kind: failure.kind, stage: failure.stage, error_name: failure.name });
+        }
+        const res = json(500, { code: 'internal', message: 'The request hit an unexpected error.', retry: 'no' }, scrub, { 'x-ply-error-kind': failure.kind });
+        return done(res, { code: 'internal', error_kind: failure.kind, stage: failure.stage, error_name: failure.name });
       }
-      const out = await handler({ remote, q: url.searchParams, body, opts, spans, ctx, log });
-      if (out instanceof Response) {
-        out.headers.set('cache-control', NO_STORE);
-        attachRays(out);
-        const s = spans();
-        const stats = { spans: s.length, rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length, wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length, cache_hits: s.filter(x => x.attrs['git.response.cache'] === 'HIT').length };
-        return done(out, stats);
+      if (!result.ok && result.error.kind === 'ply') {
+        const e = result.error.error;
+        const payload = errorBody(e);
+        if (rays && exporter) stampUpstreamSpans(exporter.lines, rays.report());
+        if (url.searchParams.get('trace') === '1') payload.trace = spans().map(spanView);
+        const res = json(statusOf(e), payload, scrub);
+        if (rays) applyUpstreamHeaders(res.headers, rays.report(), Date.now() - t0);
+        return done(res, { code: payload.code, rtt: spans().filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length });
       }
-      const res = json(out.status ?? 200, out.body, scrub);
-      attachRays(res);
-      const s = spans();
-      if (url.searchParams.get('trace') === '1') {
-        const traced = json(out.status ?? 200, { ...out.body, trace: s.map(spanView) }, scrub);
-        for (const [name, value] of res.headers) if (name !== 'content-type' && name !== 'cache-control') traced.headers.set(name, value);
-        const stats = { spans: s.length, rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length, wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length, cache_hits: s.filter(x => x.attrs['git.response.cache'] === 'HIT').length };
-        return done(traced, stats);
-      }
-      const stats = { spans: s.length, rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length, wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length, cache_hits: s.filter(x => x.attrs['git.response.cache'] === 'HIT').length };
-      return done(res, stats);
-    } catch (e) {
-      const payload = errorBody(e);
-      if (rays) stampUpstreamSpans(exporter.lines, rays.report());
-      if (url.searchParams.get('trace') === '1') payload.trace = spans().map(spanView);
-      const res = json(statusOf(e), payload, scrub);
-      if (rays) applyUpstreamHeaders(res.headers, rays.report(), Date.now() - t0);
-      return done(res, { code: payload.code, rtt: spans().filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length });
-    }
+      const value = result.ok ? result.value : result.error;
+      if (value.kind === 'json') return done(json(value.status, value.obj, scrub, value.headers), value.log);
+      const init = { status: value.status, headers: value.headers };
+      if (value.statusText) init.statusText = value.statusText;
+      return done(new Response(value.body, init), value.log);
+    });
   },
 };
 
@@ -504,9 +582,25 @@ export default worker;
  */
 export class Pinned extends WorkerEntrypoint {
   async fetch(req) {
-    const u = new URL(req.url);
-    const internal = requestForKey(`${u.pathname}${u.search}`, isPublicViewLoc(this.env));
-    if (!internal) return new Response('not a pinned key\n', { status: 404, headers: { 'cache-control': 'no-store' } });
-    return asPinned(await worker.fetch(internal, this.env, this.ctx));
+    const loc = isPublicViewLoc(this.env);
+    return runRequest({
+      parse: () => {
+        const u = new URL(req.url);
+        return ok(`${u.pathname}${u.search}`);
+      },
+      authorize: key => ok(key),
+      execute: async key => {
+        const internal = requestForKey(key, loc);
+        if (!internal) return err({ kind: 'not_pinned' });
+        return ok(await worker.fetch(internal, this.env, this.ctx));
+      },
+    }, result => {
+      if (!result.ok && result.error.kind === 'unexpected') {
+        console.log(JSON.stringify({ msg: 'ply.pinned', error_kind: result.error.kind, stage: result.error.stage, error_name: result.error.name }));
+        return new Response('unexpected\n', { status: 500, headers: { 'cache-control': 'no-store', 'content-type': 'text/plain; charset=utf-8', 'x-ply-error-kind': result.error.kind } });
+      }
+      if (!result.ok) return new Response('not a pinned key\n', { status: 404, headers: { 'cache-control': 'no-store' } });
+      return asPinned(result.value);
+    });
   }
 }

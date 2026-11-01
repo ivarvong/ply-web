@@ -1,6 +1,7 @@
 // Workers Cache sits in front of FlagsCache.fetch. The default entrypoint stays uncached and calls this
 // over ctx.exports, so a ruleset hit does not run the Worker. Per-user evaluations are not cached.
 import { envBinding } from '../absent.ts';
+import { err, httpReply, isUnexpected, ok, responseOf, runRequest, type HttpReply, type Result, type UnexpectedFailure } from '../http/machine.ts';
 import { parseDocumentText } from './document.ts';
 import {
   FLAGS_CACHE_PATH,
@@ -150,34 +151,97 @@ function noneMatch(header: string | null, etag: string): boolean {
   });
 }
 
+type RulesetMethod = 'GET' | 'HEAD';
+
+type RulesetRead = { readonly method: RulesetMethod; readonly store: ReadableStore };
+
+type RulesetFailure =
+  | { readonly kind: 'method' }
+  | { readonly kind: 'path' }
+  | { readonly kind: 'unconfigured' }
+  | { readonly kind: 'read_failed'; readonly name: string };
+
+function plainReply(status: number, text: string, headers: Headers): HttpReply {
+  return httpReply(status, text, headers);
+}
+
+function rulesetFailureReply(failure: RulesetFailure): HttpReply {
+  switch (failure.kind) {
+    case 'method':
+      return plainReply(405, 'method not allowed\n', new Headers({ 'cache-control': 'no-store', allow: 'GET, HEAD' }));
+    case 'path':
+      return plainReply(404, 'not the flag ruleset\n', new Headers({ 'cache-control': 'no-store' }));
+    case 'unconfigured':
+      return plainReply(503, 'flag store is not configured\n', new Headers({ 'cache-control': 'no-store' }));
+    case 'read_failed':
+      return plainReply(503, 'flag store read failed\n', new Headers({ 'cache-control': 'no-store', 'x-ply-error-kind': failure.kind }));
+    default:
+      return assertRulesetFailure(failure);
+  }
+}
+
+function assertRulesetFailure(failure: never): never {
+  throw new Error(`unhandled ruleset failure ${JSON.stringify(failure)}`);
+}
+
+function thrownName(error: unknown): string {
+  return error instanceof Error && error.name ? error.name : 'Error';
+}
+
 export async function serveFlags(request: Request, env: FlagCacheEnv, store: ReadableStore | null): Promise<Response> {
-  if (request.method !== 'GET' && request.method !== 'HEAD') {
-    return new Response('method not allowed\n', { status: 405, headers: { 'cache-control': 'no-store', allow: 'GET, HEAD' } });
-  }
-  if (new URL(request.url).pathname !== FLAGS_CACHE_PATH) {
-    return new Response('not the flag ruleset\n', { status: 404, headers: { 'cache-control': 'no-store' } });
-  }
-  if (!store) return new Response('flag store is not configured\n', { status: 503, headers: { 'cache-control': 'no-store' } });
+  return runRequest(
+    {
+      parse: (): Result<RulesetMethod, RulesetFailure> => {
+        if (request.method !== 'GET' && request.method !== 'HEAD') return err({ kind: 'method' });
+        if (new URL(request.url).pathname !== FLAGS_CACHE_PATH) return err({ kind: 'path' });
+        return ok(request.method);
+      },
+      authorize: (method: RulesetMethod): Result<RulesetRead, RulesetFailure> => {
+        if (!store) return err({ kind: 'unconfigured' });
+        return ok({ method, store });
+      },
+      execute: (read: RulesetRead) => readRuleset(request, env, read),
+    },
+    (result: Result<HttpReply, RulesetFailure | UnexpectedFailure>) => {
+      if (!result.ok) {
+        if (isUnexpected(result.error)) {
+          console.log(JSON.stringify({ msg: 'ply.flags.cache', error_kind: result.error.kind, stage: result.error.stage, error_name: result.error.name }));
+          return new Response('unexpected\n', {
+            status: 500,
+            headers: { 'cache-control': 'no-store', 'content-type': 'text/plain; charset=utf-8', 'x-ply-error-kind': result.error.kind },
+          });
+        }
+        if (result.error.kind === 'read_failed') {
+          console.log(JSON.stringify({ msg: 'ply.flags.cache', error_kind: result.error.kind, error_name: result.error.name }));
+        }
+        return responseOf(rulesetFailureReply(result.error));
+      }
+      return responseOf(result.value);
+    },
+  );
+}
+
+async function readRuleset(request: Request, env: FlagCacheEnv, read: RulesetRead): Promise<Result<HttpReply, RulesetFailure>> {
   const started = performance.now();
   let object: { etag: string; body: string } | null;
   try {
-    object = await store.get(FLAGS_OBJECT_KEY);
-  } catch {
-    return new Response('flag store read failed\n', { status: 503, headers: { 'cache-control': 'no-store' } });
+    object = await read.store.get(FLAGS_OBJECT_KEY);
+  } catch (error) {
+    return err({ kind: 'read_failed', name: thrownName(error) });
   }
   const r2ReadMs = Math.max(0, Math.round(performance.now() - started));
   // An absent object is the steady state before the first write. no-store here makes Workers Cache
   // BYPASS, so every GET / reads R2. The same Cache-Control and tag as a present ruleset lets the
   // empty answer hit; FlagControl.invalidate purges the tag when the object appears.
-  if (!object) return new Response('no flag config\n', { status: 404, headers: rulesetHeaders(env, r2ReadMs, null) });
+  if (!object) return ok(plainReply(404, 'no flag config\n', rulesetHeaders(env, r2ReadMs, null)));
   const parsed = parseDocumentText(object.body);
   if (parsed.kind === 'invalid') {
-    return new Response('flag config is invalid\n', { status: 500, headers: { 'cache-control': 'no-store', [R2_HEADER]: String(r2ReadMs) } });
+    return ok(plainReply(500, 'flag config is invalid\n', new Headers({ 'cache-control': 'no-store', [R2_HEADER]: String(r2ReadMs) })));
   }
   const headers = rulesetHeaders(env, r2ReadMs, object.etag);
-  if (noneMatch(request.headers.get('if-none-match'), object.etag)) return new Response(null, { status: 304, headers });
+  if (noneMatch(request.headers.get('if-none-match'), object.etag)) return ok(httpReply(304, null, headers));
   headers.set('content-type', 'application/json; charset=utf-8');
-  return new Response(request.method === 'HEAD' ? null : object.body, { status: 200, headers });
+  return ok(httpReply(200, read.method === 'HEAD' ? null : object.body, headers));
 }
 
 function r2ReadMs(response: Response, cache: CacheStatus): number | null {

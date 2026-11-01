@@ -1,6 +1,7 @@
 // Authenticated caller of FlagControl. ply's /v1/flags stays read-only.
 // This module is the operator Worker's fetch handler and the CLI's command parser.
 // It does not read the token file and it does not deploy.
+import { err, isUnexpected, ok, runRequest, type Result, type UnexpectedFailure } from '../http/machine.ts';
 import { roundMs, type Clock } from './clock.ts';
 import { applyBasisPoints, applyRollout, parseTargeting } from './document.ts';
 import { endSpan, openSpan, type SpanLike, type TracingLike } from './telemetry.ts';
@@ -48,7 +49,8 @@ export type OperatorResultKind =
   | 'invalid'
   | 'unavailable'
   | 'unauthorized'
-  | 'bad_request';
+  | 'bad_request'
+  | 'unexpected';
 
 export type OperatorSample = {
   readonly op: OperatorOpName;
@@ -243,25 +245,63 @@ async function readJson(request: Request): Promise<{ readonly kind: 'ok'; readon
   }
 }
 
-async function runOperator(request: Request, env: OperatorEnv): Promise<Outcome> {
+type OperatorRoute =
+  | { readonly kind: 'config' }
+  | { readonly kind: 'rollout' }
+  | { readonly kind: 'targeting' }
+  | { readonly kind: 'method' }
+  | { readonly kind: 'missing' };
+
+function parseOperatorRoute(request: Request): Result<OperatorRoute, Outcome> {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const known = path === OPERATOR_CONFIG_PATH || path === OPERATOR_ROLLOUT_PATH || path === OPERATOR_TARGETING_PATH;
+  if (!known) return ok({ kind: 'missing' });
+  if (path === OPERATOR_CONFIG_PATH && request.method === 'GET') return ok({ kind: 'config' });
+  if (path === OPERATOR_ROLLOUT_PATH && request.method === 'POST') return ok({ kind: 'rollout' });
+  if (path === OPERATOR_TARGETING_PATH && request.method === 'POST') return ok({ kind: 'targeting' });
+  return ok({ kind: 'method' });
+}
+
+async function authorizeOperator(request: Request, env: OperatorEnv, route: OperatorRoute): Promise<Result<OperatorRoute, Outcome>> {
   const secret = env.FLAG_OPERATOR_TOKEN;
-  if (!secret) return reject(HTTP_UNAVAILABLE, 'unavailable', 'FLAG_OPERATOR_TOKEN is not configured', 'reject', null, null);
+  if (!secret) return err(reject(HTTP_UNAVAILABLE, 'unavailable', 'FLAG_OPERATOR_TOKEN is not configured', 'reject', null, null));
   const presented = bearer(request);
   if (presented === null || !(await tokenEqual(presented, secret))) {
-    return reject(HTTP_UNAUTHORIZED, 'unauthorized', null, 'reject', null, null);
+    return err(reject(HTTP_UNAUTHORIZED, 'unauthorized', null, 'reject', null, null));
   }
-  const url = new URL(request.url);
+  return ok(route);
+}
+
+async function executeOperator(request: Request, env: OperatorEnv, route: OperatorRoute): Promise<Result<Outcome, Outcome>> {
   const control = env.FLAG_CONTROL;
-  if (url.pathname === OPERATOR_CONFIG_PATH && request.method === 'GET') {
-    if (!control) return bindingMissing('getConfig', null, null);
-    return fromRead(await control.getConfig());
+  switch (route.kind) {
+    case 'config':
+      if (!control) return err(bindingMissing('getConfig', null, null));
+      return ok(fromRead(await control.getConfig()));
+    case 'rollout':
+      return ok(await postRollout(request, control));
+    case 'targeting':
+      return ok(await postTargeting(request, control));
+    case 'method':
+      return err(reject(HTTP_METHOD_NOT_ALLOWED, 'bad_request', 'method not allowed', 'reject', null, null));
+    case 'missing':
+      return err(reject(HTTP_NOT_FOUND, 'bad_request', 'no operator route', 'reject', null, null));
+    default:
+      return assertOperatorRoute(route);
   }
-  if (url.pathname === OPERATOR_ROLLOUT_PATH && request.method === 'POST') return postRollout(request, control);
-  if (url.pathname === OPERATOR_TARGETING_PATH && request.method === 'POST') return postTargeting(request, control);
-  if (url.pathname === OPERATOR_CONFIG_PATH || url.pathname === OPERATOR_ROLLOUT_PATH || url.pathname === OPERATOR_TARGETING_PATH) {
-    return reject(HTTP_METHOD_NOT_ALLOWED, 'bad_request', 'method not allowed', 'reject', null, null);
-  }
-  return reject(HTTP_NOT_FOUND, 'bad_request', 'no operator route', 'reject', null, null);
+}
+
+function assertOperatorRoute(route: never): never {
+  throw new Error(`unhandled operator route ${JSON.stringify(route)}`);
+}
+
+function unexpectedOutcome(): Outcome {
+  return {
+    status: HTTP_UNAVAILABLE,
+    body: { kind: 'unavailable', reason: 'flag operator failed' },
+    sample: sample('reject', 'unexpected', null, null, null, null),
+  };
 }
 
 async function postRollout(request: Request, control: FlagControlBinding | undefined): Promise<Outcome> {
@@ -326,20 +366,31 @@ function writeTelemetry(span: SpanLike | null, entry: OperatorSample, log: (line
 }
 
 export async function handleOperator(request: Request, env: OperatorEnv, deps: OperatorDeps): Promise<Response> {
-  const span = openSpan(deps.tracing, OPERATOR_SPAN);
   const started = deps.clock();
-  try {
-    const outcome = await runOperator(request, env);
-    const ms = roundMs(deps.clock() - started);
-    writeTelemetry(span, { ...outcome.sample, ms }, deps.log);
-    return json(outcome.status, outcome.body);
-  } catch {
-    const ms = roundMs(deps.clock() - started);
-    writeTelemetry(span, { ...sample('reject', 'unavailable', null, null, null, null), ms }, deps.log);
-    return json(HTTP_UNAVAILABLE, { kind: 'unavailable', reason: 'flag operator failed' });
-  } finally {
+  let span: SpanLike | null = null;
+  let spanClosed = false;
+  const closeSpan = (): void => {
+    if (spanClosed) return;
+    spanClosed = true;
     endSpan(span);
-  }
+  };
+  return runRequest(
+    {
+      parse: () => {
+        span = openSpan(deps.tracing, OPERATOR_SPAN);
+        return parseOperatorRoute(request);
+      },
+      authorize: (route: OperatorRoute) => authorizeOperator(request, env, route),
+      execute: (route: OperatorRoute) => executeOperator(request, env, route),
+    },
+    (result: Result<Outcome, Outcome | UnexpectedFailure>) => {
+        const outcome = result.ok ? result.value : isUnexpected(result.error) ? unexpectedOutcome() : result.error;
+      const ms = roundMs(deps.clock() - started);
+      writeTelemetry(span, { ...outcome.sample, ms }, deps.log);
+      closeSpan();
+      return json(outcome.status, outcome.body);
+    },
+  );
 }
 
 const CLI_OPTIONS = ['--expected', '--url', '--allow', '--deny', '--rules'] as const;

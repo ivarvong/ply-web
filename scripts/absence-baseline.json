@@ -3,9 +3,9 @@
   "counts": {
     "word": 203,
     "optional": 376,
-    "chain": 562,
-    "nullish": 621,
-    "total": 1762
+    "chain": 554,
+    "nullish": 617,
+    "total": 1750
   },
   "files": {
     "cloudflare.config.ts": {
@@ -375,9 +375,9 @@
     "src/flags/telemetry.ts": {
       "word": 3,
       "optional": 1,
-      "chain": 34,
-      "nullish": 3,
-      "total": 41
+      "chain": 32,
+      "nullish": 2,
+      "total": 38
     },
     "src/gitcache.ts": {
       "word": 4,
@@ -389,9 +389,9 @@
     "src/index.js": {
       "word": 1,
       "optional": 0,
-      "chain": 29,
-      "nullish": 21,
-      "total": 51
+      "chain": 27,
+      "nullish": 19,
+      "total": 47
     },
     "src/mirror.ts": {
       "word": 0,
@@ -473,9 +473,9 @@
     "src/viewer/handle.ts": {
       "word": 0,
       "optional": 2,
-      "chain": 6,
-      "nullish": 4,
-      "total": 12
+      "chain": 2,
+      "nullish": 3,
+      "total": 7
     },
     "src/viewer/hint.ts": {
       "word": 0,

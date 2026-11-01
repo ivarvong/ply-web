@@ -59,11 +59,7 @@ export async function isEnabled(env: FlagCacheEnv, ctx: { exports?: { FlagsCache
 }
 
 export async function usageNote(env: FlagCacheEnv, ctx: { exports?: { FlagsCache?: FlagsCacheBinding }; tracing?: TracingLike | null } | undefined, unitHeader: string | null): Promise<string | null> {
-  try {
-    const id = unitHeader && unitHeader.length > 0 ? unitHeader : 'anonymous';
-    const on = await isEnabled(env, ctx, USAGE_NOTE_FLAG, { id });
-    return on ? USAGE_NOTE_LINE : null;
-  } catch {
-    return null;
-  }
+  const id = unitHeader && unitHeader.length > 0 ? unitHeader : 'anonymous';
+  const on = await isEnabled(env, ctx, USAGE_NOTE_FLAG, { id });
+  return on ? USAGE_NOTE_LINE : null;
 }

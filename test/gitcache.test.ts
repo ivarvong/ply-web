@@ -15,6 +15,16 @@ import { PUBLIC_GIT_ORIGIN, PUBLIC_NAMESPACE, type TokenSource } from '../src/pu
 import { git, makeBareRepo, startGitServer, tmpRoot, commitFiles } from './server.js';
 import { mkdirSync } from 'node:fs';
 
+type GitCacheFailureLog = { msg: 'ply.gitcache'; error_kind: string; stage: string; error_name: string };
+
+function isGitCacheFailure(value: unknown): value is GitCacheFailureLog {
+  if (!value || typeof value !== 'object') return false;
+  if (!('msg' in value) || value.msg !== 'ply.gitcache') return false;
+  if (!('error_kind' in value) || typeof value.error_kind !== 'string') return false;
+  if (!('stage' in value) || typeof value.stage !== 'string') return false;
+  return 'error_name' in value && typeof value.error_name === 'string';
+}
+
 const PUB = `${PUBLIC_GIT_ORIGIN}/git/${PUBLIC_NAMESPACE}/ply.git`;
 const GH = 'https://github.com/octocat/Hello-World.git';
 const TOKEN = `art_v1_${'c4c4'.repeat(10)}?expires=4102444800`;
@@ -163,6 +173,24 @@ test('serveGitCache: policy per kind, the key is bound to the request, the token
   assert.equal(b.status, 204);
   assert.deepEqual(purged, [[keyPath('pack', await keyHash('pack', `${PUB}/git-upload-pack`, 'version=2', FETCH))]]);
   assert.equal(seen.length, before);
+  const logs: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => { logs.push(args.length > 0 ? String(args[0]) : ''); };
+  try {
+    const failed = await serveGitCache(await gcRequest('pack', `${PUB}/git-upload-pack`, FETCH, { bust: true }), tokens(), {
+      cache: { purge: async () => { throw new Error('purge secret down'); } },
+    }, up);
+    assert.equal(failed.status, 500);
+    assert.equal(failed.headers.get('x-ply-error-kind'), 'unexpected');
+    assert.equal((await failed.text()).includes('purge secret'), false);
+    const row = logs.map(line => JSON.parse(line) as unknown).find(isGitCacheFailure);
+    if (!row) throw new Error('missing gitcache failure log');
+    assert.equal(row.error_kind, 'unexpected');
+    assert.equal(row.stage, 'execute');
+    assert.equal(row.error_name, 'Error');
+  } finally {
+    console.log = orig;
+  }
 });
 
 test('mutable TTLs: a ref change is visible within max-age + stale-while-revalidate', () => {
