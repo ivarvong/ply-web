@@ -12,7 +12,8 @@ import {
   cacheControl,
   ttlFromEnv,
 } from './ttl.ts';
-import type { CacheStatus, FlagDocument } from './types.ts';
+import { assertNever } from '../never.ts';
+import { parseCacheStatus, type CacheStatus, type FlagDocument } from './types.ts';
 
 export type FlagCacheEnv = {
   FLAGS?: unknown;
@@ -88,11 +89,39 @@ export function rulesetCacheProblems(headers: Headers): readonly string[] {
   return problems;
 }
 
-const CACHE_STATUS_SET: ReadonlySet<string> = new Set(['HIT', 'MISS', 'UPDATING', 'REVALIDATED', 'EXPIRED', 'STALE', 'BYPASS', 'NONE']);
-
+/** A missing header is `NONE`. A token the Cache API does not document is `UNKNOWN`. */
 export function normalizeCacheStatus(value: string | null): CacheStatus {
-  if (value && CACHE_STATUS_SET.has(value)) return value as CacheStatus;
-  return 'NONE';
+  const parsed = parseCacheStatus(value);
+  switch (parsed.kind) {
+    case 'known':
+      return parsed.status;
+    case 'absent':
+      return 'NONE';
+    case 'unrecognized':
+      return 'UNKNOWN';
+    default:
+      return assertNever(parsed);
+  }
+}
+
+/** HIT did not run this Worker. BYPASS is not an R2 sample: the response was not stored. */
+function countedR2Read(cache: CacheStatus): boolean {
+  switch (cache) {
+    case 'HIT':
+    case 'BYPASS':
+      return false;
+    case 'MISS':
+    case 'EXPIRED':
+    case 'STALE':
+    case 'REVALIDATED':
+    case 'UPDATING':
+    case 'DYNAMIC':
+    case 'NONE':
+    case 'UNKNOWN':
+      return true;
+    default:
+      return assertNever(cache);
+  }
 }
 
 function ttls(env: FlagCacheEnv): { maxAge: number; swr: number } {
@@ -152,7 +181,7 @@ export async function serveFlags(request: Request, env: FlagCacheEnv, store: Rea
 }
 
 function r2ReadMs(response: Response, cache: CacheStatus): number | null {
-  if (cache === 'HIT' || cache === 'BYPASS') return null;
+  if (!countedR2Read(cache)) return null;
   const raw = response.headers.get(R2_HEADER);
   if (raw === null || !/^\d+$/.test(raw)) return null;
   return Number(raw);
