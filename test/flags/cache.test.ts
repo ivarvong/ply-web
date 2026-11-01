@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { serveFlags, loadRuleset, rulesetCacheProblems, rulesetRequest, rulesetRequestProblems } from '../../src/flags/cache.ts';
+import { serveFlags, loadRuleset, normalizeCacheStatus, rulesetCacheProblems, rulesetRequest, rulesetRequestProblems } from '../../src/flags/cache.ts';
+import { CACHE_STATUSES, parseCacheStatus } from '../../src/flags/types.ts';
 import { memoryStore } from '../../src/flags/store.ts';
 import { setRollout } from '../../src/flags/api.ts';
 import { ABSENT_REVISION, FLAGS_CACHE_URL, FLAGS_MAX_AGE_S, FLAGS_SWR_S, cacheControl } from '../../src/flags/ttl.ts';
@@ -26,6 +27,20 @@ async function seeded() {
   if (written.kind !== 'ok') throw new Error(written.kind);
   return { store, revision: written.revision };
 }
+
+describe('cache status', () => {
+  it('keeps every documented token and does not alias an unknown one to NONE', () => {
+    for (const status of CACHE_STATUSES) {
+      expect(parseCacheStatus(status)).toEqual({ kind: 'known', status });
+      expect(normalizeCacheStatus(status)).toBe(status);
+    }
+    expect(parseCacheStatus(null)).toEqual({ kind: 'absent' });
+    expect(normalizeCacheStatus(null)).toBe('NONE');
+    expect(normalizeCacheStatus('')).toBe('NONE');
+    expect(parseCacheStatus('IGNORED')).toEqual({ kind: 'unrecognized', value: 'IGNORED' });
+    expect(normalizeCacheStatus('IGNORED')).toBe('UNKNOWN');
+  });
+});
 
 describe('ruleset cache', () => {
   it('sets a short max-age, a long stale-while-revalidate, the revision etag, and one tag', async () => {

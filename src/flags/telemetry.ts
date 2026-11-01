@@ -4,7 +4,7 @@
 import { roundMs } from './clock.ts';
 import { variantKind, variantValue, type CacheStatus, type FlagEvaluation } from './types.ts';
 
-export const CACHE_STATUSES = ['HIT', 'MISS', 'UPDATING', 'REVALIDATED', 'EXPIRED', 'STALE', 'BYPASS', 'NONE'] as const;
+export { CACHE_STATUSES } from './types.ts';
 
 export type ResolutionSample = {
   readonly key: string;
