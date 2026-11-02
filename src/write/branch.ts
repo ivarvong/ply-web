@@ -1,10 +1,11 @@
 // Create or delete a ref. `from: 000…0` is rejected before any transport is opened, so nothing is pushed.
 // An existing ref is ref_exists (retry no). A delete whose expected oid is stale is stale_expected and carries
 // the oid the ref actually points at.
-import { plyError, fetchCommit, operation, parseOid, push, resolveCommit, ZERO_OID } from 'ply'
-import { refname, unwrapAsync } from '../ply-result.ts'
+import { plyError, fetchCommit, operation, parseOid, parseRefname, push, resolveCommit, ZERO_OID } from 'ply'
 import { fromNullable } from '../absent.ts'
-import { advertisedOid, hasErrorCode } from './advertised.ts'
+import { err, ok, type Result } from '../http/machine.ts'
+import { type PlyError } from '../ply-result.ts'
+import { advertisedOid } from './advertised.ts'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
 import { assertNever, refExists, staleExpected } from './errors.ts'
 import { readHead } from './head.ts'
@@ -15,7 +16,7 @@ type Transport = GitTransport
 type Root = GitSpan
 type Outcome = GitOutcome
 
-async function tipOf(t: Transport, from: string): Promise<string> {
+async function tipOf(t: Transport, from: string): Promise<Result<string, PlyError>> {
   if (parseOid(from).ok) {
     const fetched = await fetchCommit(t, from)
     if (!fetched.ok) {
@@ -32,18 +33,20 @@ async function tipOf(t: Transport, from: string): Promise<string> {
           case 'ref':
           case 'repository':
           case 'submodule':
-            throw error
+            return err(error)
           default:
             return assertNever(error.miss)
         }
       }
-      throw error
+      return err(error)
     }
-    return from
+    return ok(from)
   }
-  return (await unwrapAsync(resolveCommit(t, from)) as { commit: string }).commit
+  const resolved = await resolveCommit(t, from)
+  return resolved.ok ? ok(resolved.value.commit) : resolved
 }
 
+// readHead runs in its own span (tracer.span records a throw), so its failure is thrown and operation() returns it.
 async function bornTip(t: Transport): Promise<string> {
   const head = await readHead(t)
   if (head.kind === 'born') return head.oid
@@ -52,44 +55,53 @@ async function bornTip(t: Transport): Promise<string> {
   throw plyError('bad_request', 'from is required when the remote HEAD is absent')
 }
 
-export async function createBranch(remote: string, refName: unknown, from: unknown, opts: CallOpts): Promise<Record<string, unknown>> {
+// The Worker's own errors (ref_exists, stale_expected) are not PlyErrors, so an operation() body cannot return them
+// in its Err: they are thrown, and operation() records them on the root span and rethrows them to index.js.
+export async function createBranch(remote: string, refName: unknown, from: unknown, opts: CallOpts): Promise<Result<Record<string, unknown>, PlyError>> {
   const ref = branchRef(refName, 'ref')
-  // Zero is refused here, before unwrapAsync(operation()) opens a transport, so receive-pack is never called.
+  // Zero is refused here, before operation() opens a transport, so receive-pack is never called.
   if (from === ZERO_OID) throw plyError('bad_request', 'from must not be the zero oid')
   const present = fromNullable(from)
   if (present.tag === 'some' && present.value !== '' && typeof present.value !== 'string') throw plyError('bad_request', 'from must be a branch name or a commit id')
   const specified = typeof from === 'string' && from !== '' ? from : null
-  return unwrapAsync(operation('branch_create', remote, { ...opts, attrs: { 'git.branch_create.ref': ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
+  return operation<Record<string, unknown>>('branch_create', remote, { ...opts, attrs: { 'git.branch_create.ref': ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
     const existing = await advertisedOid(t, ref)
-    if (existing) throw refExists(ref, existing)
-    const commit = specified === null ? await bornTip(t) : await tipOf(t, specified)
+    if (!existing.ok) return existing
+    if (existing.value) throw refExists(ref, existing.value)
+    const tip = specified === null ? ok(await bornTip(t)) : await tipOf(t, specified)
+    if (!tip.ok) return tip
+    const commit = tip.value
     root.set({ 'git.branch_create.oid': commit })
-    try {
-      const pushed = await unwrapAsync(push(t, { ref: refname(ref), oldOid: ZERO_OID, newOid: commit, objects: [] })) as { packBytes: number }
-      return outcome('created', writeResult('created', ref, commit, null, { pushBytes: pushed.packBytes }))
-    } catch (e) {
-      if (hasErrorCode(e, 'cas_conflict')) {
-        const cur = await advertisedOid(t, ref)
-        throw refExists(ref, cur === null ? commit : cur)
-      }
-      throw e
+    const name = parseRefname(ref)
+    if (!name.ok) return name
+    const pushed = await push(t, { ref: name.value, oldOid: ZERO_OID, newOid: commit, objects: [] })
+    if (!pushed.ok) {
+      if (pushed.error.code !== 'cas_conflict') return pushed
+      const cur = await advertisedOid(t, ref)
+      if (!cur.ok) return cur
+      throw refExists(ref, cur.value === null ? commit : cur.value)
     }
-  })) as Promise<Record<string, unknown>>
+    return outcome('created', writeResult('created', ref, commit, null, { pushBytes: pushed.value.packBytes }))
+  })
 }
 
-export async function deleteRef(remote: string, ref: string, expected: string | null, opts: CallOpts, op: 'branch_delete' | 'tag_delete'): Promise<Record<string, unknown>> {
-  return unwrapAsync(operation(op, remote, { ...opts, attrs: { [`git.${op}.ref`]: ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
-    const current = await advertisedOid(t, ref)
-    if (!current) throw plyError('not_found', `ref ${ref} not found`, { miss: { kind: 'ref', ref, candidates: [ref] } })
+export async function deleteRef(remote: string, ref: string, expected: string | null, opts: CallOpts, op: 'branch_delete' | 'tag_delete'): Promise<Result<Record<string, unknown>, PlyError>> {
+  return operation<Record<string, unknown>>(op, remote, { ...opts, attrs: { [`git.${op}.ref`]: ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
+    const advertised = await advertisedOid(t, ref)
+    if (!advertised.ok) return advertised
+    const current = advertised.value
+    if (!current) return err(plyError('not_found', `ref ${ref} not found`, { miss: { kind: 'ref', ref, candidates: [ref] } }))
     if (expected && expected !== current) throw staleExpected(ref, expected, current)
     root.set({ [`git.${op}.oid`]: current, [`git.${op}.cas_from_caller`]: expected !== null })
-    try {
-      await unwrapAsync(push(t, { ref: refname(ref), oldOid: current, newOid: ZERO_OID, objects: [] }))
-    } catch (e) {
-      if (!hasErrorCode(e, 'cas_conflict')) throw e
+    const name = parseRefname(ref)
+    if (!name.ok) return name
+    const pushed = await push(t, { ref: name.value, oldOid: current, newOid: ZERO_OID, objects: [] })
+    if (!pushed.ok) {
+      if (pushed.error.code !== 'cas_conflict') return pushed
       const now = await advertisedOid(t, ref)
-      throw staleExpected(ref, expected === null ? current : expected, now === null ? current : now)
+      if (!now.ok) return now
+      throw staleExpected(ref, expected === null ? current : expected, now.value === null ? current : now.value)
     }
     return outcome('deleted', writeResult('deleted', ref, null, current, { deleted: current }))
-  })) as Promise<Record<string, unknown>>
+  })
 }

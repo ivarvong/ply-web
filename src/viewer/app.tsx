@@ -9,7 +9,7 @@ import { hintFromError } from './hint.ts'
 import { htmlResponse, SECURITY, statusOf, textResponse } from './http.ts'
 import { VIEWER_CAPS, rateLimitFor, type RateBucket } from './limits.ts'
 import type { RateDecision, TraceModel, ViewerEnv } from './model.ts'
-import { makeTracer, plyCode, spanCollector } from './ply.ts'
+import { arrayExporter, isPlyCode, Tracer } from 'ply'
 import { createLoopbackFetch, isLoopback, type LoopbackBinding } from '../gitcache.ts'
 import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from '../rays.ts'
 import { parseViewerRequest, routeOptsFromEnv, type ViewerRoute } from './route.ts'
@@ -64,7 +64,7 @@ function traceOf(call: ViewerCall, bars: TraceModel['bars'] = []): TraceModel {
 
 function failureCode(err: unknown, fallback: string): string {
   const found = chainGet(err, 'code')
-  return found.tag === 'some' && plyCode(found.value) ? String(found.value) : fallback
+  return found.tag === 'some' && isPlyCode(found.value) ? String(found.value) : fallback
 }
 
 function failureMessage(err: unknown, code: string): string {
@@ -139,8 +139,8 @@ function cssResponse(call: ViewerCall, req: Request): Response {
 async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: Extract<ViewerRoute, { kind: 'repo' }>): Promise<Response> {
   const limited = await rateGate(req, env, call, route)
   if (limited) return headless(req, limited)
-  const collected = spanCollector()
-  const tracer = makeTracer(collected.exporter, { maxEvents: 48, resource: { 'service.name': 'ply-viewer' } })
+  const collected = arrayExporter()
+  const tracer = new Tracer({ exporter: collected, maxEvents: 48, resource: { 'service.name': 'ply-viewer' } })
   const budget = createBudget()
   const pageSignal = AbortSignal.timeout(VIEWER_CAPS.pageTimeoutMs)
   // The public namespace's read token is attached below the guard: every hop is validated by createViewerFetch first,

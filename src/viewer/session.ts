@@ -3,18 +3,16 @@
 // once per isolate, not once per page. The trace still names the fallback on every fetch that uses it.
 import { atIndex, chainGet, fromNullable, mapGet } from '../absent.ts';
 import { unwrapOr } from '../option.ts';
-import { concat } from 'ply';
-import { plyError } from 'ply';
-import { limitError } from 'ply';
-import { TYPE, hashObject, parseTree } from 'ply';
-import { unwrap } from '../ply-result.ts';
+import { commitView, concat, createTransport, discover, entryType, fetchObject, fetchPack, hashObject, inflate, isFilterRejection, limitError, lsMode, lsRefs, packStream, parseTree, plyError, refCandidates, spFinish, spInit, spStep, TYPE } from 'ply';
+import type { SpState, Tracer, Transport } from 'ply';
+import type { SpStepped } from 'ply/fetch';
+import { unwrap, type OkOf } from '../ply-result.ts';
 import type { Budget } from './budget.ts';
 import { clampText, safeFilename } from './escape.ts';
 import type { FetchLike } from './fetchguard.ts';
 import { VIEWER_CAPS, VIEWER_GIT_LIMITS, VIEWER_UA } from './limits.ts';
-import { mapParsed, type ParsedPack } from './packmap.ts';
+import { mapParsed } from './packmap.ts';
 import type { CommitInfo, FilterName, Loaded, RepoHeader, ServerInfo, TreeEntry } from './model.ts';
-import { candidates, createGitTransport, cursorFinish, cursorInit, cursorStep, discoverRepo, filterRejected, inflateObject, listRefs, readObject, readPack, streamPack, treeEntryType, treeMode, viewCommit, type GitTransport, type PackCursor, type ViewerTracer } from './ply.ts';
 import type { ViewerRoute } from './route.ts';
 import type { RepoLocation, ValidatedPublicRepoUrl } from './url.ts';
 import { viewerHref } from './url.ts';
@@ -25,32 +23,33 @@ import { nearbyRefs, type ViewerHint } from './hint.ts';
 import { tagsFromRefs } from './tags.ts';
 
 export type SessionDeps = {
-  tracer: ViewerTracer;
+  tracer: Tracer;
   fetchImpl: FetchLike;
   signal: AbortSignal;
   budget: Budget;
 };
 
 type RefRec = { oid: string };
+type DiscoverInfo = OkOf<ReturnType<typeof discover>>;
 
 function openTransport(url: ValidatedPublicRepoUrl, opts: {
-  tracer: ViewerTracer;
+  tracer: Tracer;
   fetchImpl: FetchLike;
   signal: AbortSignal;
   quirks: Quirks;
-}): GitTransport {
+}): Transport {
   const parsed = new URL(url);
   if (parsed.username || parsed.password) throw plyError('bad_request', 'remote must not carry credentials');
-  return createGitTransport(url, { ...opts, userAgent: VIEWER_UA, limits: VIEWER_GIT_LIMITS });
+  return unwrap(createTransport(url, { ...opts, userAgent: VIEWER_UA, limits: VIEWER_GIT_LIMITS }));
 }
 
-function serverOf(info: { version: number; agent: string; objectFormat: string; caps: Map<string, string>; fetch: string[]; filter: boolean }): ServerInfo {
+function serverOf(info: DiscoverInfo): ServerInfo {
   return {
     agent: info.agent,
     protocol: info.version,
     objectFormat: info.objectFormat,
     caps: [...info.caps.keys()],
-    fetchFeatures: info.fetch,
+    fetchFeatures: [...info.fetch],
     filterAdvertised: info.filter,
   };
 }
@@ -62,14 +61,14 @@ function textOrEmpty(value: unknown): string {
 }
 
 function toCommit(oid: string, data: Uint8Array): CommitInfo {
-  const view = viewCommit(data, VIEWER_GIT_LIMITS);
+  const view = unwrap(commitView(data, VIEWER_GIT_LIMITS));
   const author = fromNullable(view.author);
   const who = author.tag === 'some' ? author.value : { name: '', email: '', time: '', tz: '' };
   const parents = fromNullable(view.parents);
   return {
     oid,
     tree: textOrEmpty(view.tree),
-    parents: parents.tag === 'none' ? [] : parents.value,
+    parents: parents.tag === 'none' ? [] : [...parents.value],
     authorName: textOrEmpty(who.name),
     authorEmail: textOrEmpty(who.email),
     authorTime: textOrEmpty(who.time),
@@ -90,7 +89,7 @@ function withHint<E extends object>(err: E, viewerHint: ViewerHint): E & { viewe
 
 function refPrefixes(ref: string | null, allTags = true): string[] {
   const prefixes = new Set<string>(allTags ? ['HEAD', 'refs/heads/', 'refs/tags/'] : ['HEAD', 'refs/heads/']);
-  for (const cand of candidates(ref)) {
+  for (const cand of unwrap(refCandidates(ref))) {
     if (cand === 'HEAD') continue;
     prefixes.add(cand);
   }
@@ -114,7 +113,7 @@ function peeledOid(rec: RefRec): string {
 
 function resolveRef(listedRefs: { refs: Map<string, RefRec>; head: string | null }, ref: string | null): { name: string; commit: string } {
   const refs = listedRefs.refs;
-  const cands = candidates(ref);
+  const cands = unwrap(refCandidates(ref));
   if (!cands.length) return { name: textRef(ref), commit: textRef(ref) };
   for (const cand of cands) {
     const rec = refs.get(cand);
@@ -143,17 +142,17 @@ function refCatalog(listedRefs: { refs: Map<string, RefRec>; head: string | null
   return { branches, branchesTruncated: heads.length - branches.length, tags: tagView.tags, tagsTruncated: tagView.truncated };
 }
 
-async function loadTreeBytes(transport: GitTransport, oid: string, cache: Map<string, Uint8Array>): Promise<Uint8Array> {
+async function loadTreeBytes(transport: Transport, oid: string, cache: Map<string, Uint8Array>): Promise<Uint8Array> {
   const hit = cache.get(oid);
   if (hit) return hit;
-  const obj = await readObject(transport, { oid, filter: 'tree:0', expectType: TYPE.TREE });
+  const obj = unwrap(await fetchObject(transport, { oid, filter: 'tree:0', expectType: TYPE.TREE }));
   cache.set(oid, obj.data);
   return obj.data;
 }
 
 function listed(entries: { name: string; mode: string; oid: string }[]): { shown: TreeEntry[]; truncated: number } {
   if (entries.length > VIEWER_GIT_LIMITS.maxTreeEntries) throw limitError('tree entries', entries.length, VIEWER_GIT_LIMITS.maxTreeEntries);
-  const mapped: TreeEntry[] = entries.map(entry => ({ name: entry.name, mode: treeMode(entry.mode), oid: entry.oid, type: treeEntryType(entry.mode) }));
+  const mapped: TreeEntry[] = entries.map(entry => ({ name: entry.name, mode: lsMode(entry.mode), oid: entry.oid, type: entryType(entry.mode) }));
   mapped.sort((a, b) => (a.type === 'tree' ? 0 : 1) - (b.type === 'tree' ? 0 : 1) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return { shown: mapped.slice(0, VIEWER_CAPS.maxTreeShown), truncated: Math.max(0, mapped.length - VIEWER_CAPS.maxTreeShown) };
 }
@@ -165,23 +164,23 @@ async function closeIterator(it: AsyncIterator<Uint8Array>): Promise<void> {
   await (it.return as (this: AsyncIterator<Uint8Array>) => Promise<unknown>).call(it).catch(() => {});
 }
 
-function refuseOversizedChunk(cursor: PackCursor, chunk: Uint8Array): void {
+function refuseOversizedChunk(cursor: SpState, chunk: Uint8Array): void {
   const next = cursor.bytes + chunk.byteLength;
   if (next > VIEWER_CAPS.maxPackBytes) throw limitError('pack bytes', next, VIEWER_CAPS.maxPackBytes);
 }
 
-async function readBlob(transport: GitTransport, tracer: ViewerTracer, oid: string): Promise<{ size: number; bytes: Uint8Array | null; tooBig: boolean }> {
+async function readBlob(transport: Transport, tracer: Tracer, oid: string): Promise<{ size: number; bytes: Uint8Array | null; tooBig: boolean }> {
   const span = tracer.start('git.viewer.blob', { attrs: { 'git.read.blob.oid': oid } });
   const fetchSpan = tracer.start('git.upload-pack fetch', { parent: span, kind: 3 });
-  const it = streamPack(transport, { wants: [oid], ofsDelta: true, thinPack: false }, fetchSpan)[Symbol.asyncIterator]();
-  let sp = cursorInit();
+  const it = packStream(transport, { wants: [oid], ofsDelta: true, thinPack: false }, fetchSpan)[Symbol.asyncIterator]();
+  let sp: SpState = spInit();
   const early: Uint8Array[] = [];
   try {
     while (sp.phase !== 'body') {
       const step = await it.next();
       if (step.done) throw plyError('pack_corrupt', 'pack ended before the object header');
       refuseOversizedChunk(sp, step.value);
-      const r = cursorStep(sp, step.value);
+      const r: SpStepped = unwrap(spStep(sp, step.value));
       sp = r.state;
       early.push(...r.zlib);
     }
@@ -200,13 +199,13 @@ async function readBlob(transport: GitTransport, tracer: ViewerTracer, oid: stri
       const step = await it.next();
       if (step.done) break;
       refuseOversizedChunk(sp, step.value);
-      const r = cursorStep(sp, step.value);
+      const r: SpStepped = unwrap(spStep(sp, step.value));
       sp = r.state;
       for (const z of r.zlib) { zlibParts.push(z); zlibLen += z.byteLength; }
       if (zlibLen > VIEWER_CAPS.maxFileDisplayBytes + COMPRESSED_SLACK_BYTES) throw limitError('compressed object bytes', zlibLen, VIEWER_CAPS.maxFileDisplayBytes);
     }
-    sp = cursorFinish(sp);
-    const { out } = inflateObject(concat(zlibParts), 0, { expectedSize: sp.size, maxOutput: VIEWER_CAPS.maxFileDisplayBytes });
+    sp = unwrap(spFinish(sp));
+    const { out } = unwrap(inflate(concat(zlibParts), 0, { expectedSize: sp.size, maxOutput: VIEWER_CAPS.maxFileDisplayBytes }));
     const got = hashObject('blob', out);
     if (got !== oid) throw plyError('pack_corrupt', `blob content hashes to ${got}, not ${oid}`);
     fetchSpan.end();
@@ -238,32 +237,26 @@ type Held = { type: number; data: Uint8Array };
  * after the first commit on any server that refuses tree:0, which is every Artifacts page.
  * Returns null when the window does not fit the caps; the caller then reads the commit alone.
  */
-async function loadWindow(transport: GitTransport, head: string, quirks: Quirks): Promise<Map<string, Held> | null> {
+async function loadWindow(transport: Transport, head: string, quirks: Quirks): Promise<Map<string, Held> | null> {
   const common = { wants: [head], deepen: VIEWER_CAPS.maxLogCommits, ofsDelta: true as const, thinPack: false as const };
-  const wide = (learned: boolean) => readPack(transport, { ...common, filter: 'blob:none' }, {
+  const wide = (learned: boolean) => fetchPack(transport, { ...common, filter: 'blob:none' }, {
     attrs: { 'git.fetch.filter.fallback': 'blob:none', 'git.fetch.filter.requested': 'tree:0', 'git.fetch.filter.learned': learned, 'git.viewer.window': VIEWER_CAPS.maxLogCommits },
   });
-  try {
-    let result;
-    if (quirks.treeFilter === 'blob:none') result = await wide(false);
-    else {
-      try {
-        result = await readPack(transport, { ...common, filter: 'tree:0' }, { attrs: { 'git.viewer.window': VIEWER_CAPS.maxLogCommits } });
-      } catch (err) {
-        if (!filterRejected(err)) throw err;
-        quirks.treeFilter = 'blob:none';
-        result = await wide(true);
-      }
-    }
-    const objects = chainGet(result, 'objects');
-    return objects.tag === 'none' ? null : objects.value as Map<string, Held>;
-  } catch (err) {
-    const code = chainGet(err, 'code');
-    const message = (err as { message: unknown }).message;
-    // Too big for the window (a huge tree under blob:none): fall back to the single-commit read. Timeouts and aborts end the page.
-    if (code.tag === 'some' && code.value === 'limit_exceeded' && !/upstream/.test(String(message))) return null;
-    throw err;
+  const narrow = quirks.treeFilter !== 'blob:none';
+  let result = narrow
+    ? await fetchPack(transport, { ...common, filter: 'tree:0' }, { attrs: { 'git.viewer.window': VIEWER_CAPS.maxLogCommits } })
+    : await wide(false);
+  if (narrow && !result.ok && isFilterRejection(result.error)) {
+    quirks.treeFilter = 'blob:none';
+    result = await wide(true);
   }
+  if (!result.ok) {
+    const error = result.error;
+    // Too big for the window (a huge tree under blob:none): fall back to the single-commit read. Timeouts and aborts end the page.
+    if (error.code === 'limit_exceeded' && !/upstream/.test(error.message)) return null;
+    throw error;
+  }
+  return result.value.objects;
 }
 
 function historyOf(first: CommitInfo, held: Map<string, Held> | null): { log: CommitInfo[]; logStopped: boolean } {
@@ -284,20 +277,15 @@ function historyOf(first: CommitInfo, held: Map<string, Held> | null): { log: Co
  * Branches and every tag (for the picker). A repository whose tags alone pass maxRefs (or the ls-refs byte cap) still
  * opens: one more ls-refs lists branches and the asked-for name only, and the picker shows no tags.
  */
-export async function listPageRefs(transport: GitTransport, ref: string | null): Promise<{ refs: Map<string, RefRec>; head: string | null }> {
-  try {
-    return await listRefs(transport, refPrefixes(ref));
-  } catch (err) {
-    const code = chainGet(err, 'code');
-    const what = chainGet(err, 'what');
-    const message = chainGet(err, 'message');
-    const detail = what.tag === 'some' ? String(what.value) : message.tag === 'some' ? String(message.value) : '';
-    if (code.tag !== 'some' || code.value !== 'limit_exceeded' || !/^ls-refs /.test(detail)) throw err;
-    return await listRefs(transport, refPrefixes(ref, false));
-  }
+export async function listPageRefs(transport: Transport, ref: string | null): Promise<{ refs: Map<string, RefRec>; head: string | null }> {
+  const listed = await lsRefs(transport, refPrefixes(ref));
+  if (listed.ok) return listed.value;
+  const error = listed.error;
+  if (error.code !== 'limit_exceeded' || !/^ls-refs /.test(error.what)) throw error;
+  return unwrap(await lsRefs(transport, refPrefixes(ref, false)));
 }
 
-async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { kind: 'repo' }>, server: ServerInfo, quirks: Quirks, budget: Budget, tracer: ViewerTracer): Promise<Loaded> {
+async function loadTree(transport: Transport, route: Extract<ViewerRoute, { kind: 'repo' }>, server: ServerInfo, quirks: Quirks, budget: Budget, tracer: Tracer): Promise<Loaded> {
   const listedRefs = await listPageRefs(transport, route.ref);
   const resolved = resolveRef(listedRefs, route.ref);
   const catalog = refCatalog(listedRefs);
@@ -306,7 +294,7 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
   const headObj = held === null ? null : unwrapOr(mapGet(held, resolved.commit), null);
   const commitData = headObj && headObj.type === TYPE.COMMIT
     ? headObj.data
-    : (await readObject(transport, { oid: resolved.commit, filter: 'tree:0', deepen: 1, expectType: TYPE.COMMIT })).data;
+    : unwrap(await fetchObject(transport, { oid: resolved.commit, filter: 'tree:0', deepen: 1, expectType: TYPE.COMMIT })).data;
   const commit = toCommit(resolved.commit, commitData);
   const header = headerFor(route.loc, resolved.name, resolved.commit, server);
   const cache = new Map<string, Uint8Array>();
@@ -333,7 +321,7 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
     else file = { mode: entry.mode, oid: entry.oid };
   }
   if (file) {
-    const mode = treeMode(file.mode);
+    const mode = lsMode(file.mode);
     if (file.mode === '160000') {
       if (route.raw) throw plyError('not_found', 'submodule has no blob in this repository', { miss: { kind: 'submodule', path: route.path, commit: file.oid } });
       return { kind: 'file', header, path: route.path, ...catalog, mode, blob: file.oid, size: 0, note: 'submodule', text: null };
@@ -378,38 +366,31 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
   };
 }
 
-async function loadPack(transport: GitTransport, route: Extract<ViewerRoute, { kind: 'repo' }>, server: ServerInfo, quirks: Quirks): Promise<Loaded> {
+async function loadPack(transport: Transport, route: Extract<ViewerRoute, { kind: 'repo' }>, server: ServerInfo, quirks: Quirks): Promise<Loaded> {
   const pack = route.pack;
   if (!pack) throw plyError('internal', 'pack view without a want');
   const want = pack.want;
   const requested: FilterName = pack.filter;
   const common = { wants: [want], deepen: 1, ofsDelta: true as const, thinPack: false as const };
   let honoured: FilterName = requested;
-  let result;
-  if (requested === 'tree:0') {
-    try {
-      result = await readPack(transport, { ...common, filter: 'tree:0' }, { resolve: false });
-    } catch (err) {
-      if (!filterRejected(err)) throw err;
-      quirks.treeFilter = 'blob:none';
-      honoured = 'blob:none';
-      result = await readPack(transport, { ...common, filter: 'blob:none' }, {
-        resolve: false,
-        attrs: { 'git.fetch.filter.fallback': 'blob:none', 'git.fetch.filter.requested': 'tree:0', 'git.fetch.filter.learned': true },
-      });
-    }
-  } else {
-    result = await readPack(transport, { ...common, filter: 'blob:none' }, { resolve: false });
+  let result = await fetchPack(transport, { ...common, filter: requested }, { resolve: false });
+  if (requested === 'tree:0' && !result.ok && isFilterRejection(result.error)) {
+    quirks.treeFilter = 'blob:none';
+    honoured = 'blob:none';
+    result = await fetchPack(transport, { ...common, filter: 'blob:none' }, {
+      resolve: false,
+      attrs: { 'git.fetch.filter.fallback': 'blob:none', 'git.fetch.filter.requested': 'tree:0', 'git.fetch.filter.learned': true },
+    });
   }
-  const parsed = chainGet(result, 'parsed');
-  if (parsed.tag === 'none' || !parsed.value) throw plyError('pack_corrupt', 'server sent no pack');
+  const parsed = unwrap(result).parsed;
+  if (parsed === null) throw plyError('pack_corrupt', 'server sent no pack');
   return {
     kind: 'pack',
     header: headerFor(route.loc, route.ref === null ? 'HEAD' : route.ref, want, server),
     want,
     filterRequested: requested,
     filterHonoured: honoured,
-    map: mapParsed(parsed.value as ParsedPack, VIEWER_GIT_LIMITS),
+    map: mapParsed(parsed, VIEWER_GIT_LIMITS),
     offset: pack.offset,
     askedOfsDelta: true,
     askedThinPack: false,
@@ -419,7 +400,7 @@ async function loadPack(transport: GitTransport, route: Extract<ViewerRoute, { k
 export async function loadRepo(route: Extract<ViewerRoute, { kind: 'repo' }>, deps: SessionDeps): Promise<Loaded> {
   const quirks = quirksFor(route.loc.origin);
   const transport = openTransport(route.loc.url, { tracer: deps.tracer, fetchImpl: deps.fetchImpl, signal: deps.signal, quirks });
-  const info = await discoverRepo(transport);
+  const info = unwrap(await discover(transport));
   const server = serverOf(info);
   if (route.pack) return loadPack(transport, route, server, quirks);
   return loadTree(transport, route, server, quirks, deps.budget, deps.tracer);

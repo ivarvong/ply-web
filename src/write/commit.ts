@@ -1,10 +1,11 @@
 // Build a commit from create/write/edit/delete/rename and push it. A missing ref is created (old oid = zero):
 // that is the root commit on an empty repository, and a new branch when `base` names another ref or a commit.
 // One find/replace on an existing file still goes through ply's editFile, which streams the blob.
-import { plyError, editFile, encodeCommit, fetchCommit, fetchObject, hashObject, isLfsPointerPrefix, operation, parseOid, parseTree, push, resolveCommit, TYPE, validatePath, ZERO_OID, KIND, type Oid, type Span } from 'ply'
-import { pathOf, refname, unwrap, unwrapAsync } from '../ply-result.ts'
+import { plyError, editFile, encodeCommit, fetchCommit, fetchObject, hashObject, isLfsPointerPrefix, operation, parseOid, parseRefname, parseTree, push, resolveCommit, TYPE, validatePath, ZERO_OID, KIND, type Oid, type Span } from 'ply'
+import { pathIn, unwrap, unwrapAsync, type PlyError } from '../ply-result.ts'
 import { atIndex, mapGet } from '../absent.ts'
-import { advertisedOid, hasErrorCode } from './advertised.ts'
+import { err, ok, type Result } from '../http/machine.ts'
+import { advertisedOid } from './advertised.ts'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
 import { MODE_TREE, BLOB_MODES } from './constants.ts'
 import { assertNever, refExists } from './errors.ts'
@@ -42,25 +43,23 @@ function messageBody(message: string): string {
   return message.endsWith('\n') ? message : `${message}\n`
 }
 
-async function resolveTarget(t: Transport, ref: string | null): Promise<Target> {
+// readHead runs in its own span (tracer.span records a throw), so its failure is thrown and operation() returns it.
+async function resolveTarget(t: Transport, ref: string | null): Promise<Result<Target, PlyError>> {
   if (ref === null) {
     const head = await readHead(t)
-    if (head.kind === 'born') return { ref: head.ref, oid: head.oid }
-    if (head.kind === 'unborn') return { ref: head.ref, oid: null }
-    if (head.kind === 'detached') throw plyError('bad_request', 'remote HEAD is detached; pass ref explicitly')
-    throw plyError('not_found', 'remote HEAD is absent; pass ref explicitly', { miss: { kind: 'head_absent' } })
+    if (head.kind === 'born') return ok({ ref: head.ref, oid: head.oid })
+    if (head.kind === 'unborn') return ok({ ref: head.ref, oid: null })
+    if (head.kind === 'detached') return err(plyError('bad_request', 'remote HEAD is detached; pass ref explicitly'))
+    return err(plyError('not_found', 'remote HEAD is absent; pass ref explicitly', { miss: { kind: 'head_absent' } }))
   }
   const listed = await advertisedOid(t, ref)
-  return { ref, oid: listed ? oidOf(listed) : null }
+  if (!listed.ok) return listed
+  if (!listed.value) return ok({ ref, oid: null })
+  const oid = parseOid(listed.value)
+  return oid.ok ? ok({ ref, oid: oid.value }) : oid
 }
 
-function oidOf(value: string): Oid {
-  const parsed = parseOid(value)
-  if (!parsed.ok) throw parsed.error
-  return parsed.value
-}
-
-async function commitOf(t: Transport, oid: string): Promise<{ tree: string; parents: string[] }> {
+async function commitOf(t: Transport, oid: string): Promise<Result<{ tree: string; parents: readonly string[] }, PlyError>> {
   const fetched = await fetchCommit(t, oid)
   if (!fetched.ok) {
     const error = fetched.error
@@ -76,30 +75,38 @@ async function commitOf(t: Transport, oid: string): Promise<{ tree: string; pare
         case 'ref':
         case 'repository':
         case 'submodule':
-          throw error
+          return err(error)
         default:
           return assertNever(error.miss)
       }
     }
-    throw error
+    return err(error)
   }
-  return { tree: fetched.value.commit.tree, parents: fetched.value.commit.parents }
+  return ok({ tree: fetched.value.commit.tree, parents: fetched.value.commit.parents })
 }
 
-async function resolveParent(t: Transport, req: EditRequest, target: Target): Promise<Parent> {
-  if (req.base.kind === 'oid') return { oid: req.base.oid, tree: (await commitOf(t, req.base.oid)).tree }
+async function parentAt(t: Transport, oid: Oid): Promise<Result<Parent, PlyError>> {
+  const commit = await commitOf(t, oid)
+  return commit.ok ? ok({ oid, tree: commit.value.tree }) : commit
+}
+
+async function resolveParent(t: Transport, req: EditRequest, target: Target): Promise<Result<Parent, PlyError>> {
+  if (req.base.kind === 'oid') return parentAt(t, req.base.oid)
   if (req.base.kind === 'ref' && !sameBranch(req.base.ref, target.ref)) {
-    const resolved = await unwrapAsync(resolveCommit(t, req.base.ref)) as { commit: string }
-    return { oid: oidOf(resolved.commit), tree: (await commitOf(t, resolved.commit)).tree }
+    const resolved = await resolveCommit(t, req.base.ref)
+    if (!resolved.ok) return resolved
+    const oid = parseOid(resolved.value.commit)
+    return oid.ok ? parentAt(t, oid.value) : oid
   }
-  if (target.oid === null) return { oid: null, tree: null }
-  return { oid: target.oid, tree: (await commitOf(t, target.oid)).tree }
+  if (target.oid === null) return ok({ oid: null, tree: null })
+  return parentAt(t, target.oid)
 }
 
-function assertHead(target: Target, req: EditRequest): void {
-  if (req.head.kind !== 'oid') return
+function checkHead(target: Target, req: EditRequest): Result<null, PlyError> {
+  if (req.head.kind !== 'oid') return ok(null)
   const actual = target.oid === null ? ZERO_OID : target.oid
-  if (req.head.oid !== actual) throw plyError('cas_conflict', `${target.ref} is at ${actual}, not the expected head ${req.head.oid}`, { expected: req.head.oid, actual })
+  if (req.head.oid !== actual) return err(plyError('cas_conflict', `${target.ref} is at ${actual}, not the expected head ${req.head.oid}`, { expected: req.head.oid, actual }))
+  return ok(null)
 }
 
 async function asDir(t: Transport, node: Mem, trees: Map<string, Uint8Array>): Promise<Mem> {
@@ -190,61 +197,70 @@ function singleEdit(req: EditRequest): { path: string; find: string; replace: st
   return change.value
 }
 
-async function streamEdit(remote: string, req: EditRequest, target: Target, edit: { path: string; find: string; replace: string }, creating: boolean, opts: CallOpts): Promise<Record<string, unknown>> {
+async function streamEdit(remote: string, req: EditRequest, target: Target, edit: { path: string; find: string; replace: string }, creating: boolean, opts: CallOpts): Promise<Result<Record<string, unknown>, PlyError>> {
   const base = req.base.kind === 'ref' ? req.base.ref : target.ref
   const head = req.head.kind === 'oid' ? { head: req.head.oid, strictHead: true } : req.hint ? { head: req.hint } : {}
-  const edited = await unwrapAsync(editFile(remote, {
-    ref: refname(target.ref),
+  const ref = parseRefname(target.ref)
+  if (!ref.ok) return ref
+  const path = pathIn(edit.path, opts)
+  if (!path.ok) return path
+  const edited = await editFile(remote, {
+    ref: ref.value,
     base,
-    path: pathOf(edit.path, opts),
+    path: path.value,
     find: edit.find,
     replace: edit.replace,
     author: plyPerson(req.author),
     message: req.message,
     time: req.author.time,
-  }, { ...opts, ...head } as Parameters<typeof editFile>[2]))
-  const oid = edited.newCommit
-  const oldOid = edited.noop || !creating ? edited.oldCommit : null
-  return writeResult(edited.noop ? 'noop' : 'commit', target.ref, oid, oldOid, {
-    ...edited,
-    tree: edited.newTree,
-    onto: creating ? edited.oldCommit : oldOid,
-  })
+  }, { ...opts, ...head } as Parameters<typeof editFile>[2])
+  if (!edited.ok) return edited
+  const result = edited.value
+  const oid = result.newCommit
+  const oldOid = result.noop || !creating ? result.oldCommit : null
+  return ok(writeResult(result.noop ? 'noop' : 'commit', target.ref, oid, oldOid, {
+    ...result,
+    tree: result.newTree,
+    onto: creating ? result.oldCommit : oldOid,
+  }))
 }
 
 /**
  * Apply `req` and push. Returns the unified write body.
  * `author` stamps both author and committer unless `committer` is set, in which case the commit is built here
  * (editFile has only one identity).
+ * ref_exists is the Worker's own error, not a PlyError: it is thrown through operation() (see branch.ts). The tree
+ * edits run inside the git.commit.apply span, which records a thrown error, so applyOne and its helpers still throw.
  */
-export async function commitEdit(remote: string, req: EditRequest, opts: CallOpts): Promise<Record<string, unknown>> {
-  return unwrapAsync(operation('commit', remote, {
+export async function commitEdit(remote: string, req: EditRequest, opts: CallOpts): Promise<Result<Record<string, unknown>, PlyError>> {
+  return operation<Record<string, unknown>>('commit', remote, {
     ...opts,
     attrs: { 'git.commit.ops': req.changes.map(change => change.kind), 'git.commit.ref': req.ref === null ? 'HEAD' : req.ref },
   }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
-    const target = await resolveTarget(t, req.ref)
-    assertHead(target, req)
+    const resolvedTarget = await resolveTarget(t, req.ref)
+    if (!resolvedTarget.ok) return resolvedTarget
+    const target = resolvedTarget.value
+    const headCheck = checkHead(target, req)
+    if (!headCheck.ok) return headCheck
     const baseIsOther = req.base.kind === 'ref' && !sameBranch(req.base.ref, target.ref)
     if (target.oid !== null && baseIsOther) throw refExists(target.ref, target.oid)
     const creating = target.oid === null
     const edit = singleEdit(req)
     const stream = edit !== null && req.committer === null && req.base.kind !== 'oid' && (target.oid !== null || baseIsOther)
-    if (edit && !stream && creating && !baseIsOther) throw plyError('not_found', `ref ${target.ref} is unborn or absent; a root commit needs a create`, { miss: { kind: 'ref', ref: target.ref, candidates: [target.ref] } })
+    if (edit && !stream && creating && !baseIsOther) return err(plyError('not_found', `ref ${target.ref} is unborn or absent; a root commit needs a create`, { miss: { kind: 'ref', ref: target.ref, candidates: [target.ref] } }))
     root.set({ 'git.commit.ref': target.ref, 'git.commit.creating': creating, 'git.commit.base': req.base.kind === 'omit' ? '' : req.base.kind === 'oid' ? req.base.oid : req.base.ref })
     if (stream && edit) {
-      try {
-        const body = await streamEdit(remote, req, target, edit, creating, opts)
-        return outcome(String(body.outcome), body)
-      } catch (e) {
-        if (creating && hasErrorCode(e, 'cas_conflict')) {
-          const cur = await advertisedOid(t, target.ref)
-          throw refExists(target.ref, cur === null ? '' : cur)
-        }
-        throw e
-      }
+      const streamed = await streamEdit(remote, req, target, edit, creating, opts)
+      if (streamed.ok) return outcome(String(streamed.value.outcome), streamed.value)
+      if (!creating || streamed.error.code !== 'cas_conflict') return streamed
+      const cur = await advertisedOid(t, target.ref)
+      if (!cur.ok) return cur
+      throw refExists(target.ref, cur.value === null ? '' : cur.value)
     }
-    const parent = await resolveParent(t, req, target)
-    if (!creating && parent.oid !== target.oid) throw plyError('bad_request', `base ${parent.oid} is not the tip of ${target.ref}; omit base to commit on the tip, or name a new ref to start from that commit`)
+    const resolvedParent = await resolveParent(t, req, target)
+    if (!resolvedParent.ok) return resolvedParent
+    const parent = resolvedParent.value
+    if (!creating && parent.oid !== target.oid) return err(plyError('bad_request', `base ${parent.oid} is not the tip of ${target.ref}; omit base to commit on the tip, or name a new ref to start from that commit`))
     const blobs: Blobs = { reads: new Map(), created: new Map() }
     const trees = new Map<string, Uint8Array>()
     let mem: Mem = parent.tree === null ? emptyDir() : lazyNode(MODE_TREE, parent.tree)
@@ -263,13 +279,15 @@ export async function commitEdit(remote: string, req: EditRequest, opts: CallOpt
       root.set({ 'git.commit.tree': built.oid, 'git.commit.oid': target.oid })
       return outcome('noop', writeResult('noop', target.ref, target.oid, target.oid, { tree: built.oid, pushBytes: 0 }))
     }
-    const data = unwrap(encodeCommit({
+    const encoded = encodeCommit({
       tree: built.oid,
       parents: parent.oid ? [parent.oid] : [],
       author: req.author.line,
       committer: committer.line,
       message: messageBody(req.message),
-    }))
+    })
+    if (!encoded.ok) return encoded
+    const data = encoded.value
     const oid = hashObject('commit', data)
     const seen = new Set<string>()
     const used = new Set<string>()
@@ -279,15 +297,15 @@ export async function commitEdit(remote: string, req: EditRequest, opts: CallOpt
     for (const [blob, bytes] of blobs.created) if (used.has(blob) && !seen.has(blob)) { seen.add(blob); objects.push({ type: TYPE.BLOB, data: bytes }) }
     root.set({ 'git.commit.tree': built.oid, 'git.commit.oid': oid, 'git.commit.parent': parent.oid === null ? '' : parent.oid, 'git.commit.objects': objects.length })
     const oldOid = creating ? ZERO_OID : target.oid
-    try {
-      const pushed = await unwrapAsync(push(t, { ref: refname(target.ref), oldOid, newOid: oid, objects })) as { packBytes: number }
-      return outcome('commit', writeResult('commit', target.ref, oid, creating ? null : target.oid, { tree: built.oid, pushBytes: pushed.packBytes, onto: parent.oid }))
-    } catch (e) {
-      if (creating && hasErrorCode(e, 'cas_conflict')) {
-        const cur = await advertisedOid(t, target.ref)
-        throw refExists(target.ref, cur === null ? '' : cur)
-      }
-      throw e
+    const name = parseRefname(target.ref)
+    if (!name.ok) return name
+    const pushed = await push(t, { ref: name.value, oldOid, newOid: oid, objects })
+    if (!pushed.ok) {
+      if (!creating || pushed.error.code !== 'cas_conflict') return pushed
+      const cur = await advertisedOid(t, target.ref)
+      if (!cur.ok) return cur
+      throw refExists(target.ref, cur.value === null ? '' : cur.value)
     }
-  })) as Promise<Record<string, unknown>>
+    return outcome('commit', writeResult('commit', target.ref, oid, creating ? null : target.oid, { tree: built.oid, pushBytes: pushed.value.packBytes, onto: parent.oid }))
+  })
 }

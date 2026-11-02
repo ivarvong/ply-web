@@ -5,19 +5,19 @@
 export const CODE_REF_EXISTS = 'ref_exists';
 export const CODE_STALE_EXPECTED = 'stale_expected';
 
-export const WORKER_RETRY: Readonly<Record<string, string>> = Object.freeze({
+/** The Worker's own codes, beside ply's. status.ts maps each to an HTTP status. */
+export type WorkerCode = typeof CODE_REF_EXISTS | typeof CODE_STALE_EXPECTED;
+
+export const WORKER_RETRY: Readonly<Record<WorkerCode, string>> = Object.freeze({
   [CODE_REF_EXISTS]: 'no',
   [CODE_STALE_EXPECTED]: 'fresh',
 });
 
-export function isWorkerCode(code: unknown): code is string {
+export function isWorkerCode(code: unknown): code is WorkerCode {
   return typeof code === 'string' && Object.prototype.hasOwnProperty.call(WORKER_RETRY, code);
 }
 
-/** A switch that names every member of a closed union. A new member is a type error here, not a silent fall-through. */
-export function assertNever(value: never): never {
-  throw new Error(`unreachable: ${String(value)}`);
-}
+export { assertNever } from '../never.ts';
 
 type RefExists = { oid: string };
 type StaleExpected = { expected: string; actual: string };

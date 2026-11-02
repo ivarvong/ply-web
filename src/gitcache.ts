@@ -28,8 +28,7 @@ import { extractRequestPath, rawPathHasUnsafeSegment } from './pathguard.ts';
 import { parseCfRay } from './rays.ts';
 import { publicUploadPackRepo, scrubSecrets, type TokenSource, withPublicReadCredential, type FetchLike } from './public.ts';
 import { ALLOWED_HOSTS } from './viewer/url.ts';
-import { withLimits } from 'ply';
-import { createGitTransport, makeTracer, readPack } from './viewer/ply.ts';
+import { createTransport, fetchPack, Tracer, withLimits } from 'ply';
 
 export type CacheKind = 'pack' | 'refs' | 'discover';
 
@@ -70,13 +69,16 @@ export async function verifyPackResponse(url: string, body: Uint8Array, bytes: U
   const filter = captureGroup(/[0-9a-f]{4}filter ([^\n]+)\n/.exec(latin1(body)), 1);
   const replay = async () => new Response(bytes.slice(), { status: 200, headers: { 'content-type': contentType } });
   try {
-    const t = createGitTransport(url, { tracer: makeTracer(() => {}, { maxEvents: 0, resource: {} }), fetchImpl: replay, userAgent: 'ply-gitcache', limits: VERIFY_LIMITS, signal: AbortSignal.timeout(30_000), quirks: {} });
-    const r = await readPack(t, { wants, ...(deepen.tag === 'some' ? { deepen: Number(deepen.value) } : {}), ...(filter.tag === 'some' ? { filter: filter.value } : {}), ofsDelta: true }, { resolve: true }) as { parsed: unknown; objects: Map<string, unknown> | null };
-    const objects = fromNullable(r.objects);
+    const made = createTransport(url, { tracer: new Tracer({ exporter: () => {}, maxEvents: 0, resource: {} }), fetchImpl: replay, userAgent: 'ply-gitcache', limits: VERIFY_LIMITS, signal: AbortSignal.timeout(30_000), quirks: {} });
+    if (!made.ok) return { ok: false, reason: failureText(made.error).slice(0, 120) };
+    const r = await fetchPack(made.value, { wants, ...(deepen.tag === 'some' ? { deepen: Number(deepen.value) } : {}), ...(filter.tag === 'some' ? { filter: filter.value } : {}), ofsDelta: true }, { resolve: true });
+    if (!r.ok) return { ok: false, reason: failureText(r.error).slice(0, 120) };
+    const objects = fromNullable(r.value.objects);
     if (objects.tag === 'none') return { ok: false, reason: 'no pack in the answer' };
     const missing = wants.filter(w => !objects.value.has(w));
     return missing.length ? { ok: false, reason: `wanted ${missing.length} oid(s) not in the pack` } : { ok: true, objects: objects.value.size };
   } catch (e) {
+    // A replayed body that errors mid-stream, or a ply invariant: still a pack that is not stored.
     return { ok: false, reason: failureText(e).slice(0, 120) };
   }
 }

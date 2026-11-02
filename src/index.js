@@ -17,7 +17,6 @@ import { createTransport } from 'ply';
 import { Tracer, arrayExporter, flattenLine } from 'ply';
 import { RETRY, isPlyCode, plyError } from 'ply';
 import { withLimits } from 'ply';
-import { unwrap, unwrapAsync } from './ply-result.ts';
 import { isWorkerCode, WORKER_RETRY } from './write/errors.ts';
 import { statusOf } from './status.ts';
 import { handleEdit, handleBranchCreate, handleBranchDelete, handleMerge, handleRebase, handleCherryPick, handleRevert, handleTagCreate, handleTagDelete, readCommitOrEmpty, unbornFields } from './write/handle.ts';
@@ -337,43 +336,57 @@ function errorBody(e) {
   return body;
 }
 
+// A ply error (or the Worker's own) for the response stage: errorBody and statusOf answer it.
+const plyFailure = error => err({ kind: 'ply', error });
+
 const spanView = s => {
   const statusCode = dig(s, ['status', 'code']);
   return { name: s.name, ms: Math.round(s.durationMs * 10) / 10, status: statusCode.tag === 'some' && statusCode.value === 2 ? 'error' : 'ok', attrs: s.attrs, events: s.events.filter(e => e.name !== 'exception').slice(0, 32) };
 };
 const traceSummary = spans => spans.map(s => `${s.name.replace(/^git\.(upload-pack |receive-pack)/, '$1').replace(/ /g, '_')};dur=${Math.round(s.durationMs)}`).join(', ').slice(0, 4000);
 
-// ---- handlers: (ctx) → { status?, body } | Response ----
+// ---- handlers: (ctx) → Result<{ status?, body } | { stream, headers }, PlyError> ----
+// A ply call's failure is its Err, returned as the handler's. index.js answers it with errorBody and statusOf.
 
 const READS = {
   'GET /v1/refs': async ({ remote, q, opts }) => {
     const prefix = q.get('prefix');
-    const t = unwrap(createTransport(remote, opts));
-    const { refs, head } = await unwrapAsync(lsRefs(t, prefix ? [prefix, 'HEAD'] : []));
+    const t = createTransport(remote, opts);
+    if (!t.ok) return t;
+    const listed = await lsRefs(t.value, prefix ? [prefix, 'HEAD'] : []);
+    if (!listed.ok) return listed;
+    const { refs, head } = listed.value;
     const out = {}, peeled = {};
     for (const [name, r] of refs) { if (name === 'HEAD') continue; if (prefix && !name.startsWith(prefix)) continue; out[name] = r.oid; if (r.peeled) peeled[name] = r.peeled; }
     const extra = head ? {} : await unbornFields(remote, opts, head);
-    return { body: { refs: out, head, peeled, ...extra } };
+    return ok({ body: { refs: out, head, peeled, ...extra } });
   },
   'GET /v1/discover': async ({ remote, opts }) => {
-    const info = await unwrapAsync(discover(unwrap(createTransport(remote, opts))));
-    return { body: { ...info, caps: Object.fromEntries(info.caps) } };
+    const t = createTransport(remote, opts);
+    if (!t.ok) return t;
+    const info = await discover(t.value);
+    if (!info.ok) return info;
+    return ok({ body: { ...info.value, caps: Object.fromEntries(info.value.caps) } });
   },
   'GET /v1/tree': async ({ remote, q, opts }) => {
-    const r = await unwrapAsync(listTree(remote, { ref: q.get('ref') || null, path: unwrapOr(queryParam(q, 'path'), '') }, opts));
-    return { body: { ref: r.ref, commit: r.commit, tree: r.tree, entries: r.entries } };
+    const listed = await listTree(remote, { ref: q.get('ref') || null, path: unwrapOr(queryParam(q, 'path'), '') }, opts);
+    if (!listed.ok) return listed;
+    const r = listed.value;
+    return ok({ body: { ref: r.ref, commit: r.commit, tree: r.tree, entries: r.entries } });
   },
-  'GET /v1/commit': async ({ remote, q, opts }) => ({ body: await readCommitOrEmpty(remote, q.get('ref') || null, opts) }),
+  'GET /v1/commit': async ({ remote, q, opts }) => {
+    const read = await readCommitOrEmpty(remote, q.get('ref') || null, opts);
+    return read.ok ? ok({ body: read.value }) : read;
+  },
   'GET /v1/read': async ({ remote, q, opts, spans, ctx, log }) => {
-    let r;
-    try { r = await unwrapAsync(readFile(remote, { ref: q.get('ref') || null, path: q.get('path') }, opts)); }
-    catch (e) {
-      if (isDirectoryRead(e)) {
-        const message = chainGet(e, 'message');
-        throw plyError('bad_request', directoryReadMessage(String(message.tag === 'some' ? message.value : e)));
-      }
-      throw e;
+    const read = await readFile(remote, { ref: q.get('ref') || null, path: q.get('path') }, opts);
+    if (!read.ok) {
+      const e = read.error;
+      if (!isDirectoryRead(e)) return read;
+      const message = chainGet(e, 'message');
+      return err(plyError('bad_request', directoryReadMessage(String(message.tag === 'some' ? message.value : e))));
     }
+    const r = read.value;
     const fixed = new FixedLengthStream(r.size);
     // a verification failure aborts the body short of its Content-Length: the client sees a truncated response, never a
     // clean one with the wrong bytes. holdLastChunk keeps the final bytes back until the blob verified (src/hold-last.ts).
@@ -384,7 +397,7 @@ const READS = {
     const headers = new Headers({ 'content-type': 'application/octet-stream', 'x-ply-ref': r.ref, 'x-ply-commit': r.commit, 'x-ply-blob': r.blob, 'x-ply-mode': r.mode, 'x-ply-size': String(r.size) });
     const summary = traceSummary(spans());
     if (q.get('trace') === '1' && summary) headers.set('x-ply-trace', summary);
-    return { stream: fixed.readable, headers };
+    return ok({ stream: fixed.readable, headers });
   },
 };
 
@@ -561,15 +574,22 @@ const worker = {
           const opts = { ...(credential.tag === 'some' ? { auth: credential.value } : {}), tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), fetchImpl };
           if (!WRITES[key] && presentedRef && isAbbreviatedOid(presentedRef.toLowerCase())) {
             const prefix = presentedRef.toLowerCase();
-            const cands = unwrap(refCandidates(prefix));
-            const { refs } = await unwrapAsync(lsRefs(unwrap(createTransport(remote, opts)), [...new Set([...cands, ...ADVERTISED_REF_PREFIXES])]));
-            if (!cands.some(name => refs.has(name))) {
+            const cands = refCandidates(prefix);
+            if (!cands.ok) return plyFailure(cands.error);
+            const t = createTransport(remote, opts);
+            if (!t.ok) return plyFailure(t.error);
+            const listed = await lsRefs(t.value, [...new Set([...cands.value, ...ADVERTISED_REF_PREFIXES])]);
+            if (!listed.ok) return plyFailure(listed.error);
+            const { refs } = listed.value;
+            if (!cands.value.some(name => refs.has(name))) {
               const match = matchAbbreviatedOid(prefix, refs);
-              if (match.kind !== 'unique') throw plyError('bad_request', match.message);
+              if (match.kind !== 'unique') return plyFailure(plyError('bad_request', match.message));
               url.searchParams.set('ref', match.oid);
             }
           }
-          const out = await handler({ remote, q: url.searchParams, body, opts, spans, ctx, log });
+          const handled = await handler({ remote, q: url.searchParams, body, opts, spans, ctx, log });
+          if (!handled.ok) return plyFailure(handled.error);
+          const out = handled.value;
           if (out && typeof out === 'object' && 'stream' in out) {
             out.headers.set('cache-control', NO_STORE);
             stamp(out.headers);
@@ -589,7 +609,7 @@ const worker = {
           if (url.searchParams.get('trace') === '1') return ok(jsonOut(status, { ...out.body, trace: s.map(spanView) }, extra, stats));
           return ok(jsonOut(status, out.body, extra, stats));
         } catch (e) {
-          if (knownFailure(e)) return err({ kind: 'ply', error: e });
+          if (knownFailure(e)) return plyFailure(e);
           throw e;
         }
       },
