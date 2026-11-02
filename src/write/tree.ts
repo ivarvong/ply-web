@@ -1,6 +1,7 @@
 // Pure tree edits. A `lazy` node is an object the server already has (we send nothing for it). A `dir` is a tree
 // this commit is rebuilding. Empty directories are pruned; git does not store them. The root may be empty.
-import { fail, encodeTree, hashObject } from 'ply';
+import { plyError, encodeTree, hashObject } from 'ply';
+import { unwrap } from '../ply-result.ts';
 import { mapGet } from '../absent.ts';
 import { orNull } from '../option.ts';
 import { MODE_TREE, NOT_FOUND } from './constants.ts';
@@ -25,7 +26,7 @@ export function isTree(node: Mem): boolean {
 }
 
 function withEntry(dir: Mem, name: string, child: Mem | null): Mem {
-  if (dir.kind !== 'dir') throw fail('internal', 'withEntry on a file');
+  if (dir.kind !== 'dir') throw plyError('internal', 'withEntry on a file');
   const entries = new Map(dir.entries);
   if (child === null) entries.delete(name);
   else entries.set(name, child);
@@ -56,23 +57,23 @@ function pathPlace(path: string, comps: readonly string[], name: string): { read
 }
 
 function requireDir(node: Mem, path: string): asserts node is { kind: 'dir'; entries: ReadonlyMap<string, Mem> } {
-  if (node.kind !== 'dir') throw fail('internal', `${path}: tree was not expanded before the edit`);
+  if (node.kind !== 'dir') throw plyError('internal', `${path}: tree was not expanded before the edit`);
 }
 
 /** Insert or replace `leaf` at `comps`. Intermediate directories are created. `overwrite` is write, not create. */
 export function putAt(node: Mem, comps: readonly string[], leaf: Mem, overwrite: boolean, path: string): Mem {
   requireDir(node, path);
   const [name, ...rest] = comps;
-  if (!name) throw fail('bad_request', 'path is empty');
+  if (!name) throw plyError('bad_request', 'path is empty');
   const prev = orNull(mapGet(node.entries, name));
   if (rest.length === 0) {
-    if (prev && isTree(prev)) throw fail('bad_request', `${path} is a directory`);
-    if (prev && !overwrite) throw fail('bad_request', `${path} already exists`);
+    if (prev && isTree(prev)) throw plyError('bad_request', `${path} is a directory`);
+    if (prev && !overwrite) throw plyError('bad_request', `${path} already exists`);
     return withEntry(node, name, leaf);
   }
-  if (prev && !isTree(prev)) throw fail('bad_request', `${path} replaces a file with a directory`);
+  if (prev && !isTree(prev)) throw plyError('bad_request', `${path} replaces a file with a directory`);
   const child = prev && prev.kind === 'dir' ? prev : emptyDir();
-  if (prev && prev.kind !== 'dir') throw fail('internal', `${path}: tree was not expanded before the edit`);
+  if (prev && prev.kind !== 'dir') throw plyError('internal', `${path}: tree was not expanded before the edit`);
   return withEntry(node, name, putAt(child, rest, leaf, overwrite, path));
 }
 
@@ -80,12 +81,12 @@ export function putAt(node: Mem, comps: readonly string[], leaf: Mem, overwrite:
 export function removeAt(node: Mem, comps: readonly string[], path: string): Mem {
   requireDir(node, path);
   const [name, ...rest] = comps;
-  if (!name) throw fail('bad_request', 'path is empty');
+  if (!name) throw plyError('bad_request', 'path is empty');
   const prev = node.entries.get(name);
   const place = pathPlace(path, comps, name);
-  if (!prev) throw fail('not_found', `${path} not found`, { miss: { kind: 'path', missing: name, existingPath: place.existingPath } });
+  if (!prev) throw plyError('not_found', `${path} not found`, { miss: { kind: 'path', missing: name, existingPath: place.existingPath } });
   if (rest.length === 0) return withEntry(node, name, null);
-  if (prev.kind !== 'dir') throw fail('not_found', `${path} not found`, { miss: { kind: 'not_directory', path: place.here, mode: prev.mode } });
+  if (prev.kind !== 'dir') throw plyError('not_found', `${path} not found`, { miss: { kind: 'not_directory', path: place.here, mode: prev.mode } });
   const child = removeAt(prev, rest, path);
   if (child.kind === 'dir' && child.entries.size === 0) return withEntry(node, name, null);
   return withEntry(node, name, child);
@@ -94,11 +95,11 @@ export function removeAt(node: Mem, comps: readonly string[], path: string): Mem
 export function renameAt(node: Mem, from: readonly string[], to: readonly string[]): Mem {
   const source = from.join('/');
   const dest = to.join('/');
-  if (source === dest) throw fail('bad_request', `${source} is already ${dest}`);
-  if (dest.startsWith(`${source}/`)) throw fail('bad_request', `cannot rename ${source} into itself`);
+  if (source === dest) throw plyError('bad_request', `${source} is already ${dest}`);
+  if (dest.startsWith(`${source}/`)) throw plyError('bad_request', `cannot rename ${source} into itself`);
   const found = lookup(node, from);
-  if (!found) throw fail('not_found', `${source} not found`, { miss: { kind: 'path', missing: source, existingPath: '' } });
-  if (lookup(node, to)) throw fail('bad_request', `${dest} already exists`);
+  if (!found) throw plyError('not_found', `${source} not found`, { miss: { kind: 'path', missing: source, existingPath: '' } });
+  if (lookup(node, to)) throw plyError('bad_request', `${dest} already exists`);
   return putAt(removeAt(node, from, source), to, found, false, dest);
 }
 
@@ -117,7 +118,7 @@ export function encodeMem(node: Mem): { oid: string; trees: TreeObject[] } {
     for (const tree of sub.trees) if (!seen.has(tree.oid)) { seen.add(tree.oid); trees.push(tree); }
     entries.push({ mode: child.kind === 'dir' ? MODE_TREE : child.mode, name, oid: sub.oid });
   }
-  const data = encodeTree(entries) as Uint8Array;
+  const data = unwrap(encodeTree(entries)) as Uint8Array;
   const oid = hashObject('tree', data) as string;
   if (!seen.has(oid)) trees.push({ oid, data });
   return { oid, trees };

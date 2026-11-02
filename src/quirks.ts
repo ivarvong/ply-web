@@ -10,12 +10,12 @@ const MAX_ORIGINS = 256;
 const QUIRKS = new Map<string, Quirks>();
 
 export function quirksFor(origin: string): Quirks {
-  let q = QUIRKS.get(origin);
-  if (!q) {
-    if (QUIRKS.size >= MAX_ORIGINS) QUIRKS.clear();
-    q = {};
-    QUIRKS.set(origin, q);
-  }
+  const known = QUIRKS.get(origin);
+  if (known) return known;
+  if (QUIRKS.size >= MAX_ORIGINS) QUIRKS.clear();
+  // ply's defaults (0.2.0 quirks are a total record); the transport updates this same object as it learns.
+  const q: Quirks = { treeFilter: 'tree:0', blobWants: 'many' };
+  QUIRKS.set(origin, q);
   return q;
 }
 

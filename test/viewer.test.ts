@@ -15,6 +15,7 @@ import { TYPE } from 'ply';
 import { encodeObjHeader, spliceDelta, zlibDeflate } from 'ply';
 import { parsePack } from 'ply';
 import { createTransport, lsRefs, Tracer } from 'ply';
+import { unwrap, unwrapAsync } from '../src/ply-result.ts';
 import { git, makeBareRepo, startGitServer, tmpRoot, commitFiles } from './server.js';
 import { startProxy } from './proxy.js';
 import { createBudget } from '../src/viewer/budget.ts';
@@ -520,13 +521,13 @@ test('pack fixture matches git verify-pack; bombs and long chains fail closed', 
   new DataView(bomb.buffer).setUint32(4, 2);
   new DataView(bomb.buffer).setUint32(8, 1);
   bomb.set(encodeObjHeader(TYPE.BLOB, 50_000_000), 12);
-  assert.throws(() => parsePack(bomb, { limits: VIEWER_GIT_LIMITS, maxObjects: VIEWER_CAPS.maxPackObjects, maxInflatedTotal: VIEWER_CAPS.maxInflatedTotal }), (err: Partial<{ code: string; message: string }>) => err.code === 'limit_exceeded' && /pack object size/.test(fill(err.message, '')));
+  assert.throws(() => unwrap(parsePack(bomb, { limits: VIEWER_GIT_LIMITS, maxObjects: VIEWER_CAPS.maxPackObjects, maxInflatedTotal: VIEWER_CAPS.maxInflatedTotal })), (err: Partial<{ code: string; message: string }>) => err.code === 'limit_exceeded' && /pack object size/.test(fill(err.message, '')));
 
   const tooMany = new Uint8Array(32);
   tooMany.set([0x50, 0x41, 0x43, 0x4b]);
   new DataView(tooMany.buffer).setUint32(4, 2);
   new DataView(tooMany.buffer).setUint32(8, 401);
-  assert.throws(() => parsePack(tooMany, { limits: VIEWER_GIT_LIMITS, maxObjects: VIEWER_CAPS.maxPackObjects, maxInflatedTotal: VIEWER_CAPS.maxInflatedTotal }), (err: Partial<{ code: string }>) => err.code === 'limit_exceeded');
+  assert.throws(() => unwrap(parsePack(tooMany, { limits: VIEWER_GIT_LIMITS, maxObjects: VIEWER_CAPS.maxPackObjects, maxInflatedTotal: VIEWER_CAPS.maxInflatedTotal })), (err: Partial<{ code: string }>) => err.code === 'limit_exceeded');
 
   const short = mapPack(await ofsChain(1));
   assert.equal(short.ofsDelta, 1);
@@ -965,16 +966,16 @@ test('same-repo redirects are resolved by the viewer fetch before ply sees them;
 
     // ply alone: the 301 is a typed http error naming where the server pointed; nothing is followed.
     hops.length = 0;
-    const bareTransport = createTransport(`https://github.com/${name}`, { fetchImpl: redirecting, limits: VIEWER_GIT_LIMITS, tracer: new Tracer() });
-    await assert.rejects(lsRefs(bareTransport, ['refs/heads/']), (err: Partial<{ code: string; status: number; location: string; message: string }>) =>
+    const bareTransport = unwrap(createTransport(`https://github.com/${name}`, { fetchImpl: redirecting, limits: VIEWER_GIT_LIMITS, tracer: new Tracer() }));
+    await assert.rejects(unwrapAsync(lsRefs(bareTransport, ['refs/heads/'])), (err: Partial<{ code: string; status: number; location: string; message: string }>) =>
       err.code === 'http' && err.status === 301 && err.location === `https://github.com/${name}.git/git-upload-pack` && /does not follow redirects/.test(fill(err.message, '')));
     assert.deepEqual(hops.map(h => h.status), [301]);
 
     // Through createViewerFetch: every request is redirected once and then answered; ply gets the refs.
     hops.length = 0;
     const guarded = createViewerFetch(redirecting, loc(`https://github.com/${name}`).url, ALLOWED_HOSTS, createBudget(), AbortSignal.timeout(10_000));
-    const t = createTransport(`https://github.com/${name}`, { fetchImpl: guarded, limits: VIEWER_GIT_LIMITS, tracer: new Tracer() });
-    const { refs } = await lsRefs(t, ['refs/heads/']);
+    const t = unwrap(createTransport(`https://github.com/${name}`, { fetchImpl: guarded, limits: VIEWER_GIT_LIMITS, tracer: new Tracer() }));
+    const { refs } = await unwrapAsync(lsRefs(t, ['refs/heads/']));
     assert.equal(slot(refs.get('refs/heads/main'), 'oid'), expected);
     assert.ok(hops.some(h => h.method === 'POST' && h.status === 301), 'the POST was redirected too');
     for (let i = 0; i < hops.length; i += 2) {
@@ -992,7 +993,7 @@ test('same-repo redirects are resolved by the viewer fetch before ply sees them;
     // A redirect loop is cut at the hop cap by the viewer fetch, not handed to ply.
     let loops = 0;
     const loop = createViewerFetch(async () => { loops++; return new Response(null, { status: 302, headers: { location: `https://github.com/${name}/info/refs?service=git-upload-pack` } }); }, loc(`https://github.com/${name}`).url, ALLOWED_HOSTS, createBudget(), AbortSignal.timeout(1000));
-    await assert.rejects(lsRefs(createTransport(`https://github.com/${name}`, { fetchImpl: loop, limits: VIEWER_GIT_LIMITS, tracer: new Tracer() }), ['refs/heads/']), (err: Partial<{ code: string; message: string }>) => err.code === 'bad_request' && /too many redirects/.test(fill(err.message, '')));
+    await assert.rejects(unwrapAsync(lsRefs(unwrap(createTransport(`https://github.com/${name}`, { fetchImpl: loop, limits: VIEWER_GIT_LIMITS, tracer: new Tracer() })), ['refs/heads/'])), (err: Partial<{ code: string; message: string }>) => err.code === 'bad_request' && /too many redirects/.test(fill(err.message, '')));
     assert.equal(loops, VIEWER_CAPS.maxRedirects + 1);
   } finally {
     await srv.close();

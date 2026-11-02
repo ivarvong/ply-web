@@ -7,7 +7,7 @@
 // below the redirect-following guards (createGuardedFetch, createViewerFetch) and each hop calls it again.
 import { atIndex, captureGroup, chainGet, fromNullable, mapGet, thrownField } from './absent.ts';
 import { unwrapOr } from './option.ts';
-import { fail } from 'ply';
+import { plyError } from 'ply';
 import { extractRequestPath, rawPathHasUnsafeSegment } from './pathguard.ts';
 
 import { PUBLIC_NAMESPACE } from './public-namespace.ts';
@@ -81,7 +81,7 @@ export async function publicRepoExists(binding: unknown, name: string): Promise<
 
 /** The canonical remote for a repo in the public namespace. */
 export function publicRemote(name: string, origin: string = PUBLIC_GIT_ORIGIN): string {
-  if (!isPublicRepoName(name)) throw fail('bad_request', 'not a public repository name');
+  if (!isPublicRepoName(name)) throw plyError('bad_request', 'not a public repository name');
   return `${origin}/git/${PUBLIC_NAMESPACE}/${name}.git`;
 }
 
@@ -190,7 +190,7 @@ export function createTokenSource(binding: ArtifactsNamespace, now: () => number
     try {
       const minted = await handle.createToken('read', READ_TOKEN_TTL_S);
       const token = presentText(minted);
-      if (token.length < 8) throw fail('upstream_5xx', 'the public namespace did not return a read token');
+      if (token.length < 8) throw plyError('upstream_5xx', 'the public namespace did not return a read token');
       const old = cache.get(repo);
       if (old) retired.push(old.token);
       if (retired.length > MAX_CACHED_TOKENS) retired.splice(0, retired.length - MAX_CACHED_TOKENS);
@@ -212,7 +212,7 @@ export function createTokenSource(binding: ArtifactsNamespace, now: () => number
   };
   return {
     async readToken(repo) {
-      if (!isPublicRepoName(repo)) throw fail('bad_request', 'not a public repository name');
+      if (!isPublicRepoName(repo)) throw plyError('bad_request', 'not a public repository name');
       const hit = cache.get(repo);
       if (hit && hit.expiresAtMs - now() > READ_TOKEN_REFRESH_S * MS_PER_SECOND) return hit.token;
       let p = pending.get(repo);
@@ -225,8 +225,8 @@ export function createTokenSource(binding: ArtifactsNamespace, now: () => number
         const code = thrownField(e, 'code');
         if (code.tag === 'some' && code.value === 'upstream_5xx') throw e;
         // binding.get throws when the repo does not exist (developers.cloudflare.com/artifacts/api/workers-binding/#getname).
-        if (/not.?found|does not exist|no such/i.test(thrownText(e))) throw fail('not_found', `no repository ${repo} in the public namespace`, { miss: { kind: 'repository' } });
-        throw fail('upstream_5xx', 'could not mint a read token for the public namespace');
+        if (/not.?found|does not exist|no such/i.test(thrownText(e))) throw plyError('not_found', `no repository ${repo} in the public namespace`, { miss: { kind: 'repository' } });
+        throw plyError('upstream_5xx', 'could not mint a read token for the public namespace');
       }
     },
     secrets() {

@@ -1,4 +1,4 @@
-// Worker-level codes. ply's fail() rejects anything outside its RETRY table, and Artifacts answers every lost
+// Worker-level codes. ply's plyError() rejects anything outside its RETRY table, and Artifacts answers every lost
 // compare-and-swap — create onto an existing ref, and delete with a stale old oid — with the same "stale ref".
 // The distinction is made here, before the push, where the current oid is known.
 

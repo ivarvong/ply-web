@@ -1,5 +1,6 @@
 // Pure reading of a write body. Every rejection here is bad_request and happens before any fetch.
-import { fail, parseOid, validateRef, ZERO_OID, type Oid } from 'ply';
+import { plyError, parseOid, validateRef, ZERO_OID, type Oid } from 'ply';
+import { unwrap } from '../ply-result.ts';
 import { fromNullable, recordGet } from '../absent.ts';
 import { BLOB_MODES, MODE_BLOB, OP_CREATE, OP_DELETE, OP_EDIT, OP_RENAME, OP_WRITE } from './constants.ts';
 import { stamp, type Stamp, type UnixSeconds } from './identity.ts';
@@ -41,7 +42,7 @@ function parsedOid(value: unknown): Oid | null {
 }
 
 export function asBody(value: unknown): Body {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw fail('bad_request', 'body must be a JSON object');
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw plyError('bad_request', 'body must be a JSON object');
   return value as Body;
 }
 
@@ -51,10 +52,10 @@ export function fullRef(name: string): string {
 
 /** A branch we may push. A 40-hex string is a commit id, never a branch called that. */
 export function branchRef(value: unknown, field: string): string {
-  if (typeof value !== 'string' || value === '') throw fail('bad_request', `${field} is required`);
-  if (value === ZERO_OID) throw fail('bad_request', `${field} must not be the zero oid`);
-  if (parsedOid(value)) throw fail('bad_request', `${field} must be a branch name, not a commit id`);
-  return validateRef(fullRef(value)) as string;
+  if (typeof value !== 'string' || value === '') throw plyError('bad_request', `${field} is required`);
+  if (value === ZERO_OID) throw plyError('bad_request', `${field} must not be the zero oid`);
+  if (parsedOid(value)) throw plyError('bad_request', `${field} must be a branch name, not a commit id`);
+  return unwrap(validateRef(fullRef(value))) as string;
 }
 
 /**
@@ -62,17 +63,17 @@ export function branchRef(value: unknown, field: string): string {
  * The zero oid is rejected here, before a transport opens. Anything else is a branch name.
  */
 export function refOrCommit(value: unknown, field: string): string {
-  if (typeof value !== 'string' || value === '') throw fail('bad_request', `${field} is required`);
-  if (value === ZERO_OID) throw fail('bad_request', `${field} must not be the zero oid`);
+  if (typeof value !== 'string' || value === '') throw plyError('bad_request', `${field} is required`);
+  if (value === ZERO_OID) throw plyError('bad_request', `${field} must not be the zero oid`);
   if (parsedOid(value)) return value;
   return branchRef(value, field);
 }
 
 export function tagRef(value: unknown): string {
-  if (typeof value !== 'string' || value === '') throw fail('bad_request', 'name is required');
-  if (parsedOid(value)) throw fail('bad_request', 'name must be a tag name, not an object id');
+  if (typeof value !== 'string' || value === '') throw plyError('bad_request', 'name is required');
+  if (parsedOid(value)) throw plyError('bad_request', 'name must be a tag name, not an object id');
   const full = value.startsWith('refs/tags/') ? value : `refs/tags/${value}`;
-  return validateRef(full) as string;
+  return unwrap(validateRef(full)) as string;
 }
 
 /** Missing, null, and empty text. A present 0 or false is not blank. */
@@ -87,8 +88,8 @@ function field(body: Body, key: string) {
 
 export function parseBase(value: unknown): BaseSpec {
   if (blank(value)) return { kind: 'omit' };
-  if (typeof value !== 'string') throw fail('bad_request', 'base must be a branch name or a 40-hex commit id');
-  if (value === ZERO_OID) throw fail('bad_request', 'base must not be the zero oid; omit base to create a root commit');
+  if (typeof value !== 'string') throw plyError('bad_request', 'base must be a branch name or a 40-hex commit id');
+  if (value === ZERO_OID) throw plyError('bad_request', 'base must not be the zero oid; omit base to create a root commit');
   const baseOid = parsedOid(value);
   if (baseOid) return { kind: 'oid', oid: baseOid };
   return { kind: 'ref', ref: branchRef(value, 'base') };
@@ -97,23 +98,23 @@ export function parseBase(value: unknown): BaseSpec {
 /** The oid a delete compares against. Omitted means "whatever ls-refs shows now". The zero oid is not a tip. */
 export function parseDeleteOid(value: unknown): Oid | null {
   if (blank(value)) return null;
-  if (value === ZERO_OID) throw fail('bad_request', 'oid must not be the zero oid');
+  if (value === ZERO_OID) throw plyError('bad_request', 'oid must not be the zero oid');
   const oid = parsedOid(value);
-  if (!oid) throw fail('bad_request', 'oid must be a 40-hex oid');
+  if (!oid) throw plyError('bad_request', 'oid must be a 40-hex oid');
   return oid;
 }
 
 export function parseExpectedHead(value: unknown): ExpectedHead {
   if (blank(value)) return { kind: 'any' };
   const oid = parsedOid(value);
-  if (!oid) throw fail('bad_request', 'head must be a 40-hex oid');
+  if (!oid) throw plyError('bad_request', 'head must be a 40-hex oid');
   return { kind: 'oid', oid };
 }
 
 function parseHint(value: unknown): Oid | null {
   if (blank(value)) return null;
   const oid = parsedOid(value);
-  if (value === ZERO_OID || !oid) throw fail('bad_request', 'hint must be a 40-hex commit id');
+  if (value === ZERO_OID || !oid) throw plyError('bad_request', 'hint must be a 40-hex commit id');
   return oid;
 }
 
@@ -121,20 +122,20 @@ export function parseMode(value: unknown): BlobMode {
   const found = fromNullable(value);
   if (found.tag === 'none') return MODE_BLOB;
   if (typeof value === 'string' && (BLOB_MODES as readonly string[]).includes(value)) return value as BlobMode;
-  throw fail('bad_request', 'mode must be 100644, 100755, or 120000');
+  throw plyError('bad_request', 'mode must be 100644, 100755, or 120000');
 }
 
 function text(value: unknown, field: string): string {
-  if (typeof value !== 'string') throw fail('bad_request', `${field} must be a string`);
+  if (typeof value !== 'string') throw plyError('bad_request', `${field} must be a string`);
   return value;
 }
 
 function contentOf(obj: Body): string {
   const content = field(obj, 'content');
   const replace = field(obj, 'replace');
-  if (content.tag === 'some' && typeof content.value !== 'string') throw fail('bad_request', 'content must be a string');
-  if (replace.tag === 'some' && typeof replace.value !== 'string') throw fail('bad_request', 'replace must be a string');
-  if (content.tag === 'some' && replace.tag === 'some' && content.value !== replace.value) throw fail('bad_request', 'content and replace differ');
+  if (content.tag === 'some' && typeof content.value !== 'string') throw plyError('bad_request', 'content must be a string');
+  if (replace.tag === 'some' && typeof replace.value !== 'string') throw plyError('bad_request', 'replace must be a string');
+  if (content.tag === 'some' && replace.tag === 'some' && content.value !== replace.value) throw plyError('bad_request', 'content and replace differ');
   if (content.tag === 'some' && typeof content.value === 'string') return content.value;
   if (replace.tag === 'some' && typeof replace.value === 'string') return replace.value;
   return '';
@@ -148,7 +149,7 @@ function parseOp(obj: Body): Change {
   }
   if (op === OP_EDIT) {
     const find = text(obj.find, 'find');
-    if (find === '') throw fail('bad_request', 'edit find must be non-empty; omit find, or use op create, to create a file');
+    if (find === '') throw plyError('bad_request', 'edit find must be non-empty; omit find, or use op create, to create a file');
     const replace = field(obj, 'replace');
     return { kind: 'edit', path: text(obj.path, 'path'), find, replace: replace.tag === 'none' ? '' : text(replace.value, 'replace') };
   }
@@ -158,29 +159,29 @@ function parseOp(obj: Body): Change {
     const from = path.tag === 'some' ? path.value : obj.from;
     return { kind: 'rename', from: text(from, 'path'), to: text(obj.to, 'to') };
   }
-  throw fail('bad_request', `op must be ${OP_CREATE}, ${OP_WRITE}, ${OP_EDIT}, ${OP_DELETE}, or ${OP_RENAME}`);
+  throw plyError('bad_request', `op must be ${OP_CREATE}, ${OP_WRITE}, ${OP_EDIT}, ${OP_DELETE}, or ${OP_RENAME}`);
 }
 
 function parseChanges(body: Body): readonly Change[] {
   const changes = field(body, 'changes');
   if (changes.tag === 'some') {
-    if (field(body, 'path').tag === 'some' || field(body, 'find').tag === 'some' || field(body, 'to').tag === 'some' || field(body, 'delete').tag === 'some') throw fail('bad_request', 'pass changes or a single path, not both');
-    if (!Array.isArray(changes.value) || changes.value.length === 0) throw fail('bad_request', 'changes must be a non-empty array');
+    if (field(body, 'path').tag === 'some' || field(body, 'find').tag === 'some' || field(body, 'to').tag === 'some' || field(body, 'delete').tag === 'some') throw plyError('bad_request', 'pass changes or a single path, not both');
+    if (!Array.isArray(changes.value) || changes.value.length === 0) throw plyError('bad_request', 'changes must be a non-empty array');
     return changes.value.map(item => {
-      if (item === null || typeof item !== 'object' || Array.isArray(item)) throw fail('bad_request', 'each change must be an object');
+      if (item === null || typeof item !== 'object' || Array.isArray(item)) throw plyError('bad_request', 'each change must be an object');
       return parseOp(item as Body);
     });
   }
   const path = text(body.path, 'path');
   const deleted = field(body, 'delete');
   if (deleted.tag === 'some' && deleted.value === true) return [{ kind: 'delete', path }];
-  if (deleted.tag === 'some') throw fail('bad_request', 'delete must be true');
+  if (deleted.tag === 'some') throw plyError('bad_request', 'delete must be true');
   const to = field(body, 'to');
   if (to.tag === 'some') return [{ kind: 'rename', from: path, to: text(to.value, 'to') }];
   const find = field(body, 'find');
   const creating = find.tag === 'none' || find.value === '';
   if (creating) return [{ kind: 'create', path, content: contentOf(body), mode: parseMode(body.mode) }];
-  if (typeof find.value !== 'string') throw fail('bad_request', 'find must be a string');
+  if (typeof find.value !== 'string') throw plyError('bad_request', 'find must be a string');
   const replace = field(body, 'replace');
   return [{ kind: 'edit', path, find: find.value, replace: replace.tag === 'none' ? '' : text(replace.value, 'replace') }];
 }
@@ -188,7 +189,7 @@ function parseChanges(body: Body): readonly Change[] {
 export function parseEdit(body: Body, now: UnixSeconds): EditRequest {
   const ref = blank(body.ref) ? null : branchRef(body.ref, 'ref');
   const message = text(body.message, 'message');
-  if (message.includes('\0')) throw fail('bad_request', 'message must not contain NUL');
+  if (message.includes('\0')) throw plyError('bad_request', 'message must not contain NUL');
   const author = stamp(body.author, 'author', now);
   const committer = field(body, 'committer');
   const stampedCommitter = committer.tag === 'none' ? null : stamp(committer.value, 'committer', now);

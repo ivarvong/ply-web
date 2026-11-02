@@ -1,7 +1,8 @@
 // Build a commit from create/write/edit/delete/rename and push it. A missing ref is created (old oid = zero):
 // that is the root commit on an empty repository, and a new branch when `base` names another ref or a commit.
 // One find/replace on an existing file still goes through ply's editFile, which streams the blob.
-import { fail, editFile, encodeCommit, fetchCommit, fetchObject, hashObject, isLfsPointerPrefix, operation, parseOid, parseTree, push, resolveCommit, TYPE, validatePath, ZERO_OID, KIND, type Oid, type Span } from 'ply'
+import { plyError, editFile, encodeCommit, fetchCommit, fetchObject, hashObject, isLfsPointerPrefix, operation, parseOid, parseTree, push, resolveCommit, TYPE, validatePath, ZERO_OID, KIND, type Oid, type Span } from 'ply'
+import { pathOf, refname, unwrap, unwrapAsync } from '../ply-result.ts'
 import { atIndex, mapGet } from '../absent.ts'
 import { advertisedOid, hasErrorCode } from './advertised.ts'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
@@ -46,8 +47,8 @@ async function resolveTarget(t: Transport, ref: string | null): Promise<Target> 
     const head = await readHead(t)
     if (head.kind === 'born') return { ref: head.ref, oid: head.oid }
     if (head.kind === 'unborn') return { ref: head.ref, oid: null }
-    if (head.kind === 'detached') throw fail('bad_request', 'remote HEAD is detached; pass ref explicitly')
-    throw fail('not_found', 'remote HEAD is absent; pass ref explicitly', { miss: { kind: 'head_absent' } })
+    if (head.kind === 'detached') throw plyError('bad_request', 'remote HEAD is detached; pass ref explicitly')
+    throw plyError('not_found', 'remote HEAD is absent; pass ref explicitly', { miss: { kind: 'head_absent' } })
   }
   const listed = await advertisedOid(t, ref)
   return { ref, oid: listed ? oidOf(listed) : null }
@@ -88,7 +89,7 @@ async function commitOf(t: Transport, oid: string): Promise<{ tree: string; pare
 async function resolveParent(t: Transport, req: EditRequest, target: Target): Promise<Parent> {
   if (req.base.kind === 'oid') return { oid: req.base.oid, tree: (await commitOf(t, req.base.oid)).tree }
   if (req.base.kind === 'ref' && !sameBranch(req.base.ref, target.ref)) {
-    const resolved = await resolveCommit(t, req.base.ref) as { commit: string }
+    const resolved = await unwrapAsync(resolveCommit(t, req.base.ref)) as { commit: string }
     return { oid: oidOf(resolved.commit), tree: (await commitOf(t, resolved.commit)).tree }
   }
   if (target.oid === null) return { oid: null, tree: null }
@@ -98,7 +99,7 @@ async function resolveParent(t: Transport, req: EditRequest, target: Target): Pr
 function assertHead(target: Target, req: EditRequest): void {
   if (req.head.kind !== 'oid') return
   const actual = target.oid === null ? ZERO_OID : target.oid
-  if (req.head.oid !== actual) throw fail('cas_conflict', `${target.ref} is at ${actual}, not the expected head ${req.head.oid}`, { expected: req.head.oid, actual })
+  if (req.head.oid !== actual) throw plyError('cas_conflict', `${target.ref} is at ${actual}, not the expected head ${req.head.oid}`, { expected: req.head.oid, actual })
 }
 
 async function asDir(t: Transport, node: Mem, trees: Map<string, Uint8Array>): Promise<Mem> {
@@ -106,11 +107,11 @@ async function asDir(t: Transport, node: Mem, trees: Map<string, Uint8Array>): P
   if (node.mode !== MODE_TREE) return node
   let data = trees.get(node.oid)
   if (!data) {
-    const obj = await fetchObject(t, { oid: node.oid, filter: 'tree:0', expectType: TYPE.TREE })
+    const obj = await unwrapAsync(fetchObject(t, { oid: node.oid, filter: 'tree:0', expectType: TYPE.TREE }))
     data = obj.data as Uint8Array
     trees.set(node.oid, data)
   }
-  const entries = parseTree(data, t.limits) as { name: string; mode: string; oid: string }[]
+  const entries = unwrap(parseTree(data, t.limits)) as { name: string; mode: string; oid: string }[]
   const map = new Map<string, Mem>()
   for (const entry of entries) map.set(entry.name, lazyNode(entry.mode, entry.oid))
   return { kind: 'dir', entries: map }
@@ -128,7 +129,7 @@ async function expandDirs(t: Transport, node: Mem, comps: readonly string[], tre
 }
 
 function compsOf(t: Transport, path: string): string[] {
-  return validatePath(path, t.limits) as string[]
+  return unwrap(validatePath(path, t.limits)).components
 }
 
 type Blobs = { readonly reads: Map<string, Uint8Array>; readonly created: Map<string, Uint8Array> }
@@ -138,7 +139,7 @@ async function blobBytes(t: Transport, oid: string, blobs: Blobs): Promise<Uint8
   const readBlob = createdBlob.tag === 'some' ? createdBlob : mapGet(blobs.reads, oid)
   const held = readBlob.tag === 'some' ? readBlob.value : null
   if (held) return held
-  const obj = await fetchObject(t, { oid, filter: NO_FILTER, expectType: TYPE.BLOB })
+  const obj = await unwrapAsync(fetchObject(t, { oid, filter: NO_FILTER, expectType: TYPE.BLOB }))
   const data = obj.data as Uint8Array
   blobs.reads.set(oid, data)
   return data
@@ -151,7 +152,7 @@ function remember(blobs: Blobs, data: Uint8Array): string {
 }
 
 function rejectPointer(data: Uint8Array, oid: string): void {
-  if (isLfsPointerPrefix(data)) throw fail('lfs_pointer', `${oid} is a Git LFS pointer; the file's content is in the LFS store, not in git`)
+  if (isLfsPointerPrefix(data)) throw plyError('lfs_pointer', `${oid} is a Git LFS pointer; the file's content is in the LFS store, not in git`)
 }
 
 async function applyOne(t: Transport, mem: Mem, change: Change, blobs: Blobs, trees: Map<string, Uint8Array>): Promise<Mem> {
@@ -168,14 +169,14 @@ async function applyOne(t: Transport, mem: Mem, change: Change, blobs: Blobs, tr
   if (change.kind === 'delete') return removeAt(mem, comps, path)
   if (change.kind === 'edit') {
     const leaf = lookup(mem, comps)
-    if (!leaf) throw fail('not_found', `${path} not found`, { miss: { kind: 'path', missing: path, existingPath: '' } })
-    if (leaf.kind === 'lazy' && leaf.mode === '160000') throw fail('not_found', `${path} not found`, { miss: { kind: 'submodule', path, commit: leaf.oid } })
-    if (leaf.kind === 'lazy' && leaf.mode === MODE_TREE) throw fail('not_found', `${path} not found`, { miss: { kind: 'is_directory', path, tree: leaf.oid } })
-    if (leaf.kind === 'dir' || !FILE_MODES.has(leaf.mode)) throw fail('not_found', `${path} not found`, { miss: { kind: 'path', missing: path, existingPath: '' } })
+    if (!leaf) throw plyError('not_found', `${path} not found`, { miss: { kind: 'path', missing: path, existingPath: '' } })
+    if (leaf.kind === 'lazy' && leaf.mode === '160000') throw plyError('not_found', `${path} not found`, { miss: { kind: 'submodule', path, commit: leaf.oid } })
+    if (leaf.kind === 'lazy' && leaf.mode === MODE_TREE) throw plyError('not_found', `${path} not found`, { miss: { kind: 'is_directory', path, tree: leaf.oid } })
+    if (leaf.kind === 'dir' || !FILE_MODES.has(leaf.mode)) throw plyError('not_found', `${path} not found`, { miss: { kind: 'path', missing: path, existingPath: '' } })
     const bytes = await blobBytes(t, leaf.oid, blobs)
     rejectPointer(bytes, leaf.oid)
     const replaced = replaceOnce(bytes, text.encode(change.find), text.encode(change.replace))
-    if (replaced.kind === 'count') throw fail('match_count', `expected exactly one match, found ${replaced.matches}`, { matches: replaced.matches })
+    if (replaced.kind === 'count') throw plyError('match_count', `expected exactly one match, found ${replaced.matches}`, { matches: replaced.matches })
     return putAt(mem, comps, fileLeaf(leaf.mode as typeof BLOB_MODES[number], remember(blobs, replaced.data)), true, path)
   }
   const oid = remember(blobs, text.encode(change.content))
@@ -192,16 +193,16 @@ function singleEdit(req: EditRequest): { path: string; find: string; replace: st
 async function streamEdit(remote: string, req: EditRequest, target: Target, edit: { path: string; find: string; replace: string }, creating: boolean, opts: CallOpts): Promise<Record<string, unknown>> {
   const base = req.base.kind === 'ref' ? req.base.ref : target.ref
   const head = req.head.kind === 'oid' ? { head: req.head.oid, strictHead: true } : req.hint ? { head: req.hint } : {}
-  const edited = await editFile(remote, {
-    ref: target.ref,
+  const edited = await unwrapAsync(editFile(remote, {
+    ref: refname(target.ref),
     base,
-    path: edit.path,
+    path: pathOf(edit.path, opts),
     find: edit.find,
     replace: edit.replace,
     author: plyPerson(req.author),
     message: req.message,
     time: req.author.time,
-  }, { ...opts, ...head })
+  }, { ...opts, ...head } as Parameters<typeof editFile>[2]))
   const oid = edited.newCommit
   const oldOid = edited.noop || !creating ? edited.oldCommit : null
   return writeResult(edited.noop ? 'noop' : 'commit', target.ref, oid, oldOid, {
@@ -217,7 +218,7 @@ async function streamEdit(remote: string, req: EditRequest, target: Target, edit
  * (editFile has only one identity).
  */
 export async function commitEdit(remote: string, req: EditRequest, opts: CallOpts): Promise<Record<string, unknown>> {
-  return operation('commit', remote, {
+  return unwrapAsync(operation('commit', remote, {
     ...opts,
     attrs: { 'git.commit.ops': req.changes.map(change => change.kind), 'git.commit.ref': req.ref === null ? 'HEAD' : req.ref },
   }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
@@ -228,7 +229,7 @@ export async function commitEdit(remote: string, req: EditRequest, opts: CallOpt
     const creating = target.oid === null
     const edit = singleEdit(req)
     const stream = edit !== null && req.committer === null && req.base.kind !== 'oid' && (target.oid !== null || baseIsOther)
-    if (edit && !stream && creating && !baseIsOther) throw fail('not_found', `ref ${target.ref} is unborn or absent; a root commit needs a create`, { miss: { kind: 'ref', ref: target.ref, candidates: [target.ref] } })
+    if (edit && !stream && creating && !baseIsOther) throw plyError('not_found', `ref ${target.ref} is unborn or absent; a root commit needs a create`, { miss: { kind: 'ref', ref: target.ref, candidates: [target.ref] } })
     root.set({ 'git.commit.ref': target.ref, 'git.commit.creating': creating, 'git.commit.base': req.base.kind === 'omit' ? '' : req.base.kind === 'oid' ? req.base.oid : req.base.ref })
     if (stream && edit) {
       try {
@@ -243,7 +244,7 @@ export async function commitEdit(remote: string, req: EditRequest, opts: CallOpt
       }
     }
     const parent = await resolveParent(t, req, target)
-    if (!creating && parent.oid !== target.oid) throw fail('bad_request', `base ${parent.oid} is not the tip of ${target.ref}; omit base to commit on the tip, or name a new ref to start from that commit`)
+    if (!creating && parent.oid !== target.oid) throw plyError('bad_request', `base ${parent.oid} is not the tip of ${target.ref}; omit base to commit on the tip, or name a new ref to start from that commit`)
     const blobs: Blobs = { reads: new Map(), created: new Map() }
     const trees = new Map<string, Uint8Array>()
     let mem: Mem = parent.tree === null ? emptyDir() : lazyNode(MODE_TREE, parent.tree)
@@ -262,13 +263,13 @@ export async function commitEdit(remote: string, req: EditRequest, opts: CallOpt
       root.set({ 'git.commit.tree': built.oid, 'git.commit.oid': target.oid })
       return outcome('noop', writeResult('noop', target.ref, target.oid, target.oid, { tree: built.oid, pushBytes: 0 }))
     }
-    const data = encodeCommit({
+    const data = unwrap(encodeCommit({
       tree: built.oid,
       parents: parent.oid ? [parent.oid] : [],
       author: req.author.line,
       committer: committer.line,
       message: messageBody(req.message),
-    })
+    }))
     const oid = hashObject('commit', data)
     const seen = new Set<string>()
     const used = new Set<string>()
@@ -279,7 +280,7 @@ export async function commitEdit(remote: string, req: EditRequest, opts: CallOpt
     root.set({ 'git.commit.tree': built.oid, 'git.commit.oid': oid, 'git.commit.parent': parent.oid === null ? '' : parent.oid, 'git.commit.objects': objects.length })
     const oldOid = creating ? ZERO_OID : target.oid
     try {
-      const pushed = await push(t, { ref: target.ref, oldOid, newOid: oid, objects }) as { packBytes: number }
+      const pushed = await unwrapAsync(push(t, { ref: refname(target.ref), oldOid, newOid: oid, objects })) as { packBytes: number }
       return outcome('commit', writeResult('commit', target.ref, oid, creating ? null : target.oid, { tree: built.oid, pushBytes: pushed.packBytes, onto: parent.oid }))
     } catch (e) {
       if (creating && hasErrorCode(e, 'cas_conflict')) {
@@ -288,5 +289,5 @@ export async function commitEdit(remote: string, req: EditRequest, opts: CallOpt
       }
       throw e
     }
-  }) as Promise<Record<string, unknown>>
+  })) as Promise<Record<string, unknown>>
 }

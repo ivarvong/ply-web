@@ -1,7 +1,8 @@
-import { fail } from 'ply';
+import { plyError } from 'ply';
 import { atIndex, captureGroup, chainGet } from '../absent.ts';
 import { unwrapOr } from '../option.ts';
 import { validatePath } from 'ply';
+import { unwrap } from '../ply-result.ts';
 import { VIEWER_CAPS, VIEWER_GIT_LIMITS } from './limits.ts';
 import type { FilterName } from './model.ts';
 import { interpretRemote } from './paste.ts';
@@ -31,7 +32,7 @@ const SECRET_QUERY = /^(access_token|token|password|auth|authorization|git-token
 const OID = /^[0-9a-f]{40}$/;
 
 function bad(message: string): never {
-  throw fail('bad_request', message);
+  throw plyError('bad_request', message);
 }
 
 export function routeOptsFromEnv(env: unknown): RouteOpts {
@@ -88,7 +89,7 @@ function parsePath(raw: string | null): string {
   const stripped = raw.replace(/^\/+|\/+$/g, '');
   if (!stripped) return '';
   if (stripped.length > 1024) bad('path is too long');
-  validatePath(stripped, VIEWER_GIT_LIMITS);
+  unwrap(validatePath(stripped, VIEWER_GIT_LIMITS));
   return stripped;
 }
 
@@ -149,8 +150,8 @@ export function parseViewerRoute(url: URL, opts: RouteOpts): ViewerRoute {
   if (url.pathname.startsWith('/r/')) {
     const rest = url.pathname.slice('/r/'.length);
     let name: string;
-    try { name = decodeURIComponent(rest); } catch { throw fail('not_found', `not a repository in ${PUBLIC_NAMESPACE}`, { miss: { kind: 'repository' } }); }
-    if (name.includes('/') || !isPublicRepoName(name)) throw fail('not_found', `not a repository in ${PUBLIC_NAMESPACE}`, { miss: { kind: 'repository' } });
+    try { name = decodeURIComponent(rest); } catch { throw plyError('not_found', `not a repository in ${PUBLIC_NAMESPACE}`, { miss: { kind: 'repository' } }); }
+    if (name.includes('/') || !isPublicRepoName(name)) throw plyError('not_found', `not a repository in ${PUBLIC_NAMESPACE}`, { miss: { kind: 'repository' } });
     loc = validateLocation(publicRemote(name), opts);
   } else {
     if (!url.pathname.startsWith('/view/')) bad('not a viewer route');

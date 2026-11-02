@@ -3,6 +3,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { encodeTag, hashObject, ZERO_OID } from 'ply'
+import { unwrap } from '../src/ply-result.ts'
 import { MODE_BLOB } from '../src/write/constants.ts'
 import { type CallOpts } from '../src/write/call.ts'
 import { createBranch } from '../src/write/branch.ts'
@@ -254,7 +255,7 @@ test('write results share oid aliases and empty outcomes are noops', () => {
 test('annotated tag bytes hash the way git hash-object does', () => {
   const object = 'a'.repeat(40)
   const tagger = 'w <w@x> 1700000000 +0530'
-  const data = encodeTag({ object, type: 'commit', tag: 'v2', tagger, message: 'version two\n' })
+  const data = unwrap(encodeTag({ object, type: 'commit', tag: 'v2', tagger, message: 'version two\n' }))
   const oid = hashObject('tag', data) as string
   const gitOid = execFileSync('git', ['hash-object', '-t', 'tag', '--stdin'], { input: data }).toString().trim()
   assert.equal(oid, gitOid)
