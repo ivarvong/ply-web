@@ -6,6 +6,7 @@
 // An Err's error is thrown exactly as ply 0.1 threw it (the same Error instance, the same code and fields).
 import { CODES, DEFAULT_LIMITS, discover, parsePath, parseRefname, type Path, type Refname } from 'ply';
 import { chainGet } from './absent.ts';
+import type { Result } from './http/machine.ts';
 
 type PlyResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown };
 
@@ -30,8 +31,9 @@ export async function unwrapAsync<T>(p: Promise<PlyResult<T>>): Promise<T> {
 // bad_request, as ply 0.1's push and editFile did when they validated the same string.
 export const refname = (ref: string): Refname => unwrap(parseRefname(ref));
 // `opts` is the call's options: its limits (ply's defaults when it names none, as operation() does) bound the path.
-export function pathOf(path: string, opts: object): Path {
+export function pathIn(path: string, opts: object): Result<Path, PlyError> {
   const given = chainGet(opts, 'limits');
   const limits = given.tag === 'some' && typeof given.value === 'object' && given.value !== null ? given.value : DEFAULT_LIMITS;
-  return unwrap(parsePath(path, limits)).path;
+  const parsed = parsePath(path, limits);
+  return parsed.ok ? { ok: true, value: parsed.value.path } : parsed;
 }

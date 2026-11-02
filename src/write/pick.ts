@@ -6,7 +6,8 @@
 // and ignored the extra paths. `allowEmpty` is ply's `empty: 'keep'` (`kept_empty`, an applied commit on the same
 // tree). `empty: 'stop'` reports empty and writes nothing.
 import { cherryPick, plyError, revertCommit } from 'ply'
-import { unwrapAsync } from '../ply-result.ts'
+import { ok, type Result } from '../http/machine.ts'
+import { type PlyError } from '../ply-result.ts'
 import { type CallOpts } from './call.ts'
 import { type Stamp } from './identity.ts'
 import { firstPresent, writeResult } from './result.ts'
@@ -28,7 +29,7 @@ export type MappedPick =
 
 /**
  * ply's pick result. `empty`, `ok`, and `kept_empty` are the whole `PickOutcome` union. Any other string is an
- * internal error (HTTP 500), not a guessed success. `merge_conflict` is not a result: ply throws it, and the status
+ * internal error (HTTP 500), not a guessed success. `merge_conflict` is not a result: ply returns it as an Err, and the status
  * table maps that code to 409.
  */
 export function mapPickOutcome(result: PlyPickResult, revert: boolean): MappedPick {
@@ -51,16 +52,17 @@ function emptyResult(ref: string, oid: string): Record<string, unknown> {
   return writeResult('empty', ref, oid, oid, {})
 }
 
-export async function pick(remote: string, opts: CallOpts, spec: { ref: string; commit: string; committer: Stamp; message: string | null; allowEmpty: boolean; revert: boolean }): Promise<Record<string, unknown>> {
+export async function pick(remote: string, opts: CallOpts, spec: { ref: string; commit: string; committer: Stamp; message: string | null; allowEmpty: boolean; revert: boolean }): Promise<Result<Record<string, unknown>, PlyError>> {
   const run = spec.revert ? revertCommit : cherryPick
-  const result = await unwrapAsync(run(remote, {
+  const picked = await run(remote, {
     ref: spec.ref,
     commit: spec.commit,
     committer: { name: spec.committer.name, email: spec.committer.email, tz: spec.committer.tz, time: spec.committer.time },
     message: spec.message,
     empty: spec.allowEmpty ? 'keep' : 'stop',
-  }, opts)) as PlyPickResult
-  const mapped = mapPickOutcome(result, spec.revert)
-  if (mapped.kind === 'empty') return emptyResult(mapped.ref, mapped.oid)
-  return writeResult(mapped.name, mapped.ref, mapped.oid, mapped.oldOid, { tree: mapped.tree, pushBytes: mapped.pushBytes })
+  }, opts)
+  if (!picked.ok) return picked
+  const mapped = mapPickOutcome(picked.value as PlyPickResult, spec.revert)
+  if (mapped.kind === 'empty') return ok(emptyResult(mapped.ref, mapped.oid))
+  return ok(writeResult(mapped.name, mapped.ref, mapped.oid, mapped.oldOid, { tree: mapped.tree, pushBytes: mapped.pushBytes }))
 }
