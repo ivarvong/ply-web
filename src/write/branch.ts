@@ -1,7 +1,8 @@
 // Create or delete a ref. `from: 000…0` is rejected before any transport is opened, so nothing is pushed.
 // An existing ref is ref_exists (retry no). A delete whose expected oid is stale is stale_expected and carries
 // the oid the ref actually points at.
-import { fail, fetchCommit, operation, parseOid, push, resolveCommit, ZERO_OID } from 'ply'
+import { plyError, fetchCommit, operation, parseOid, push, resolveCommit, ZERO_OID } from 'ply'
+import { refname, unwrapAsync } from '../ply-result.ts'
 import { fromNullable } from '../absent.ts'
 import { advertisedOid, hasErrorCode } from './advertised.ts'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
@@ -40,31 +41,31 @@ async function tipOf(t: Transport, from: string): Promise<string> {
     }
     return from
   }
-  return (await resolveCommit(t, from) as { commit: string }).commit
+  return (await unwrapAsync(resolveCommit(t, from)) as { commit: string }).commit
 }
 
 async function bornTip(t: Transport): Promise<string> {
   const head = await readHead(t)
   if (head.kind === 'born') return head.oid
-  if (head.kind === 'unborn') throw fail('bad_request', `from is required when the remote HEAD is unborn (${head.ref})`)
-  if (head.kind === 'detached') throw fail('bad_request', 'from is required when the remote HEAD is detached')
-  throw fail('bad_request', 'from is required when the remote HEAD is absent')
+  if (head.kind === 'unborn') throw plyError('bad_request', `from is required when the remote HEAD is unborn (${head.ref})`)
+  if (head.kind === 'detached') throw plyError('bad_request', 'from is required when the remote HEAD is detached')
+  throw plyError('bad_request', 'from is required when the remote HEAD is absent')
 }
 
 export async function createBranch(remote: string, refName: unknown, from: unknown, opts: CallOpts): Promise<Record<string, unknown>> {
   const ref = branchRef(refName, 'ref')
-  // Zero is refused here, before operation() opens a transport, so receive-pack is never called.
-  if (from === ZERO_OID) throw fail('bad_request', 'from must not be the zero oid')
+  // Zero is refused here, before unwrapAsync(operation()) opens a transport, so receive-pack is never called.
+  if (from === ZERO_OID) throw plyError('bad_request', 'from must not be the zero oid')
   const present = fromNullable(from)
-  if (present.tag === 'some' && present.value !== '' && typeof present.value !== 'string') throw fail('bad_request', 'from must be a branch name or a commit id')
+  if (present.tag === 'some' && present.value !== '' && typeof present.value !== 'string') throw plyError('bad_request', 'from must be a branch name or a commit id')
   const specified = typeof from === 'string' && from !== '' ? from : null
-  return operation('branch_create', remote, { ...opts, attrs: { 'git.branch_create.ref': ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
+  return unwrapAsync(operation('branch_create', remote, { ...opts, attrs: { 'git.branch_create.ref': ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
     const existing = await advertisedOid(t, ref)
     if (existing) throw refExists(ref, existing)
     const commit = specified === null ? await bornTip(t) : await tipOf(t, specified)
     root.set({ 'git.branch_create.oid': commit })
     try {
-      const pushed = await push(t, { ref, oldOid: ZERO_OID, newOid: commit, objects: [] }) as { packBytes: number }
+      const pushed = await unwrapAsync(push(t, { ref: refname(ref), oldOid: ZERO_OID, newOid: commit, objects: [] })) as { packBytes: number }
       return outcome('created', writeResult('created', ref, commit, null, { pushBytes: pushed.packBytes }))
     } catch (e) {
       if (hasErrorCode(e, 'cas_conflict')) {
@@ -73,22 +74,22 @@ export async function createBranch(remote: string, refName: unknown, from: unkno
       }
       throw e
     }
-  }) as Promise<Record<string, unknown>>
+  })) as Promise<Record<string, unknown>>
 }
 
 export async function deleteRef(remote: string, ref: string, expected: string | null, opts: CallOpts, op: 'branch_delete' | 'tag_delete'): Promise<Record<string, unknown>> {
-  return operation(op, remote, { ...opts, attrs: { [`git.${op}.ref`]: ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
+  return unwrapAsync(operation(op, remote, { ...opts, attrs: { [`git.${op}.ref`]: ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
     const current = await advertisedOid(t, ref)
-    if (!current) throw fail('not_found', `ref ${ref} not found`, { miss: { kind: 'ref', ref, candidates: [ref] } })
+    if (!current) throw plyError('not_found', `ref ${ref} not found`, { miss: { kind: 'ref', ref, candidates: [ref] } })
     if (expected && expected !== current) throw staleExpected(ref, expected, current)
     root.set({ [`git.${op}.oid`]: current, [`git.${op}.cas_from_caller`]: expected !== null })
     try {
-      await push(t, { ref, oldOid: current, newOid: ZERO_OID, objects: [] })
+      await unwrapAsync(push(t, { ref: refname(ref), oldOid: current, newOid: ZERO_OID, objects: [] }))
     } catch (e) {
       if (!hasErrorCode(e, 'cas_conflict')) throw e
       const now = await advertisedOid(t, ref)
       throw staleExpected(ref, expected === null ? current : expected, now === null ? current : now)
     }
     return outcome('deleted', writeResult('deleted', ref, null, current, { deleted: current }))
-  }) as Promise<Record<string, unknown>>
+  })) as Promise<Record<string, unknown>>
 }

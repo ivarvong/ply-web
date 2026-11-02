@@ -15,6 +15,7 @@ import { PUBLIC_GIT_ORIGIN, publicRemote, type ArtifactsNamespace, type FetchLik
 import { checkRemote, createGuardedFetch } from './remote.ts';
 import { Tracer, ZERO_OID, arrayExporter, createTransport, fetchPack, lsRefs, push, withLimits } from 'ply';
 import type { Transport } from 'ply/transport';
+import { refname, unwrap, unwrapAsync } from './ply-result.ts';
 
 export type Mirror = { repo: string; source: string; branch: string };
 
@@ -67,7 +68,7 @@ function releaseStub(handle: unknown): void {
 
 async function tip(t: Transport, branch: string): Promise<string | null> {
   const ref = `refs/heads/${branch}`;
-  const { refs } = await lsRefs(t, [ref]);
+  const { refs } = await unwrapAsync(lsRefs(t, [ref]));
   const row = mapGet(refs, ref);
   if (row.tag === 'none') return null;
   return row.value.oid;
@@ -99,14 +100,14 @@ export async function syncMirror(m: Mirror, deps: SyncDeps): Promise<SyncResult>
   const blank = { from: null, to: null, objects: null, pushBytes: null, code: null, message: null };
   try {
     const src = checkRemote(m.source);
-    const srcT = createTransport(src.href, { tracer: tracer(), limits: LIMITS, quirks: {}, fetchImpl: createGuardedFetch(raw, src) });
+    const srcT = unwrap(createTransport(src.href, { tracer: tracer(), limits: LIMITS, quirks: {}, fetchImpl: createGuardedFetch(raw, src) }));
     const dst = checkRemote(mirrorUrl, allow);
     const read = await deps.tokens.readToken(m.repo);
-    const dstT = createTransport(dst.href, { tracer: tracer(), limits: LIMITS, quirks: {}, auth: { bearer: read }, fetchImpl: createGuardedFetch(raw, dst, allow) });
+    const dstT = unwrap(createTransport(dst.href, { tracer: tracer(), limits: LIMITS, quirks: {}, auth: { bearer: read }, fetchImpl: createGuardedFetch(raw, dst, allow) }));
     const [want, have] = await Promise.all([tip(srcT, m.branch), tip(dstT, m.branch)]);
     if (!want) return { repo: m.repo, outcome: 'error', ...blank, code: 'not_found', message: `source has no ${m.branch}`, ms: Date.now() - t0 };
     if (want === have) return { repo: m.repo, outcome: 'in-sync', ...blank, from: have, to: want, ms: Date.now() - t0 };
-    const r = await fetchPack(srcT, { wants: [want], haves: have ? [have] : [], ofsDelta: true, thinPack: false, done: true }, { resolve: true });
+    const r = await unwrapAsync(fetchPack(srcT, { wants: [want], haves: have ? [have] : [], ofsDelta: true, thinPack: false, done: true }, { resolve: true }));
     const objects = r.objects ? [...r.objects.values()] : [];
     const handle = await deps.binding.get(m.repo);
     let writeToken = '';
@@ -115,8 +116,8 @@ export async function syncMirror(m: Mirror, deps: SyncDeps): Promise<SyncResult>
       const plain = chainGet(minted, 'plaintext');
       writeToken = plain.tag === 'some' ? String(plain.value) : '';
       if (!writeToken) throw Object.assign(new Error('no write token'), { code: 'upstream_5xx' });
-      const dstW = createTransport(dst.href, { tracer: tracer(), limits: LIMITS, quirks: {}, auth: { bearer: writeToken }, fetchImpl: createGuardedFetch(raw, dst, allow) });
-      const pushed = await push(dstW, { ref: `refs/heads/${m.branch}`, oldOid: have === null ? ZERO_OID : have, newOid: want, objects });
+      const dstW = unwrap(createTransport(dst.href, { tracer: tracer(), limits: LIMITS, quirks: {}, auth: { bearer: writeToken }, fetchImpl: createGuardedFetch(raw, dst, allow) }));
+      const pushed = await unwrapAsync(push(dstW, { ref: refname(`refs/heads/${m.branch}`), oldOid: have === null ? ZERO_OID : have, newOid: want, objects }));
       const bytes = chainGet(pushed, 'packBytes');
       const pushBytes = bytes.tag === 'some' && typeof bytes.value === 'number' ? bytes.value : 0;
       return { repo: m.repo, outcome: 'updated', ...blank, from: have, to: want, objects: objects.length, pushBytes, ms: Date.now() - t0 };

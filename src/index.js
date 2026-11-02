@@ -15,8 +15,9 @@ import { lsRefs } from 'ply';
 import { discover } from 'ply';
 import { createTransport } from 'ply';
 import { Tracer, arrayExporter, flattenLine } from 'ply';
-import { RETRY, isPlyCode, fail } from 'ply';
+import { RETRY, isPlyCode, plyError } from 'ply';
 import { withLimits } from 'ply';
+import { unwrap, unwrapAsync } from './ply-result.ts';
 import { isWorkerCode, WORKER_RETRY } from './write/errors.ts';
 import { statusOf } from './status.ts';
 import { handleEdit, handleBranchCreate, handleBranchDelete, handleMerge, handleRebase, handleCherryPick, handleRevert, handleTagCreate, handleTagDelete, readCommitOrEmpty, unbornFields } from './write/handle.ts';
@@ -203,7 +204,7 @@ function decodeBasic(payload) {
 
 export function gitAuth(headers, host) {
   const ga = headers.get('git-authorization'), gt = headers.get('git-token');
-  if (ga && gt) throw fail('bad_request', 'send Git-Authorization or Git-Token, not both');
+  if (ga && gt) throw plyError('bad_request', 'send Git-Authorization or Git-Token, not both');
   if (ga) {
     const secrets = [ga, ga.replace(/^\S+\s+/, '')];
     if (/^basic\s/i.test(ga)) {
@@ -275,13 +276,13 @@ async function timingSafeTokenEqual(a, b) {
 
 async function readJson(req) {
   const len = headerNumber(readHeader(req.headers, 'content-length'));
-  if (len > MAX_BODY) throw fail('limit_exceeded', `request body over ${MAX_BODY} bytes`);
+  if (len > MAX_BODY) throw plyError('limit_exceeded', `request body over ${MAX_BODY} bytes`);
   if (!req.body) return {};
   const parts = []; let n = 0;
-  for await (const c of req.body) { n += c.length; if (n > MAX_BODY) throw fail('limit_exceeded', `request body over ${MAX_BODY} bytes`); parts.push(c); }
+  for await (const c of req.body) { n += c.length; if (n > MAX_BODY) throw plyError('limit_exceeded', `request body over ${MAX_BODY} bytes`); parts.push(c); }
   const text = new TextDecoder().decode(parts.length === 1 ? parts[0] : new Uint8Array(await new Blob(parts).arrayBuffer()));
   if (!text.trim()) return {};
-  try { const v = JSON.parse(text); if (!v || typeof v !== 'object' || Array.isArray(v)) throw 0; return v; } catch { throw fail('bad_request', 'body must be a JSON object'); }
+  try { const v = JSON.parse(text); if (!v || typeof v !== 'object' || Array.isArray(v)) throw 0; return v; } catch { throw plyError('bad_request', 'body must be a JSON object'); }
 }
 
 // /v1 is a credentialed API: nothing it answers is stored by a browser or a cache, whatever the ref names.
@@ -347,29 +348,29 @@ const traceSummary = spans => spans.map(s => `${s.name.replace(/^git\.(upload-pa
 const READS = {
   'GET /v1/refs': async ({ remote, q, opts }) => {
     const prefix = q.get('prefix');
-    const t = createTransport(remote, opts);
-    const { refs, head } = await lsRefs(t, prefix ? [prefix, 'HEAD'] : []);
+    const t = unwrap(createTransport(remote, opts));
+    const { refs, head } = await unwrapAsync(lsRefs(t, prefix ? [prefix, 'HEAD'] : []));
     const out = {}, peeled = {};
     for (const [name, r] of refs) { if (name === 'HEAD') continue; if (prefix && !name.startsWith(prefix)) continue; out[name] = r.oid; if (r.peeled) peeled[name] = r.peeled; }
     const extra = head ? {} : await unbornFields(remote, opts, head);
     return { body: { refs: out, head, peeled, ...extra } };
   },
   'GET /v1/discover': async ({ remote, opts }) => {
-    const info = await discover(createTransport(remote, opts));
+    const info = await unwrapAsync(discover(unwrap(createTransport(remote, opts))));
     return { body: { ...info, caps: Object.fromEntries(info.caps) } };
   },
   'GET /v1/tree': async ({ remote, q, opts }) => {
-    const r = await listTree(remote, { ref: q.get('ref') || null, path: unwrapOr(queryParam(q, 'path'), '') }, opts);
+    const r = await unwrapAsync(listTree(remote, { ref: q.get('ref') || null, path: unwrapOr(queryParam(q, 'path'), '') }, opts));
     return { body: { ref: r.ref, commit: r.commit, tree: r.tree, entries: r.entries } };
   },
   'GET /v1/commit': async ({ remote, q, opts }) => ({ body: await readCommitOrEmpty(remote, q.get('ref') || null, opts) }),
   'GET /v1/read': async ({ remote, q, opts, spans, ctx, log }) => {
     let r;
-    try { r = await readFile(remote, { ref: q.get('ref') || null, path: q.get('path') }, opts); }
+    try { r = await unwrapAsync(readFile(remote, { ref: q.get('ref') || null, path: q.get('path') }, opts)); }
     catch (e) {
       if (isDirectoryRead(e)) {
         const message = chainGet(e, 'message');
-        throw fail('bad_request', directoryReadMessage(String(message.tag === 'some' ? message.value : e)));
+        throw plyError('bad_request', directoryReadMessage(String(message.tag === 'some' ? message.value : e)));
       }
       throw e;
     }
@@ -560,11 +561,11 @@ const worker = {
           const opts = { ...(credential.tag === 'some' ? { auth: credential.value } : {}), tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), fetchImpl };
           if (!WRITES[key] && presentedRef && isAbbreviatedOid(presentedRef.toLowerCase())) {
             const prefix = presentedRef.toLowerCase();
-            const cands = refCandidates(prefix);
-            const { refs } = await lsRefs(createTransport(remote, opts), [...new Set([...cands, ...ADVERTISED_REF_PREFIXES])]);
+            const cands = unwrap(refCandidates(prefix));
+            const { refs } = await unwrapAsync(lsRefs(unwrap(createTransport(remote, opts)), [...new Set([...cands, ...ADVERTISED_REF_PREFIXES])]));
             if (!cands.some(name => refs.has(name))) {
               const match = matchAbbreviatedOid(prefix, refs);
-              if (match.kind !== 'unique') throw fail('bad_request', match.message);
+              if (match.kind !== 'unique') throw plyError('bad_request', match.message);
               url.searchParams.set('ref', match.oid);
             }
           }

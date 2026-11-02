@@ -13,10 +13,14 @@ import { commitView as commitViewJs, entryType as entryTypeJs, lsMode as lsModeJ
 import type { FetchLike } from './fetchguard.ts';
 import type { ParsedPack } from './packmap.ts';
 import type { Quirks } from '../quirks.ts';
+import { unwrap, unwrapAsync } from '../ply-result.ts';
 
 function loose<T>(fn: unknown): T {
   return fn as T;
 }
+
+// ply 0.2.0 returns its failures as values; the viewer throws them (ply-result.ts), as ply 0.1 did.
+type PlyResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown };
 
 export type GitTransport = object;
 
@@ -58,25 +62,31 @@ export function createGitTransport(url: string, opts: {
   userAgent: string;
   limits: object;
   signal: AbortSignal;
-  quirks: Quirks;
+  quirks: Partial<Quirks>;
 }): GitTransport {
-  return loose<(url: string, opts: object) => GitTransport>(createTransportJs)(url, opts);
+  return unwrap(loose<(url: string, opts: object) => PlyResult<GitTransport>>(createTransportJs)(url, opts));
 }
 
-export const discoverRepo: (transport: GitTransport) => Promise<DiscoverInfo> = loose(discoverJs);
-export const listRefs: (transport: GitTransport, prefixes: string[]) => Promise<{ refs: Map<string, { oid: string } & Partial<{ peeled: string }>>; head: string | null }> = loose(lsRefsJs);
-export const candidates: (ref: string | null) => string[] = loose(refCandidatesJs);
-export const viewCommit: (data: Uint8Array, limits: object) => CommitView = loose(commitViewJs);
+export const discoverRepo = async (transport: GitTransport): Promise<DiscoverInfo> => unwrapAsync(loose<(t: GitTransport) => Promise<PlyResult<DiscoverInfo>>>(discoverJs)(transport));
+type Listing = { refs: Map<string, { oid: string } & Partial<{ peeled: string }>>; head: string | null };
+export const listRefs = async (transport: GitTransport, prefixes: string[]): Promise<Listing> => unwrapAsync(loose<(t: GitTransport, p: string[]) => Promise<PlyResult<Listing>>>(lsRefsJs)(transport, prefixes));
+export const candidates = (ref: string | null): string[] => unwrap(loose<(r: string | null) => PlyResult<string[]>>(refCandidatesJs)(ref));
+export const viewCommit = (data: Uint8Array, limits: object): CommitView => unwrap(loose<(d: Uint8Array, l: object) => PlyResult<CommitView>>(commitViewJs)(data, limits));
 export const treeEntryType: (mode: string) => string = loose(entryTypeJs);
 export const treeMode: (mode: string) => string = loose(lsModeJs);
-export const readObject: (transport: GitTransport, opts: { oid: string } & Partial<{ filter: string; deepen: number; expectType: number | null }>) => Promise<Fetched> = loose(fetchObjectJs);
-export const readPack: (transport: GitTransport, opts: object, extra: Partial<{ resolve: boolean; attrs: Record<string, unknown> }> | null) => Promise<{ parsed: ParsedPack | null; objects: Map<string, { type: number; data: Uint8Array }> | null }> = loose(fetchPackJs);
+type ObjectOpts = { oid: string } & Partial<{ filter: string; deepen: number; expectType: number | null }>;
+export const readObject = async (transport: GitTransport, opts: ObjectOpts): Promise<Fetched> => unwrapAsync(loose<(t: GitTransport, o: ObjectOpts) => Promise<PlyResult<Fetched>>>(fetchObjectJs)(transport, opts));
+type PackExtra = Partial<{ resolve: boolean; attrs: Record<string, unknown> }> | null;
+type FetchedPack = { parsed: ParsedPack | null; objects: Map<string, { type: number; data: Uint8Array }> | null };
+export const readPack = async (transport: GitTransport, opts: object, extra: PackExtra): Promise<FetchedPack> => unwrapAsync(loose<(t: GitTransport, o: object, e: PackExtra) => Promise<PlyResult<FetchedPack>>>(fetchPackJs)(transport, opts, extra));
 export const filterRejected: (err: unknown) => boolean = loose(isFilterRejectionJs);
 export const streamPack: (transport: GitTransport, opts: object, span: ViewerSpan) => AsyncIterable<Uint8Array> = loose(packStreamJs);
 export const cursorInit: () => PackCursor = loose(spInitJs);
-export const cursorStep: (cursor: PackCursor, chunk: Uint8Array) => { state: PackCursor; zlib: Uint8Array[] } = loose(spStepJs);
-export const cursorFinish: (cursor: PackCursor) => PackCursor = loose(spFinishJs);
-export const inflateObject: (buf: Uint8Array, offset: number, opts: { expectedSize: number; maxOutput: number }) => { out: Uint8Array } = loose(inflateJs);
+type Stepped = { state: PackCursor; zlib: Uint8Array[] };
+export const cursorStep = (cursor: PackCursor, chunk: Uint8Array): Stepped => unwrap(loose<(c: PackCursor, b: Uint8Array) => PlyResult<Stepped>>(spStepJs)(cursor, chunk));
+export const cursorFinish = (cursor: PackCursor): PackCursor => unwrap(loose<(c: PackCursor) => PlyResult<PackCursor>>(spFinishJs)(cursor));
+type InflateOpts = { expectedSize: number; maxOutput: number };
+export const inflateObject = (buf: Uint8Array, offset: number, opts: InflateOpts): { out: Uint8Array } => unwrap(loose<(b: Uint8Array, o: number, x: InflateOpts) => PlyResult<{ out: Uint8Array }>>(inflateJs)(buf, offset, opts));
 export const plyCode: (code: unknown) => boolean = loose(isPlyCodeJs);
 
 export function spanCollector(): { lines: unknown[]; exporter: (line: unknown) => void } {

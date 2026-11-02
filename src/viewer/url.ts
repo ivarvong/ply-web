@@ -4,7 +4,7 @@
 //
 // Host policy is an exact allowlist. There is no suffix match, no wildcard, and no IP-literal
 // folding: a hostname is accepted only when it is one of the allowed hosts, character for character.
-import { fail } from 'ply';
+import { plyError } from 'ply';
 import { chainGet } from '../absent.ts';
 import { extractRequestPath, rawPathHasUnsafeSegment } from '../pathguard.ts';
 import { publicRepoShortName } from '../public.ts';
@@ -96,7 +96,7 @@ function supported(allowed: readonly AllowedHost[]): string {
 }
 
 function reject(allowed: readonly AllowedHost[], message: string): never {
-  throw fail('bad_request', `${message} ${supported(allowed)}`);
+  throw plyError('bad_request', `${message} ${supported(allowed)}`);
 }
 
 function authorityEndsWithDot(raw: string): boolean {

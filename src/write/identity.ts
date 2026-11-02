@@ -1,7 +1,8 @@
 // Author and committer stamps. ply's validateIdent is the gate (name, email, civil zone, non-negative time) and
-// brands the object ident() will accept. This module is the HTTP shape: {name, email, tz?, time?}.
+// brands the object unwrap(ident()) will accept. This module is the HTTP shape: {name, email, tz?, time?}.
 // The zone check lives in validateIdent; a bad tz is still 400 bad_request, with ply's message.
-import { fail, ident, validateIdent } from 'ply';
+import { plyError, ident, validateIdent } from 'ply';
+import { unwrap } from '../ply-result.ts';
 import { recordGet } from '../absent.ts';
 
 declare const tzBrand: unique symbol;
@@ -12,8 +13,8 @@ export type TzOffset = string & { readonly [tzBrand]: 'TzOffset' };
 /** Unix seconds. git ident timestamp: a non-negative safe integer. fsck refuses a date that overflows time_t. */
 export type UnixSeconds = number & { readonly [timeBrand]: 'UnixSeconds' };
 
-/** The object validateIdent brands. ident() refuses a copy, so the line is taken from this value. */
-type Person = ReturnType<typeof validateIdent>;
+/** The object validateIdent brands. unwrap(ident()) refuses a copy, so the line is taken from this value. */
+type Person = Extract<ReturnType<typeof validateIdent>, { ok: true }>['value'];
 
 export type Stamp = {
   readonly name: string;
@@ -25,12 +26,12 @@ export type Stamp = {
 };
 
 export function parseTime(value: unknown, field: string): UnixSeconds {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw fail('bad_request', `${field} must be a non-negative integer (unix seconds)`);
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw plyError('bad_request', `${field} must be a non-negative integer (unix seconds)`);
   return value as UnixSeconds;
 }
 
 function rawOf(value: unknown, field: string): Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw fail('bad_request', `${field} must be {name, email}`);
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw plyError('bad_request', `${field} must be {name, email}`);
   return value as Record<string, unknown>;
 }
 
@@ -42,13 +43,13 @@ export function stamp(value: unknown, field: string, now: UnixSeconds): Stamp {
   const email = recordGet(raw, 'email');
   const tz = recordGet(raw, 'tz');
   // Omitted tz is validateIdent's UTC. A present tz is checked there (sign, four digits, civil range).
-  const person = validateIdent({
+  const person = unwrap(validateIdent({
     ...(name.tag === 'some' ? { name: name.value } : {}),
     ...(email.tag === 'some' ? { email: email.value } : {}),
     time: time.tag === 'none' ? now : parseTime(time.value, `${field}.time`),
     ...(tz.tag === 'some' ? { tz: tz.value } : {}),
-  });
-  return { name: person.name, email: person.email, tz: person.tz as TzOffset, time: person.time as UnixSeconds, person, line: ident(person) };
+  }));
+  return { name: person.name, email: person.email, tz: person.tz as TzOffset, time: person.time as UnixSeconds, person, line: unwrap(ident(person)) };
 }
 
 export function nowSeconds(): UnixSeconds {

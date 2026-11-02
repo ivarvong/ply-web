@@ -5,7 +5,8 @@
 // is `merge_conflict` (HTTP 409). ply-web used to report that wider case as empty, because it compared post-images
 // and ignored the extra paths. `allowEmpty` is ply's `empty: 'keep'` (`kept_empty`, an applied commit on the same
 // tree). `empty: 'stop'` reports empty and writes nothing.
-import { cherryPick, fail, revertCommit } from 'ply'
+import { cherryPick, plyError, revertCommit } from 'ply'
+import { unwrapAsync } from '../ply-result.ts'
 import { type CallOpts } from './call.ts'
 import { type Stamp } from './identity.ts'
 import { firstPresent, writeResult } from './result.ts'
@@ -43,7 +44,7 @@ export function mapPickOutcome(result: PlyPickResult, revert: boolean): MappedPi
       pushBytes: firstPresent(result, ['pushBytes'], 0) as number,
     }
   }
-  throw fail('internal', `unexpected ${revert ? 'revert' : 'cherry-pick'} outcome ${result.outcome}`)
+  throw plyError('internal', `unexpected ${revert ? 'revert' : 'cherry-pick'} outcome ${result.outcome}`)
 }
 
 function emptyResult(ref: string, oid: string): Record<string, unknown> {
@@ -52,13 +53,13 @@ function emptyResult(ref: string, oid: string): Record<string, unknown> {
 
 export async function pick(remote: string, opts: CallOpts, spec: { ref: string; commit: string; committer: Stamp; message: string | null; allowEmpty: boolean; revert: boolean }): Promise<Record<string, unknown>> {
   const run = spec.revert ? revertCommit : cherryPick
-  const result = await run(remote, {
+  const result = await unwrapAsync(run(remote, {
     ref: spec.ref,
     commit: spec.commit,
     committer: { name: spec.committer.name, email: spec.committer.email, tz: spec.committer.tz, time: spec.committer.time },
     message: spec.message,
     empty: spec.allowEmpty ? 'keep' : 'stop',
-  }, opts) as PlyPickResult
+  }, opts)) as PlyPickResult
   const mapped = mapPickOutcome(result, spec.revert)
   if (mapped.kind === 'empty') return emptyResult(mapped.ref, mapped.oid)
   return writeResult(mapped.name, mapped.ref, mapped.oid, mapped.oldOid, { tree: mapped.tree, pushBytes: mapped.pushBytes })

@@ -1,12 +1,13 @@
 // HEAD, including an unborn symref, as ply's lsRefs reports it.
 //
 // Asking for `unborn` costs one advertisement GET the first time an origin is seen in this isolate: ply sends the
-// argument only when discover() shows `ls-refs=unborn`, which is git's own rule (connect.c server_supports_feature).
+// argument only when unwrapAsync(discover()) shows `ls-refs=unborn`, which is git's own rule (connect.c server_supports_feature).
 // The bit is a fact about the server. It is remembered here and passed back as `info`, the option ply provides so a
 // discover result already in hand does not fetch the advertisement again. A later HEAD read on that origin is one
 // ls-refs. The first is discover + ls-refs. Sending `unborn` without that check would be this module speaking the
 // protocol, which is the code this adapter replaced.
 import { discover, KIND, lsRefs, parseOid, type Oid, type Span } from 'ply';
+import { unwrapAsync } from '../ply-result.ts';
 import { mapGet } from '../absent.ts';
 import { type GitTransport } from './call.ts';
 
@@ -55,7 +56,7 @@ async function lsRefsUnbornOf(t: GitTransport): Promise<{ readonly advertised: b
   if (known.tag === 'some') return { advertised: known.value, source: DISCOVER_CACHED };
   let flight = unbornInflight.get(origin);
   if (!flight) {
-    flight = discover(t).then(info => rememberUnborn(origin, info.lsRefsUnborn)).finally(() => { unbornInflight.delete(origin); });
+    flight = unwrapAsync(discover(t)).then(info => rememberUnborn(origin, info.lsRefsUnborn)).finally(() => { unbornInflight.delete(origin); });
     unbornInflight.set(origin, flight);
   }
   return { advertised: await flight, source: DISCOVER_FETCHED };
@@ -86,7 +87,7 @@ export async function readHead(t: GitTransport): Promise<HeadState> {
     attrs: { 'git.command': 'ls-refs', 'git.ls_refs.unborn': true, 'git.ls_refs.prefixes': [HEAD_NAME] },
   }, async (span: Span) => {
     const cap = await lsRefsUnbornOf(t);
-    const listed = await lsRefs(t, [HEAD_NAME], { unborn: true, info: { lsRefsUnborn: cap.advertised } });
+    const listed = await unwrapAsync(lsRefs(t, [HEAD_NAME], { unborn: true, info: { lsRefsUnborn: cap.advertised } }));
     const head = headFromListing(listed);
     span.set({
       'git.head.kind': head.kind,

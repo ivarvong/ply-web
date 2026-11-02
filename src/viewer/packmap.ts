@@ -4,6 +4,7 @@ import { unwrapOr } from '../option.ts';
 import { limitError } from 'ply';
 import { TYPE, TYPE_NAME, parseCommit, parseTree, hashObject } from 'ply';
 import { parsePack, resolvePack } from 'ply';
+import { unwrap } from '../ply-result.ts';
 import { VIEWER_CAPS, VIEWER_GIT_LIMITS } from './limits.ts';
 import { clampText } from './escape.ts';
 
@@ -56,7 +57,8 @@ export type PackMap = {
 };
 
 // ply's own parsed-pack type: resolvePack needs each object's inflate stats, which a hand-written copy left out.
-export type ParsedPack = ReturnType<typeof parsePack>;
+// The parsed pack itself (ply 0.2.0's parsePack returns it inside a Result).
+export type ParsedPack = Extract<ReturnType<typeof parsePack>, { ok: true }>['value'];
 
 type ResolvedObject = {
   oid: string;
@@ -94,13 +96,13 @@ function previewOf(type: number, data: Uint8Array, limits: object): ObjectPrevie
   }
   try {
     if (type === TYPE.COMMIT) {
-      const commit = parseCommit(data, limits);
+      const commit = unwrap(parseCommit(data, limits));
       const message = textOrEmpty(commit.message);
       const summary = unwrapOr(atIndex(message.split('\n'), 0), '');
       return { kind: 'commit', summary: clampText(summary, 200), tree: textOrEmpty(commit.tree), parents: commit.parents.slice(0, 8) };
     }
     if (type === TYPE.TREE) {
-      const entries = parseTree(data, limits);
+      const entries = unwrap(parseTree(data, limits));
       return { kind: 'tree', names: entries.slice(0, 40).map((entry: { name: string }) => entry.name) };
     }
     if (type === TYPE.BLOB) {
@@ -116,7 +118,7 @@ function previewOf(type: number, data: Uint8Array, limits: object): ObjectPrevie
 
 export function mapPack(buf: Uint8Array, limits = VIEWER_GIT_LIMITS): PackMap {
   if (buf.length > VIEWER_CAPS.maxPackBytes) throw limitError('pack bytes', buf.length, VIEWER_CAPS.maxPackBytes);
-  const parsed = parsePack(buf, { limits, maxObjects: VIEWER_CAPS.maxPackObjects, maxInflatedTotal: VIEWER_CAPS.maxInflatedTotal });
+  const parsed = unwrap(parsePack(buf, { limits, maxObjects: VIEWER_CAPS.maxPackObjects, maxInflatedTotal: VIEWER_CAPS.maxInflatedTotal }));
   return mapParsed(parsed, limits);
 }
 
@@ -126,7 +128,7 @@ export function mapParsed(parsed: ParsedPack, limits = VIEWER_GIT_LIMITS): PackM
   let maxChain = 0;
   let externalBases = 0;
   try {
-    const out = resolvePack({ objects: parsed.objects }, () => null, limits);
+    const out = unwrap(resolvePack({ objects: parsed.objects }, () => null, limits));
     resolved = out.objects;
     maxChain = out.stats.maxChain;
     externalBases = out.stats.externalBases;

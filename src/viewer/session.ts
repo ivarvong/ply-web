@@ -4,9 +4,10 @@
 import { atIndex, chainGet, fromNullable, mapGet } from '../absent.ts';
 import { unwrapOr } from '../option.ts';
 import { concat } from 'ply';
-import { fail } from 'ply';
+import { plyError } from 'ply';
 import { limitError } from 'ply';
 import { TYPE, hashObject, parseTree } from 'ply';
+import { unwrap } from '../ply-result.ts';
 import type { Budget } from './budget.ts';
 import { clampText, safeFilename } from './escape.ts';
 import type { FetchLike } from './fetchguard.ts';
@@ -39,7 +40,7 @@ function openTransport(url: ValidatedPublicRepoUrl, opts: {
   quirks: Quirks;
 }): GitTransport {
   const parsed = new URL(url);
-  if (parsed.username || parsed.password) throw fail('bad_request', 'remote must not carry credentials');
+  if (parsed.username || parsed.password) throw plyError('bad_request', 'remote must not carry credentials');
   return createGitTransport(url, { ...opts, userAgent: VIEWER_UA, limits: VIEWER_GIT_LIMITS });
 }
 
@@ -98,7 +99,7 @@ function refPrefixes(ref: string | null, allTags = true): string[] {
 
 function refMiss(listedRefs: { refs: Map<string, RefRec>; head: string | null }, wanted: string, code: 'not_found' | 'bad_request', message: string): never {
   const catalog = refCatalog(listedRefs);
-  throw withHint(fail(code, message), { nearby: nearbyRefs(wanted, catalog.branches, catalog.tags), path: null });
+  throw withHint(plyError(code, message), { nearby: nearbyRefs(wanted, catalog.branches, catalog.tags), path: null });
 }
 
 function textRef(ref: string | null): string {
@@ -178,13 +179,13 @@ async function readBlob(transport: GitTransport, tracer: ViewerTracer, oid: stri
   try {
     while (sp.phase !== 'body') {
       const step = await it.next();
-      if (step.done) throw fail('pack_corrupt', 'pack ended before the object header');
+      if (step.done) throw plyError('pack_corrupt', 'pack ended before the object header');
       refuseOversizedChunk(sp, step.value);
       const r = cursorStep(sp, step.value);
       sp = r.state;
       early.push(...r.zlib);
     }
-    if (sp.type !== TYPE.BLOB) throw fail('pack_corrupt', `expected blob, got type ${sp.type}`);
+    if (sp.type !== TYPE.BLOB) throw plyError('pack_corrupt', `expected blob, got type ${sp.type}`);
     if (sp.size > VIEWER_CAPS.maxFileDisplayBytes) {
       span.set({ 'git.viewer.blob.too_big': true, 'git.viewer.blob.size': sp.size });
       await closeIterator(it);
@@ -207,7 +208,7 @@ async function readBlob(transport: GitTransport, tracer: ViewerTracer, oid: stri
     sp = cursorFinish(sp);
     const { out } = inflateObject(concat(zlibParts), 0, { expectedSize: sp.size, maxOutput: VIEWER_CAPS.maxFileDisplayBytes });
     const got = hashObject('blob', out);
-    if (got !== oid) throw fail('pack_corrupt', `blob content hashes to ${got}, not ${oid}`);
+    if (got !== oid) throw plyError('pack_corrupt', `blob content hashes to ${got}, not ${oid}`);
     fetchSpan.end();
     span.set({ 'git.viewer.blob.size': sp.size });
     span.end();
@@ -316,15 +317,15 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
   for (let depth = 0; depth < comps.length; depth++) {
     const name = unwrapOr(atIndex(comps, depth), '');
     const data = await loadTreeBytes(transport, treeOid, cache);
-    const entries = parseTree(data, VIEWER_GIT_LIMITS);
+    const entries = unwrap(parseTree(data, VIEWER_GIT_LIMITS));
     if (entries.length > VIEWER_GIT_LIMITS.maxTreeEntries) throw limitError('tree entries', entries.length, VIEWER_GIT_LIMITS.maxTreeEntries);
     const entry = entries.find((item: { name: string }) => item.name === name);
     const existingPath = comps.slice(0, depth).join('/');
-    if (!entry) throw withHint(fail('not_found', `path component ${name} not found`, { miss: { kind: 'path', missing: name, existingPath } }), { nearby: [], path: { missing: name, existingPath, notDirectory: false } });
+    if (!entry) throw withHint(plyError('not_found', `path component ${name} not found`, { miss: { kind: 'path', missing: name, existingPath } }), { nearby: [], path: { missing: name, existingPath, notDirectory: false } });
     const last = depth === comps.length - 1;
     if (!last) {
       const walked = existingPath === '' ? name : `${existingPath}/${name}`;
-      if (entry.mode !== '40000') throw withHint(fail('not_found', `${name} is not a directory`, { miss: { kind: 'not_directory', path: walked, mode: entry.mode } }), { nearby: [], path: { missing: name, existingPath, notDirectory: true } });
+      if (entry.mode !== '40000') throw withHint(plyError('not_found', `${name} is not a directory`, { miss: { kind: 'not_directory', path: walked, mode: entry.mode } }), { nearby: [], path: { missing: name, existingPath, notDirectory: true } });
       treeOid = entry.oid;
       continue;
     }
@@ -334,7 +335,7 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
   if (file) {
     const mode = treeMode(file.mode);
     if (file.mode === '160000') {
-      if (route.raw) throw fail('not_found', 'submodule has no blob in this repository', { miss: { kind: 'submodule', path: route.path, commit: file.oid } });
+      if (route.raw) throw plyError('not_found', 'submodule has no blob in this repository', { miss: { kind: 'submodule', path: route.path, commit: file.oid } });
       return { kind: 'file', header, path: route.path, ...catalog, mode, blob: file.oid, size: 0, note: 'submodule', text: null };
     }
     const blob = await readBlob(transport, tracer, file.oid);
@@ -346,9 +347,9 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
     const text = asText(blob.bytes);
     return { kind: 'file', header, path: route.path, ...catalog, mode, blob: file.oid, size: blob.size, note: text === null ? 'binary' : 'text', text };
   }
-  if (route.raw) throw fail('bad_request', 'raw is a file view');
+  if (route.raw) throw plyError('bad_request', 'raw is a file view');
   const data = await loadTreeBytes(transport, treeOid, cache);
-  const parsed = parseTree(data, VIEWER_GIT_LIMITS);
+  const parsed = unwrap(parseTree(data, VIEWER_GIT_LIMITS));
   const entries = listed(parsed);
   let readme: { name: string; text: string } | { name: string; tooBig: true } | null = null;
   if (!route.path && budget.canSpend(1)) {
@@ -379,7 +380,7 @@ async function loadTree(transport: GitTransport, route: Extract<ViewerRoute, { k
 
 async function loadPack(transport: GitTransport, route: Extract<ViewerRoute, { kind: 'repo' }>, server: ServerInfo, quirks: Quirks): Promise<Loaded> {
   const pack = route.pack;
-  if (!pack) throw fail('internal', 'pack view without a want');
+  if (!pack) throw plyError('internal', 'pack view without a want');
   const want = pack.want;
   const requested: FilterName = pack.filter;
   const common = { wants: [want], deepen: 1, ofsDelta: true as const, thinPack: false as const };
@@ -401,7 +402,7 @@ async function loadPack(transport: GitTransport, route: Extract<ViewerRoute, { k
     result = await readPack(transport, { ...common, filter: 'blob:none' }, { resolve: false });
   }
   const parsed = chainGet(result, 'parsed');
-  if (parsed.tag === 'none' || !parsed.value) throw fail('pack_corrupt', 'server sent no pack');
+  if (parsed.tag === 'none' || !parsed.value) throw plyError('pack_corrupt', 'server sent no pack');
   return {
     kind: 'pack',
     header: headerFor(route.loc, route.ref === null ? 'HEAD' : route.ref, want, server),

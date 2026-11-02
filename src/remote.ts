@@ -1,6 +1,6 @@
 // /v1 remote policy. decideRemote is the discriminated result. The fetch layer takes only an
 // AllowedRemote, follows redirects manually, and re-runs the same policy on every hop.
-import { fail } from 'ply';
+import { plyError } from 'ply';
 import { atIndex, captureGroup, chainGet, recordGet } from './absent.ts';
 import { unwrapOr } from './option.ts';
 import { extractRequestPath, rawPathHasUnsafeSegment } from './pathguard.ts';
@@ -203,14 +203,14 @@ export function reasonText(reason: RemoteReason): string {
 /** Throw the /v1 bad_request the worker already returns. The value is an AllowedRemote. */
 export function checkRemote(raw: string, allow: readonly string[] = []): AllowedRemote {
   const decision = decideRemote(raw, allow);
-  if (decision.kind === 'rejected') throw fail('bad_request', reasonText(decision.reason));
+  if (decision.kind === 'rejected') throw plyError('bad_request', reasonText(decision.reason));
   return decision.remote;
 }
 
 function authorizeHop(raw: string, home: AllowedRemote, allow: readonly string[]): AllowedRemote {
   const decision = decideRemote(raw, allow, { allowQuery: true });
-  if (decision.kind === 'rejected') throw fail('bad_request', reasonText(decision.reason));
-  if (decision.remote.origin !== home.origin) throw fail('bad_request', 'redirect host is not an allowlisted host');
+  if (decision.kind === 'rejected') throw plyError('bad_request', reasonText(decision.reason));
+  if (decision.remote.origin !== home.origin) throw plyError('bad_request', 'redirect host is not an allowlisted host');
   return decision.remote;
 }
 
@@ -227,14 +227,14 @@ function rejectRedirectLocation(location: string): boolean {
  * redirect hop is parsed again; a hop whose origin is not that remote is not followed.
  */
 export function createGuardedFetch(inner: FetchLike, remote: AllowedRemote, allow: readonly string[] = [], maxRedirects = 3): FetchLike {
-  if (!isAllowedRemote(remote)) throw fail('bad_request', 'remote was not allowlisted');
+  if (!isAllowedRemote(remote)) throw plyError('bad_request', 'remote was not allowlisted');
   const guarded: FetchLike = async (input, init) => {
     let current = authorizeHop(requestUrl(input), remote, allow);
     const methodField = chainGet(init, 'method');
     const method = methodField.tag === 'none' ? 'GET' : methodField.value as string;
     const bodyField = chainGet(init, 'body');
     const body = bodyField.tag === 'none' ? null : bodyField.value;
-    if (body !== null && !(body instanceof Uint8Array)) throw fail('bad_request', 'upstream body is not replayable');
+    if (body !== null && !(body instanceof Uint8Array)) throw plyError('bad_request', 'upstream body is not replayable');
     const initRecord = init !== null && typeof init === 'object' ? init as Record<string, unknown> : null;
     const headerField = recordGet(initRecord, 'headers');
     const signalField = chainGet(init, 'signal');
@@ -247,17 +247,17 @@ export function createGuardedFetch(inner: FetchLike, remote: AllowedRemote, allo
       if (res.status >= 300 && res.status < 400) {
         const location = res.headers.get('location');
         if (res.body) await res.body.cancel().catch(() => {});
-        if (!location || rejectRedirectLocation(location)) throw fail('bad_request', 'redirect host is not an allowlisted host');
-        if (hop === maxRedirects) throw fail('bad_request', 'too many redirects');
+        if (!location || rejectRedirectLocation(location)) throw plyError('bad_request', 'redirect host is not an allowlisted host');
+        if (hop === maxRedirects) throw plyError('bad_request', 'too many redirects');
         let next: string;
         try { next = new URL(location, current.href).href; }
-        catch { throw fail('bad_request', 'redirect host is not an allowlisted host'); }
+        catch { throw plyError('bad_request', 'redirect host is not an allowlisted host'); }
         current = authorizeHop(next, remote, allow);
         continue;
       }
       return res;
     }
-    throw fail('bad_request', 'too many redirects');
+    throw plyError('bad_request', 'too many redirects');
   };
   return guarded;
 }
