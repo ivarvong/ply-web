@@ -32,10 +32,34 @@ function firstString(...values: readonly unknown[]): string | null {
   return null
 }
 
-/** A stored outcome other than ok, including a present null. A missing outcome is not a fault. */
-function outcomeFailed(workers: Record<string, unknown> | null): boolean {
-  const outcome = recordGet(workers, 'outcome')
-  return outcome.tag === 'some' && outcome.value !== 'ok'
+/** Workers outcome ADT: client-caused probe loss vs worker fault. Unknown non-ok fails closed as worker_fault. */
+export type WorkersOutcome =
+  | { readonly kind: 'ok' }
+  | { readonly kind: 'client_caused'; readonly outcome: 'canceled' | 'clientDisconnected' | 'responseStreamDisconnected' }
+  | { readonly kind: 'worker_fault'; readonly outcome: 'exception' | 'exceededCpu' | 'exceededMemory' | 'scriptNotFound' | 'loadShed' | 'overload' | 'unknown'; readonly value: string }
+
+function classifyWorkersOutcome(workers: Record<string, unknown> | null): WorkersOutcome {
+  const got = recordGet(workers, 'outcome')
+  if (got.tag !== 'some') return { kind: 'ok' }
+  const value = String(got.value)
+  switch (value) {
+    case 'ok':
+      return { kind: 'ok' }
+    case 'canceled':
+    case 'clientDisconnected':
+    case 'responseStreamDisconnected':
+      return { kind: 'client_caused', outcome: value }
+    case 'exception':
+    case 'exceededCpu':
+    case 'exceededMemory':
+    case 'scriptNotFound':
+    case 'loadShed':
+    case 'overload':
+      return { kind: 'worker_fault', outcome: value, value }
+    default:
+      // Fail closed on any unknown non-ok string
+      return { kind: 'worker_fault', outcome: 'unknown', value }
+  }
 }
 
 /**
@@ -576,7 +600,7 @@ export function statsFromEvents(events: readonly unknown[], spans: readonly unkn
     requests += 1
     exceptions += exceptionCount(event)
     const workers = asRecord(event.$workers)
-    if (outcomeFailed(workers)) errors += 1
+    if (classifyWorkersOutcome(workers).kind === 'worker_fault') errors += 1
     const wall = field(workers, 'wallTimeMs')
     if (typeof wall === 'number') wallMs.push(wall)
     const cpu = field(workers, 'cpuTimeMs')
@@ -673,7 +697,7 @@ export function summarizeTelemetry(
     invocations += 1
     if (exceptionCount(event) > 0) exceptions += 1
     const workers = asRecord(event.$workers)
-    if (outcomeFailed(workers)) nonOk += 1
+    if (classifyWorkersOutcome(workers).kind === 'worker_fault') nonOk += 1
   }
   const wallMs: number[] = []
   const cpuMs: number[] = []

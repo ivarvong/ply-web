@@ -79,25 +79,7 @@ export type ProbeJudge = {
  * Simplified ADT for probe outcomes at the harness edges.
  * ok | server_error | timeout | shed | transport_error
  */
-export type SimpleProbeOutcome =
-  | { readonly kind: 'ok' }
-  | { readonly kind: 'server_error' }
-  | { readonly kind: 'timeout' }
-  | { readonly kind: 'shed' }
-  | { readonly kind: 'transport_error' }
-
-export function toSimpleOutcome(outcome: ProbeOutcome): SimpleProbeOutcome {
-  switch (outcome.kind) {
-    case 'responded':
-      return outcome.status >= 500 ? { kind: 'server_error' } : { kind: 'ok' }
-    case 'lost':
-      return outcome.reason === 'timed_out' ? { kind: 'timeout' } : { kind: 'transport_error' }
-    case 'shed':
-      return { kind: 'shed' }
-    default:
-      return assertNever(outcome)
-  }
-}
+// (simple probe outcome mapping deleted; the ramp judges directly from ProbeOutcome)
 
 /** One step recorded in ramp.jsonl, events, and the verdict. */
 export type ProbeLossRecord = {
