@@ -340,10 +340,12 @@ export function judgeStep(input: {
   const gates = input.policy.gates
   for (const scope of SCOPES) {
     const side = scope.pick(input)
+    // Only treat non-ok outcomes on the new version as a hard gate. Non-ok on the old or aggregate are informational.
+    const nonOkMode = scope.id === 'new' ? gates.nonOk : 'informational'
     consider(gates.exceptions, countBreach(side.exceptions, 'exception', `max_${scope.id}_exceptions`, scope.scope), hard, notes)
     consider(gates.fivexx, countBreach(side.fivexx, '5xx response', `max_${scope.id}_5xx`, scope.scope), hard, notes)
     consider(gates.errorLogs, countBreach(side.errorLogs, 'error log', `max_${scope.id}_error_logs`, scope.scope), hard, notes)
-    consider(gates.nonOk, countBreach(side.errors, 'non-ok outcome', `max_${scope.id}_errors`, scope.scope), hard, notes)
+    consider(nonOkMode, countBreach(side.errors, 'non-ok outcome', `max_${scope.id}_errors`, scope.scope), hard, notes)
     if (gates.burn !== 'hard' && gates.burn !== 'informational') continue
     for (const slo of [AVAILABILITY, READ_LATENCY, WRITE_LATENCY]) {
       const count = countSlo(slo, side.v1)
