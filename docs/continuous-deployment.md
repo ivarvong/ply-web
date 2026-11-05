@@ -221,10 +221,19 @@ It fails when any of these are true:
 
 A 409 the smoke expected is not an unexpected status. A 500 the smoke did not expect is.
 
+On the pinned window (not the live one after 100%) it also checks ply's own spans (issue #67). The smoke's `edit-traced` step is a single-file find/replace on the `squash` branch (`POST /v1/edit` with `path`, `find`, `replace`), which ply runs as `editFile`. Every ply span of a `/v1` request is a Workers span under the request span (`src/edge-trace.ts`), so that request's trace must hold `git.edit`, `git.edit.tree`, `git.edit.blob`, `git.upload-pack fetch`, and `git.receive-pack` besides the platform's own `POST` and `fetch` spans. The check reads the same span-events query (`$metadata.type = span`), joins on the request's `cf-ray` from the smoke report and then on the `traceId` those events carry, and re-queries on the telemetry polls (5s, 10s, 15s, up to 60s) while names are missing, because span events of one trace are ingested independently. Source: `scripts/cd/span-check.ts`.
+
+- Every name is there: a second line, `spans: edit-traced <request id> trace <traceId> has git.edit, …`.
+- The trace is there and a ply span is not: `cd: FAIL telemetry: spans: edit-traced <id> trace <traceId> is missing ply spans <names>; saw <names> (#67: ply spans are not reaching Workers tracing)`. That is a worker fault. The canary stays at 0% and the ramp does not start.
+- No span event joins to the request within the wait, or the report has no `edit-traced` row (an older `smoke.json`): `harness_fault`, with `spans: no span event joined to edit-traced …` as the reason. The split is unchanged.
+
+The result is `spans` in `telemetry.json` and the last line of `telemetry.md`, and a `ply_spans` rule on the telemetry decision in `events.jsonl`. It decides only when every other telemetry check passed.
+
 Pass prints the verdict line, then:
 
 ```text
 telemetry: 40/42 matched, 2 lost (tolerated)
+spans: edit-traced 3f9c2a1e-… trace 6ae804bdd2731f488b904cf72e929540 has git.edit, git.edit.tree, git.edit.blob, git.upload-pack fetch, git.receive-pack (14 span events)
 cd: PASS telemetry 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e
 ```
 

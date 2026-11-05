@@ -25,6 +25,12 @@ export type HttpStep = {
   readonly git?: boolean
 }
 
+/**
+ * A single-file find/replace edit (ply's editFile) after the squash. Telemetry requires its ply spans (`git.edit`,
+ * `git.edit.tree`, `git.edit.blob`, upload-pack, receive-pack) in Workers tracing: scripts/cd/span-check.ts, issue #67.
+ */
+export const TRACED_EDIT_STEP = 'edit-traced'
+
 const T = 1_700_000_000
 const ZERO = '0'.repeat(40)
 
@@ -656,6 +662,14 @@ export function lifecycle(): readonly HttpStep[] {
       ray: 'required',
       rayIncludes: 'receive-pack=',
     },
+    write(TRACED_EDIT_STEP, () => ({
+      ref: 'squash',
+      message: 'traced',
+      author: author(T + 930),
+      path: 'sq1.txt',
+      find: '1',
+      replace: 'one',
+    }), { kind: 'outcome', status: 200, outcome: 'commit' }),
     {
       name: 'refs-final',
       method: 'GET',
