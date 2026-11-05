@@ -59,7 +59,7 @@ before(async () => {
   writeFileSync(join(out, 'config.capnp'), `using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
   services = [
-    (name = "rw", worker = (modules = [ (name = "worker.mjs", esModule = embed "worker.mjs") ], compatibilityDate = "2026-10-19", globalOutbound = "internet",
+    (name = "rw", worker = (modules = [ (name = "worker.mjs", esModule = embed "worker.mjs") ], compatibilityDate = "2026-10-19", compatibilityFlags = ["nodejs_als"], globalOutbound = "internet",
       bindings = [ (name = "PLY_TOKEN", text = "${PLY}"), (name = "WRITES", text = "on"), (name = "PACK_CACHE", text = "off"), (name = "ALLOW_REMOTE_ORIGINS", text = "${srv.url}") ],
       streamingTails = [ "tail" ])),
     (name = "tail", worker = (modules = [ (name = "tail.mjs", esModule = embed "tail.mjs") ], compatibilityDate = "2026-10-19", globalOutbound = "internet")),

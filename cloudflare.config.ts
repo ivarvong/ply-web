@@ -64,6 +64,9 @@ const plyWorker = {
 		name: WORKER_NAME,
 		// The date the live Worker already runs on. No nodejs_compat: ply is Web APIs only.
 		compatibilityDate: "2026-10-19",
+		// nodejs_als: only AsyncLocalStorage (node:async_hooks), which src/edge-trace.ts uses to nest ply's spans under
+		// their ply parent in Workers tracing (#67). Declared rather than relying on the runtime allowing the import.
+		compatibilityFlags: ["nodejs_als"],
 		entrypoint: "src/index.js",
 		workersDev: true,
 		previewUrls: false,
