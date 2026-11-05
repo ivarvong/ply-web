@@ -159,8 +159,6 @@ export function mapParsed(parsed: ParsedPack, limits = VIEWER_GIT_LIMITS): PackM
     const chain = chainField.tag === 'some' && typeof chainField.value === 'number' ? chainField.value : 0;
     const typeField = placed.tag === 'some' ? chainGet(placed.value, 'type') : fromNullable(null);
     const previewType = typeField.tag === 'some' && typeof typeField.value === 'number' ? typeField.value : obj.type;
-    const baseOffset = fromAbsent(obj.baseOffset);
-    const baseOid = fromAbsent(obj.baseOid);
     return {
       offset: obj.offset,
       length: obj.headerBytes + obj.compressed,
@@ -170,8 +168,8 @@ export function mapParsed(parsed: ParsedPack, limits = VIEWER_GIT_LIMITS): PackM
       wireType: wire,
       resolvedType,
       oid,
-      baseOffset: baseOffset.tag === 'some' ? baseOffset.value as number | null : null,
-      baseOid: baseOid.tag === 'some' ? baseOid.value as string | null : null,
+      baseOffset: obj.base.tag === 'ofs' ? obj.base.offset : null,
+      baseOid: obj.base.tag === 'ref' ? obj.base.oid : null,
       chain,
       preview: data ? previewOf(previewType, data, limits) : (wire === 'ofs_delta' || wire === 'ref_delta' ? { kind: 'unresolved' } : null),
     };
