@@ -105,3 +105,34 @@ test('syncMirror: first sync, in-sync, incremental, rewritten upstream; a 60 s w
     cleanup();
   }
 });
+
+// A pack past ply's held size (INFLATE_CHUNK, 32 KiB) is sent as a ReadableStream (ply#172's streamed push): the guarded
+// fetch must forward it, not refuse it as unreplayable. 64 KiB of random bytes deflates to more than 32 KiB.
+test('syncMirror: a pack larger than 32 KiB is streamed through the guarded fetch', async () => {
+  const { root, cleanup } = tmpRoot();
+  const srv = await startGitServer(root);
+  try {
+    const source = makeBareRepo(root, 'src');
+    mkdirSync(join(root, 'git', 'public-v0'), { recursive: true });
+    const mirrorBare = makeBareRepo(root, 'git/public-v0/ply');
+    const work = join(root, 'w-src');
+    mkdirSync(work);
+    git(work, ['init', '-q', '-b', 'main']);
+    const big = Buffer.from(crypto.getRandomValues(new Uint8Array(64 * 1024))).toString('base64');
+    const c1 = commitFiles(work, source, { 'big.txt': big }, 'big');
+    const binding: ArtifactsNamespace = {
+      async get() {
+        return Object.assign({ async createToken() { return { plaintext: WRITE }; } }, { async revokeToken() { return true; } });
+      },
+    };
+    const tokens: TokenSource = { readToken: async () => READ, secrets: () => [READ] };
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => fetch(String(input).replace('https://github.com/ivarvong/ply.git', `${srv.url}/src.git`), init);
+    const r = await syncMirror({ repo: 'ply', source: 'https://github.com/ivarvong/ply.git', branch: 'main' }, { binding, tokens, fetchImpl, origin: srv.url });
+    assert.equal(r.outcome, 'updated', JSON.stringify(r));
+    assert.equal(git(mirrorBare, ['rev-parse', 'refs/heads/main']).trim(), c1);
+    git(mirrorBare, ['fsck', '--strict', '--no-dangling']);
+  } finally {
+    await srv.close();
+    cleanup();
+  }
+});

@@ -632,6 +632,20 @@ test('writes equal git: edit, branch create/delete, merge, rebase, cherry-pick, 
   assert.equal(git(r.bare, ['fsck', '--strict', '--no-dangling']).trim(), '');
 });
 
+// ply sends a pack past its held size (32 KiB) as a ReadableStream (ply#172); the Worker's guarded fetch forwards it.
+// A new file of 64 KiB of random bytes in base64 (no base to delta against) deflates to more than 32 KiB, so this push
+// is streamed.
+test('a write whose pack is past 32 KiB is streamed to the remote and equals git', { skip }, async () => {
+  const big = Buffer.from(crypto.getRandomValues(new Uint8Array(64 * 1024))).toString('base64');
+  const r = repo({ 'f.txt': 'one\n' });
+  const res = await W('/v1/edit', { method: 'POST', body: { remote: r.remote, path: 'big.txt', find: '', replace: big, author: A, message: 'big' } });
+  const body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.equal(git(r.bare, ['rev-parse', 'main']).trim(), body.newCommit);
+  assert.equal(gitBuf(r.bare, ['show', 'main:big.txt']).toString(), big);
+  git(r.bare, ['fsck', '--strict', '--no-dangling']);
+});
+
 test('writes switch: WRITES=off → 501 on every write endpoint, reads still served', { skip }, async () => {
   const r = repo({ 'f.txt': 'MARK\n' });
   for (const [m, p] of [['POST', '/v1/edit'], ['POST', '/v1/branch'], ['DELETE', '/v1/branch'], ['POST', '/v1/merge'], ['POST', '/v1/rebase'], ['POST', '/v1/cherry-pick'], ['POST', '/v1/revert'], ['POST', '/v1/tag'], ['DELETE', '/v1/tag']]) {

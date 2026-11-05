@@ -234,7 +234,10 @@ export function createGuardedFetch(inner: FetchLike, remote: AllowedRemote, allo
     const method = methodField.tag === 'none' ? 'GET' : methodField.value as string;
     const bodyField = chainGet(init, 'body');
     const body = bodyField.tag === 'none' ? null : bodyField.value;
-    if (body !== null && !(body instanceof Uint8Array)) throw plyError('bad_request', 'upstream body is not replayable');
+    // Bytes are replayed on each hop. A stream (ply's push past its held size, ply#172) is sent once: a redirect
+    // answering it is not followed, as git never follows one on a POST.
+    const streamed = body instanceof ReadableStream;
+    if (body !== null && !(body instanceof Uint8Array) && !streamed) throw plyError('bad_request', 'upstream body is not bytes or a stream');
     const initRecord = init !== null && typeof init === 'object' ? init as Record<string, unknown> : null;
     const headerField = recordGet(initRecord, 'headers');
     const signalField = chainGet(init, 'signal');
@@ -242,11 +245,14 @@ export function createGuardedFetch(inner: FetchLike, remote: AllowedRemote, allo
       const requestInit: RequestInit = { method, redirect: 'manual' };
       if (headerField.tag === 'some') requestInit.headers = headerField.value as HeadersInit;
       if (body !== null) requestInit.body = body as BodyInit;
+      // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- duplex is in fetch's RequestInit (workerd and undici) but not in lib.dom's
+      if (streamed) (requestInit as RequestInit & { duplex: 'half' }).duplex = 'half';
       if (signalField.tag === 'some') requestInit.signal = signalField.value as AbortSignal;
       const res = await inner(current.href, requestInit);
       if (res.status >= 300 && res.status < 400) {
         const location = res.headers.get('location');
         if (res.body) await res.body.cancel().catch(() => {});
+        if (streamed) throw plyError('bad_request', 'redirect on a streamed request body is not followed');
         if (!location || rejectRedirectLocation(location)) throw plyError('bad_request', 'redirect host is not an allowlisted host');
         if (hop === maxRedirects) throw plyError('bad_request', 'too many redirects');
         let next: string;

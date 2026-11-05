@@ -302,6 +302,30 @@ test('guarded fetch re-validates every redirect hop and stays on the allowed ori
   assert.throws(() => createGuardedFetch(async () => new Response('x'), { href: 'https://evil.example', origin: 'https://evil.example', hostname: 'evil.example', host: 'evil.example' } as AllowedRemote));
 });
 
+test('guarded fetch sends a stream body once, with duplex, and does not follow a redirect that answers it', async () => {
+  const remote = mustAllow('https://github.com/acme/widgets.git');
+  const url = `${remote.href}/git-receive-pack`;
+  const stream = () => new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new Uint8Array([1, 2, 3])); c.close(); } });
+  const seen: unknown[] = [];
+  const ok = createGuardedFetch(async (_input, init) => {
+    seen.push(slot(init, 'duplex'));
+    return new Response(new Uint8Array(await new Response(slot(init, 'body') as BodyInit).arrayBuffer()), { status: 200 });
+  }, remote, []);
+  const res = await ok(url, { method: 'POST', body: stream() });
+  assert.deepEqual([...new Uint8Array(await res.arrayBuffer())], [1, 2, 3]);
+  assert.deepEqual(seen, ['half']);
+
+  let hops = 0;
+  const redirected = createGuardedFetch(async () => {
+    hops++;
+    return new Response(null, { status: 307, headers: { location: url } });
+  }, remote, []);
+  await assert.rejects(() => redirected(url, { method: 'POST', body: stream() }), (err: Partial<{ code: string; message: string }>) => err.code === 'bad_request' && /streamed/.test(String(err.message)));
+  assert.equal(hops, 1);
+
+  await assert.rejects(() => ok(url, { method: 'POST', body: 'text' }), (err: Partial<{ code: string }>) => err.code === 'bad_request');
+});
+
 test('viewer paths reject dot segments and encoded separators before normalization', () => {
   const opts = routeOptsFromEnv({});
   const collapsed = new URL('https://ply.example/view/github.com/a/%2e%2e/%2e%2e/evil.com/x/y');
