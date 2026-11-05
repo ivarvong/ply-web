@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { SMOKE_LATENCY, TELEMETRY_CHUNK, TELEMETRY_POLLS_MS, TELEMETRY_WAIT_MS } from './baseline.ts'
+import { pollEditSpans, type SpanCheck } from './span-check.ts'
 import { raysByRequestId } from './csv.ts'
 import { asRecord } from './json.ts'
 import { activeLog } from './log.ts'
@@ -106,6 +107,25 @@ async function logsFor(
   return out
 }
 
+/** The span check over the window, starting from the span events already queried; later polls query again. */
+async function editSpans(config: CdConfig, requests: readonly SmokeRequest[], from: number, first: readonly unknown[], retry: QueryRetry): Promise<SpanCheck> {
+  let page: readonly unknown[] | null = first
+  return pollEditSpans(requests, {
+    query: async () => {
+      if (page !== null) {
+        const ready = page
+        page = null
+        return ready
+      }
+      return queryAll('events', from, queryTo(Date.now()), [serviceFilter(config.worker), spanTypeFilter()], retry)
+    },
+    sleep,
+    now: () => Date.now(),
+    pollsMs: TELEMETRY_POLLS_MS,
+    waitMs: TELEMETRY_WAIT_MS,
+  })
+}
+
 export async function stageTelemetry(
   config: CdConfig,
   opts: { readonly version: string; readonly since: number; readonly reportPath: string; readonly runDir: string; readonly live: boolean },
@@ -151,9 +171,12 @@ export async function stageTelemetry(
     const loss = telemetryLoss(requests, summary, maxLossRate)
     const judged = judgeSmokeTelemetry({ version: opts.version, requests, summary, ceilings: SMOKE_LATENCY, maxLossRate })
     const judge = applyGates(judged, config.policy.gates)
-    const markdown = telemetryMarkdown({ version: opts.version, from, to, judge, summary, loss })
+    // #67: the pinned smoke's edit-traced request must show ply's spans in Workers tracing. Pinned only: it gates the 0%
+    // canary, and a tracing regression found after 100% is not a reason to roll back.
+    const spanCheck: SpanCheck | null = opts.live ? null : await editSpans(config, requests, from, spans, retry)
     const stem = opts.live ? 'live-telemetry' : 'telemetry'
-    await writeText(opts.runDir, `${stem}.md`, markdown)
+    const spanLine = spanCheck === null ? '' : `\n\n${spanCheck.line}\n`
+    await writeText(opts.runDir, `${stem}.md`, `${telemetryMarkdown({ version: opts.version, from, to, judge, summary, loss })}${spanLine}`)
     const failures = judge.kind === 'worker'
       ? judge.failures.map(failure => {
         if (failure.kind === 'unexpected-status') return `unexpected-status ${failure.id} ${failure.status}`
@@ -161,13 +184,19 @@ export async function stageTelemetry(
         return `${failure.kind}: ${failure.detail}`
       })
       : judge.kind === 'harness_fault' ? [judge.reason] : []
+    // The span check decides only when everything else passed: a worker fault or a harness fault above is reported first.
+    const spanVerdict = judge.kind === 'pass' && spanCheck !== null && spanCheck.kind !== 'pass' ? spanCheck : null
+    if (spanVerdict) failures.push(spanVerdict.line)
+    const kind = spanVerdict ? spanVerdict.kind : judge.kind
+    const line = spanCheck === null ? judge.line : `${judge.line}\n${spanCheck.line}`
     const verdict = {
-      kind: judge.kind === 'pass' ? 'pass' : judge.kind,
-      pass: judge.kind === 'pass',
+      kind,
+      pass: kind === 'pass',
       version: opts.version,
       failures,
-      line: judge.line,
+      line,
       loss,
+      spans: spanCheck,
       from,
       to,
     }
@@ -207,14 +236,16 @@ export async function stageTelemetry(
             ? (judge.checks.some(check => check.kind === 'join') ? 'span_join' : 'telemetry_evaluable')
             : 'smoke_telemetry',
           value: judge.kind === 'pass' ? 'pass' : judge.kind,
-        }],
-        outcome: judge.kind === 'pass' ? 'advance' : judge.kind === 'harness_fault' ? 'harness_fault' : opts.live ? 'rollback' : 'stop',
-        reason: judge.line,
+        }, ...(spanCheck === null ? [] : [{ name: 'ply_spans', value: spanCheck.kind }])],
+        outcome: kind === 'pass' ? 'advance' : kind === 'harness_fault' ? 'harness_fault' : opts.live ? 'rollback' : 'stop',
+        reason: spanVerdict ? spanVerdict.line : judge.line,
       })
     }
     if (judge.kind === 'harness_fault') return fail('telemetry', judge.reason, false, 'harness_fault')
     if (judge.kind === 'worker') return fail('telemetry', judge.line)
-    return pass('telemetry', { version: opts.version, line: judge.line, from, to })
+    if (spanVerdict && spanVerdict.kind === 'harness_fault') return fail('telemetry', spanVerdict.line, false, 'harness_fault')
+    if (spanVerdict) return fail('telemetry', spanVerdict.line)
+    return pass('telemetry', { version: opts.version, line, from, to })
   } catch (error) {
     const fault = queryFault(`telemetry unavailable: ${errorMessage(error)}`)
     await activeLog()?.error(fault.reason, { stage: 'telemetry', fault: fault.kind })

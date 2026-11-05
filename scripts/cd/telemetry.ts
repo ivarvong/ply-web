@@ -212,7 +212,7 @@ export type FetchSample = {
   readonly artifacts: boolean
 }
 
-function spanNameOf(event: Record<string, unknown>): string | null {
+export function spanNameOf(event: Record<string, unknown>): string | null {
   const source = asRecord(event.source)
   const meta = asRecord(event.$metadata)
   return firstString(field(source, 'name'), field(meta, 'spanName'), event.name)
@@ -287,12 +287,12 @@ function requestIdOf(event: Record<string, unknown>): string | null {
   return firstString(field(meta, 'requestId'), event.requestId)
 }
 
-function traceIdOf(event: Record<string, unknown>): string | null {
+export function traceIdOf(event: Record<string, unknown>): string | null {
   const meta = asRecord(event.$metadata)
   return firstString(event.traceId, event.trace_id, field(meta, 'traceId'), field(meta, 'trace_id'))
 }
 
-function rayIdOf(event: Record<string, unknown>): string | null {
+export function rayIdOf(event: Record<string, unknown>): string | null {
   const meta = asRecord(event.$metadata)
   return firstString(event.rayId, event.ray_id, field(meta, 'rayId'), field(meta, 'ray_id'))
 }
@@ -315,7 +315,7 @@ function rayBody(ray: string): string | null {
   return body.toLowerCase()
 }
 
-function sameRay(left: string, right: string): boolean {
+export function sameRay(left: string, right: string): boolean {
   if (left === right) return true
   const a = rayBody(left)
   const b = rayBody(right)

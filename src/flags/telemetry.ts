@@ -38,6 +38,8 @@ export type SpanLike = {
 };
 
 export type TracingLike = {
+  /** The runtime's form (workerd `ctx.tracing.startSpan`): a child of the active span, open until `end()`. Preferred. */
+  startSpan?(name: string): SpanLike;
   /**
    * One-argument form, same as the viewer: the span stays open until `end()`.
    * A callback form would close before an await, and the Workers clock would record 0.
@@ -64,13 +66,20 @@ function revisionText(revision: string | null): string {
 }
 
 export function openSpan(tracing: TracingLike | null, name: string): SpanLike | null {
+  if (tracing === null) return null;
+  // workerd's ctx.tracing: startSpan(name) stays open until end(). Its enterSpan takes a callback (enterSpan.length is 0
+  // there), so before startSpan was read here the runtime got no span at all.
+  const start = chainGet(tracing, 'startSpan');
+  if (start.tag === 'some' && typeof start.value === 'function') {
+    const span = (start.value as (spanName: string) => unknown).call(tracing, name);
+    return span ? span as SpanLike : null;
+  }
   // The one-argument form stays open until end(). A platform enterSpan that requires a callback
   // (workerd: parameter 2 must be a Function) is not this form; skip it instead of failing the request.
-  if (tracing === null) return null;
   const enter = chainGet(tracing, 'enterSpan');
   if (enter.tag === 'none' || typeof enter.value !== 'function' || enter.value.length !== 1) return null;
   const enterFn = enter.value as (spanName: string) => unknown;
-  const span = enterFn(name);
+  const span = enterFn.call(tracing, name);
   return span ? span as SpanLike : null;
 }
 

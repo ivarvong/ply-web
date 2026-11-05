@@ -14,7 +14,9 @@ import { readFile, listTree, refCandidates } from 'ply';
 import { lsRefs } from 'ply';
 import { discover } from 'ply';
 import { createTransport } from 'ply';
-import { Tracer, arrayExporter, flattenLine } from 'ply';
+import { arrayExporter, flattenLine } from 'ply';
+import { plyTracer } from './edge-trace.ts';
+import { assertRouteTable } from './api-routes.ts';
 import { RETRY, isPlyCode, plyError } from 'ply';
 import { withLimits } from 'ply';
 import { isWorkerCode, WORKER_RETRY } from './write/errors.ts';
@@ -413,6 +415,9 @@ const WRITES = {
   'POST /v1/revert': ({ remote, body, opts }) => handleRevert(remote, body, opts),
 };
 
+// src/api-routes.ts lists these keys for the span test. A route added to one and not the other stops the Worker at load.
+assertRouteTable(READS, WRITES);
+
 // A viewer URL whose repo is public by construction: public-v0 or a built-in forge (never a VIEWER_EXTRA_HOSTS host).
 const PINNABLE_HOSTS = new Set([...ALLOWED_HOSTS, PUBLIC_GIT_HOST]);
 function classifyViewLoc(env, url) {
@@ -561,7 +566,8 @@ const worker = {
           const credential = chainGet(cred, 'auth');
           const callerScrub = scrubber(cred.secrets);
           scrub = text => callerScrub(publicScrub(text));
-          const tracer = new Tracer({ exporter, resource: { 'service.name': 'ply-worker', 'cloudflare.colo': unwrapOr(dig(req, ['cf', 'colo']), '') } });
+          // Every /v1 route runs under this one tracer: each ply span is also a Workers span under the request span (src/edge-trace.ts).
+          const tracer = plyTracer(ctx, { exporter, resource: { 'service.name': 'ply-worker', 'cloudflare.colo': unwrapOr(dig(req, ['cf', 'colo']), '') } });
           // The public read token is attached below the redirect guard, so each hop is re-validated before it is considered,
           // and only when the request carries no credential of its own (a caller's Git-Token or Git-Authorization wins).
           // Under the guard: public, credential-free upload-pack exchanges go to the cache-enabled GitCache entrypoint
