@@ -2,7 +2,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseFragment, type DefaultTreeAdapterMap } from 'parse5';
-import { createGuardedFetch, decideRemote, isAllowedRemote, type AllowedRemote } from '../src/remote.ts';
+import { createGuardedFetch, decideRemote, isAllowedRemote, redirectOptions, remoteAllowUrl, type AllowedRemote } from '../src/remote.ts';
+import { createTransport, forgetQuirks, lsRefs, Tracer } from 'ply';
+import { unwrap } from '../src/ply-result.ts';
 import { classifyHref, renderMarkdown } from '../src/viewer/markdown.ts';
 import { handleViewer } from '../src/viewer/handle.ts';
 import { renderLoaded } from '../src/viewer/html.ts';
@@ -262,7 +264,7 @@ test('checkRemote rejects a table of hostile URLs and brands the ones it allows'
   mustReject('https://user:pw@127.0.0.1:9/r.git', 'userinfo', ['http://127.0.0.1:9']);
 });
 
-test('guarded fetch re-validates every redirect hop and stays on the allowed origin', async () => {
+test('guarded fetch never follows a 3xx: a same-origin one goes back to ply as is, any other Location is refused', async () => {
   const remote = mustAllow('https://github.com/acme/widgets.git');
   const seen: { url: string; redirect: unknown }[] = [];
   const good = createGuardedFetch(async (input, init) => {
@@ -274,10 +276,12 @@ test('guarded fetch re-validates every redirect hop and stays on the allowed ori
     return new Response('ok', { status: 200, headers: { 'content-type': 'text/plain' } });
   }, remote, []);
   const res = await good('https://github.com/acme/widgets/info/refs?service=git-upload-pack', { method: 'GET' });
-  assert.equal(res.status, 200);
-  assert.equal(await res.text(), 'ok');
-  assert.deepEqual(seen.map(hop => hop.redirect), ['manual', 'manual']);
-  assert.equal(slot(seen[1], 'url'), 'https://github.com/acme/widgets.git/info/refs?service=git-upload-pack');
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.get('location'), 'https://github.com/acme/widgets.git/info/refs?service=git-upload-pack');
+  assert.deepEqual(seen, [{ url: 'https://github.com/acme/widgets/info/refs?service=git-upload-pack', redirect: 'manual' }], 'one dial, manual');
+  // Every request is checked on its own: another origin is refused before it is dialled.
+  await assert.rejects(() => good('https://gitlab.com/acme/widgets.git/info/refs?service=git-upload-pack'), (err: Partial<{ code: string }>) => err.code === 'bad_request');
+  assert.equal(seen.length, 1);
 
   for (const location of [
     'https://127.0.0.1.nip.io/latest',
@@ -302,7 +306,73 @@ test('guarded fetch re-validates every redirect hop and stays on the allowed ori
   assert.throws(() => createGuardedFetch(async () => new Response('x'), { href: 'https://evil.example', origin: 'https://evil.example', hostname: 'evil.example', host: 'evil.example' } as AllowedRemote));
 });
 
-test('guarded fetch sends a stream body once, with duplex, and does not follow a redirect that answers it', async () => {
+test('remoteAllowUrl (ply\'s allowUrl) applies decideRemote and the remote\'s origin to the base and to each rebase', () => {
+  const remote = mustAllow('https://github.com/acme/widgets');
+  const allow = remoteAllowUrl(remote);
+  assert.equal(allow(new URL(remote.href)).ok, true);
+  assert.equal(allow(new URL('https://github.com/acme/widgets.git/info/refs?service=git-upload-pack')).ok, true);
+  for (const bad of ['https://127.0.0.1.nip.io/acme/widgets.git/info/refs?service=git-upload-pack', 'https://169.254.169.254/latest', 'https://github.com.evil.com/acme/widgets.git/info/refs?service=git-upload-pack', 'https://gitlab.com/acme/widgets.git/info/refs?service=git-upload-pack', 'https://github.com./acme/widgets.git/info/refs?service=git-upload-pack', 'http://github.com/acme/widgets.git/info/refs?service=git-upload-pack']) {
+    const got = allow(new URL(bad));
+    assert.equal(got.ok, false, bad);
+    if (!got.ok) assert.equal(got.error.code, 'bad_request', bad);
+  }
+  const local = mustAllow('http://127.0.0.1:9/r.git', ['http://127.0.0.1:9']);
+  assert.equal(remoteAllowUrl(local, ['http://127.0.0.1:9'])(new URL('http://127.0.0.1:9/s.git/info/refs?service=git-upload-pack')).ok, true);
+  assert.equal(remoteAllowUrl(local, ['http://127.0.0.1:9', 'http://127.0.0.1:10'])(new URL('http://127.0.0.1:10/r.git/info/refs?service=git-upload-pack')).ok, false, 'another allowlisted origin is still another origin');
+  assert.throws(() => remoteAllowUrl({ href: 'https://evil.example', origin: 'https://evil.example', hostname: 'evil.example', host: 'evil.example' } as AllowedRemote));
+});
+
+const V2_AD = new TextEncoder().encode('000eversion 2\n0013ls-refs=unborn\n0000');
+
+test('through the guard, ply follows only the first info/refs (git\'s rule): the base is rewritten, the credential stays on the origin, a POST 3xx is an error naming the target', async () => {
+  const remote = mustAllow('https://github.com/acme/widgets');
+  type Call = { method: string; url: string; auth: string | null };
+  const host = (mode: 'moved' | 'post' | 'away') => {
+    // a different fake host at the same URL each time: forget ply's per-remote memo of the settled redirect
+    forgetQuirks();
+    const calls: Call[] = [];
+    const inner: typeof fetch = async (input, init) => {
+      const url = String(input);
+      calls.push({ method: String(fill(slot(init, 'method'), 'GET')), url, auth: new Headers(slot(init, 'headers') as HeadersInit).get('authorization') });
+      if (url === 'https://github.com/acme/widgets/info/refs?service=git-upload-pack') {
+        const location = mode === 'away' ? 'https://gitlab.com/acme/widgets.git/info/refs?service=git-upload-pack' : mode === 'post' ? '' : '/acme/widgets.git/info/refs?service=git-upload-pack';
+        if (location) return new Response(null, { status: 302, headers: { location } });
+      }
+      if (url.endsWith('/info/refs?service=git-upload-pack')) return new Response(V2_AD, { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-advertisement' } });
+      if (mode === 'post') return new Response(null, { status: 307, headers: { location: 'https://github.com/acme/elsewhere.git/git-upload-pack' } });
+      return new Response(new TextEncoder().encode('0000'), { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' } });
+    };
+    return { calls, t: unwrap(createTransport(remote.href, { fetchImpl: createGuardedFetch(inner, remote), auth: { bearer: 'sekrit' }, tracer: new Tracer(), ...redirectOptions(remote) })) };
+  };
+
+  const moved = host('moved');
+  const listed = await lsRefs(moved.t, ['refs/heads/']);
+  assert.equal(listed.ok, true, JSON.stringify(listed));
+  assert.equal(moved.t.url, 'https://github.com/acme/widgets.git');
+  assert.deepEqual(moved.calls.map(c => [c.method, c.url]), [
+    ['GET', 'https://github.com/acme/widgets/info/refs?service=git-upload-pack'],
+    ['GET', 'https://github.com/acme/widgets.git/info/refs?service=git-upload-pack'],
+    ['POST', 'https://github.com/acme/widgets.git/git-upload-pack'],
+  ]);
+  assert.ok(moved.calls.every(c => c.auth === 'Bearer sekrit'), 'same origin: the credential is sent');
+
+  const post = host('post');
+  const refused = await lsRefs(post.t, ['refs/heads/']);
+  assert.equal(refused.ok, false);
+  if (!refused.ok) {
+    assert.equal(refused.error.code, 'http');
+    assert.match(refused.error.message, /redirected to https:\/\/github\.com\/acme\/elsewhere\.git\/git-upload-pack/);
+  }
+  assert.deepEqual(post.calls.map(c => c.method), ['GET', 'POST'], 'the POST redirect is not followed');
+
+  const away = host('away');
+  const cross = await lsRefs(away.t, ['refs/heads/']);
+  assert.equal(cross.ok, false);
+  if (!cross.ok) assert.equal(cross.error.code, 'bad_request');
+  assert.equal(away.calls.length, 1, 'another origin is never dialled, so the credential cannot go there');
+});
+
+test('guarded fetch sends a stream body once, with duplex, and hands a redirect that answers it back to ply unfollowed', async () => {
   const remote = mustAllow('https://github.com/acme/widgets.git');
   const url = `${remote.href}/git-receive-pack`;
   const stream = () => new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new Uint8Array([1, 2, 3])); c.close(); } });
@@ -320,7 +390,8 @@ test('guarded fetch sends a stream body once, with duplex, and does not follow a
     hops++;
     return new Response(null, { status: 307, headers: { location: url } });
   }, remote, []);
-  await assert.rejects(() => redirected(url, { method: 'POST', body: stream() }), (err: Partial<{ code: string; message: string }>) => err.code === 'bad_request' && /streamed/.test(String(err.message)));
+  const answered = await redirected(url, { method: 'POST', body: stream() });
+  assert.equal(answered.status, 307);
   assert.equal(hops, 1);
 
   await assert.rejects(() => ok(url, { method: 'POST', body: 'text' }), (err: Partial<{ code: string }>) => err.code === 'bad_request');

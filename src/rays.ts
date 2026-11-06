@@ -19,7 +19,8 @@
 // Server-Timing uses the same phases and durations, then `total` for the Worker request.
 // Nothing in either header is a URL, a credential, or a repository name.
 
-import { chainGet } from './absent.ts';
+import { atIndex, chainGet } from './absent.ts';
+import type { Option } from './option.ts';
 
 /** Response header carrying the upstream ray log. */
 export const RAY_HEADER = 'x-artifacts-ray';
@@ -54,8 +55,13 @@ export type RayEntry = {
   readonly phase: Phase;
   readonly ray: Ray;
   readonly durMs: DurationMs;
-  /** False for a redirect hop the guard followed. The header still lists it; the span gets the hop ply read. */
+  /** False for a 3xx (a redirect ply followed or reported). The header still lists it; the span gets the hop ply read. */
   readonly delivered: boolean;
+  /**
+   * A GET info/refs. With followRedirects 'initial' ply advertises before a transport's first POST, inside that POST's
+   * span: a POST span is paired with the exchange after such a preamble, not with the preamble.
+   */
+  readonly advertisement: boolean;
 };
 
 export type RayReport =
@@ -149,11 +155,12 @@ type Slot = {
   ray: Ray;
   durMs: DurationMs;
   delivered: boolean;
+  advertisement: boolean;
   filled: boolean;
 };
 
 export type RayLog = {
-  reserve(phase: Phase): number | null;
+  reserve(phase: Phase, advertisement: boolean): number | null;
   fill(index: number, ray: Ray, durMs: DurationMs, delivered: boolean): void;
   report(): RayReport;
 };
@@ -162,9 +169,9 @@ export function createRayLog(): RayLog {
   const slots: Slot[] = [];
   let omitted = 0;
   return {
-    reserve(phase) {
+    reserve(phase, advertisement) {
       if (slots.length >= MAX_RAY_ENTRIES) { omitted += 1; return null; }
-      slots.push({ phase, ray: { kind: 'no_response' }, durMs: durationMs(0, 0), delivered: true, filled: false });
+      slots.push({ phase, ray: { kind: 'no_response' }, durMs: durationMs(0, 0), delivered: true, advertisement, filled: false });
       return slots.length - 1;
     },
     fill(index, ray, durMs, delivered) {
@@ -177,7 +184,7 @@ export function createRayLog(): RayLog {
     },
     report() {
       const entries: RayEntry[] = slots.filter(slot => slot.filled).map(slot => ({
-        phase: slot.phase, ray: slot.ray, durMs: slot.durMs, delivered: slot.delivered,
+        phase: slot.phase, ray: slot.ray, durMs: slot.durMs, delivered: slot.delivered, advertisement: slot.advertisement,
       }));
       return omitted === 0 ? { kind: 'within', entries } : { kind: 'overflow', entries, omitted };
     },
@@ -195,13 +202,17 @@ function requestUrl(input: RequestInfo | URL): string {
   return input.url;
 }
 
+function isAdvertisement(url: string): boolean {
+  try { return new URL(url).pathname.endsWith('/info/refs'); } catch { return false; }
+}
+
 function bodyBytes(body: unknown): Uint8Array | null {
   return body instanceof Uint8Array ? body : null;
 }
 
 /**
  * Record every git exchange `inner` performs. A redirect (3xx) is listed and marked not delivered:
- * the guard follows it, and the span is stamped with the hop ply actually read.
+ * ply follows it (or reports it), and the span is stamped with the hop ply actually read.
  * A throw before headers is `no-response` and is rethrown unchanged.
  */
 export function observeUpstream(inner: UpstreamFetch, log: RayLog): UpstreamFetch {
@@ -210,7 +221,7 @@ export function observeUpstream(inner: UpstreamFetch, log: RayLog): UpstreamFetc
     const method = methodField.tag === 'none' ? 'GET' : methodField.value as string;
     const bodyField = chainGet(init, 'body');
     const phase = phaseOf(method, requestUrl(input), bodyBytes(bodyField.tag === 'none' ? null : bodyField.value));
-    const index = phase === null ? null : log.reserve(phase);
+    const index = phase === null ? null : log.reserve(phase, method.toUpperCase() === 'GET' && isAdvertisement(requestUrl(input)));
     const start = Date.now();
     try {
       const res = await inner(input, init);
@@ -260,6 +271,10 @@ const ATTR_DUR = 'git.upstream.dur_ms';
  * Attributes are `git.upstream.cf_ray`, `git.upstream.phase`, and `git.upstream.dur_ms`.
  * The value is the same token the header uses (`-` or `no-response` included).
  */
+function isPreamble(entry: Option<RayEntry>): boolean {
+  return entry.tag === 'some' && entry.value.advertisement;
+}
+
 export function stampUpstreamSpans(lines: readonly unknown[], report: RayReport): void {
   const spans: { start: bigint; span: OtlpSpan }[] = [];
   for (const line of lines as OtlpLine[]) {
@@ -281,13 +296,17 @@ export function stampUpstreamSpans(lines: readonly unknown[], report: RayReport)
     return 0;
   });
   const delivered = report.entries.filter(entry => entry.delivered);
-  const n = Math.min(spans.length, delivered.length);
-  for (let i = 0; i < n; i++) {
-    const entry = delivered[i];
-    const span = spans[i];
-    if (!entry || !span) continue;
+  let next = 0;
+  for (const span of spans) {
     const foundAttributes = chainGet(span.span, 'attributes');
     const attributes = foundAttributes.tag === 'some' ? foundAttributes.value as OtlpAttribute[] : [];
+    // A span that ended on a POST read the POST: an advertisement before it was ply's initial GET info/refs, in this span.
+    const posted = attributes.some(a => a.key === 'http.request.method' && 'stringValue' in a.value && a.value.stringValue === 'POST');
+    while (posted && next + 1 < delivered.length && isPreamble(atIndex(delivered, next))) next += 1;
+    const found = atIndex(delivered, next);
+    if (found.tag === 'none') break;
+    const entry = found.value;
+    next += 1;
     if (foundAttributes.tag === 'none') span.span.attributes = attributes;
     attributes.push(
       { key: ATTR_RAY, value: { stringValue: renderRay(entry.ray) } },

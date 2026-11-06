@@ -52,11 +52,16 @@ const ALL_CODES: readonly ErrorCode[] = [...CODES, CODE_REF_EXISTS, CODE_STALE_E
 
 export const STATUS: Readonly<Record<string, number>> = Object.freeze(Object.fromEntries(ALL_CODES.map(code => [code, statusOfCode(code)])))
 
-/** `auth` keeps the upstream's own 401 or 403; anything unmapped is 500. */
+/**
+ * `auth` keeps the upstream's own 401 or 403; anything unmapped is 500. An `http` error with a 3xx status is a redirect
+ * ply would not follow (git's http.followRedirects=initial: a 3xx on a POST, a loop past the hop cap, a Location that
+ * drops the info/refs suffix). The remote URL has to change, as with a cross-origin redirect the guard refuses: 400.
+ */
 export function statusOf(err: unknown): number {
   const code = chainGet(err, 'code')
   if (code.tag !== 'some' || !isErrorCode(code.value)) return 500
   const status = chainGet(err, 'status')
   if (code.value === 'auth' && status.tag === 'some' && (status.value === 401 || status.value === 403)) return status.value
+  if (code.value === 'http' && status.tag === 'some' && typeof status.value === 'number' && status.value >= 300 && status.value < 400) return 400
   return statusOfCode(code.value)
 }

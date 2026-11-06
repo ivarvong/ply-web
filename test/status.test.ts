@@ -20,3 +20,11 @@ test('statusOf keeps the upstream auth status and defaults to 500', () => {
   assert.equal(statusOf({ code: 'nope' }), 500)
   assert.equal(statusOf(null), 500)
 })
+
+test('statusOf: an http error with a 3xx status (a redirect ply would not follow) is 400; other http errors stay 502', () => {
+  assert.equal(statusOf({ code: 'http', status: 307 }), 400)
+  assert.equal(statusOf({ code: 'http', status: 301 }), 400)
+  assert.equal(statusOf({ code: 'http', status: 418 }), 502)
+  assert.equal(statusOf({ code: 'http', status: 200 }), 502)
+  assert.equal(statusOf({ code: 'http' }), 502)
+})
