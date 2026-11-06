@@ -4,7 +4,7 @@
 import { dig } from '../absent.ts';
 import { EDGE_ATTR, edgeTracingOf, type EdgeSpan } from '../edge-trace.ts';
 import { Batcher, defaultTuning, type FlushReport } from './batcher.ts';
-import { BUCKET_PACK, BUCKET_PAGE, DOC_URL, KEY_HEX, MEMO_FALLBACK_MS } from './config.ts';
+import { BUCKET_PACK, BUCKET_PAGE, DOC_URL, KEY_HEX, MEMO_FALLBACK_MS, READ_BUDGET_MS } from './config.ts';
 import type { Fault } from './core.ts';
 import { DOC_AT_HEADER, indexDoc, type DocIndex } from './doc.ts';
 import { counterNamespace, counterOf } from './stub.ts';
@@ -117,7 +117,7 @@ export async function inSpan<T>(ctx: unknown, name: string, stamp: Readonly<Reco
 type Memo = { etag: string; index: DocIndex; gen: number; at: number; entries: number; fetchedAt: number };
 let memo: Memo | null = null;
 
-export type DocRead = { readonly read: 'ok' | 'memo' | 'fail'; readonly cache: string; readonly memo: Memo | null; readonly parsed: boolean };
+export type DocRead = { readonly read: 'ok' | 'memo' | 'fail' | 'late_memo' | 'late_open'; readonly cache: string; readonly memo: Memo | null; readonly parsed: boolean };
 
 type CacheBinding = { fetch(req: Request): Promise<Response> };
 
@@ -127,7 +127,7 @@ function rateCacheOf(ctx: unknown): CacheBinding | null {
   return found.value as CacheBinding;
 }
 
-export async function readDoc(ctx: unknown, now: number): Promise<DocRead> {
+async function fetchDoc(ctx: unknown, now: number): Promise<DocRead> {
   const rateCache = rateCacheOf(ctx);
   const fallback = (cache: string): DocRead => (memo !== null && now - memo.fetchedAt < MEMO_FALLBACK_MS ? { read: 'memo', cache, memo, parsed: false } : { read: 'fail', cache, memo: null, parsed: false });
   if (rateCache === null) return fallback('NONE');
@@ -157,6 +157,25 @@ export async function readDoc(ctx: unknown, now: number): Promise<DocRead> {
   } catch {
     return fallback(cache);
   }
+}
+
+/**
+ * The read on the request path never waits on the Durable Object (docs/rate-limit.md "Read budget"). The cached fetch
+ * gets `budgetMs`; a HIT answers in a few ms. Past the budget (a MISS is a synchronous DO read, 400+ ms on lat2; an
+ * isolate's first loopback, ~55 ms) the request decides from the isolate's last document, or admits when it has none,
+ * and the fetch finishes in waitUntil, refreshing that document for the next request. `budgetMs` null waits (tests).
+ */
+export async function readDoc(ctx: unknown, now: number, budgetMs: number | null = null): Promise<DocRead> {
+  const pending = fetchDoc(ctx, now);
+  if (budgetMs === null) return pending;
+  const late: DocRead = { read: 'late_open', cache: 'LATE', memo: null, parsed: false };
+  const won = await Promise.race([pending, new Promise<DocRead>(resolve => setTimeout(() => resolve(late), budgetMs))]);
+  if (won !== late) return won;
+  const waitUntil = dig(ctx, ['waitUntil']);
+  if (waitUntil.tag === 'some' && typeof waitUntil.value === 'function') (waitUntil.value as (p: Promise<unknown>) => void).call(ctx, pending.catch(() => null));
+  const held = memo;
+  if (held !== null && Date.now() - held.fetchedAt < MEMO_FALLBACK_MS) return { read: 'late_memo', cache: 'LATE', memo: held, parsed: false };
+  return late;
 }
 
 // ---- write side: the isolate's one batcher ----
@@ -244,7 +263,7 @@ export async function admitBatched(input: {
   const { ctx, env, id, bucket, now, set } = input;
   const key = id.hex.slice(0, KEY_HEX);
   const b = bucket === 'pack' ? BUCKET_PACK : BUCKET_PAGE;
-  const doc = await readDoc(ctx, now);
+  const doc = await readDoc(ctx, now, READ_BUDGET_MS);
   set('rate.read', doc.read);
   set('rate.cache', doc.cache);
   set('rate.doc_parsed', doc.parsed);
@@ -259,7 +278,7 @@ export async function admitBatched(input: {
       return { ok: false, remaining: 0, retryAfterMs: hit[0] - now };
     }
   }
-  set('rate.decision', doc.read === 'fail' ? 'fail_open' : 'allow');
+  set('rate.decision', doc.read === 'fail' || doc.read === 'late_open' ? 'fail_open' : 'allow');
   const batch = batcherFor(env, input.limitFor);
   const before = batch.pending().keys === 0 && batch.pending().hits === 0;
   const version = versionOf(env);

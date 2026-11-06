@@ -46,8 +46,8 @@ Nothing on the request path waits for the Durable Object except a cache MISS/EXP
   (50 ms, doubling) → the same id again. 5 s after the first attempt (`FLUSH_DEADLINE_MS`) the batch is dropped and
   recorded. A timed-out attempt may still apply later; that is exactly what the id covers (tested: a DO that applies
   after the client gave up, plus the retry, counts once).
-- **Per-attempt timeout.** Set from the measured RPC latency: 1000 ms initially (old per-client DO call p99 ≈ 49 ms warm,
-  117 ms fresh isolate), to be revised to ≈ 2× the measured apply-RPC p99.9 (see Results). Lower is not better: an
+- **Per-attempt timeout.** 1500 ms = ≈ 2× the measured apply-RPC p99.9 (722 ms, ae21dee2 run lat2, 5,649 flushes). The
+  first cut used 1000 ms: Marseille's RPCs (436–984 ms) timed out and were replayed (counted once, but extra DO load). Lower is not better: an
   attempt that times out and is retried while the first is merely slow adds a replay, never a double count.
 - **Drop, not merge.** An expired batch is dropped, not merged into the next batch. Merging moves its counts under a new
   id, and if the original's last attempt applies late the counts land twice: the one property the id exists to give
@@ -83,6 +83,11 @@ Nothing on the request path waits for the Durable Object except a cache MISS/EXP
   second, whatever the client count. The cost is size: the document is O(blocked clients), capped at 4096 entries ×
   ~40 bytes. Measured hit ratio in Results.
 - **In the isolate** the parsed document is memoized by its `etag`: a HIT costs the loopback fetch, not a JSON parse.
+- **Read budget (never block on the DO).** The cached fetch gets 25 ms (`READ_BUDGET_MS`; warm HIT/SWR reads on lat2:
+  p99 12 ms, max 46 ms). A MISS is a synchronous DO read (403–481 ms on lat2) and an isolate's first loopback ~55 ms: past
+  the budget the request decides from the isolate's last document (any age ≤ 5 min), or admits when the isolate has
+  none, and the fetch completes in `waitUntil`, refreshing that document. Extra lag this adds: only in an isolate that
+  has never read the document, for ≤ one DO read (~0.5 s); measured in Results.
 - **Failure.** If the read fails, the last good document (≤ 5 min old) is used; with none, the request is admitted (fail
   open) and recorded. Today's limiter fails closed (503); with one object instead of one per client, failing closed would
   turn a DO incident into a viewer outage. The limit bounds cost; it is not an access control.

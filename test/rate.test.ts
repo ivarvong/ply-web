@@ -196,18 +196,18 @@ test('batcher: hits within the linger are one RPC with one id; the next batch ha
 });
 
 test('batcher: a DO that applies after the client gave up, plus the retry, counts once', async () => {
-  // Attempt 1 applies at once but its answer takes 3 s (the client's 1 s timer wins); attempt 2 is answered at once.
+  // Attempt 1 applies at once but its answer takes 3 s (the client's 1.5 s timer wins); attempt 2 is answered at once.
   const h = harness(({ clock, core }, r) => {
     const result = core.apply(r, clock.now());
     if (r.attempt === 1) return clock.sleep(3_000).then(() => result);
     return Promise.resolve(result);
   });
   for (let i = 0; i < 60; i++) h.batcher.add(K1, 0, null);
-  await h.clock.advance(200 + 1_000 + 50 + 10);
+  await h.clock.advance(200 + 1_500 + 50 + 10);
   const r = h.reports[0];
   assert.equal(r.outcome, 'ok');
   assert.deepEqual(r.attempts.map(a => a.outcome), ['timeout', 'ok']);
-  assert.equal(r.attempts[0].ms, 1_000);
+  assert.equal(r.attempts[0].ms, 1_500);
   assert.equal(r.replay, true, 'the retry was acknowledged as a replay');
   assert.equal(new Set(h.sends.map(s => s.id)).size, 1, 'every attempt carries the same key');
   // Exactly 60 counted: one more admitted hit makes 61, and the block's peak is 60 before it.
@@ -219,9 +219,9 @@ test('batcher: a DO that applies after the client gave up, plus the retry, count
 });
 
 test('batcher: a slow DO that applies late (after the retry) still counts once', async () => {
-  // Attempt 1 is delivered late: it applies 1.5 s after it was sent. Attempt 2 applies first. Attempt 1 is then a replay.
+  // Attempt 1 is delivered late: it applies 2 s after it was sent. Attempt 2 applies first. Attempt 1 is then a replay.
   const h = harness(({ clock, core }, r) => {
-    if (r.attempt === 1) return clock.sleep(1_500).then(() => core.apply(r, clock.now()));
+    if (r.attempt === 1) return clock.sleep(2_000).then(() => core.apply(r, clock.now()));
     return Promise.resolve(core.apply(r, clock.now()));
   });
   for (let i = 0; i < 10; i++) h.batcher.add(K1, 0, null);
@@ -522,4 +522,29 @@ test('counterNamespace: found on a ctx.exports that answers `in` with false (the
   const callable = Object.assign(() => {}, ns);
   assert.equal(counterNamespace({}, { exports: { RateCounter: callable } }), callable);
   assert.equal(counterNamespace({}, null), null);
+});
+
+test('admit: the read never waits past its budget — late reads use the isolate memo, or admit with none', async () => {
+  resetRateState();
+  const core = new CounterCore(sqlite());
+  core.apply(req('b:1', [['f'.repeat(KEY_HEX), 0, 60]]), Date.now());
+  const ns = fakeNamespace(core);
+  const env = { RATE_MODE: 'batched', RATE_COUNTER: ns };
+  const waits: Promise<unknown>[] = [];
+  // Every read is a slow MISS: 100 ms, four times the budget.
+  const ctx = { waitUntil: (p: Promise<unknown>) => { waits.push(p); }, exports: { RateCache: { fetch: async (r: Request) => { await new Promise(res => setTimeout(res, 100)); return serveDoc(r, ns.get()); } } } };
+  const id = { hex: 'f'.repeat(64), mode: 'batched' as const, fault: null, load: true };
+  const attrs: Record<string, string | number | boolean> = {};
+  const set = (k: string, v: string | number | boolean) => { attrs[k] = v; };
+  const t0 = Date.now();
+  const first = await admitBatched({ ctx, env, id, bucket: 'page', now: Date.now(), limitFor: () => 60, set });
+  assert.ok(Date.now() - t0 < 80, 'did not wait for the slow read');
+  assert.equal(first.ok, true, 'no document in this isolate yet: admitted (the bounded extra lag)');
+  assert.equal(attrs['rate.read'], 'late_open');
+  await Promise.all(waits);
+  const second = await admitBatched({ ctx, env, id, bucket: 'page', now: Date.now(), limitFor: () => 60, set });
+  assert.equal(second.ok, false, 'the late fetch refreshed the isolate document; this read decides from it');
+  assert.equal(attrs['rate.read'], 'late_memo');
+  await Promise.all(waits);
+  resetRateState();
 });

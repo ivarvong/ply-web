@@ -2,8 +2,11 @@
 
 /** How long an isolate's open batch collects hits before one flush RPC. Ivar's design: "only write every 200ms". */
 export const LINGER_MS = 200;
-/** One flush attempt races this timer. docs/rate-limit.md "Per-attempt timeout" says where the number comes from. */
-export const ATTEMPT_TIMEOUT_MS = 1_000;
+/**
+ * One flush attempt races this timer: about 2x the apply RPC's p99.9 (722 ms on ae21dee2, run lat2, 5649 flushes). At
+ * 1000 ms, colos far from the counter (MRS: 436-984 ms) timed out and replayed healthy attempts.
+ */
+export const ATTEMPT_TIMEOUT_MS = 1_500;
 /** A batch is retried with the same id until acked or this long after its first attempt, then dropped. */
 export const FLUSH_DEADLINE_MS = 5_000;
 /** First retry backoff; doubles per attempt, capped by what is left of the deadline. */
@@ -27,6 +30,11 @@ export const DOC_SWR_S = 30;
 export const DOC_URL = 'https://rate.internal/blocked/v1';
 export const DOC_PATH = '/blocked/v1';
 export const DOC_TAG = 'rate-blocked';
+/**
+ * The request waits this long for the cached document. Warm HIT and stale (SWR) reads on lat2: p99 12 ms, max 46 ms
+ * (5,669); a MISS is a synchronous DO read (403-481 ms). Past this the request uses the isolate's last document.
+ */
+export const READ_BUDGET_MS = 25;
 /** After a failed read, the isolate's last good document is used for this long; then the request fails open. */
 export const MEMO_FALLBACK_MS = 300_000;
 
