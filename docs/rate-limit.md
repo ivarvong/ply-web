@@ -137,4 +137,32 @@ DO log lines: `ply.rate.apply` (id, attempt, replay, keys, hits, apply_ms, rows_
 
 ## Results
 
-(filled in from the measurement runs)
+Load: ply-load (`bench/load`), generator DOs in wnam/enam/weur/apac (4 shards each, 5 req/s each, open loop),
+`GET /r/ply`, the two arms interleaved per request inside ONE version via `x-ply-rate-mode`, pinned with
+`Cloudflare-Workers-Version-Overrides`. Server numbers: `ply.rate.check` spans (`rate.check_ms`) and `ply.request` logs
+joined by trace, filtered by `ply.script_version`. Synthetic clients each stay under the limit.
+
+| run · version | arm | n checks | check p50 / p99 / p99.9 / max ms | page wall p50 / p99 / p99.9 ms |
+|---|---|---|---|---|
+| lat3 · 6ed2e746 (no read budget) | legacy | 13,187 | 15 / 404 / 533 / 1375 | 27 / 462 / 1567 |
+| lat3 · 6ed2e746 (no read budget) | batched | 13,188 | 3 / 13 / 49 / 373 | 16 / 107 / 1446 |
+| lat4 · a020b1b1 (25 ms read budget) | legacy | 13,177 | 14 / 403 / 588 / 3274 | 28 / 463 / 3447 |
+| lat4 · a020b1b1 (25 ms read budget) | batched | 15,099 | **3 / 12 / 25 / 25** | 16 / 71 / 3049 |
+
+The page p99.9 (≈3 s in both arms) is git work, not the limiter (lat1, A/A legacy, has the same tail).
+
+- **Read cache (lat4):** HIT 77.9%, UPDATING (served stale while one request revalidates) 21.9%, past the 25 ms budget
+  0.19% (29); 13 of those had no document in the isolate and were admitted (`fail_open`). HIT+SWR 99.8%.
+- **Enforcement (abuse runs, 12 clients/arm at 2× the 60/min limit for 100 s):** batched lag p50 511 / max 1007 ms
+  (abuse2, a020b1b1; abuse1 6ed2e746: p50 1007, max 1012), overshoot p50 1 / max 2 requests per client (the DO's
+  `peak − limit` agrees: 2). Legacy: lag 19–44 ms, overshoot 0. Admitted totals over the run are equal (1,440 vs 1,440).
+- **Flushes (lat4, a020b1b1, no fault):** 12,525 flushes, 99.9% one attempt; 11 timeouts in 12,536 attempts at 1.5 s
+  (lat3 at 1.0 s: 175 in 11,655, every one later a DO replay). RPC p50 / p99 / p99.9 142 / 762 / 1363 ms. Keys per
+  batch p50 1, p99 3: at ~1 req/s per colo an isolate rarely sees two hits in 200 ms, so the DO is written about once per
+  admitted request; the batching pays off only with denser per-isolate traffic.
+- **Counter DO (lat3 window):** 11,228 invocations (≈47/s); CPU p50 0 / p99 2 / p99.9 7 ms; wall p50 133 / p99 1317 ms.
+  The wall is the SQLite commit behind the output gate, and it is the RPC latency the flush sees.
+- **Fault injection in prod (a020b1b1, fault1 SJC / fault2 LHR+MRS, 20–60 s of each run):**
+  `slow-ack=2500` → 305/305 batches: attempt 1 timed out at 1.5 s, attempt 2 acked as a replay. `error;attempts=2` → 280
+  batches ok on attempt 3, 3 on attempt 4, 1 hit the 5 s deadline (recorded `dropped`), yet the DO log shows its attempt
+  3 applied and attempt 4 replayed: counted once. Across 13,978 applies, no id applied twice.

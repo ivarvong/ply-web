@@ -103,7 +103,7 @@ const plyWorker = {
 			// RateCounter; "legacy" calls ViewerRateLimit on every request. Flip to "legacy" to roll the limiter back alone.
 			// RateCounter is reached through ctx.exports.RateCounter, not a binding: the versions API refuses a binding to a class
 			// that no deploy has provisioned yet (checked 2026-11-06 on the first upload of RateCounter).
-			RATE_MODE: bindings.text("legacy"),
+			RATE_MODE: bindings.text("batched"),
 			// The public namespace, served read-only with no token (src/public.ts). The binding is scoped to this one
 			// namespace; the Worker calls only get(<repo>).createToken("read", 3600) and list(). No stored secret.
 			PUBLIC_REPOS: bindings.artifacts({ namespace: PUBLIC_NAMESPACE }),
