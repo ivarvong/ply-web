@@ -148,6 +148,8 @@ joined by trace, filtered by `ply.script_version`. Synthetic clients each stay u
 | lat3 · 6ed2e746 (no read budget) | batched | 13,188 | 3 / 13 / 49 / 373 | 16 / 107 / 1446 |
 | lat4 · a020b1b1 (25 ms read budget) | legacy | 13,177 | 14 / 403 / 588 / 3274 | 28 / 463 / 3447 |
 | lat4 · a020b1b1 (25 ms read budget) | batched | 15,099 | **3 / 12 / 25 / 25** | 16 / 71 / 3049 |
+| lat5 · 78ddd5c3 (promoted, unpinned) | legacy | 10,778 | 13 / 424 / 584 / 819 | 26 / 531 / 2739 |
+| lat5 · 78ddd5c3 (promoted, unpinned) | default (batched) | 10,782 | **3 / 12 / 25 / 25** | 15 / 193 / 2747 |
 
 The page p99.9 (≈3 s in both arms) is git work, not the limiter (lat1, A/A legacy, has the same tail).
 
@@ -166,3 +168,9 @@ The page p99.9 (≈3 s in both arms) is git work, not the limiter (lat1, A/A leg
   `slow-ack=2500` → 305/305 batches: attempt 1 timed out at 1.5 s, attempt 2 acked as a replay. `error;attempts=2` → 280
   batches ok on attempt 3, 3 on attempt 4, 1 hit the 5 s deadline (recorded `dropped`), yet the DO log shows its attempt
   3 applied and attempt 4 replayed: counted once. Across 13,978 applies, no id applied twice.
+- **After promotion (lat5, 78ddd5c3 at 100%, unpinned, default vs `x-ply-rate-mode: legacy`, 10,800 requests/arm):**
+  all 200, 0 wrong-version. Client TTFB p50 / p99 / p99.9 45 / 935 / 4505 ms default vs 59 / 1035 / 4717 legacy. Read
+  cache HIT 74.7%, UPDATING 25.1%, LATE 0.25% (27; 9 `fail_open`). 10,563 flushes, all ok on attempt 1 (0 timeouts,
+  0 replays, 0 deadline); RPC p50 / p99 / p99.9 150 / 290 / 453 ms, a much tighter tail than lat4's 762 / 1363. Real
+  (non-load) traffic on batched in the window: 58 checks, p99 5 ms. DO `rows_written` p50 6, p99.9 519, max 3983: the
+  large ones are the retention prunes (`rate_hits`, `rate_batches` older than 10 min), not hit writes.
