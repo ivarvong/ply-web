@@ -152,6 +152,7 @@ async function dwell(
     periodMs: 1000 / probe.rps,
     maxInFlight: probe.maxInFlight,
     batch: live.length,
+    graceMs: probe.timeoutMs,
     issue: seq => {
       const call = live[(seq - 1) % live.length]
       if (!call) throw new Error('probe call missing')

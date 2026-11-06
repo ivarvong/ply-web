@@ -104,6 +104,7 @@ test('at the in-flight bound the next tick is shed and the dwell stays on the wa
     periodMs: 40,
     maxInFlight: 2,
     batch: 2,
+    graceMs: 0,
     issue: seq => ({ id: `probe-${seq}`, promise: new Promise<ProbeOutcome>(() => {}) }),
     shed: seq => ({ kind: 'shed', id: `shed-${seq}` }),
     stop: () => {
@@ -130,6 +131,7 @@ test('a client stall does not stretch a 40s dwell and the unfinished probes are 
     periodMs: 40,
     maxInFlight: 4,
     batch: 2,
+    graceMs: 0,
     issue: seq => ({ id: `probe-${seq}`, promise: new Promise<ProbeOutcome>(() => {}) }),
     shed: seq => ({ kind: 'shed', id: `shed-${seq}` }),
     stop: () => {},
@@ -156,6 +158,7 @@ test('a fast probe is issued on the period and is not shed', async () => {
     periodMs: 40,
     maxInFlight: 10,
     batch: 2,
+    graceMs: 0,
     issue: seq => ({
       id: `probe-${seq}`,
       promise: Promise.resolve({ kind: 'responded', id: `probe-${seq}`, status: 200, ray: none(), latencyMs: 40, version: none() }),
@@ -166,6 +169,57 @@ test('a fast probe is issued on the period and is not shed', async () => {
   assert.equal(ticks.read(), 200)
   assert.equal(outcomes.filter(item => item.kind === 'shed').length, 0)
   assert.equal(outcomes.filter(item => item.kind === 'responded').length, 10)
+})
+
+test('a probe in flight at the deadline answers within the grace and is not lost', async () => {
+  // The last tick (t=80) is unanswered at the deadline (t=120); it answers once the grace wait has begun.
+  let at = 0
+  const late: (() => void)[] = []
+  const ticks: ProbeClock = {
+    now: () => at,
+    sleep: async ms => {
+      if (at >= 120) { for (const release of late.splice(0)) release(); await Promise.resolve(); return }
+      at += ms
+    },
+  }
+  let stopped = 0
+  const outcomes = await runProbeSchedule({
+    clock: ticks,
+    dwellMs: 120,
+    periodMs: 40,
+    maxInFlight: 10,
+    batch: 2,
+    graceMs: 2000,
+    issue: seq => {
+      const answer: ProbeOutcome = { kind: 'responded', id: `probe-${seq}`, status: 200, ray: none(), latencyMs: 40, version: none() }
+      if (seq <= 4) return { id: `probe-${seq}`, promise: Promise.resolve(answer) }
+      return { id: `probe-${seq}`, promise: new Promise<ProbeOutcome>(resolve => { late.push(() => resolve(answer)) }) }
+    },
+    shed: seq => ({ kind: 'shed', id: `shed-${seq}` }),
+    stop: () => {
+      stopped += 1
+    },
+  })
+  assert.equal(stopped, 1)
+  assert.equal(outcomes.filter(item => item.kind === 'lost').length, 0)
+  assert.equal(outcomes.filter(item => item.kind === 'responded').length, 6)
+})
+
+test('a probe still hung after the grace is timed_out and the dwell ends at deadline + grace', async () => {
+  const ticks = clock()
+  const outcomes = await runProbeSchedule({
+    clock: ticks,
+    dwellMs: 120,
+    periodMs: 40,
+    maxInFlight: 10,
+    batch: 2,
+    graceMs: 2000,
+    issue: seq => ({ id: `probe-${seq}`, promise: new Promise<ProbeOutcome>(() => {}) }),
+    shed: seq => ({ kind: 'shed', id: `shed-${seq}` }),
+    stop: () => {},
+  })
+  assert.equal(ticks.read(), 2120)
+  assert.equal(outcomes.filter(item => item.kind === 'lost').length, 6)
 })
 
 test('10/128 above the loss rate does not fail a window under probe.minSamples', () => {
