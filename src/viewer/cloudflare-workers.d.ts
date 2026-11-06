@@ -20,6 +20,7 @@ declare module 'cloudflare:workers' {
   export interface DurableObjectStorage {
     get<T>(key: string): Promise<T | PlatformAbsent>;
     put<T>(key: string, value: T): Promise<void>;
+    put<T>(key: string, value: T, options: { allowUnconfirmed: boolean }): Promise<void>;
     sql: SqlStorage;
   }
   export interface SqlStorage {

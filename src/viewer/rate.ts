@@ -18,7 +18,9 @@ export class ViewerRateLimit extends DurableObject {
       return { ok: false, remaining: 0, retryAfterMs: Math.max(0, oldest + windowMs - now) };
     }
     hits.push(now);
-    await this.ctx.storage.put(bucket, hits.slice(-1000));
+    // allowUnconfirmed: the answer does not wait for the write to be durable (the output gate). A counter that loses its
+    // last hits in a crash admits a few extra pages; every page paid that wait before git started.
+    await this.ctx.storage.put(bucket, hits.slice(-1000), { allowUnconfirmed: true });
     return { ok: true, remaining: Math.max(0, limit - hits.length), retryAfterMs: 0 };
   }
 }
