@@ -14,7 +14,7 @@ import { Sha1 } from 'ply';
 import { TYPE } from 'ply';
 import { encodeObjHeader, spliceDelta, zlibDeflate } from 'ply';
 import { parsePack } from 'ply';
-import { createTransport, lsRefs, Tracer } from 'ply';
+import { createTransport, forgetQuirks, lsRefs, Tracer } from 'ply';
 import { unwrap, unwrapAsync } from '../src/ply-result.ts';
 import { git, makeBareRepo, startGitServer, tmpRoot, commitFiles } from './server.js';
 import { startProxy } from './proxy.js';
@@ -983,7 +983,12 @@ test('same-repo redirects: ply follows the first info/refs and rebases; a POST r
     const expected = git(bare, ['rev-parse', 'refs/heads/main']).trim();
     assert.equal(expected, head);
     const repo = loc(`https://github.com/${name}`);
-    const viewerTransport = (fetchImpl: typeof fetch) => unwrap(createTransport(`https://github.com/${name}`, { fetchImpl, limits: VIEWER_GIT_LIMITS, tracer: new Tracer(), followRedirects: 'initial', allowUrl: viewerAllowUrl(repo.url, ALLOWED_HOSTS), maxRedirects: VIEWER_CAPS.maxRedirects }));
+    // Each scenario fakes a different host at the same URL: ply's per-remote memo of the settled redirect is cleared
+    // first, as its docs say for this case.
+    const viewerTransport = (fetchImpl: typeof fetch) => {
+      forgetQuirks();
+      return unwrap(createTransport(`https://github.com/${name}`, { fetchImpl, limits: VIEWER_GIT_LIMITS, tracer: new Tracer(), followRedirects: 'initial', allowUrl: viewerAllowUrl(repo.url, ALLOWED_HOSTS), maxRedirects: VIEWER_CAPS.maxRedirects }));
+    };
 
     // Through createViewerFetch: the first GET is redirected once, then everything goes to the new base.
     hops.length = 0;
@@ -1005,6 +1010,7 @@ test('same-repo redirects: ply follows the first info/refs and rebases; a POST r
     assert.deepEqual(hops.map(h => [h.method, h.status]), [['GET', 200], ['POST', 301]], 'the redirected POST was not re-sent');
 
     // End to end: /view on the redirecting spelling renders the repository.
+    forgetQuirks();
     const page = await handleViewer(new Request(`https://ply.ivar.workers.dev/view/github.com/${name}?path=README.md`), viewerEnv(), {}, { fetchImpl: redirecting });
     assert.equal(page.status, 200, await page.clone().text());
     assert.match(await page.text(), /redirected/);

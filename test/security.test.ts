@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseFragment, type DefaultTreeAdapterMap } from 'parse5';
 import { createGuardedFetch, decideRemote, isAllowedRemote, redirectOptions, remoteAllowUrl, type AllowedRemote } from '../src/remote.ts';
-import { createTransport, lsRefs, Tracer } from 'ply';
+import { createTransport, forgetQuirks, lsRefs, Tracer } from 'ply';
 import { unwrap } from '../src/ply-result.ts';
 import { classifyHref, renderMarkdown } from '../src/viewer/markdown.ts';
 import { handleViewer } from '../src/viewer/handle.ts';
@@ -328,6 +328,8 @@ test('through the guard, ply follows only the first info/refs (git\'s rule): the
   const remote = mustAllow('https://github.com/acme/widgets');
   type Call = { method: string; url: string; auth: string | null };
   const host = (mode: 'moved' | 'post' | 'away') => {
+    // a different fake host at the same URL each time: forget ply's per-remote memo of the settled redirect
+    forgetQuirks();
     const calls: Call[] = [];
     const inner: typeof fetch = async (input, init) => {
       const url = String(input);
