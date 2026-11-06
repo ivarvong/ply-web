@@ -25,10 +25,15 @@ Feature flags are one R2 object and a service binding ([Feature flags](docs/feat
   in every encoding the URL parser accepts (dotted, zero-padded, octal, hex, decimal `2130706433`, IPv6, IPv4-mapped,
   IPv4-compatible). So are single-label hosts, `localhost`/`.local`/`.internal`/`.lan`/`.home.arpa`/… names, and
   wildcard-DNS names (`nip.io`, `sslip.io`, `localtest.me`, and the same shape of zone). A path segment of `.` or `..`,
-  or an encoded slash, backslash, or dot (`%2f`, `%5c`, `%2e`), is rejected before normalisation. Redirects are
-  followed manually, at most three hops, and only when the next URL passes the same check and stays on the same origin.
-  The Worker's fetch wrapper (`createGuardedFetch`, `src/remote.ts`) follows them, so ply only sees the final response;
-  ply itself never follows a 3xx and would report it as an `http` error (`test/worker.test.js`, "redirects").
+  or an encoded slash, backslash, or dot (`%2f`, `%5c`, `%2e`), is rejected before normalisation. Redirects follow
+  git's `http.followRedirects=initial`: ply follows a 3xx only on the first `GET info/refs` (at most three hops, and only
+  when the `Location` keeps the `/info/refs?service=…` suffix), and every later request, POSTs included, goes to the
+  rewritten base. ply's `allowUrl` hook (`remoteAllowUrl`, `src/remote.ts`) vets each new base with the same check, on
+  the same origin. A 3xx on a POST, a loop past three hops, or a `Location` git would not rebase to is a 400 with
+  code `http` naming the target (git cannot use such a remote either). The Worker's fetch wrapper (`createGuardedFetch`)
+  re-checks every request and never follows a 3xx itself; a 3xx whose `Location` is on another origin or fails the
+  check is a 400 `bad_request` before ply sees it, so a credential never leaves the origin (`test/worker.test.js`,
+  "redirects").
   `ALLOW_REMOTE_ORIGINS` (comma-separated origins) exempts those origins from the public-host rules (http, an IP, a
   non-default port). Only the tests use it.
 
@@ -234,9 +239,12 @@ trailing dot (`github.com.`) does not match. Lookalikes (`github.com.evil.com`, 
 do not match. Everything else is rejected before a fetch, and the error lists the supported hosts.
 `VIEWER_EXTRA_HOSTS` appends exact hostnames (comma-separated). A token with a scheme, port, userinfo, wildcard,
 or trailing dot is skipped, not treated as a suffix. Cloudflare Artifacts is off unless that variable names the
-exact public git host. `ALLOW_REMOTE_ORIGINS` is a `/v1` test hook and does not apply to `/view`. Redirects are
-manual, re-checked against the same allowlist, and limited to that repo's `info/refs` and `git-upload-pack`
-paths (plus a `.git` suffix). `createViewerFetch` follows them before ply sees the response (ply refuses any 3xx). A redirect whose raw `Location` contains `.`, `..`, `%2e`, `%2f`, or `%5c` is not followed, and a redirect to any other host is not followed. Upstream `User-Agent` is
+exact public git host. `ALLOW_REMOTE_ORIGINS` is a `/v1` test hook and does not apply to `/view`. Redirects follow
+git's `http.followRedirects=initial`: ply follows only the first `GET info/refs` and rebases the repo there, after
+`viewerAllowUrl` checks the new base is still that repo's `info/refs` / `git-upload-pack` path (plus a `.git` suffix)
+on the same host; a 3xx on a POST is an error. `createViewerFetch` checks every request the same way and never
+follows a 3xx itself. A redirect whose raw `Location` contains `.`, `..`, `%2e`, `%2f`, or `%5c`, or names any other
+host, is refused there before ply sees it. Upstream `User-Agent` is
 `ply-viewer/0.1.0`.
 
 **Caps** (not raised by environment; rate limits can be lowered and are clamped to 1…1000):
@@ -252,7 +260,7 @@ paths (plus a `.git` suffix). `createViewerFetch` follows them before ply sees t
 | delta chain | 32 |
 | delta result | 1 MiB |
 | upstream calls / page | 16 |
-| redirects / upstream call | 2 |
+| redirects (first info/refs only) | 2 |
 | per-call timeout | 12 s |
 | page timeout | 20 s |
 | refs retained | 2000 (200 branches shown) |
@@ -300,7 +308,7 @@ URLs under it, so moving to `public-v1` is a one-line change (plus creating the 
   retired ones, kept only so the scrubber still removes them). A read token is refused by `git-receive-pack` (403,
   checked 2026-10-30).
 - **Where the token goes.** `withPublicReadCredential` (`src/public.ts`) is the innermost fetch, below
-  `createGuardedFetch` and `createViewerFetch`, so it runs on every request and on every redirect hop. It adds
+  `createGuardedFetch` and `createViewerFetch`, so it runs on every request, including each hop ply follows. It adds
   `Authorization: Bearer <token>` only when the raw URL's origin is exactly `https://<that host>` (no `:443`, no
   uppercase, no trailing dot, no userinfo), the raw path is exactly `/git/public-v0/<repo>(.git)/info/refs` with query
   `?service=git-upload-pack` and method GET, or `…/git-upload-pack` with no query and method POST, and the path has no
@@ -346,7 +354,7 @@ Workers Caching only, never the Cache API (`caches.default`): `test/gitcache.tes
 
 ```
 eyeball ─▶ default entrypoint (cache OFF: always runs → rate limit, ply.request log, scrub, traces)
-             └─ ply ─▶ redirect guard (createGuardedFetch / createViewerFetch: every hop re-validated)
+             └─ ply ─▶ request guard (createGuardedFetch / createViewerFetch: every request re-validated, no 3xx followed)
                         └─ createLoopbackFetch (src/gitcache.ts)
                              ├─ public + no Authorization + pure function of its request ─▶ ctx.exports.GitCache (cache ON) ─▶ upstream
                              └─ anything else (every caller credential, haves, other hosts) ─────────────────────────▶ upstream

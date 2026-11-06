@@ -9,12 +9,12 @@ import type { SpStepped } from 'ply/fetch';
 import { unwrap, type OkOf } from '../ply-result.ts';
 import type { Budget } from './budget.ts';
 import { clampText, safeFilename } from './escape.ts';
-import type { FetchLike } from './fetchguard.ts';
+import { viewerAllowUrl, type FetchLike } from './fetchguard.ts';
 import { VIEWER_CAPS, VIEWER_GIT_LIMITS, VIEWER_UA } from './limits.ts';
 import { mapParsed } from './packmap.ts';
 import type { CommitInfo, FilterName, Loaded, RepoHeader, ServerInfo, TreeEntry } from './model.ts';
 import type { ViewerRoute } from './route.ts';
-import type { RepoLocation, ValidatedPublicRepoUrl } from './url.ts';
+import type { AllowedHost, RepoLocation, ValidatedPublicRepoUrl } from './url.ts';
 import { viewerHref } from './url.ts';
 
 import { quirksFor, type Quirks } from '../quirks.ts';
@@ -32,7 +32,7 @@ export type SessionDeps = {
 type RefRec = { oid: string };
 type DiscoverInfo = OkOf<ReturnType<typeof discover>>;
 
-function openTransport(url: ValidatedPublicRepoUrl, opts: {
+function openTransport(url: ValidatedPublicRepoUrl, allowed: readonly AllowedHost[], opts: {
   tracer: Tracer;
   fetchImpl: FetchLike;
   signal: AbortSignal;
@@ -40,7 +40,9 @@ function openTransport(url: ValidatedPublicRepoUrl, opts: {
 }): Transport {
   const parsed = new URL(url);
   if (parsed.username || parsed.password) throw plyError('bad_request', 'remote must not carry credentials');
-  return unwrap(createTransport(url, { ...opts, userAgent: VIEWER_UA, limits: VIEWER_GIT_LIMITS }));
+  // git's http.followRedirects=initial: a moved repo (name → name.git) answers its first GET info/refs with a 3xx that ply
+  // follows, after viewerAllowUrl has checked it is still this repo; a 3xx on a POST is an error naming the target.
+  return unwrap(createTransport(url, { ...opts, userAgent: VIEWER_UA, limits: VIEWER_GIT_LIMITS, followRedirects: 'initial', allowUrl: viewerAllowUrl(url, allowed), maxRedirects: VIEWER_CAPS.maxRedirects }));
 }
 
 function serverOf(info: DiscoverInfo): ServerInfo {
@@ -399,7 +401,7 @@ async function loadPack(transport: Transport, route: Extract<ViewerRoute, { kind
 
 export async function loadRepo(route: Extract<ViewerRoute, { kind: 'repo' }>, deps: SessionDeps): Promise<Loaded> {
   const quirks = quirksFor(route.loc.origin);
-  const transport = openTransport(route.loc.url, { tracer: deps.tracer, fetchImpl: deps.fetchImpl, signal: deps.signal, quirks });
+  const transport = openTransport(route.loc.url, route.loc.allowedHosts, { tracer: deps.tracer, fetchImpl: deps.fetchImpl, signal: deps.signal, quirks });
   const info = unwrap(await discover(transport));
   const server = serverOf(info);
   if (route.pack) return loadPack(transport, route, server, quirks);

@@ -52,26 +52,34 @@ function authProxy(upstream) {
   });
   return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({ url: `http://127.0.0.1:${s.address().port}`, close: () => new Promise(r => { closeServer(s, r); }) })));
 }
-// a hostile host that echoes the credential back in a 500 body
+// a hostile host that echoes the credential back in a 500 body. Its info/refs is a plain v2 advertisement, so the
+// transport's first GET (followRedirects 'initial' advertises first) succeeds and the echo arrives on the POST.
+const V2_ADVERTISEMENT = '000eversion 2\n0013ls-refs=unborn\n0019fetch=shallow filter\n0000';
 function echoServer() {
-  const s = http.createServer((req, res) => { res.writeHead(500, { 'content-type': 'text/plain' }); res.end(`echo ${req.headers.authorization} ${Buffer.from(fill(String(req.headers.authorization).split(' ')[1], ''), 'base64').toString()}`); });
+  const s = http.createServer((req, res) => {
+    if (req.method === 'GET' && fill(req.url, '').includes('/info/refs')) { res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-advertisement' }); return void res.end(V2_ADVERTISEMENT); }
+    res.writeHead(500, { 'content-type': 'text/plain' }); res.end(`echo ${req.headers.authorization} ${Buffer.from(fill(String(req.headers.authorization).split(' ')[1], ''), 'base64').toString()}`);
+  });
   return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({ url: `http://127.0.0.1:${s.address().port}`, close: () => new Promise(r => { closeServer(s, r); }) })));
 }
 
 // A host that has moved repositories: `/moved/<p>` 307s to `/<p>` (same origin, relative Location), `/away/<p>` 307s to
-// another allowlisted origin, `/loop/<p>` 307s to itself; anything else is proxied to http-backend. `hits` records each
-// request (path, method, whether it carried Authorization) so a test can see what was and was not dialled.
+// another allowlisted origin, `/loop/<p>` 307s to itself, `/postmoved/<p>` serves GETs from `/<p>` and 307s every POST
+// there; anything else is proxied to http-backend. `hits` records each request (path, method, whether it carried
+// Authorization) so a test can see what was and was not dialled.
 function redirector(upstream) {
   const up = new URL(upstream);
   const hits = [];
   const s = http.createServer((req, res) => {
     hits.push({ path: req.url, method: req.method, auth: !!req.headers.authorization });
-    const m = /^\/(moved|away|loop)(\/.*)$/.exec(req.url);
-    if (m) {
-      const location = m[1] === 'moved' ? m[2] : m[1] === 'away' ? `${upstream}${m[2]}` : req.url;
+    const m = /^\/(moved|away|loop|postmoved)(\/.*)$/.exec(req.url);
+    let path = req.url;
+    if (m && m[1] === 'postmoved' && req.method !== 'POST') path = m[2];
+    else if (m) {
+      const location = m[1] === 'moved' || m[1] === 'postmoved' ? m[2] : m[1] === 'away' ? `${upstream}${m[2]}` : req.url;
       req.resume(); res.writeHead(307, { location }); return void res.end();
     }
-    const u = http.request({ host: up.hostname, port: up.port, path: req.url, method: req.method, headers: { ...req.headers, host: up.host } }, r => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
+    const u = http.request({ host: up.hostname, port: up.port, path, method: req.method, headers: { ...req.headers, host: up.host } }, r => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
     req.pipe(u);
   });
   return new Promise(ok => s.listen(0, '127.0.0.1', () => ok({ url: `http://127.0.0.1:${s.address().port}`, hits, close: () => new Promise(r => { closeServer(s, r); }) })));
@@ -685,34 +693,53 @@ test('git credentials: Git-Authorization verbatim, Git-Token mapped; upstream 40
   assert.ok(!logs.includes(PLY), 'the PLY token is not logged');
 });
 
-// ply (since #26) refuses every 3xx with a typed `http` error. The README promises /v1 follows redirects manually, at most
-// three hops, same origin only: createGuardedFetch (src/remote.ts) does that before ply sees a response. Under workerd, end
-// to end, with the credential attached: reads and a push through a moved path equal git; another origin and a loop are 400.
-test('redirects: same-origin hops followed by the Worker (reads and a push), cross-origin and loops refused before ply', { skip }, async () => {
+// git's http.followRedirects=initial (ply-web#117): ply follows a 3xx only on the first GET info/refs and rewrites the
+// base; every later request, the push included, goes to the new base. A 3xx on a POST is an error naming the target.
+// createGuardedFetch (src/remote.ts) never follows a 3xx: another origin is refused before ply sees it (400
+// bad_request, one dial), and a loop is ply's `http` error past its three hops (400). Under workerd, end to end, with
+// the credential attached.
+test('redirects: git\'s rule (initial info/refs followed and the base rewritten; a POST redirect is an error), cross-origin refused before ply, loops cut', { skip }, async () => {
   const r = repo({ 'f.txt': 'one MARK\n' });
   const moved = `${redirSrv.url}/moved/${r.name}.git`;
   const token = 'redirtoken_' + 'Z9'.repeat(10);
   const H = { 'git-token': token };
+  const paths = () => redirSrv.hits.map(h => [h.method, h.path.split('?')[0]]);
   redirSrv.hits.length = 0;
   let res = await W(`/v1/refs?${qs({ remote: moved })}`, { headers: H });
   let body = await res.json();
   assert.equal(res.status, 200, JSON.stringify(body)); assert.equal(body.refs['refs/heads/main'], r.head);
-  assert.deepEqual(redirSrv.hits.map(h => [h.method, h.path.split('?')[0]]), [['POST', `/moved/${r.name}.git/git-upload-pack`], ['POST', `/${r.name}.git/git-upload-pack`]]);
+  assert.deepEqual(paths(), [['GET', `/moved/${r.name}.git/info/refs`], ['GET', `/${r.name}.git/info/refs`], ['POST', `/${r.name}.git/git-upload-pack`]], 'the info/refs GET was followed once and the POST went to the rewritten base');
   assert.ok(redirSrv.hits.every(h => h.auth), 'the same-origin hop keeps the credential');
   res = await W(`/v1/read?${qs({ remote: moved, path: 'f.txt' })}`, { headers: H });
   assert.equal(res.status, 200); assert.equal(await res.text(), 'one MARK\n');
+  redirSrv.hits.length = 0;
   res = await W('/v1/edit', { method: 'POST', headers: H, body: { remote: moved, path: 'f.txt', find: 'MARK', replace: 'MOVED', author: A, message: 'via redirect' } });
   body = await res.json();
   assert.equal(res.status, 200, JSON.stringify(body)); assert.equal(git(r.bare, ['rev-parse', 'main']).trim(), body.newCommit);
   assert.equal(gitBuf(r.bare, ['show', 'main:f.txt']).toString(), 'one MOVED\n');
-  assert.ok(redirSrv.hits.some(h => h.method === 'POST' && h.path === `/${r.name}.git/git-receive-pack`), 'the push followed the redirect');
+  assert.ok(redirSrv.hits.some(h => h.method === 'POST' && h.path === `/${r.name}.git/git-receive-pack`), 'the push went to the rewritten base');
+  assert.deepEqual(redirSrv.hits.filter(h => h.path.startsWith('/moved/')).map(h => h.method), ['GET'], 'only the first info/refs GET was asked of the old base');
 
-  for (const [kind, msg, dials] of [['away', /redirect host is not an allowlisted host/, 1], ['loop', /too many redirects/, 4]]) {
+  // A remote that redirects only its POSTs: git cannot use it (http.followRedirects=initial), and neither can /v1.
+  const before = git(r.bare, ['rev-parse', 'main']).trim();
+  for (const req of [[`/v1/refs?${qs({ remote: `${redirSrv.url}/postmoved/${r.name}.git` })}`, { headers: H }], ['/v1/edit', { method: 'POST', headers: H, body: { remote: `${redirSrv.url}/postmoved/${r.name}.git`, path: 'f.txt', find: 'MOVED', replace: 'NOPE', author: A, message: 'post redirect' } }]]) {
+    redirSrv.hits.length = 0;
+    res = await W(...req);
+    body = await res.json();
+    assert.equal(res.status, 400, JSON.stringify(body)); assert.equal(body.code, 'http');
+    assert.match(body.message, new RegExp(`HTTP 307 git-upload-pack: redirected to ${redirSrv.url}/${r.name}\\.git/git-upload-pack`), 'the error names the target');
+    assert.equal(redirSrv.hits.some(h => h.method === 'POST' && !h.path.startsWith('/postmoved/')), false, 'the redirected POST was not re-sent');
+    assert.equal(JSON.stringify(body).includes(token), false);
+  }
+  assert.equal(git(r.bare, ['rev-parse', 'main']).trim(), before, 'nothing was pushed');
+
+  for (const [kind, code, msg, dials] of [['away', 'bad_request', /redirect host is not an allowlisted host/, 1], ['loop', 'http', /HTTP 307 git-upload-pack advertisement: redirected to .*\/loop\//, 4]]) {
     redirSrv.hits.length = 0;
     res = await W(`/v1/refs?${qs({ remote: `${redirSrv.url}/${kind}/${r.name}.git`, trace: '1' })}`, { headers: H });
     body = await res.json();
-    assert.equal(res.status, 400, `${kind}: ${JSON.stringify(body)}`); assert.equal(body.code, 'bad_request'); assert.match(body.message, msg);
+    assert.equal(res.status, 400, `${kind}: ${JSON.stringify(body)}`); assert.equal(body.code, code); assert.match(body.message, msg);
     assert.equal(redirSrv.hits.length, dials, `${kind}: hops dialled`);
+    assert.ok(redirSrv.hits.every(h => h.method === 'GET'), `${kind}: only info/refs GETs`);
     assert.equal(JSON.stringify(body).includes(token), false);
   }
   assert.equal(logs.includes(token), false);
@@ -761,9 +788,10 @@ function assertRaysMatch(header, hits, timing) {
   const parsed = parseRayHeader(header);
   const want = hits.flatMap(hit => {
     const phase = phaseOfHit(hit);
-    return phase ? [{ phase, ray: hit.ray }] : [];
+    return phase ? [{ phase, ray: hit.ray, advert: hit.method === 'GET' }] : [];
   });
-  assert.deepEqual(parsed.entries.map(e => ({ phase: e.phase, ray: e.ray })), want, header);
+  assert.deepEqual(parsed.entries.map(e => ({ phase: e.phase, ray: e.ray })), want.map(w => ({ phase: w.phase, ray: w.ray })), header);
+  parsed.entries.forEach((e, i) => { e.advert = want[i].advert; });
   assert.equal(parsed.overflow, null);
   assert.equal(header.includes('/'), false, header);
   const st = fill(timing, '');
@@ -772,8 +800,17 @@ function assertRaysMatch(header, hits, timing) {
   return parsed;
 }
 
-function assertSpanRays(trace, entries) {
+// Each span is stamped with the exchange it read. A transport advertises (GET info/refs) before its first POST, inside
+// that POST's span (followRedirects 'initial'): a span that ended on a POST skips that preamble.
+function assertSpanRays(trace, all) {
   const spans = trace.filter(s => RAY_SPAN[s.name]);
+  const entries = [];
+  let next = 0;
+  for (const s of spans) {
+    while (s.attrs['http.request.method'] === 'POST' && all[next] && all[next].advert && next + 1 < all.length) next++;
+    entries.push(all[next++]);
+  }
+  assert.equal(next, all.length, 'every exchange is a span or the preamble of one');
   assert.deepEqual(spans.map(s => RAY_SPAN[s.name]), entries.map(e => e.phase), JSON.stringify(spans.map(s => s.name)));
   spans.forEach((s, i) => {
     assert.equal(s.attrs['git.upstream.phase'], entries[i].phase);

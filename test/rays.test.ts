@@ -40,9 +40,9 @@ test('phaseOf names info/refs, ls-refs, fetch, and receive-pack', () => {
 
 test('encodeRayHeader keeps start order, renders a missing ray as "-", and does not echo a bad header', () => {
   const log = createRayLog();
-  const ls = log.reserve('ls-refs');
-  const fetch = log.reserve('fetch');
-  const push = log.reserve('receive-pack');
+  const ls = log.reserve('ls-refs', false);
+  const fetch = log.reserve('fetch', false);
+  const push = log.reserve('receive-pack', false);
   assert.ok(ls !== null && fetch !== null && push !== null);
   const bad = parseCfRay('https://user:tok@github.com/secret/repo.git');
   assert.equal(bad.kind, 'missing');
@@ -60,7 +60,7 @@ test('encodeRayHeader keeps start order, renders a missing ray as "-", and does 
 test('the ray log caps entries and counts the rest', () => {
   const log = createRayLog();
   for (let i = 0; i < MAX_RAY_ENTRIES + 3; i++) {
-    const index = log.reserve('fetch');
+    const index = log.reserve('fetch', false);
     if (index !== null) log.fill(index, parseCfRay('0123456789abcdef-IAD'), durationMs(0, i + 1), true);
   }
   const report = log.report();
@@ -98,8 +98,8 @@ test('observeUpstream records a ray, a missing ray, a redirect, and a failure be
 
 test('headers and spans use the same tokens, and CORS exposure is opt-in', () => {
   const entries = [
-    { phase: 'fetch' as const, ray: parseCfRay('https://user:tok@github.com/secret/repo.git'), durMs: durationMs(0, 4), delivered: false },
-    { phase: 'fetch' as const, ray: parseCfRay('dddddddddddddddd-IAD'), durMs: durationMs(0, 9), delivered: true },
+    { phase: 'fetch' as const, ray: parseCfRay('https://user:tok@github.com/secret/repo.git'), durMs: durationMs(0, 4), delivered: false, advertisement: false },
+    { phase: 'fetch' as const, ray: parseCfRay('dddddddddddddddd-IAD'), durMs: durationMs(0, 9), delivered: true, advertisement: false },
   ];
   const report: RayReport = { kind: 'within', entries };
   const headers = new Headers({ 'server-timing': 'total;dur=8, app;dur=1', 'access-control-allow-origin': 'https://app.example' });

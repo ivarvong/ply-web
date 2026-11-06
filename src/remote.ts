@@ -1,6 +1,7 @@
 // /v1 remote policy. decideRemote is the discriminated result. The fetch layer takes only an
-// AllowedRemote, follows redirects manually, and re-runs the same policy on every hop.
-import { plyError } from 'ply';
+// AllowedRemote and re-runs the same policy on every request; it never follows a redirect. ply follows the first
+// GET info/refs (git's http.followRedirects=initial) and vets the new base with remoteAllowUrl, the same policy.
+import { fail, plyError } from 'ply';
 import { atIndex, captureGroup, chainGet, recordGet } from './absent.ts';
 import { unwrapOr } from './option.ts';
 import { extractRequestPath, rawPathHasUnsafeSegment } from './pathguard.ts';
@@ -210,9 +211,11 @@ export function checkRemote(raw: string, allow: readonly string[] = []): Allowed
 function authorizeHop(raw: string, home: AllowedRemote, allow: readonly string[]): AllowedRemote {
   const decision = decideRemote(raw, allow, { allowQuery: true });
   if (decision.kind === 'rejected') throw plyError('bad_request', reasonText(decision.reason));
-  if (decision.remote.origin !== home.origin) throw plyError('bad_request', 'redirect host is not an allowlisted host');
+  if (decision.remote.origin !== home.origin) throw plyError('bad_request', REDIRECT_HOST);
   return decision.remote;
 }
+
+const REDIRECT_HOST = 'redirect host is not an allowlisted host';
 
 function rejectRedirectLocation(location: string): boolean {
   if (!location || location.length > MAX_REMOTE) return true;
@@ -222,48 +225,70 @@ function rejectRedirectLocation(location: string): boolean {
   return rawPathHasUnsafeSegment(path.startsWith('/') || /^[a-z][a-z0-9+.-]*:/i.test(location) ? extractRequestPath(location.startsWith('/') ? `https://reject.invalid${path}` : location) : path);
 }
 
+type Vetted = { readonly ok: true; readonly value: URL } | ReturnType<typeof fail<'bad_request'>>;
+
 /**
- * Fetch wrapper ply calls. `remote` is the branded result of decideRemote. Each request and each
- * redirect hop is parsed again; a hop whose origin is not that remote is not followed.
+ * ply's `allowUrl` for a /v1 or mirror transport (followRedirects 'initial'). ply calls it with the remote before any
+ * request and with the Location of a 3xx on the first GET info/refs before it rebases there. The same policy as every
+ * request: decideRemote (query allowed, since a Location keeps `?service=`), the same path checks, and the remote's
+ * origin. A refusal is the /v1 400 bad_request the guard has always answered for a redirect elsewhere.
  */
-export function createGuardedFetch(inner: FetchLike, remote: AllowedRemote, allow: readonly string[] = [], maxRedirects = 3): FetchLike {
+export function remoteAllowUrl(remote: AllowedRemote, allow: readonly string[] = []): (url: URL) => Vetted {
+  if (!isAllowedRemote(remote)) throw plyError('bad_request', 'remote was not allowlisted');
+  return url => {
+    const decision = decideRemote(url.href, allow, { allowQuery: true });
+    if (decision.kind === 'rejected') return fail('bad_request', reasonText(decision.reason));
+    if (decision.remote.origin !== remote.origin) return fail('bad_request', REDIRECT_HOST);
+    return { ok: true, value: url };
+  };
+}
+
+/** The redirect options every ply transport on a remote gets: git's `http.followRedirects=initial`, vetted by allowUrl. */
+export function redirectOptions(remote: AllowedRemote, allow: readonly string[] = []): { readonly followRedirects: 'initial'; readonly allowUrl: (url: URL) => Vetted } {
+  return { followRedirects: 'initial', allowUrl: remoteAllowUrl(remote, allow) };
+}
+
+/**
+ * Fetch wrapper ply calls. `remote` is the branded result of decideRemote. Every request is parsed again and must stay
+ * on that remote's origin, so a credential ply attaches cannot leave it. A 3xx is never followed here: ply follows the
+ * first GET info/refs itself (followRedirects 'initial', git's rule) and reports any other. A 3xx whose Location is
+ * missing, unsafe, or on another origin is refused here, before ply sees it; any other 3xx is handed to ply as is.
+ */
+export function createGuardedFetch(inner: FetchLike, remote: AllowedRemote, allow: readonly string[] = []): FetchLike {
   if (!isAllowedRemote(remote)) throw plyError('bad_request', 'remote was not allowlisted');
   const guarded: FetchLike = async (input, init) => {
-    let current = authorizeHop(requestUrl(input), remote, allow);
+    const current = authorizeHop(requestUrl(input), remote, allow);
     const methodField = chainGet(init, 'method');
     const method = methodField.tag === 'none' ? 'GET' : methodField.value as string;
     const bodyField = chainGet(init, 'body');
     const body = bodyField.tag === 'none' ? null : bodyField.value;
-    // Bytes are replayed on each hop. A stream (ply's push past its held size, ply#172) is sent once: a redirect
-    // answering it is not followed, as git never follows one on a POST.
+    // A stream (ply's push past its held size, ply#172) is sent once, with duplex.
     const streamed = body instanceof ReadableStream;
     if (body !== null && !(body instanceof Uint8Array) && !streamed) throw plyError('bad_request', 'upstream body is not bytes or a stream');
     const initRecord = init !== null && typeof init === 'object' ? init as Record<string, unknown> : null;
     const headerField = recordGet(initRecord, 'headers');
     const signalField = chainGet(init, 'signal');
-    for (let hop = 0; hop <= maxRedirects; hop++) {
-      const requestInit: RequestInit = { method, redirect: 'manual' };
-      if (headerField.tag === 'some') requestInit.headers = headerField.value as HeadersInit;
-      if (body !== null) requestInit.body = body as BodyInit;
-      // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- duplex is in fetch's RequestInit (workerd and undici) but not in lib.dom's
-      if (streamed) (requestInit as RequestInit & { duplex: 'half' }).duplex = 'half';
-      if (signalField.tag === 'some') requestInit.signal = signalField.value as AbortSignal;
-      const res = await inner(current.href, requestInit);
-      if (res.status >= 300 && res.status < 400) {
-        const location = res.headers.get('location');
-        if (res.body) await res.body.cancel().catch(() => {});
-        if (streamed) throw plyError('bad_request', 'redirect on a streamed request body is not followed');
-        if (!location || rejectRedirectLocation(location)) throw plyError('bad_request', 'redirect host is not an allowlisted host');
-        if (hop === maxRedirects) throw plyError('bad_request', 'too many redirects');
-        let next: string;
-        try { next = new URL(location, current.href).href; }
-        catch { throw plyError('bad_request', 'redirect host is not an allowlisted host'); }
-        current = authorizeHop(next, remote, allow);
-        continue;
+    // 'error' (ply's choice for a stream under undici, which would tee the body for 'manual') is kept; never 'follow'.
+    const redirectField = chainGet(init, 'redirect');
+    const requestInit: RequestInit = { method, redirect: redirectField.tag === 'some' && redirectField.value === 'error' ? 'error' : 'manual' };
+    if (headerField.tag === 'some') requestInit.headers = headerField.value as HeadersInit;
+    if (body !== null) requestInit.body = body as BodyInit;
+    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- duplex is in fetch's RequestInit (workerd and undici) but not in lib.dom's
+    if (streamed) (requestInit as RequestInit & { duplex: 'half' }).duplex = 'half';
+    if (signalField.tag === 'some') requestInit.signal = signalField.value as AbortSignal;
+    const res = await inner(current.href, requestInit);
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get('location');
+      let target: string | null = null;
+      if (location && !rejectRedirectLocation(location)) {
+        try { target = authorizeHop(new URL(location, current.href).href, remote, allow).href; } catch { target = null; }
       }
-      return res;
+      if (target === null) {
+        if (res.body) await res.body.cancel().catch(() => {});
+        throw plyError('bad_request', REDIRECT_HOST);
+      }
     }
-    throw plyError('bad_request', 'too many redirects');
+    return res;
   };
   return guarded;
 }

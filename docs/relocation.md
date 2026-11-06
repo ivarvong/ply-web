@@ -358,6 +358,8 @@ createTransport(url, {
 
 `decideRemote`, `assertUpstreamUrl`, credential stripping, and the viewer byte budget stay in ply-web. They become the `allowUrl` hook.
 
+Done (ply-web#117): every transport passes `followRedirects: 'initial'` and an `allowUrl` (`remoteAllowUrl` on `decideRemote`, `viewerAllowUrl` on `assertUpstreamUrl`). The hop loops are gone: both guards still re-check every request and refuse a 3xx whose `Location` leaves the origin or repo, and hand any other 3xx to ply. A remote that redirects only POSTs stops working, as it does for git. A transport now advertises (GET info/refs) before its first POST; the ray stamping (`stampUpstreamSpans`, step 16) pairs a POST span with the exchange after that preamble.
+
 ### 15. Decode an upload-pack request — ply #120
 
 Depends on nothing. Step 16 is easier after this, because both touch `src/rays.ts`, but #123's API does not require the parser.

@@ -23,7 +23,7 @@ import { isWorkerCode, WORKER_RETRY } from './write/errors.ts';
 import { statusOf } from './status.ts';
 import { handleEdit, handleBranchCreate, handleBranchDelete, handleMerge, handleRebase, handleCherryPick, handleRevert, handleTagCreate, handleTagDelete, readCommitOrEmpty, unbornFields } from './write/handle.ts';
 import { handleViewer } from './viewer/handle.ts';
-import { checkRemote, createGuardedFetch } from './remote.ts';
+import { checkRemote, createGuardedFetch, redirectOptions } from './remote.ts';
 import { applySecurityHeaders } from './security-headers.ts';
 import { quirksFor } from './quirks.ts';
 import { createLoopbackFetch } from './gitcache.ts';
@@ -558,9 +558,16 @@ const worker = {
           const direct = withPublicReadCredential(globalThis.fetch.bind(globalThis), publicTokens);
           const loopback = env.PACK_CACHE === 'off' ? null : () => unwrapOr(chainGet(ctx.exports, 'GitCache'), null);
           rays = createRayLog();
-          // Inside the guard, so each hop (including a redirect the guard follows) is one entry.
+          // Inside the guard, so each exchange (a 3xx included) is one entry. The guard never follows a 3xx: ply follows the
+          // first GET info/refs (git's http.followRedirects=initial), vetted by allowUrl; a 3xx on a POST is an error.
           const fetchImpl = createGuardedFetch(observeUpstream(createLoopbackFetch(direct, loopback), rays), remoteUrl, allow);
-          const opts = { ...(credential.tag === 'some' ? { auth: credential.value } : {}), tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), fetchImpl };
+          const opts = { ...(credential.tag === 'some' ? { auth: credential.value } : {}), tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), fetchImpl, ...redirectOptions(remoteUrl, allow) };
+          // ply's operation() (readFile, listTree, the writes) builds its transport from auth/fetchImpl/limits only, so it
+          // would not follow a redirect. It is handed this one, built with the redirect options; the request's operations
+          // share it, and with it the base a followed info/refs rewrote, as git does for one command. A transport that
+          // cannot be built is left to operation(), which reports it on its root span as before.
+          const shared = createTransport(remote, opts);
+          if (shared.ok) opts.transport = shared.value;
           if (!WRITES[key] && presentedRef && isAbbreviatedOid(presentedRef.toLowerCase())) {
             const prefix = presentedRef.toLowerCase();
             const cands = refCandidates(prefix);
