@@ -841,6 +841,9 @@ test('a tree:0 rejection is visible, then the blob:none retry, and a denied rate
     const html = await res.text();
     assert.match(html, /filter tree:0 was rejected/);
     assert.match(html, /<span class="num wf-status" role="cell">400<\/span>/);
+    // the refusal ply handled (blob:none answered it) is drawn as the fallback, not as a failed call
+    assert.equal(html.includes('<details class="wf-row err"'), false, 'a handled tree:0 refusal is not an error row');
+    assert.match(html, /<details class="wf-row" role="row"><summary class="wf-sum"><span class="wf-name"[^>]*><span class="wf-call">fetch<\/span><span class="wf-tag">tree:0[^<]*<\/span><\/span><span class="num wf-status" role="cell">400<\/span>[\s\S]*?wf-bar c-fallback/);
     assert.match(html, /blob:none/);
     // The log fix: on a server that refuses tree:0, Recent commits used to stop after one commit ("Log stopped").
     // One fetch (want HEAD, deepen 10, blob:none after the 400) now carries the whole first-parent window.

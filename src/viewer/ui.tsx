@@ -249,7 +249,7 @@ export function PlyStrip(props: { trace: TraceModel; header: RepoHeader }) {
           const left = Math.max(0, Math.min(LAYOUT.percentSteps, Math.round((bar.startMs / span) * LAYOUT.percentSteps)))
           let width = Math.max(1, Math.round((bar.durMs / span) * LAYOUT.percentSteps))
           if (left + width > LAYOUT.percentSteps) width = Math.max(1, LAYOUT.percentSteps - left)
-          return <span class={`wf-bar ${barTone(bar)} ${percentClass('o', left)} ${percentClass('w', width)}`}></span>
+          return <span class={`wf-bar ${barTone(bar, bars)} ${percentClass('o', left)} ${percentClass('w', width)}`}></span>
         })}
       </span>
     </a>
@@ -269,7 +269,20 @@ export function Protocol(props: { header: RepoHeader }) {
   )
 }
 
-function barTone(bar: TraceBar): string {
+/**
+ * A 400 to a narrow filter that a later call on this page answered with the blob:none fallback: the server's known
+ * refusal (Cloudflare Artifacts refuses tree:0), which ply handled. Drawn as the fallback, not as a failure.
+ */
+function handledRefusal(bar: TraceBar, bars: readonly TraceBar[]): boolean {
+  if (bar.httpStatus !== 400) return false
+  const filter = lineValue(bar.lines, 'git.fetch.filter=')
+  if (filter === null || filter === 'blob:none') return false
+  const at = bars.indexOf(bar)
+  return bars.slice(at + 1).some(next => next.httpStatus === 200 && lineValue(next.lines, 'git.fetch.filter.fallback=') === 'blob:none')
+}
+
+function barTone(bar: TraceBar, bars: readonly TraceBar[]): string {
+  if (handledRefusal(bar, bars)) return 'c-fallback'
   if (bar.status === 'error' || (bar.httpStatus !== null && bar.httpStatus >= 400)) return 'c-err'
   if (bar.cache === 'HIT') return 'c-hit'
   if (bar.lines.some(line => line.startsWith('git.fetch.filter.fallback='))) return 'c-fallback'
@@ -320,7 +333,7 @@ export function Waterfall(props: { trace: TraceModel; host: string; repoPath: st
         const left = Math.max(0, Math.min(LAYOUT.percentSteps, Math.round((bar.startMs / span) * LAYOUT.percentSteps)))
         let width = Math.max(bar.durMs > 0 ? 1 : 0, Math.round((bar.durMs / span) * LAYOUT.percentSteps))
         if (left + width > LAYOUT.percentSteps) width = Math.max(1, LAYOUT.percentSteps - left)
-        const failed = bar.status === 'error' || (bar.httpStatus !== null && bar.httpStatus >= 400)
+        const failed = !handledRefusal(bar, trace.bars) && (bar.status === 'error' || (bar.httpStatus !== null && bar.httpStatus >= 400))
         const label = callLabel(bar)
         const packHref = bar.packWant && bar.packFilter
           ? viewerHref(props.host, props.repoPath, { ref: props.ref === null ? '' : props.ref, want: bar.packWant, filter: bar.packFilter })
@@ -333,7 +346,7 @@ export function Waterfall(props: { trace: TraceModel; host: string; repoPath: st
               <span class="num" role="cell">{bar.bytes === null ? '—' : formatBytes(bar.bytes)}{bar.cache === 'HIT' ? <span class="wf-hit" title="Served from Workers Cache"> · hit</span> : null}</span>
               <span class="num wf-ms" role="cell">{formatDuration(bar.durMs)}</span>
               <span class="wf-track" role="cell" title={`${label.name} · starts at ${formatDuration(bar.startMs)} · ${formatDuration(bar.durMs)}`}>
-                <span class={`wf-bar ${barTone(bar)} ${percentClass('o', left)} ${percentClass('w', width)}`}></span>
+                <span class={`wf-bar ${barTone(bar, trace.bars)} ${percentClass('o', left)} ${percentClass('w', width)}`}></span>
               </span>
             </summary>
             <div class="wf-detail">
@@ -347,7 +360,7 @@ export function Waterfall(props: { trace: TraceModel; host: string; repoPath: st
       <p class="wf-legend" aria-hidden="true">
         <span><i class="dot c-discover"></i>handshake</span>
         <span><i class="dot c-fetch"></i>fetch</span>
-        <span><i class="dot c-fallback"></i>blob:none</span>
+        <span><i class="dot c-fallback"></i>blob:none fallback</span>
         <span><i class="dot c-hit"></i>cache hit</span>
         <span><i class="dot c-err"></i>error</span>
       </p>
