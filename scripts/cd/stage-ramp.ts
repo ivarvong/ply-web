@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { none, orNull, some, type Option } from '../../src/option.ts'
 import type { CdConfig } from './config.ts'
 import { isTrafficSplit, sameSplit, trafficSplit, type VersionShare } from './deploy-plan.ts'
-import { queryCaptured, telemetryQueryRetry } from './o11y.ts'
+import { notSpanFilter, queryCapturedSliced, telemetryQueryRetry } from './o11y.ts'
 import { errorMessage } from './proc.ts'
 import { activeLog } from './log.ts'
 import { readPassVerdict, runRamp, type Observation } from './ramp.ts'
@@ -13,7 +13,7 @@ import { accountProbeLoss, classifyProbe, probeLossRecord, rayOf, type ProbeOutc
 import { runProbeSchedule } from './probe-schedule.ts'
 import { writeJson } from './run-dir.ts'
 import { routedShare } from './slo.ts'
-import { percentile, queryTo, scriptVersionId, serviceFilter, spanTypeFilter, statsFromEvents } from './telemetry.ts'
+import { percentile, queryTo, scriptVersionId, serviceFilter, statsFromEvents } from './telemetry.ts'
 import { applySplit, readShares, rollbackTo } from './traffic.ts'
 import { armStep, beginRamp, endRamp, HarnessFault, noteStepApplied } from './traffic-gate.ts'
 
@@ -31,12 +31,11 @@ async function observe(config: CdConfig, version: string, previous: string, from
   const service = serviceFilter(config.worker)
   const query = { view: 'events' as const, filters: [service] }
   try {
-    const spansQuery = [service, spanTypeFilter()]
     const retry = telemetryQueryRetry(config.policy)
-    const [all, spans] = await Promise.all([
-      queryCaptured('events', from, to, [service], retry),
-      queryCaptured('events', from, to, spansQuery, retry),
-    ])
+    // Invocations and logs only, in parallel 10 s slices. The unscoped span query paged past TELEMETRY_MAX_PAGES under
+    // load (run 2026-11-06T21-37-46-183Z); spans only fed fetchMs, which gates nothing here.
+    const all = await queryCapturedSliced('events', from, to, [service, notSpanFilter()], retry)
+    const spans = { events: [] as unknown[], raw: '', query: all.query }
     const next = statsFromEvents(eventsFor(all.events, version), spans.events)
     const prior = statsFromEvents(eventsFor(all.events, previous), spans.events)
     const aggregate = statsFromEvents(all.events, spans.events)

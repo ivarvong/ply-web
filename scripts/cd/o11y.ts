@@ -103,3 +103,50 @@ export async function queryAll(
 ): Promise<unknown[]> {
   return (await queryCaptured(view, from, to, filters, retry, secrets)).events
 }
+
+/** Width of one slice of a sliced query. 10 s of ply's non-span events under load was 3719 events in 4 pages (2026-11-06). */
+export const SLICE_MS = 10_000
+
+/** Events that are not child spans: invocations and logs. Spans are ~85% of ply's events under load and gate nothing. */
+export function notSpanFilter(): Filter {
+  return { key: '$metadata.type', operation: 'neq', type: 'string', value: 'span' }
+}
+
+/**
+ * One query over [from, to], run as parallel `SLICE_MS` windows so a busy window pages in
+ * parallel instead of serially into TELEMETRY_MAX_PAGES. Rows are deduplicated by `$metadata.id`.
+ */
+export async function queryCapturedSliced(
+  view: 'events' | 'traces',
+  from: number,
+  to: number,
+  filters: readonly Filter[],
+  retry: QueryRetry,
+): Promise<CapturedQuery> {
+  const bounds: [number, number][] = []
+  for (let start = from; start < to; start += SLICE_MS) bounds.push([start, Math.min(to, start + SLICE_MS)])
+  if (bounds.length === 0) bounds.push([from, to])
+  const parts = await Promise.all(bounds.map(([start, end]) => queryCaptured(view, start, end, filters, retry)))
+  const seen = new Set<string>()
+  const events: unknown[] = []
+  for (const part of parts) {
+    for (const event of part.events) {
+      const id = metaId(event)
+      if (id !== '') {
+        if (seen.has(id)) continue
+        seen.add(id)
+      }
+      events.push(event)
+    }
+  }
+  const first = parts[0]
+  if (!first) throw new Error('sliced query with no slice')
+  return { events, raw: parts.map(part => part.raw).join('\n'), query: telemetryQuery(view, from, to, filters, null) }
+}
+
+function metaId(event: unknown): string {
+  if (typeof event !== 'object' || event === null || !('$metadata' in event)) return ''
+  const meta = event.$metadata
+  if (typeof meta !== 'object' || meta === null || !('id' in meta)) return ''
+  return typeof meta.id === 'string' ? meta.id : ''
+}

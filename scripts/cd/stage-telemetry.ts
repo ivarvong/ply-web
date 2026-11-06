@@ -5,7 +5,7 @@ import { pollEditSpans, type SpanCheck } from './span-check.ts'
 import { raysByRequestId } from './csv.ts'
 import { asRecord } from './json.ts'
 import { activeLog } from './log.ts'
-import { queryAll, telemetryQueryRetry, type QueryRetry } from './o11y.ts'
+import { queryAll, queryCapturedSliced, telemetryQueryRetry, type QueryRetry } from './o11y.ts'
 import { errorMessage } from './proc.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import { writeJson, writeText } from './run-dir.ts'
@@ -19,6 +19,7 @@ import {
   serviceFilter,
   spanTypeFilter,
   summarizeTelemetry,
+  traceIdOf,
   telemetryMarkdown,
   telemetryQuery,
   versionFilter,
@@ -107,8 +108,34 @@ async function logsFor(
   return out
 }
 
+/**
+ * Traces-view rows or span events of the smoke's own traces only. An unscoped query over the window pages through every
+ * span the Worker emitted: under load that is over TELEMETRY_MAX_PAGES (run 2026-11-06T21-37-46-183Z: 50 pages in 80 s,
+ * harness_fault). Span events carry no script version, so the scope is the traceIds on the smoke's own log lines.
+ */
+async function byTrace(config: CdConfig, view: 'events' | 'traces', from: number, to: number, traceIds: readonly string[], retry: QueryRetry): Promise<unknown[]> {
+  const base: Filter[] = view === 'events' ? [serviceFilter(config.worker), spanTypeFilter()] : [serviceFilter(config.worker)]
+  const groups = chunks(traceIds)
+  const pages = await Promise.all(groups.map(group => queryAll(view, from, to, [
+    ...base,
+    { key: '$metadata.traceId', operation: 'in', type: 'string', value: group.join(',') },
+  ], retry)))
+  return pages.flat()
+}
+
+function traceIdsOf(events: readonly unknown[]): string[] {
+  const ids = new Set<string>()
+  for (const item of events) {
+    const event = asRecord(item)
+    if (!event) continue
+    const id = traceIdOf(event)
+    if (id) ids.add(id)
+  }
+  return [...ids]
+}
+
 /** The span check over the window, starting from the span events already queried; later polls query again. */
-async function editSpans(config: CdConfig, requests: readonly SmokeRequest[], from: number, first: readonly unknown[], retry: QueryRetry): Promise<SpanCheck> {
+async function editSpans(config: CdConfig, requests: readonly SmokeRequest[], from: number, first: readonly unknown[], retry: QueryRetry, traceIds: readonly string[]): Promise<SpanCheck> {
   let page: readonly unknown[] | null = first
   return pollEditSpans(requests, {
     query: async () => {
@@ -117,7 +144,7 @@ async function editSpans(config: CdConfig, requests: readonly SmokeRequest[], fr
         page = null
         return ready
       }
-      return queryAll('events', from, queryTo(Date.now()), [serviceFilter(config.worker), spanTypeFilter()], retry)
+      return byTrace(config, 'events', from, queryTo(Date.now()), traceIds, retry)
     },
     sleep,
     now: () => Date.now(),
@@ -151,11 +178,14 @@ export async function stageTelemetry(
     if (missing.length) events.push(...await logsFor(config, from, queryTo(Date.now()), missing, null, retry))
     const to = queryTo(Date.now())
     const scoped = [serviceFilter(config.worker), versionFilter(opts.version)]
-    const health = await queryAll('events', from, to, scoped, retry)
-    const service = serviceFilter(config.worker)
+    // Sliced: on the live version this is every invocation in the window (≈370 non-span events/s under load, 2026-11-06).
+    const health = (await queryCapturedSliced('events', from, to, scoped, retry)).events
     // The traces view is one summary row per trace and has no child spans. Fetch durations come from span events.
-    const traces = await queryAll('traces', from, to, [service], retry)
-    const spans = await queryAll('events', from, to, [service, spanTypeFilter()], retry)
+    const traceIds = traceIdsOf(events)
+    const [traces, spans] = await Promise.all([
+      byTrace(config, 'traces', from, to, traceIds, retry),
+      byTrace(config, 'events', from, to, traceIds, retry),
+    ])
     const seen = new Set<string>()
     const combined = []
     for (const event of [...events, ...health]) {
@@ -173,7 +203,7 @@ export async function stageTelemetry(
     const judge = applyGates(judged, config.policy.gates)
     // #67: the pinned smoke's edit-traced request must show ply's spans in Workers tracing. Pinned only: it gates the 0%
     // canary, and a tracing regression found after 100% is not a reason to roll back.
-    const spanCheck: SpanCheck | null = opts.live ? null : await editSpans(config, requests, from, spans, retry)
+    const spanCheck: SpanCheck | null = opts.live ? null : await editSpans(config, requests, from, spans, retry, traceIds)
     const stem = opts.live ? 'live-telemetry' : 'telemetry'
     const spanLine = spanCheck === null ? '' : `\n\n${spanCheck.line}\n`
     await writeText(opts.runDir, `${stem}.md`, `${telemetryMarkdown({ version: opts.version, from, to, judge, summary, loss })}${spanLine}`)
