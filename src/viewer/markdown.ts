@@ -223,6 +223,10 @@ function findCloser(src: string, from: number, delim: string): number {
   return -1;
 }
 
+// Every character `inline` acts on; anything else is literal text.
+const INLINE_SPECIAL = new Set(['\\', '\n', '`', '!', '[', '<', 'h', 'H', '*', '_', '~']);
+const PLAIN_RUN = /[^\\\n`![<hH*_~]+/y;
+
 function inline(src: string, ctx: Ctx, inLink = false, depth = 0): SafeHtml {
   const out: SafeHtml[] = [];
   let text = '';
@@ -230,7 +234,15 @@ function inline(src: string, ctx: Ctx, inLink = false, depth = 0): SafeHtml {
   let i = 0;
   while (i < src.length) {
     const ch = chAt(src, i);
-    const rest = src.slice(i);
+    if (!INLINE_SPECIAL.has(ch)) {
+      // A run of plain characters is copied at once (it was one `text += ch` per character).
+      PLAIN_RUN.lastIndex = i;
+      const run = PLAIN_RUN.exec(src);
+      const end = run === null ? i + 1 : i + run[0].length;
+      text += src.slice(i, end);
+      i = end;
+      continue;
+    }
     if (ch === '\\' && PUNCT.test(chAt(src, i + 1))) { text += src[i + 1]; i += 2; continue; }
     if (ch === '\\' && src[i + 1] === '\n') { flush(); out.push(voidTag('br')); i += 2; continue; }
     if (ch === '\n') {
@@ -297,7 +309,8 @@ function inline(src: string, ctx: Ctx, inLink = false, depth = 0): SafeHtml {
       }
     }
     if (ch === '<' && !inLink) {
-      const auto = /^<(https:[^\s<>]+|http:[^\s<>]+|mailto:[^\s<>]+)>/i.exec(rest);
+      // The rest of the line is sliced only at a `<` or an `h` (it was sliced at every character).
+      const auto = /^<(https:[^\s<>]+|http:[^\s<>]+|mailto:[^\s<>]+)>/i.exec(src.slice(i));
       const autoUrl = captureGroup(auto, 1);
       if (autoUrl.tag === 'some' && autoUrl.value !== '') {
         const href = classifyHref(autoUrl.value);
@@ -308,7 +321,7 @@ function inline(src: string, ctx: Ctx, inLink = false, depth = 0): SafeHtml {
       }
     }
     if ((ch === 'h' || ch === 'H') && !inLink && !isWordChar(chAt(src, i - 1))) {
-      const bare = /^https:\/\/[^\s<>"'`]+|^http:\/\/[^\s<>"'`]+/i.exec(rest);
+      const bare = /^https:\/\/[^\s<>"'`]+|^http:\/\/[^\s<>"'`]+/i.exec(src.slice(i));
       if (bare) {
         let url = bare[0];
         while (/[.,:;!?)\]*_~]$/.test(url)) {
@@ -461,9 +474,10 @@ function renderBlocks(lines: string[], ctx: Ctx, depth: number, tight = false): 
       const marker = group(fence, 2, '```');
       const body: string[] = [];
       i++;
+      // Built once per fence (it was built per line inside the fence).
+      const closing = new RegExp(`^ {0,3}${marker[0] === '`' ? '`' : '~'}{${marker.length},}[ \\t]*$`);
       while (i < lines.length) {
         const l = lineAt(lines, i);
-        const closing = new RegExp(`^ {0,3}${marker[0] === '`' ? '`' : '~'}{${marker.length},}[ \\t]*$`);
         if (closing.test(l)) { i++; break; }
         body.push(dedent(l, indent));
         i++;
