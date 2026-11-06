@@ -288,11 +288,27 @@ export async function listPageRefs(transport: Transport, ref: string | null): Pr
 }
 
 async function loadTree(transport: Transport, route: Extract<ViewerRoute, { kind: 'repo' }>, server: ServerInfo, quirks: Quirks, budget: Budget, tracer: Tracer): Promise<Loaded> {
-  const listedRefs = await listPageRefs(transport, route.ref);
-  const resolved = resolveRef(listedRefs, route.ref);
-  const catalog = refCatalog(listedRefs);
-  // Raw bytes need no history: read the commit alone. Every page reads the window (it replaces the commit read).
-  const held = route.raw ? null : await loadWindow(transport, resolved.commit, quirks);
+  // A full object id names the commit without the ref listing (resolveRef never reads it then), so the listing, which
+  // only fills the branch and tag picker, runs beside the window fetch instead of before it, and a raw read skips it.
+  // An ls-refs miss is 140-490 ms on /r pages (59f39490).
+  const direct = unwrap(refCandidates(route.ref)).length === 0 && route.ref !== null;
+  let listing: Promise<{ refs: Map<string, RefRec>; head: string | null }> | null = null;
+  const refsNow = () => {
+    if (listing === null) listing = listPageRefs(transport, route.ref);
+    return listing;
+  };
+  let resolved: { name: string; commit: string };
+  let held: Map<string, Held> | null;
+  if (direct) {
+    resolved = { name: route.ref as string, commit: route.ref as string };
+    if (!route.raw) refsNow().catch(() => {});
+    // Raw bytes need no history: read the commit alone. Every page reads the window (it replaces the commit read).
+    held = route.raw ? null : await loadWindow(transport, resolved.commit, quirks);
+  } else {
+    resolved = resolveRef(await refsNow(), route.ref);
+    held = route.raw ? null : await loadWindow(transport, resolved.commit, quirks);
+  }
+  const catalog = route.raw && direct ? { branches: [], branchesTruncated: 0, tags: [], tagsTruncated: 0 } : refCatalog(await refsNow());
   const headObj = held === null ? null : unwrapOr(mapGet(held, resolved.commit), null);
   const commitData = headObj && headObj.type === TYPE.COMMIT
     ? headObj.data
