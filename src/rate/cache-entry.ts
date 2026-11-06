@@ -6,6 +6,6 @@ import { serveDoc } from './doc.ts';
 
 export class RateCache extends WorkerEntrypoint<CounterEnv> {
   override async fetch(req: Request): Promise<Response> {
-    return serveDoc(req, counterOf(this.env));
+    return serveDoc(req, counterOf(this.env, this.ctx));
   }
 }

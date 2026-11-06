@@ -61,7 +61,6 @@ export const entrypoints = {
 
 // A binding can only name a class declared live above. src/index.js re-exports it from src/viewer/rate.ts.
 const VIEWER_RATE_CLASS: keyof typeof durableObjects = "ViewerRateLimit";
-const RATE_COUNTER_CLASS: keyof typeof durableObjects = "RateCounter";
 
 const plyWorker = {
 	worker: {
@@ -102,8 +101,9 @@ const plyWorker = {
 			VIEWER_RATE: bindings.durableObject({ worker: WORKER_NAME, exportName: VIEWER_RATE_CLASS }),
 			// The batched limiter (docs/rate-limit.md): "batched" reads one cached document and flushes counts in batches to
 			// RateCounter; "legacy" calls ViewerRateLimit on every request. Flip to "legacy" to roll the limiter back alone.
+			// RateCounter is reached through ctx.exports.RateCounter, not a binding: the versions API refuses a binding to a class
+			// that no deploy has provisioned yet (checked 2026-11-06 on the first upload of RateCounter).
 			RATE_MODE: bindings.text("batched"),
-			RATE_COUNTER: bindings.durableObject({ worker: WORKER_NAME, exportName: RATE_COUNTER_CLASS }),
 			// The public namespace, served read-only with no token (src/public.ts). The binding is scoped to this one
 			// namespace; the Worker calls only get(<repo>).createToken("read", 3600) and list(). No stored secret.
 			PUBLIC_REPOS: bindings.artifacts({ namespace: PUBLIC_NAMESPACE }),

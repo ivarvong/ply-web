@@ -20,7 +20,7 @@ request ─▶ default entrypoint
                         the request that opens a batch: ctx.waitUntil(linger 200 ms → flush)
                         flush: RateCounter.apply({id: <isolate>:<seq>, entries}) raced against a per-attempt timer,
                                retried with the SAME id until acked or 5 s from the first attempt
-RateCounter (ONE SQLite Durable Object, name "global-v1")
+RateCounter (ONE SQLite Durable Object, name "global-v1", reached as ctx.exports.RateCounter)
    rate_batches(id)          idempotency keys, kept 10 min: a replayed id is acked and changes nothing
    rate_hits(k,b,slot,n)     10 s slots, sliding 60 s window
    rate_blocked(k,b,until)   keys at or over the limit; the read side's whole document
@@ -59,7 +59,9 @@ Nothing on the request path waits for the Durable Object except a cache MISS/EXP
 
 ## Durable Object side
 
-- One object (`RateCounter`, a new SQLite class, additive: `ViewerRateLimit` and its namespace stay). `apply` is
+- One object (`RateCounter`, a new SQLite class, additive: `ViewerRateLimit` and its namespace stay). It is reached
+  through `ctx.exports.RateCounter`, not an env binding: the versions API refuses a binding to a class that no deploy
+  has provisioned yet (first upload, 2026-11-06). `apply` is
   synchronous SQL (no await between the dedupe check and the writes), so it is atomic under the input gate.
 - **Window.** Sliding 60 s over 10 s slots. A slot counts while its end is within the last 60 s, so a hit counts for
   60–70 s: never more lenient than an exact sliding window (worst case 1/6 stricter at the edge).

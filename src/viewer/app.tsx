@@ -34,7 +34,7 @@ function callOf(req: Request): ViewerCall {
  * one Durable Object call per request). Either way one `ply.rate.check` span records mode, decision and latency.
  */
 export async function admitClient(req: Request, env: ViewerEnv, bucket: RateBucket, now: number, ctx: unknown = null): Promise<RateDecision | 'unconfigured' | 'unavailable'> {
-  const id = await rateIdentity(req, env)
+  const id = await rateIdentity(req, env, ctx)
   const limitFor = (b: RateBucket): number => rateLimitFor(b, envBinding(b === 'pack' ? env.VIEWER_PACK_RATE_PER_MIN : env.VIEWER_RATE_PER_MIN))
   return inSpan(ctx, 'ply.rate.check', { [EDGE_ATTR.version]: versionOf(env), [EDGE_ATTR.route]: 'rate.check' }, async set => {
     set('rate.mode', id.mode)

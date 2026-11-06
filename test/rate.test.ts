@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:net';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -332,15 +333,15 @@ test('doc: served with max-age + SWR, one path only, and indexed by key and buck
 
 test('identity: load-test headers count only with the right token', async () => {
   const env = { PLY_TOKEN: 'secret-token-123', RATE_MODE: 'legacy', RATE_COUNTER: fakeNamespace(new CounterCore(sqlite())) };
-  const plain = await rateIdentity(new Request('https://x/', { headers: { 'cf-connecting-ip': '198.51.100.1', [LOAD_CLIENT_HEADER]: 'c1', [LOAD_MODE_HEADER]: 'batched' } }), env);
+  const plain = await rateIdentity(new Request('https://x/', { headers: { 'cf-connecting-ip': '198.51.100.1', [LOAD_CLIENT_HEADER]: 'c1', [LOAD_MODE_HEADER]: 'batched' } }), env, null);
   assert.equal(plain.load, false);
   assert.equal(plain.mode, 'legacy');
-  const wrong = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'nope', [LOAD_CLIENT_HEADER]: 'c1', [LOAD_MODE_HEADER]: 'batched' } }), env);
+  const wrong = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'nope', [LOAD_CLIENT_HEADER]: 'c1', [LOAD_MODE_HEADER]: 'batched' } }), env, null);
   assert.equal(wrong.load, false);
-  const right = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'secret-token-123', [LOAD_CLIENT_HEADER]: 'c1', [LOAD_MODE_HEADER]: 'batched' } }), env);
+  const right = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'secret-token-123', [LOAD_CLIENT_HEADER]: 'c1', [LOAD_MODE_HEADER]: 'batched' } }), env, null);
   assert.equal(right.load, true);
   assert.equal(right.mode, 'batched');
-  const other = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'secret-token-123', [LOAD_CLIENT_HEADER]: 'c2' } }), env);
+  const other = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'secret-token-123', [LOAD_CLIENT_HEADER]: 'c2' } }), env, null);
   assert.notEqual(right.hex, other.hex);
   assert.equal(other.mode, 'legacy');
   assert.equal(right.hex.length, 64);
@@ -418,14 +419,26 @@ test('admit: a failed read uses the last good document, and with none admits (fa
 
 // ---- the deployed bundle under workerd: real RateCounter on SQLite, ctx.exports.RateCache, the load-test headers ----
 
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address();
+      const port = addr !== null && typeof addr === 'object' ? addr.port : 0;
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
 const WORKERD = [process.env.WORKERD, fileURLToPath(new URL('../node_modules/.bin/workerd', import.meta.url))].filter((p): p is string => !!p && existsSync(p));
 
-test('workerd: batched limiter refuses within the lag, and a slow ack is retried as a replay', { skip: WORKERD.length === 0 && 'workerd not installed', timeout: 60_000 }, async () => {
+async function workerdRun(withBinding: boolean): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), 'ply-rate-'));
   const out = join(root, 'wk');
   mkdirSync(out);
   copyCfBundle(join(out, 'worker.mjs'));
-  const port = 19200 + (process.pid % 40);
+  const port = await freePort();
   const token = 'load-token-' + 'y'.repeat(20);
   writeFileSync(join(out, 'config.capnp'), `using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
@@ -441,8 +454,7 @@ const config :Workerd.Config = (
       (name = "PACK_CACHE", text = "off"),
       (name = "VIEWER_RATE_PER_MIN", text = "3"),
       (name = "RATE_MODE", text = "batched"),
-      (name = "VIEWER_RATE", durableObjectNamespace = "ViewerRateLimit"),
-      (name = "RATE_COUNTER", durableObjectNamespace = "RateCounter")
+      (name = "VIEWER_RATE", durableObjectNamespace = "ViewerRateLimit")${withBinding ? ', (name = "RATE_COUNTER", durableObjectNamespace = "RateCounter")' : ''}
     ]
   )), (name = "do-disk", disk = (path = "${join(root, 'do')}", writable = true)), (name = "internet", network = (allow = ["private", "public", "local"])) ],
   sockets = [ (name = "http", address = "127.0.0.1:${port}", http = (), service = "main") ]
@@ -474,20 +486,27 @@ const config :Workerd.Config = (
     // A forged token is ignored: the headers do nothing and the request is keyed by its (absent) address.
     const forged = await fetch(`http://127.0.0.1:${port}/view`, { headers: { [LOAD_TOKEN_HEADER]: 'nope', [LOAD_CLIENT_HEADER]: 'c1' } });
     assert.equal(forged.status, 200);
+    if (!withBinding) return;
+    // workerd prints a Durable Object's console only when it is reached through an env binding, so the fault half runs there.
     // Fault: the DO applies and holds its answer 1.5 s; the 1 s attempt timer fires, the retry with the same id is a replay.
     assert.equal((await hit('c4', { 'x-ply-rate-fault': 'slow-ack=1500;attempts=1' })).status, 200);
     await sleep(2_500);
     const applies = logs.split('\n').filter(l => l.includes('"ply.rate.apply"') && l.includes('slow-ack') === false).map(l => JSON.parse(l.slice(l.indexOf('{'))));
     const faulted = logs.split('\n').filter(l => l.includes('"ply.rate.apply"') && l.includes('slow-ack=1500')).map(l => JSON.parse(l.slice(l.indexOf('{'))));
-    assert.equal(faulted.length, 1, logs.slice(-3000));
+    assert.equal(faulted.length, 1, logs.split('\n').filter(l => !l.includes('ply.request')).join('\n').slice(-3000));
     const replays = applies.filter(a => a.id === faulted[0].id);
-    assert.equal(replays.length, 1, 'one retry of the faulted batch');
+    assert.equal(replays.length, 1, `one retry of the faulted batch\n${logs.split('\n').filter(l => l.includes('rate') || l.includes('rror')).join('\n').slice(-4000)}`);
     assert.equal(replays[0].replay, true);
     assert.equal(replays[0].attempt, 2);
     assert.equal(logs.includes(token), false, 'the load token never reaches a log');
   } finally {
+    if (process.env.RATE_TEST_LOG) writeFileSync(process.env.RATE_TEST_LOG, logs);
     if (proc.pid) { try { process.kill(-proc.pid, 'SIGKILL'); } catch { proc.kill('SIGKILL'); } }
     else proc.kill('SIGKILL');
     rmSync(root, { recursive: true, force: true });
   }
-});
+}
+
+test('workerd: batched limiter through ctx.exports.RateCounter (production path) refuses within the lag', { skip: WORKERD.length === 0 && 'workerd not installed', timeout: 60_000 }, () => workerdRun(false));
+
+test('workerd: a slow ack is retried with the same id and applied once (replay)', { skip: WORKERD.length === 0 && 'workerd not installed', timeout: 60_000 }, () => workerdRun(true));

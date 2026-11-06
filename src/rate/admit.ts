@@ -7,7 +7,7 @@ import { Batcher, defaultTuning, type FlushReport } from './batcher.ts';
 import { BUCKET_PACK, BUCKET_PAGE, DOC_URL, KEY_HEX, MEMO_FALLBACK_MS } from './config.ts';
 import type { Fault } from './core.ts';
 import { DOC_AT_HEADER, indexDoc, type DocIndex } from './doc.ts';
-import { counterOf } from './stub.ts';
+import { counterNamespace, counterOf } from './stub.ts';
 
 export type RateMode = 'legacy' | 'batched';
 export type SpanSet = (key: string, value: string | number | boolean) => void;
@@ -63,23 +63,23 @@ export function parseFault(raw: string | null): Fault | null {
 }
 
 /** The env's default mode. Batched needs the counter binding; otherwise legacy. */
-export function defaultMode(env: unknown): RateMode {
-  return textBinding(env, 'RATE_MODE') === 'batched' && counterOf(env) !== null ? 'batched' : 'legacy';
+export function defaultMode(env: unknown, ctx: unknown): RateMode {
+  return textBinding(env, 'RATE_MODE') === 'batched' && counterNamespace(env, ctx) !== null ? 'batched' : 'legacy';
 }
 
 /**
  * The client's rate identity. Load-test headers count only with `x-ply-load-token` equal to PLY_TOKEN (constant time);
  * the token is never forwarded, logged or echoed.
  */
-export async function rateIdentity(req: Request, env: unknown): Promise<RateIdentity> {
-  let mode = defaultMode(env);
+export async function rateIdentity(req: Request, env: unknown, ctx: unknown): Promise<RateIdentity> {
+  let mode = defaultMode(env, ctx);
   const presented = req.headers.get(LOAD_TOKEN_HEADER);
   const secret = textBinding(env, 'PLY_TOKEN');
   if (presented !== null && secret.length > 0 && (await tokenEqual(presented, secret))) {
     const label = req.headers.get(LOAD_CLIENT_HEADER);
     const asked = req.headers.get(LOAD_MODE_HEADER);
     if (asked === 'legacy') mode = 'legacy';
-    if (asked === 'batched' && counterOf(env) !== null) mode = 'batched';
+    if (asked === 'batched' && counterNamespace(env, ctx) !== null) mode = 'batched';
     const hex = await sha256Hex(`ply-viewer-rate/1\n${label === null ? 'load' : `load:${label.slice(0, 128)}`}`);
     return { hex, mode, fault: parseFault(req.headers.get(LOAD_FAULT_HEADER)), load: true };
   }
@@ -205,8 +205,8 @@ function batcherFor(env: unknown, limitFor: (bucket: 'page' | 'pack') => number)
     batcher = new Batcher({
       now: () => Date.now(),
       sleep,
-      send: req => {
-        const stub = counterOf(env);
+      send: (req, owner) => {
+        const stub = counterOf(env, owner);
         if (stub === null) return Promise.reject(new Error('RATE_COUNTER is not bound'));
         return stub.apply(req);
       },
@@ -263,7 +263,7 @@ export async function admitBatched(input: {
   const batch = batcherFor(env, input.limitFor);
   const before = batch.pending().keys === 0 && batch.pending().hits === 0;
   const version = versionOf(env);
-  const joined = batch.add(key, b, id.fault);
+  const joined = batch.add(key, b, id.fault, ctx);
   const waitUntil = (p: Promise<unknown>): void => {
     const found = dig(ctx, ['waitUntil']);
     if (found.tag === 'some' && typeof found.value === 'function') (found.value as (p: Promise<unknown>) => void).call(ctx, p);

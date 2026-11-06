@@ -31,7 +31,8 @@ export type FlushReport = {
 export type BatcherDeps = {
   readonly now: () => number;
   readonly sleep: (ms: number) => Promise<void>;
-  readonly send: (req: ApplyRequest) => Promise<ApplyResult>;
+  /** `owner` is the ctx of the request that opened the batch (the RPC goes through its ctx.exports). */
+  readonly send: (req: ApplyRequest, owner: unknown) => Promise<ApplyResult>;
   /** The isolate's id, minted on first use (no randomness at global scope in Workers). */
   readonly isolateId: () => string;
   readonly limits: () => readonly [number, number];
@@ -54,6 +55,7 @@ type OpenBatch = {
   readonly counts: Map<string, number>;
   hits: number;
   fault: Fault | null;
+  readonly owner: unknown;
   closed: boolean;
   early: boolean;
   done: Promise<FlushReport>;
@@ -92,14 +94,14 @@ export class Batcher {
    * Count one admitted hit. Returns the promise of the batch it joined, for ctx.waitUntil, or null when the batch was
    * dropped on overflow (recorded in overflowDrops).
    */
-  add(key: string, bucket: number, fault: Fault | null): Promise<FlushReport> | null {
+  add(key: string, bucket: number, fault: Fault | null, owner: unknown = null): Promise<FlushReport> | null {
     let b = this.#open;
     if (b === null) {
       if (this.#inflight >= this.#deps.maxInflight) {
         this.overflowDrops++;
         return null;
       }
-      b = this.#start();
+      b = this.#start(owner);
     }
     const slot = `${key}:${bucket}`;
     b.counts.set(slot, (b.counts.get(slot) || 0) + 1);
@@ -112,12 +114,12 @@ export class Batcher {
     return b.done;
   }
 
-  #start(): OpenBatch {
+  #start(owner: unknown): OpenBatch {
     const deps = this.#deps;
     this.#inflight++;
     let release: (r: FlushReport) => void = () => {};
     const done = new Promise<FlushReport>(resolve => { release = resolve; });
-    const b: OpenBatch = { seq: ++this.#seq, openedAt: deps.now(), counts: new Map(), hits: 0, fault: null, closed: false, early: false, done };
+    const b: OpenBatch = { seq: ++this.#seq, openedAt: deps.now(), counts: new Map(), hits: 0, fault: null, owner, closed: false, early: false, done };
     this.#open = b;
     // #close starts the flush and resolves `done` when it ends, whichever path closed the batch (linger or size).
     this.#pendingRelease.set(b, release);
@@ -158,7 +160,7 @@ export class Batcher {
       const left = deps.deadlineMs - (deps.now() - started);
       if (left <= 0) { deadlineHit = true; break; }
       const t0 = deps.now();
-      const call = deps.send({ id, attempt, limits, entries, fault: b.fault });
+      const call = deps.send({ id, attempt, limits, entries, fault: b.fault }, b.owner);
       // The loser of the race keeps running (that is what the key covers). Its rejection must not be unhandled.
       call.catch(() => {});
       let outcome: AttemptOutcome;
