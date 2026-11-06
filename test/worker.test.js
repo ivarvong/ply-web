@@ -380,7 +380,9 @@ test('empty repo lifecycle: first commit through history, with no git seeding', 
   assert.equal(warmTrace.filter(s => s.name === 'git.upload-pack discover').length, 1, JSON.stringify(warmTrace.map(s => s.name)));
   assert.equal(warmTrace.some(s => s.name === 'git.head'), false);
   const warmLs = (fill(warmRes.headers.get('x-artifacts-ray'), '')).split(', ').filter(part => part.startsWith('ls-refs=')).length;
-  assert.equal(coldLs, warmLs, `cold ${emptyRes.headers.get('x-artifacts-ray')} warm ${warmRes.headers.get('x-artifacts-ray')}`);
+  // The cold request settles the transport's initial exchange (a GET info/refs before its first POST); ply remembers it
+  // for the remote in this isolate, so the warm request skips exactly that GET.
+  assert.equal(warmLs, coldLs - 1, `cold ${emptyRes.headers.get('x-artifacts-ray')} warm ${warmRes.headers.get('x-artifacts-ray')}`);
   assert.notEqual(warmRes.headers.get('x-ply-request-id'), emptyRes.headers.get('x-ply-request-id'));
   assert.match(fill(warmRes.headers.get('server-timing'), ''), /total;dur=\d+/);
   assert.equal((await W(`/v1/commit?${qs({ remote, ref: 'nope' })}`)).status, 404);
@@ -718,7 +720,7 @@ test('redirects: git\'s rule (initial info/refs followed and the base rewritten;
   assert.equal(res.status, 200, JSON.stringify(body)); assert.equal(git(r.bare, ['rev-parse', 'main']).trim(), body.newCommit);
   assert.equal(gitBuf(r.bare, ['show', 'main:f.txt']).toString(), 'one MOVED\n');
   assert.ok(redirSrv.hits.some(h => h.method === 'POST' && h.path === `/${r.name}.git/git-receive-pack`), 'the push went to the rewritten base');
-  assert.deepEqual(redirSrv.hits.filter(h => h.path.startsWith('/moved/')).map(h => h.method), ['GET'], 'only the first info/refs GET was asked of the old base');
+  assert.deepEqual(redirSrv.hits.filter(h => h.path.startsWith('/moved/')), [], 'ply remembers the settled base from the reads above: the edit asks nothing of the old base');
 
   // A remote that redirects only its POSTs: git cannot use it (http.followRedirects=initial), and neither can /v1.
   const before = git(r.bare, ['rev-parse', 'main']).trim();
@@ -743,6 +745,27 @@ test('redirects: git\'s rule (initial info/refs followed and the base rewritten;
     assert.equal(JSON.stringify(body).includes(token), false);
   }
   assert.equal(logs.includes(token), false);
+});
+
+// ply remembers how a remote's initial exchange settled (per isolate): a second /v1 request for the same remote sends its
+// POST straight to the settled base, with no GET info/refs, redirected or not.
+test('redirect memo: a second /v1 request for the same remote in the isolate makes no info/refs GET', { skip }, async () => {
+  const r = repo({ 'f.txt': 'memo\n' });
+  const paths = () => redirSrv.hits.map(h => [h.method, h.path.split('?')[0]]);
+  for (const [remote, first] of [
+    [`${redirSrv.url}/moved/${r.name}.git`, [['GET', `/moved/${r.name}.git/info/refs`], ['GET', `/${r.name}.git/info/refs`], ['POST', `/${r.name}.git/git-upload-pack`]]],
+    [`${redirSrv.url}/${r.name}.git`, [['GET', `/${r.name}.git/info/refs`], ['POST', `/${r.name}.git/git-upload-pack`]]],
+  ]) {
+    redirSrv.hits.length = 0;
+    let res = await W(`/v1/refs?${qs({ remote })}`);
+    assert.equal(res.status, 200, await res.text());
+    assert.deepEqual(paths(), first, `${remote}: the first request settles the initial exchange`);
+    redirSrv.hits.length = 0;
+    res = await W(`/v1/refs?${qs({ remote })}`);
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body)); assert.equal(body.refs['refs/heads/main'], r.head);
+    assert.deepEqual(paths(), [['POST', `/${r.name}.git/git-upload-pack`]], `${remote}: the second request makes no GET`);
+  }
 });
 
 const RAY_ENTRY = /^([a-z-]+)=([0-9a-f]{16}-[A-Z]{3}|-|no-response);dur=(\d+)$/;
