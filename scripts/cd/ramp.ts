@@ -1,5 +1,6 @@
 import { assertNever } from '../../src/never.ts'
 import { none, some, type Option } from '../../src/option.ts'
+import { compareStep, observedBasis, observeStep, predictStep, probeBasis, type ForecastBasis, type ForecastCheck } from './forecast.ts'
 import { asRecord } from './json.ts'
 import type { ObservationRef } from './log.ts'
 import type { RolloutPolicy } from './policy.ts'
@@ -218,6 +219,8 @@ export type RampStepRecord = {
   readonly outcome: RampDecision['outcome']
   readonly line: string
   readonly probeLoss: ProbeLoss
+  /** What the step predicted next to what it saw (scripts/cd/forecast.ts). Null when the step had no telemetry sample. */
+  readonly forecast: ForecastCheck | null
 }
 
 export type RampLoopResult = {
@@ -375,6 +378,8 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
   let carried: VersionStats | null = null
   let rollbackError: string | null = null
   let lastPassed: Option<number> = none()
+  // The first step is predicted from the probe rate alone; each later one from the step before it.
+  let basis: ForecastBasis | null = io.dwell ? probeBasis(policy) : null
   const cap = policy.steps.length
   for (let guard = 0; guard < cap && state.kind === 'ramping'; guard++) {
     const index = state.step
@@ -424,7 +429,7 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
           probe: { kind: 'measured', loss: probeLoss },
         })
         lines.push(line)
-        steps.push({ percent, burns: noted.burns, outcome: noted.outcome, line, probeLoss })
+        steps.push({ percent, burns: noted.burns, outcome: noted.outcome, line, probeLoss, forecast: null })
         if (window.kind === 'harness_fault') {
           const settled = await settleHarnessFault(policy, io, percent, window.reason, lastPassed)
           state = settled.state
@@ -477,7 +482,14 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
       probe: io.dwell ? { kind: 'measured', loss: probeLoss } : { kind: 'none' },
     })
     lines.push(line)
-    steps.push({ percent, burns: decision.burns, outcome: decision.outcome, line, probeLoss })
+    let forecast: ForecastCheck | null = null
+    if (observed.kind === 'sample') {
+      const seen = observeStep(observed, policy.split.z)
+      const predicted = basis === null ? null : predictStep(basis, percent, step.dwellMs, policy.split.z)
+      forecast = compareStep({ step: index + 1, percent, basis, predicted, observed: seen.resolution, wallDeltaMs: seen.wallDeltaMs })
+      basis = observedBasis(index + 1, percent, observed, step.dwellMs)
+    }
+    steps.push({ percent, burns: decision.burns, outcome: decision.outcome, line, probeLoss, forecast })
     if (io.onDecision) {
       if (!observed.ref) throw new Error('decision without an observation')
       await io.onDecision(observed.ref, decision, percent)
