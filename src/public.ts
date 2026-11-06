@@ -79,6 +79,33 @@ export async function publicRepoExists(binding: unknown, name: string): Promise<
   }
 }
 
+/** How long an isolate trusts a `true` from publicRepoExists: the same minute the namespace listing is cached. */
+export const EXISTS_TTL_MS = 60_000;
+const MAX_EXISTS_MEMO = 256;
+const existsMemo = new WeakMap<object, Map<string, number>>();
+
+/**
+ * publicRepoExists, with a `true` remembered per isolate (and per binding object) for EXISTS_TTL_MS. Each /r page asked
+ * the binding first, before any git: 37 of a 105 ms page (trace 7dc622ba…, 59f39490). Only `true` is kept, so a
+ * new repo is seen at once and a deleted one is a 404 within the minute; `false` and `unknown` always ask again.
+ */
+export async function publicRepoExistsMemo(binding: unknown, name: string, now: number = Date.now()): Promise<RepoPresence> {
+  if (binding === null || typeof binding !== 'object') return publicRepoExists(binding, name);
+  let memo = existsMemo.get(binding);
+  if (!memo) { memo = new Map(); existsMemo.set(binding, memo); }
+  const until = mapGet(memo, name);
+  if (until.tag === 'some' && until.value > now) return true;
+  const found = await publicRepoExists(binding, name);
+  if (found === true) {
+    memo.delete(name);
+    if (memo.size >= MAX_EXISTS_MEMO) { const first = memo.keys().next(); if (!first.done) memo.delete(first.value); }
+    memo.set(name, now + EXISTS_TTL_MS);
+  } else {
+    memo.delete(name);
+  }
+  return found;
+}
+
 /** The canonical remote for a repo in the public namespace. */
 export function publicRemote(name: string, origin: string = PUBLIC_GIT_ORIGIN): string {
   if (!isPublicRepoName(name)) throw plyError('bad_request', 'not a public repository name');

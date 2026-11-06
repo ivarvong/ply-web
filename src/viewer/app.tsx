@@ -19,7 +19,7 @@ import { VIEWER_CSS, VIEWER_CSS_HASH } from './styles.ts'
 import { loadRepo } from './session.ts'
 import { buildTrace, traceHeader } from './traceview.ts'
 import { LAYOUT } from './layout.ts'
-import { PUBLIC_NAMESPACE, listPublicRepos, publicRepoExists, publicRepoShortName, tokenSourceFor, withPublicReadCredential } from '../public.ts'
+import { PUBLIC_NAMESPACE, listPublicRepos, publicRepoExistsMemo, publicRepoShortName, tokenSourceFor, withPublicReadCredential } from '../public.ts'
 
 function callOf(req: Request): ViewerCall {
   const call = viewerCalls.get(req)
@@ -180,12 +180,21 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
     return res
   }
   try {
+    // The namespace's yes/no runs beside the git reads instead of before them (it was 37 ms of a 105 ms page, trace
+    // 7dc622ba…). A missing repo still answers this 404: its git reads fail at the read-token mint before any upstream
+    // request, and are cancelled here.
     const short = publicRepoShortName(route.loc.host, route.loc.repoPath)
+    const stop = new AbortController()
+    const pending = loadRepo(route, { tracer, fetchImpl, signal: AbortSignal.any([pageSignal, stop.signal]), budget })
     if (short) {
-      const exists = await publicRepoExists(env.PUBLIC_REPOS, short)
-      if (exists === false) throw Object.assign(new Error(`no repository ${short} in ${PUBLIC_NAMESPACE}`), { code: 'not_found' })
+      pending.catch(() => {})
+      const exists = await publicRepoExistsMemo(env.PUBLIC_REPOS, short, call.now)
+      if (exists === false) {
+        stop.abort()
+        throw Object.assign(new Error(`no repository ${short} in ${PUBLIC_NAMESPACE}`), { code: 'not_found' })
+      }
     }
-    const loaded = await loadRepo(route, { tracer, fetchImpl, signal: pageSignal, budget })
+    const loaded = await pending
     const trace = traced()
     notify(call.opts, { host: route.loc.host, rtt: trace.bars.length, bytes: budget.bytes, code: 'ok' })
     if (loaded.kind === 'raw') {

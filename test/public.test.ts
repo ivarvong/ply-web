@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import {
   PUBLIC_GIT_HOST, PUBLIC_GIT_ORIGIN, PUBLIC_NAMESPACE, READ_TOKEN_REFRESH_S, READ_TOKEN_TTL_S,
   createTokenSource, EMPTY_PUBLIC_REPOS, isPublicNamespaceRemote, isPublicRepoName, listPublicRepos, publicRemote, publicRepoOfRemote, publicUploadPackRepo,
-  scrubSecrets, withPublicReadCredential, type ArtifactsNamespace,
+  scrubSecrets, withPublicReadCredential, type ArtifactsNamespace, EXISTS_TTL_MS, publicRepoExistsMemo,
 } from '../src/public.ts';
 import { PUBLIC_NAMESPACE as CONFIG_NAMESPACE } from '../src/public-namespace.ts';
 
@@ -208,4 +208,25 @@ test('scrubSecrets removes every form, longest first', () => {
   assert.equal(out.includes('art_v1_'), false);
   assert.equal(out.includes(btoa(`x-access-token:${TOKEN}`)), false);
   assert.match(out, /short$/, 'strings under 8 chars are not treated as secrets');
+});
+
+test('publicRepoExistsMemo remembers a yes for a minute and never remembers a no', async () => {
+  const known = new Set(['ply']);
+  let calls = 0;
+  const binding = { async get(name: string) { calls++; if (!known.has(name)) throw new Error(`repo not found: ${name}`); return {}; } };
+  assert.equal(await publicRepoExistsMemo(binding, 'ply', 1_000), true);
+  assert.equal(await publicRepoExistsMemo(binding, 'ply', 1_000 + EXISTS_TTL_MS - 1), true);
+  assert.equal(calls, 1, 'the second ask within the minute is the memo');
+  known.delete('ply');
+  assert.equal(await publicRepoExistsMemo(binding, 'ply', 1_000 + EXISTS_TTL_MS), false, 'past the minute the binding is asked again');
+  assert.equal(calls, 2);
+  assert.equal(await publicRepoExistsMemo(binding, 'ply', 1_000 + EXISTS_TTL_MS + 1), false);
+  assert.equal(calls, 3, 'a no is not remembered');
+  known.add('ply');
+  assert.equal(await publicRepoExistsMemo(binding, 'ply', 1_000 + EXISTS_TTL_MS + 2), true, 'a repo that appears is seen at once');
+  const other = { async get() { calls++; return {}; } };
+  assert.equal(await publicRepoExistsMemo(other, 'ply', 1_000 + EXISTS_TTL_MS + 2), true);
+  assert.equal(calls, 5, 'the memo is per binding object');
+  assert.equal(await publicRepoExistsMemo(null, 'ply'), 'unknown');
+  assert.equal(await publicRepoExistsMemo(binding, '../x'), false);
 });
