@@ -271,7 +271,7 @@ npm run cd -- ramp --version 8c1af0e2-7b3d-4c1a-9e20-6f0a1b2c3d4e \
 
 Without `--verdict`, or with a verdict that is not a pass for that version, the command exits and does not change traffic.
 
-The checked-in steps are `10, 25, 50, 75, 100`, each with a `40000` ms dwell. The list is only in the policy file. After the dwell the step waits `ingestWaitMs` (`20000` in the checked-in file) and then queries. Smoke id-matching still uses `TELEMETRY_WAIT_MS` (`60000`); that budget is not the ramp wait. `warmupMs` is `0`. Set it above 0 to pause after the split is applied and before the probes, and that pause is not part of the judged window.
+The checked-in steps are `10, 25, 50, 75, 100`, each with a `40000` ms dwell. The list is only in the policy file. After the dwell the step waits `ingestWaitMs` (`20000` in the checked-in file) and then queries. Smoke id-matching still uses `TELEMETRY_WAIT_MS` (`60000`); that budget is not the ramp wait. `warmupMs` is `10000`: after the split is applied the step pauses 10 s before the probes, and that pause is not part of the judged window. It was `0` until 2026-11-06, when two ramps of 86456068 (runs 20-01-37Z, 20-11-49Z) rolled back at 100% on routed share 98.84% and 98.74%: 24 and 25 old-version requests, every one within 4.6 s and 3.7 s of the 100% deployment, none after, 0 errors (the split takes a few seconds to reach every edge).
 
 The only pinned traffic is the 0% gate: the lifecycle smoke and the deploy check, both sent with `Cloudflare-Workers-Version-Overrides`. From the first ramp step on, probes are ordinary requests. They do not set that header, and they do not pin the old version to balance the arms. Right now those requests are the only load. Real users would be judged by the same telemetry.
 

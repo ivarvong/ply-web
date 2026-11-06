@@ -259,7 +259,8 @@ test('the same stall on both versions re-runs the dwell and does not roll back',
   assert.equal(dwells, rollout.probe.windowAttempts)
   assert.equal(rolled, 0)
   assert.equal(result.state.kind, 'complete')
-  assert.deepEqual(waits, [rollout.probe.windowBackoffMs, rollout.ingestWaitMs])
+  // the policy's warm-up (the split reaching every edge) comes first, outside the judged window
+  assert.deepEqual(waits, [...(rollout.warmupMs > 0 ? [rollout.warmupMs] : []), rollout.probe.windowBackoffMs, rollout.ingestWaitMs])
 })
 
 test('a stall that is still there after the bounded re-runs holds and does not roll back', async () => {

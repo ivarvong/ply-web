@@ -29,6 +29,7 @@ test('the checked-in calibrated entries are the ones with a measured run behind 
     'policy:probe.timeoutMs',
     'policy:probe.windowAttempts',
     'policy:telemetry.query.attempts',
+    'policy:warmupMs',
   ])
   const prior = registry.thresholds.get('policy:telemetry.maxLossRate')
   assert.ok(prior)

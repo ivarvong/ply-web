@@ -46,9 +46,15 @@
       "headroom": "20000 is 1.16x the larger gap"
     },
     "policy:warmupMs": {
-      "value": 0,
-      "status": "PRIOR (uncalibrated)",
-      "why": "No warmup: nothing measured needed one."
+      "value": 10000,
+      "status": "calibrated",
+      "source": "runs 2026-11-06T20-01-37-842Z and 2026-11-06T20-11-49-685Z",
+      "query": "old-version request events after the 100% deployment's created_on, Workers Observability events view, service ply, partitioned by $workers.scriptVersion.id",
+      "window": "100% ramp steps of 86456068 (previous c43f01cd)",
+      "date": "2026-11-06",
+      "n": 2,
+      "percentile": "max of two measured split-propagation tails (4.6 s, 3.7 s; 24 and 25 old-version requests, none later); not a percentile",
+      "headroom": "10000 is 2.2x the larger tail"
     },
     "policy:probe.rps": {
       "value": 25,
