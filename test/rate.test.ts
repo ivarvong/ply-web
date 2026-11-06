@@ -518,5 +518,8 @@ test('counterNamespace: found on a ctx.exports that answers `in` with false (the
   assert.equal('RateCounter' in exportsLike, false);
   assert.equal(counterNamespace({}, { exports: exportsLike }), ns);
   assert.equal(counterNamespace({}, { exports: {} }), null);
+  // The platform's namespace is callable: typeof 'function', with idFromName.
+  const callable = Object.assign(() => {}, ns);
+  assert.equal(counterNamespace({}, { exports: { RateCounter: callable } }), callable);
   assert.equal(counterNamespace({}, null), null);
 });

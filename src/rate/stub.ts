@@ -7,7 +7,10 @@ export type CounterNamespace = { idFromName(name: string): unknown; get(id: unkn
 export type CounterEnv = { RATE_COUNTER: CounterNamespace | null };
 
 function isNamespace(v: unknown): v is CounterNamespace {
-  return v !== null && typeof v === 'object' && typeof (v as CounterNamespace).idFromName === 'function';
+  // typeof 'function' too: on the platform ctx.exports.RateCounter is a callable namespace (e61a5742: rate.counter =
+  // "function:idFromName=function"), and requiring 'object' sent every batched request to legacy.
+  if (v === null || (typeof v !== 'object' && typeof v !== 'function')) return false;
+  return typeof (v as CounterNamespace).idFromName === 'function';
 }
 
 /**
