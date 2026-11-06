@@ -13,7 +13,8 @@
 import { chainGet, fromNullable, mapGet } from './absent.ts';
 import { PUBLIC_GIT_ORIGIN, publicRemote, type ArtifactsNamespace, type FetchLike, type TokenSource } from './public.ts';
 import { checkRemote, createGuardedFetch } from './remote.ts';
-import { Tracer, ZERO_OID, arrayExporter, createTransport, fetchPack, lsRefs, push, withLimits } from 'ply';
+import { Tracer, ZERO_OID, arrayExporter, createTransport, fetchPack, lsRefs, push } from 'ply';
+import { MIRROR_CAPS, MIRROR_LIMITS } from './limits.ts';
 import type { Transport } from 'ply/transport';
 import { refname, unwrap, unwrapAsync } from './ply-result.ts';
 
@@ -24,9 +25,8 @@ export const MIRRORS: readonly Mirror[] = Object.freeze([
   { repo: 'ply-web', source: 'https://github.com/ivarvong/ply-web.git', branch: 'main' },
 ]);
 
-const MIB = 1024 * 1024;
-export const MAX_SYNC_PACK = 32 * MIB;
-const LIMITS = withLimits({ maxPackBytes: MAX_SYNC_PACK, maxObjectSize: 16 * MIB, maxInflatedTotal: 96 * MIB, maxHarvestBytes: 16 * MIB, maxPackObjects: 50_000, requestTimeoutMs: 30_000 });
+export const MAX_SYNC_PACK = MIRROR_CAPS.maxPackBytes;
+const LIMITS = MIRROR_LIMITS;
 export const WRITE_TTL_S = 60;
 
 export type SyncResult = {

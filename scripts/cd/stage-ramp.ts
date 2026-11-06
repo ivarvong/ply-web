@@ -318,7 +318,8 @@ export async function stageRamp(
     const probeLoss = result.steps.map(step => probeLossRecord(step.percent, step.probeLoss))
     for (const step of result.steps) {
       opts.log(step.line)
-      await appendFile(logPath, JSON.stringify({ line: step.line, probe_loss: probeLossRecord(step.percent, step.probeLoss) }) + '\n')
+      if (step.forecast) opts.log(step.forecast.line)
+      await appendFile(logPath, JSON.stringify({ line: step.line, probe_loss: probeLossRecord(step.percent, step.probeLoss), forecast: step.forecast }) + '\n')
     }
     await writeJson(opts.runDir, 'ramp.json', {
       state: result.state,

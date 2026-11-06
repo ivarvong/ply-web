@@ -14,6 +14,7 @@ import { copyCfBundle } from './cf-bundle.js';
 import { git, tmpRoot, makeBareRepo, startGitServer, commitFiles } from './server.js';
 import { API_ROUTES } from '../src/api-routes.ts';
 import { TRACED_EDIT_SPANS } from '../scripts/cd/span-check.ts';
+import { REQUEST_INPUTS, ROUTE_INPUTS } from '../scripts/calibrate/attributes.ts';
 
 const WORKERD = [process.env.WORKERD, fileURLToPath(new URL('../node_modules/.bin/workerd', import.meta.url))].filter(Boolean).find(p => existsSync(p));
 const skip = !WORKERD && 'workerd not installed';
@@ -156,8 +157,15 @@ async function invocationOf(id) {
 /** Platform spans of one invocation: id, name, parent, attributes, status, closed. And the request (root) span id. */
 function spansOf(mine) {
   const spans = new Map();
+  /** Attributes by the span they were set on, the request span included (it has no spanOpen of its own). */
+  const attrsBySpan = new Map();
   for (const e of mine) {
     const ev = e.event;
+    if (ev.type === 'attributes') {
+      const into = attrsBySpan.get(e.spanContext.spanId) || {};
+      for (const { name, value } of ev.info) into[name] = value;
+      attrsBySpan.set(e.spanContext.spanId, into);
+    }
     if (ev.type === 'spanOpen') spans.set(ev.spanId, { id: ev.spanId, name: ev.name, parent: e.spanContext.spanId, attrs: {}, status: null, closed: false, opened: e.sequence, closedAt: Infinity });
     const own = spans.get(e.spanContext.spanId);
     if (!own) continue;
@@ -166,7 +174,8 @@ function spansOf(mine) {
     if (ev.type === 'spanClose') { own.closed = true; own.closedAt = e.sequence; }
   }
   const outcome = mine.find(e => e.event.type === 'outcome');
-  return { spans: [...spans.values()], rootId: outcome.spanContext.spanId };
+  const rootId = outcome.spanContext.spanId;
+  return { spans: [...spans.values()], rootId, rootAttrs: attrsBySpan.get(rootId) || {} };
 }
 
 /** The `ply.request` log line of the invocation, parsed. */
@@ -191,7 +200,7 @@ test('every /v1 route exports each ply span to Workers tracing under the request
     assert.ok(res.status >= 200 && res.status < 300, `${route}: ${res.status} ${res.text}`);
     assert.ok(res.id, `${route}: x-ply-request-id`);
     const mine = await invocationOf(res.id);
-    const { spans, rootId } = spansOf(mine);
+    const { spans, rootId, rootAttrs } = spansOf(mine);
     const log = requestLog(mine);
     assert.ok(log, `${route}: ply.request log`);
     const ply = spans.filter(s => typeof s.attrs['ply.span_id'] === 'string');
@@ -220,6 +229,8 @@ test('every /v1 route exports each ply span to Workers tracing under the request
         assert.ok(byEdgeId.has(at.parent) && ++hops < 32, `${where}: does not reach the request span`);
       }
       assert.match(s.attrs['ply.trace_id'], /^[0-9a-f]{32}$/, where);
+      // #73: every ply span carries its route, so an input distribution groups per route without a join.
+      assert.equal(s.attrs['ply.route'], route, `${where}: ply.route`);
       assert.equal(typeof s.attrs['ply.duration_ms'], 'number', where);
       // ply's telemetry contract: every wire span carries these; every operation root its outcome.
       if (/^git\.(upload-pack|receive-pack)/.test(s.name)) {
@@ -229,6 +240,18 @@ test('every /v1 route exports each ply span to Workers tracing under the request
         assert.ok(`${s.name}.outcome` in s.attrs, `${where}: no ${s.name}.outcome`);
       }
     }
+    // #73: the request span carries the route, surface, status and ply's counts (the log line's, as numbers).
+    if (process.env.PLY_SPANS_DEBUG) console.log(route, 'request span', JSON.stringify(rootAttrs));
+    for (const key of REQUEST_INPUTS) assert.equal(typeof rootAttrs[key], 'number', `${route}: request span ${key}`);
+    // #73: the input distributions scripts/calibrate reads for this route are on its ply spans, as numbers.
+    for (const key of ROUTE_INPUTS[route]) {
+      assert.ok(ply.some(s => typeof s.attrs[key] === 'number'), `${route}: no ply span carries ${key} as a number`);
+    }
+    assert.equal(rootAttrs['ply.route'], route, `${route}: request span ply.route`);
+    assert.equal(rootAttrs['ply.surface'], 'api', `${route}: request span ply.surface`);
+    assert.equal(rootAttrs['http.response.status_code'], res.status, `${route}: request span status`);
+    assert.equal(rootAttrs['ply.spans'], log.spans, `${route}: request span ply.spans`);
+    assert.equal(typeof rootAttrs['ply.round_trips'], 'number', `${route}: request span ply.round_trips`);
     // The edit in the issue (#67): delta, pack bytes, ttfb and cpu_ms are on the platform spans, as numbers.
     if (route === 'POST /v1/edit') {
       const one = name => ply.find(s => s.name === name);

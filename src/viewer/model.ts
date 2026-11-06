@@ -121,4 +121,6 @@ export type ViewerEnv = Partial<{
   VIEWER_RATE_PER_MIN: string;
   VIEWER_PACK_RATE_PER_MIN: string;
   PACK_CACHE: string;
+  /** Workers version metadata (cloudflare.config.ts). Its id is the `ply.script_version` on the viewer's ply spans. */
+  VERSION: { readonly id: string };
 }>;

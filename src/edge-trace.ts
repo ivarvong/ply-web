@@ -42,7 +42,31 @@ export const EDGE_ATTR = {
   parentSpanId: 'ply.parent_span_id',
   followsSpanId: 'ply.follows_span_id',
   durationMs: 'ply.duration_ms',
+  /** The route the span ran under (`GET /v1/tree`, `viewer`): telemetry groups input distributions by it (#73). */
+  route: 'ply.route',
+  /** The Workers version id (`env.VERSION.id`), so a distribution is per version without a join to the request span. */
+  version: 'ply.script_version',
 } as const
+
+/**
+ * Attribute keys stamped on the request span (the runtime's root span for the invocation). With the route and version
+ * these are the per-request inputs scripts/calibrate reads: outcome, error, and the shape of the ply work it did.
+ */
+export const REQUEST_ATTR = {
+  route: EDGE_ATTR.route,
+  version: EDGE_ATTR.version,
+  surface: 'ply.surface',
+  status: 'http.response.status_code',
+  errorCode: 'ply.error.code',
+  errorKind: 'ply.error.kind',
+  spans: 'ply.spans',
+  roundTrips: 'ply.round_trips',
+  wide: 'ply.wide_fetches',
+  cacheHits: 'ply.cache_hits',
+} as const
+
+/** Attributes every platform span of one request carries beside ply's own. */
+export type EdgeStamp = Readonly<Record<string, string | number | boolean>>
 
 const OTLP_ERROR = 2
 const FOLLOWS_FROM = 'follows_from'
@@ -56,6 +80,36 @@ export function edgeTracingOf(ctx: unknown): EdgeTracing | null {
   return found.value as EdgeTracing
 }
 
+/** `ctx.tracing.getActiveSpan()` when the runtime has it (the request span outside any user span), else null. */
+function activeSpanOf(ctx: unknown): EdgeSpan | null {
+  const found = chainGet(ctx, 'tracing')
+  if (found.tag === 'none' || found.value === null || typeof found.value !== 'object') return null
+  const get = chainGet(found.value, 'getActiveSpan')
+  if (get.tag === 'none' || typeof get.value !== 'function') return null
+  try {
+    const span: unknown = (get.value as () => unknown).call(found.value)
+    const set = chainGet(span, 'setAttribute')
+    return set.tag === 'some' && typeof set.value === 'function' ? span as EdgeSpan : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Stamp attributes on the span active in the caller's context: the request span when called from the fetch handler.
+ * Without `ctx.tracing` (node tests) or with a runtime that refuses, nothing happens and the request goes on.
+ * Returns whether a span took the attributes.
+ */
+export function stampRequestSpan(ctx: unknown, attrs: EdgeStamp): boolean {
+  const span = activeSpanOf(ctx)
+  if (span === null) return false
+  let stamped = true
+  for (const [key, value] of Object.entries(attrs)) {
+    try { span.setAttribute(key, value) } catch { stamped = false }
+  }
+  return stamped
+}
+
 /** Platform calls never fail a request: a span the runtime refuses is a span not recorded. */
 function quietly(fn: () => void): void {
   try { fn() } catch { /* the runtime refused the span call; the request goes on */ }
@@ -67,10 +121,11 @@ function attributeValue(value: unknown): string | number | boolean {
 }
 
 /** ply's ended span onto the platform span: every attribute, ply's ids and duration, and an error status. */
-function closeEdge(edge: EdgeSpan, otlp: OtlpSpan, tracer: Tracer): void {
+function closeEdge(edge: EdgeSpan, otlp: OtlpSpan, tracer: Tracer, stamp: EdgeStamp): void {
   const [flat] = flattenLine({ resourceSpans: [{ resource: tracer.resource, scopeSpans: [{ scope: tracer.scope, spans: [otlp] }] }] })
   if (flat) {
     quietly(() => {
+      for (const [key, value] of Object.entries(stamp)) edge.setAttribute(key, value)
       for (const [key, value] of Object.entries(flat.attrs)) edge.setAttribute(key, attributeValue(value))
       edge.setAttribute(EDGE_ATTR.spanId, flat.spanId)
       edge.setAttribute(EDGE_ATTR.traceId, flat.traceId)
@@ -101,10 +156,12 @@ class EdgeTracer extends Tracer {
   readonly #tracing: EdgeTracing
   /** Platform spans of ply spans still open, by ply span id. */
   readonly #open = new Map<string, Opened>()
+  readonly #stamp: EdgeStamp
 
-  constructor(options: TracerOptions, tracing: EdgeTracing) {
+  constructor(options: TracerOptions, tracing: EdgeTracing, stamp: EdgeStamp) {
     super(options)
     this.#tracing = tracing
+    this.#stamp = stamp
   }
 
   override start(name: string, options: StartOptions): PlySpan {
@@ -128,15 +185,48 @@ class EdgeTracer extends Tracer {
     const opened = this.#open.get(otlp.spanId)
     if (!opened) return
     this.#open.delete(otlp.spanId)
-    closeEdge(opened.edge, otlp, this)
+    closeEdge(opened.edge, otlp, this, this.#stamp)
   }
 }
 
 /**
  * The Tracer for one Worker request. Every span it records still goes to `options.exporter`; with `ctx.tracing` each
- * one is also a platform span under the request span (see the top of this file).
+ * one is also a platform span under the request span (see the top of this file), carrying `stamp` (the route and
+ * version, EDGE_ATTR) beside ply's attributes. ply's own export (rays, ?trace=1) is not stamped.
  */
-export function plyTracer(ctx: unknown, options: TracerOptions): Tracer {
+export function plyTracer(ctx: unknown, options: TracerOptions, stamp: EdgeStamp = {}): Tracer {
   const tracing = edgeTracingOf(ctx)
-  return tracing === null ? new Tracer(options) : new EdgeTracer(options, tracing)
+  return tracing === null ? new Tracer(options) : new EdgeTracer(options, tracing, stamp)
+}
+
+/** The route and version stamp for one request. A missing version id (local dev, tests) is left out, not faked. */
+export function routeStamp(route: string, version: string | null): EdgeStamp {
+  return version === null || version === '' ? { [EDGE_ATTR.route]: route } : { [EDGE_ATTR.route]: route, [EDGE_ATTR.version]: version }
+}
+
+/** What the request log line already carries (src/index.js `done`): the code on a failure, and ply's span counts. */
+type RequestLog = Readonly<Record<string, unknown>>
+
+const LOGGED_COUNTS = [
+  ['spans', REQUEST_ATTR.spans],
+  ['rtt', REQUEST_ATTR.roundTrips],
+  ['wide', REQUEST_ATTR.wide],
+  ['cache_hits', REQUEST_ATTR.cacheHits],
+] as const
+
+/**
+ * The request span's attributes: route, version, surface, status, and from the log line the error code and kind and
+ * ply's counts. Only finite numbers and non-empty strings are copied; a field the log does not have is left out.
+ */
+export function requestStamp(input: { readonly route: string; readonly version: string | null; readonly surface: string; readonly status: number; readonly log: RequestLog }): EdgeStamp {
+  const out: Record<string, string | number | boolean> = { ...routeStamp(input.route, input.version), [REQUEST_ATTR.surface]: input.surface, [REQUEST_ATTR.status]: input.status }
+  const code = input.log.code
+  if (typeof code === 'string' && code !== '') out[REQUEST_ATTR.errorCode] = code
+  const kind = input.log.error_kind
+  if (typeof kind === 'string' && kind !== '') out[REQUEST_ATTR.errorKind] = kind
+  for (const [from, to] of LOGGED_COUNTS) {
+    const value = input.log[from]
+    if (typeof value === 'number' && Number.isFinite(value)) out[to] = value
+  }
+  return out
 }
