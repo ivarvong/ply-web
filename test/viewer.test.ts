@@ -397,6 +397,19 @@ test('header identity: public-v0 leads with namespace / repo; GitHub with owner 
   assert.equal(html.includes('git/public-v0/ply<'), false)
   const open = String(renderLoaded(treeFixture({}), { ...trace, expanded: true }))
   assert.match(open, /<details class="diag-box" open="">/)
+  // The waterfall is the demo: open without ?trace=1 too, and summarised under the title by the ply strip.
+  assert.match(html, /<details class="diag-box" open="">/)
+  assert.equal(html.includes('class="ply-strip"'), false, 'no git calls, no strip')
+  const bar = (name: string, startMs: number, durMs: number, bytes: number, cache: string) =>
+    ({ name, startMs, durMs, status: 'ok' as const, httpStatus: 200, bytes, cache, lines: [], packWant: null, packFilter: null })
+  const busy: TraceModel = { ...trace, totalMs: 200, bars: [bar('git.upload-pack discover', 0, 4, 191, 'MISS'), bar('git.upload-pack ls-refs', 4, 150, 23_552, 'MISS'), bar('git.upload-pack fetch', 160, 40, 6_246, 'HIT')] }
+  const strip = String(renderLoaded(treeFixture({}), busy))
+  const inner = String(fill(slot(/<a class="ply-strip" href="#diagnostics"[^>]*>([\s\S]*?)<\/a>/.exec(strip), '1'), ''))
+  assert.ok(inner, 'strip present')
+  const text = inner.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+  assert.match(text, /^ply 3 git calls 200 ms 29 KiB 1 cached protocol v2$/)
+  assert.equal(inner.split('class="wf-bar ').length - 1, 3)
+  assert.ok(strip.indexOf('class="ply-strip"') < strip.indexOf('class="files"'), 'strip sits above the listing')
 })
 
 test('rate and byte caps clamp and fail closed', () => {

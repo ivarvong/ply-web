@@ -390,6 +390,13 @@ ${wide} {
   .wf-track { grid-column: auto; height: 8px; }
   .wf-sum { padding-top: 8px; padding-bottom: 8px; }
 }
+/* ply strip: the page's git work under the title, linking to the waterfall */
+.ply-strip { display: grid; gap: 6px; margin: 0 0 ${S.md}; padding: ${S.sm} ${S.md}; border-radius: ${R.md}; background: var(--color-kumo-elevated); box-shadow: inset 0 0 0 1px var(--color-kumo-hairline); color: var(--text-color-kumo-subtle); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+.ply-strip:hover { text-decoration: none; background: var(--color-kumo-tint); }
+.ply-strip-text { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; min-width: 0; }
+.ply-strip-brand { font-family: var(--font-mono); font-weight: 600; color: var(--text-color-kumo-brand); }
+.ply-strip-track { position: relative; height: 6px; border-radius: 999px; background: var(--color-kumo-recessed); }
+.ply-strip-track .wf-bar { min-width: 2px; }
 .site-footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: ${S.sm}; padding: ${S.md} 2px 0; font-size: var(--text-xs); color: var(--text-color-kumo-subtle); }
 .site-footer a { color: inherit; font-weight: 500; }
 .site-footer .build > span { white-space: nowrap; }

@@ -508,6 +508,12 @@ const worker = {
       },
       execute: async parsed => {
         if (parsed.kind === 'usage') {
+          // A browser landing on the bare origin gets the viewer (the showcase); curl, fetch and the CD probes (Accept */*)
+          // keep the usage text.
+          const accept = readHeader(req.headers, 'accept');
+          if (accept.kind === 'present' && /\btext\/html\b/i.test(accept.value)) {
+            return ok(rawOut(302, '', new Headers({ location: '/view', 'cache-control': 'no-store', vary: 'Accept' })));
+          }
           // ply.usage.note is off unless the flag ruleset says otherwise. A missing binding leaves this text unchanged.
           let body = USAGE;
           const note = await usageNote(env, ctx, readHeader(req.headers, 'x-ply-unit'));

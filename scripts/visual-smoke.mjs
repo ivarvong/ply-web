@@ -4,7 +4,7 @@
 //   - horizontal page overflow,
 //   - no stylesheet with rules applied, or an icon whose computed width is not 16 px,
 //   - a stylesheet href that is not the content-hashed /view.<hash>.css (a stale cached sheet could pair with new HTML),
-//   - a tree page with no li[data-oid] rows (the scraping contract, README "Machine-readable markup"),
+//   - a tree page with no li[data-oid] rows (the scraping contract, README "Machine-readable markup"), or no ply strip,
 //   - a footer build token (ply=…, ply-web=…) broken across lines, an error-page headline that starts lowercase, or a
 //     missing-repo page whose "Repository root" link points back at the missing repo.
 // Default pages: home, /r/ply, a file, the /r index, and the failure pages (missing repo/ref/path, missing GitHub repo).
@@ -100,6 +100,7 @@ const PROBE = `(() => {
     sheets: [...document.styleSheets].map(s => { try { return { href: s.href, rules: s.cssRules.length }; } catch { return { href: s.href, rules: -1 }; } }),
     tree: !!document.querySelector('ul.files'),
     rows: document.querySelectorAll('li[data-oid]').length,
+    strip: !!document.querySelector('a.ply-strip[href="#diagnostics"] .ply-strip-track .wf-bar'),
     // the footer build line: each token (ply=…, ply-web=…) must sit on one line
     buildTokensBroken: [...document.querySelectorAll('.site-footer .build > span')].filter(s => s.getClientRects().length > 1).map(s => s.textContent),
     headline: document.querySelector('h1.display')?.textContent ?? null,
@@ -121,6 +122,7 @@ for (const url of urls) for (const [w, h, mobile] of [[375, 812, true], [1280, 8
   if (r.iconPx && r.iconPx !== '16px') problems.push(`icon ${r.iconPx}`);
   if (!r.sheets.some(s => /\/view\.[0-9a-f]{12}\.css$/.test(s.href ?? ''))) problems.push(`stylesheet not content-hashed: ${r.sheets.map(s => s.href).join(' ')}`);
   if (r.tree && r.rows === 0) problems.push('tree page has no li[data-oid] rows');
+  if (r.tree && !r.strip) problems.push('tree page has no ply strip (the git calls under the title)');
   if (r.buildTokensBroken.length) problems.push(`footer build token wraps inside itself: ${r.buildTokensBroken.join(', ')}`);
   if (r.kicker && r.headline && /^\p{Ll}/u.test(r.headline)) problems.push(`headline not sentence case: ${r.headline}`);
   // an error page never links "Repository root" back to the repository it just failed to find

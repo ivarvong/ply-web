@@ -166,6 +166,9 @@ function repo(files, host = () => srv.url) {
 
 test('GET / is public usage text; everything else needs the PLY bearer (missing or wrong → 401)', { skip }, async () => {
   const u = await W('/', { auth: false }); assert.equal(u.status, 200); const usage = await u.text(); assert.match(usage, /Authorization: Bearer <PLY_TOKEN>/); assert.match(usage, /GET +\/v1\/commit\?remote=&ref=/);
+  // a browser (Accept: text/html) is sent to the viewer; the usage text stays for curl and fetch
+  const html = await fetch(`http://127.0.0.1:${PORT}/`, { redirect: 'manual', headers: { accept: 'text/html,application/xhtml+xml,*/*;q=0.8' } });
+  assert.equal(html.status, 302); assert.equal(html.headers.get('location'), '/view'); assert.equal(html.headers.get('cache-control'), 'no-store'); assert.match(String(html.headers.get('vary')), /Accept/i); await html.arrayBuffer();
   for (const [m, p] of [['GET', '/v1/refs'], ['GET', '/v1/read'], ['GET', '/v1/tree'], ['GET', '/v1/discover'], ['GET', '/v1/commit'], ['POST', '/v1/edit'], ['POST', '/v1/branch'], ['DELETE', '/v1/branch'], ['POST', '/v1/merge'], ['POST', '/v1/rebase'], ['POST', '/v1/cherry-pick'], ['POST', '/v1/revert'], ['POST', '/v1/tag'], ['DELETE', '/v1/tag'], ['GET', '/nope']]) {
     for (const headers of [{}, { authorization: `Bearer ${PLY}x` }, { authorization: `Bearer ${PLY.slice(0, -1)}` }, { authorization: `Basic ${btoa(`x:${PLY}`)}` }]) {
       const r = await W(`${p}?remote=${encodeURIComponent(srv.url + '/x.git')}`, { method: m, headers, auth: false });

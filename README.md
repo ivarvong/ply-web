@@ -203,10 +203,15 @@ every page; on Artifacts that 400 was ~110–150 ms of every page.
 
 The home form accepts an https URL, `github.com/owner/repo`, `owner/repo` (github.com), or `git@host:path` (the ssh user is dropped, then the allowlist runs). Shareable URLs: `/view/<host>/<repo path>?ref=&path=` (`path` may use `/` or `%2F`). A path segment of `.` or `..`, a backslash, or an encoded slash, backslash, or dot in the URL path (and an encoded dot or backslash in `?path=`) is rejected on the raw URL, before the URL parser collapses it. `?raw=1` returns the file as `text/plain` or
 `application/octet-stream` (never `text/html`). `?want=<oid>&filter=tree:0|blob:none&offset=` is the pack map.
-Every HTML page ends with a collapsed **Diagnostics** section (`?trace=1` opens it): the raw remote, a waterfall of the
-git round trips that produced the page on one shared timeline (call, filter, HTTP status, bytes, cache HIT, duration;
-tap a row for wants, server agent and pkt-line counters), the protocol the server spoke, pack-map links, and the
-`cf-ray` when the platform sends one. The Workers trace id is not readable inside the isolate.
+The viewer is ply's showcase, so every page shows the git work behind it. Under the title of a tree or file page, the
+**ply strip** sums it up (git calls, wall time, bytes, how many came from Workers Cache, protocol version) with every call
+drawn on one timeline, and links to `#diagnostics`. Every HTML page ends with the **Diagnostics** section, open by
+default (it was collapsed until 2026-11-06; `?trace=1` still forces it open): the raw remote, a waterfall of the git
+round trips that produced the page on one shared timeline (call, filter, HTTP status, bytes, cache HIT, duration; tap a
+row for wants, server agent and pkt-line counters), the protocol the server spoke, pack-map links, and the `cf-ray` when
+the platform sends one. The footer links the ply and ply-web commits the deploy was built from. The Workers trace id is
+not readable inside the isolate. `GET /` from a browser (`Accept` containing `text/html`) is a `302` to `/view`; curl,
+fetch and the CD probes (`Accept: */*`) still get the usage text.
 
 The commit, its first-parent history (Recent commits, 10) and, on a server that refuses `tree:0`, every tree, come from
 ONE fetch: `want <head> deepen 10` with `filter tree:0`, or `blob:none` on Artifacts. Measured on the same graphs on

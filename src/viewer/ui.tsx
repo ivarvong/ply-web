@@ -213,6 +213,49 @@ export function RefSwitcher(props: { header: RepoHeader; path: string; branches:
 
 // ── diagnostics ─────────────────────────────────────────────────────────────────────────────────────────────────
 
+const COMMIT_HEX = /^[0-9a-f]{40}$/
+
+/** A GitHub link for a build commit when it is a full id; otherwise plain text. */
+function BuildLink(props: { repo: 'ply' | 'ply-web'; sha: string }) {
+  const short = props.sha.slice(0, BUILD_SHA_CHARS)
+  return COMMIT_HEX.test(props.sha)
+    ? <span><a href={`https://github.com/ivarvong/${props.repo}/commit/${props.sha}`}>{props.repo}={short}</a></span>
+    : <span>{props.repo}={short}</span>
+}
+
+/**
+ * The page's git work, one line under the title: how many round trips ply made, how long, how many bytes, how many
+ * came from Workers Cache, and every call as a bar on one shared timeline. Links to the full waterfall below.
+ */
+export function PlyStrip(props: { trace: TraceModel; header: RepoHeader }) {
+  const bars = props.trace.bars
+  if (!bars.length) return null
+  const span = Math.max(props.trace.totalMs, 1)
+  const bytes = bars.reduce((sum, bar) => sum + (bar.bytes === null ? 0 : bar.bytes), 0)
+  const hits = bars.filter(bar => bar.cache === 'HIT').length
+  const server = props.header.server
+  return (
+    <a class="ply-strip" href="#diagnostics" title="Every git round trip ply made to render this page">
+      <span class="ply-strip-text">
+        <span class="ply-strip-brand">ply</span>
+        <span>{bars.length} git {bars.length === 1 ? 'call' : 'calls'}</span>
+        <span>{formatDuration(props.trace.totalMs)}</span>
+        <span>{formatBytes(bytes)}</span>
+        {hits ? <span class="wf-hit">{hits} cached</span> : null}
+        <span class="ply-strip-proto">protocol v{server.protocol}</span>
+      </span>
+      <span class="ply-strip-track" aria-hidden="true">
+        {bars.map(bar => {
+          const left = Math.max(0, Math.min(LAYOUT.percentSteps, Math.round((bar.startMs / span) * LAYOUT.percentSteps)))
+          let width = Math.max(1, Math.round((bar.durMs / span) * LAYOUT.percentSteps))
+          if (left + width > LAYOUT.percentSteps) width = Math.max(1, LAYOUT.percentSteps - left)
+          return <span class={`wf-bar ${barTone(bar)} ${percentClass('o', left)} ${percentClass('w', width)}`}></span>
+        })}
+      </span>
+    </a>
+  )
+}
+
 export function Protocol(props: { header: RepoHeader }) {
   const server = props.header.server
   return (
@@ -360,11 +403,11 @@ export function Diagnostics(props: { trace: TraceModel; header: RepoHeader | nul
         </div>
       </details>
       <footer class="site-footer">
-        <span>ply · read-only, no credentials</span>
+        <span>Rendered by <a href="https://github.com/ivarvong/ply">ply</a>, a zero-dependency git client · read-only</span>
         {/* Abbreviated commits, one unbreakable token each, so a narrow footer wraps between them (never at "ply-web").
             The full value is the title and the x-ply-build header. */}
         <span class="mono build" title={`${plyBuildValue()} (ply commit and ply-web commit this deploy was built from)`}>
-          <span>ply={PLY_SHA.slice(0, BUILD_SHA_CHARS)}</span> <span>ply-web={PLY_WEB_SHA.slice(0, BUILD_SHA_CHARS)}</span>
+          <BuildLink repo="ply" sha={PLY_SHA} /> <BuildLink repo="ply-web" sha={PLY_WEB_SHA} />
         </span>
         <a href="/view#limits">Limits</a>
       </footer>

@@ -11,14 +11,16 @@ import { commitProse, formatBytes, percentClass, portions, shortOid } from './fo
 import { LAYOUT } from './layout.ts'
 import { KUMO_BUTTON_FOCUS, KUMO_BUTTON_SECONDARY, KUMO_BUTTON_SIZE_SM, KUMO_INPUT, KUMO_SURFACE } from './kumo-classes.ts'
 import { repoIdentity } from './identity.ts'
-import { Badge, Banner, Button, Card, Diagnostics, Document, Footer, Icon, PathCrumbs, RepoIdentity, RepoTitle, Signed, Time } from './ui.tsx'
+import { Badge, Banner, Button, Card, Diagnostics, Document, Footer, Icon, PathCrumbs, PlyStrip, RepoIdentity, RepoTitle, Signed, Time } from './ui.tsx'
 import { PUBLIC_NAMESPACE, type PublicRepoList } from '../public.ts'
 import type { ViewerHint } from './hint.ts'
 
+// One per forge: the same client speaks to each one's git server (checked 2026-11-06, all 200).
 const EXAMPLES = [
-  ['octocat/Hello-World', '/view/github.com/octocat/Hello-World'],
-  ['sindresorhus/is', '/view/github.com/sindresorhus/is'],
-  ['tj/commander.js', '/view/github.com/tj/commander.js'],
+  ['curl/curl', '/view/github.com/curl/curl'],
+  ['gitlab.com/gitlab-org/cli', '/view/gitlab.com/gitlab-org/cli'],
+  ['codeberg.org/dnkl/foot', '/view/codeberg.org/dnkl/foot'],
+  ['ply itself', '/r/ply'],
 ] as const
 
 const PACK_SWATCH: Record<string, string> = {
@@ -51,9 +53,10 @@ function Home(props: { error: string | null; publicRepos: PublicRepoList }) {
   return (
     <>
       <div class="hero">
-        <p class="kicker">Read-only · no credentials</p>
+        <p class="kicker">ply · git over the wire, in a Worker</p>
         <h1 class="display">Read a public git repository</h1>
-        <p class="lede">Paste a URL, <span class="mono">github.com/owner/repo</span>, or <span class="mono">owner/repo</span>. Pages are rendered on the server straight from the git wire protocol, with no clone.</p>
+        <p class="lede">Every page here is rendered by <a href="https://github.com/ivarvong/ply">ply</a>, a zero-dependency TypeScript git client, speaking git's smart-HTTP protocol from a Cloudflare Worker: no clone, no git binary. Each page shows every round trip it made: the call, bytes, cache tier and time.</p>
+        <p class="lede">Paste a URL, <span class="mono">github.com/owner/repo</span>, or <span class="mono">owner/repo</span>.</p>
         <form class="stack-form" action="/view" method="get">
           <input class={`control ${KUMO_INPUT}`} type="text" name="remote" required placeholder="octocat/Hello-World" aria-label="Git URL" autocomplete="off" autocapitalize="off" spellcheck={false} />
           <Button variant="primary" size="base" type={null}>Open</Button>
@@ -67,7 +70,7 @@ function Home(props: { error: string | null; publicRepos: PublicRepoList }) {
       <div class="steps">
         <div class="step"><strong>Paste</strong><span>A public https URL on an allowlisted host. A username or password in the URL is rejected and never forwarded.</span></div>
         <div class="step"><strong>Browse</strong><span>Branches, trees, files and READMEs, rendered on the server.</span></div>
-        <div class="step"><strong>Inspect</strong><span>Every page lists its git round trips; the pack map shows how the server deltified objects.</span></div>
+        <div class="step"><strong>Inspect</strong><span>Every page shows its git round trips as a waterfall; the pack map shows how the server deltified objects.</span></div>
       </div>
       <div class="card-grid">
         <Card id={null} class={null} head={<span class="card-title">Supported hosts</span>}>
@@ -180,6 +183,7 @@ function TreePage(props: { loaded: TreeLoaded; trace: TraceModel; now: number })
     <Document title={path ? `${path} · ${id.name}` : `${id.scope ? `${id.scope}/` : ''}${id.name}`}>
       <RepoTitle header={header} path={path} branches={props.loaded.branches} tags={props.loaded.tags} />
       <PathCrumbs header={header} path={path} />
+      <PlyStrip trace={props.trace} header={header} />
       <Card id={null} head={<CommitHead commit={props.loaded.commit} header={header} now={props.now} />} class="tree-card">
         {props.loaded.entries.length === 0 && !path ? <p class="empty">This directory is empty.</p> : (
           // Stable scraping contract (README "Machine-readable markup"): one li[data-oid] per entry shown.
@@ -206,7 +210,7 @@ function TreePage(props: { loaded: TreeLoaded; trace: TraceModel; now: number })
       </Card>
       <Readme loaded={props.loaded} />
       <Log loaded={props.loaded} now={props.now} />
-      <Diagnostics trace={props.trace} header={header} host={null} repoPath={null} ref={null} open={props.trace.expanded === true} />
+      <Diagnostics trace={props.trace} header={header} host={null} repoPath={null} ref={null} open={true} />
     </Document>
   )
 }
@@ -305,13 +309,14 @@ function FilePage(props: { loaded: FileLoaded; trace: TraceModel; now: number })
     <Document title={`${name} · ${id.name}`}>
       <RepoTitle header={header} path={props.loaded.path} branches={props.loaded.branches} tags={props.loaded.tags} />
       <PathCrumbs header={header} path={props.loaded.path} />
+      <PlyStrip trace={props.trace} header={header} />
       <Card id={null} head={head} class={md ? 'file-card has-md' : 'file-card'}>
         {md ? <span id="preview" class="anchor"></span> : null}
         {md ? <article class="md md-view">{rawSafe(renderMarkdown(text === null ? '' : text, markdownOptions(header, props.loaded.path)))}</article> : null}
         {md ? <span id="code" class="anchor"></span> : null}
         <FileBody loaded={props.loaded} rawHref={rawHref} />
       </Card>
-      <Diagnostics trace={props.trace} header={header} host={null} repoPath={null} ref={null} open={props.trace.expanded === true} />
+      <Diagnostics trace={props.trace} header={header} host={null} repoPath={null} ref={null} open={true} />
     </Document>
   )
 }
@@ -412,7 +417,7 @@ function PackPage(props: { loaded: PackLoaded; trace: TraceModel; now: number })
           </li>
         ))}
       </ul>
-      <Diagnostics trace={props.trace} header={header} host={null} repoPath={null} ref={null} open={props.trace.expanded === true} />
+      <Diagnostics trace={props.trace} header={header} host={null} repoPath={null} ref={null} open={true} />
     </Document>
   )
 }
