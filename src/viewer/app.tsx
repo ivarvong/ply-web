@@ -12,6 +12,7 @@ import type { RateDecision, TraceModel, ViewerEnv } from './model.ts'
 import { isPlyCode } from 'ply'
 import { EDGE_ATTR, plyTracer, routeStamp, spanList } from '../edge-trace.ts'
 import { admitBatched, inSpan, rateIdentity, versionOf } from '../rate/admit.ts'
+import { describeCounter } from '../rate/stub.ts'
 import { createLoopbackFetch, isLoopback, type LoopbackBinding } from '../gitcache.ts'
 import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from '../rays.ts'
 import { parseViewerRequest, routeOptsFromEnv, type ViewerRoute } from './route.ts'
@@ -39,7 +40,10 @@ export async function admitClient(req: Request, env: ViewerEnv, bucket: RateBuck
   return inSpan(ctx, 'ply.rate.check', { [EDGE_ATTR.version]: versionOf(env), [EDGE_ATTR.route]: 'rate.check' }, async set => {
     set('rate.mode', id.mode)
     set('rate.bucket', bucket)
-    if (id.load) set('rate.load', true)
+    if (id.load) {
+      set('rate.load', true)
+      set('rate.counter', describeCounter(ctx))
+    }
     const t0 = performance.now()
     try {
       if (id.mode === 'batched') return await admitBatched({ ctx, env, id, bucket, now, limitFor, set })

@@ -14,6 +14,7 @@ import { CounterCore, InvalidBatch, blockedUntil, firstLiveSlot, type ApplyReque
 import { Batcher, defaultTuning, type BatcherDeps, type FlushReport } from '../src/rate/batcher.ts';
 import { SLOT_MS, WINDOW_MS, DOC_PATH, DOC_URL, KEY_HEX } from '../src/rate/config.ts';
 import { indexDoc, serveDoc } from '../src/rate/doc.ts';
+import { counterNamespace } from '../src/rate/stub.ts';
 import { admitBatched, parseFault, rateIdentity, readDoc, resetRateState, LOAD_CLIENT_HEADER, LOAD_MODE_HEADER, LOAD_TOKEN_HEADER } from '../src/rate/admit.ts';
 
 function sqlite(): SqlExec {
@@ -510,3 +511,12 @@ const config :Workerd.Config = (
 test('workerd: batched limiter through ctx.exports.RateCounter (production path) refuses within the lag', { skip: WORKERD.length === 0 && 'workerd not installed', timeout: 60_000 }, () => workerdRun(false));
 
 test('workerd: a slow ack is retried with the same id and applied once (replay)', { skip: WORKERD.length === 0 && 'workerd not installed', timeout: 60_000 }, () => workerdRun(true));
+
+test('counterNamespace: found on a ctx.exports that answers `in` with false (the platform object does)', () => {
+  const ns = fakeNamespace(new CounterCore(sqlite()));
+  const exportsLike = new Proxy({ RateCounter: ns }, { has: () => false });
+  assert.equal('RateCounter' in exportsLike, false);
+  assert.equal(counterNamespace({}, { exports: exportsLike }), ns);
+  assert.equal(counterNamespace({}, { exports: {} }), null);
+  assert.equal(counterNamespace({}, null), null);
+});
