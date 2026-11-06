@@ -108,7 +108,10 @@ export async function syncMirror(m: Mirror, deps: SyncDeps): Promise<SyncResult>
     if (!want) return { repo: m.repo, outcome: 'error', ...blank, code: 'not_found', message: `source has no ${m.branch}`, ms: Date.now() - t0 };
     if (want === have) return { repo: m.repo, outcome: 'in-sync', ...blank, from: have, to: want, ms: Date.now() - t0 };
     const r = await unwrapAsync(fetchPack(srcT, { wants: [want], haves: have ? [have] : [], ofsDelta: true, thinPack: false, done: true }, { resolve: true }));
-    const objects = r.objects ? [...r.objects.values()] : [];
+    // Whole objects only. A resolved object keeps its wire base in the SOURCE pack ({ tag: 'ofs', offset }); push reads
+    // `base` as its own input ({ tag: 'ofs', index } into this list) and refuses the mismatch, which failed every sync
+    // with a delta in it (2026-11-06). The data is already resolved, so nothing is lost.
+    const objects = r.objects ? [...r.objects.values()].map(o => ({ type: o.type, data: o.data })) : [];
     const handle = await deps.binding.get(m.repo);
     let writeToken = '';
     try {

@@ -136,3 +136,37 @@ test('syncMirror: a pack larger than 32 KiB is streamed through the guarded fetc
     cleanup();
   }
 });
+
+// 2026-11-06: every mirror sync failed for ~6 h with `push: an ofs base must name an earlier object`. A resolved fetch
+// keeps each object's wire base ({ tag: 'ofs', offset } in the SOURCE pack); push reads `base` as its own input
+// ({ tag: 'ofs', index } into the objects it is given) and refused it. A source whose pack carries ofs deltas reproduces it.
+test('syncMirror: a source pack with ofs deltas is pushed (whole objects, not the fetched wire bases)', async () => {
+  const { root, cleanup } = tmpRoot();
+  const srv = await startGitServer(root);
+  try {
+    const source = makeBareRepo(root, 'src');
+    mkdirSync(join(root, 'git', 'public-v0'), { recursive: true });
+    const mirrorBare = makeBareRepo(root, 'git/public-v0/ply');
+    const work = join(root, 'w-src');
+    mkdirSync(work);
+    git(work, ['init', '-q', '-b', 'main']);
+    const text = Array.from({ length: 400 }, (_, i) => `line ${i} of a file that deltas well\n`).join('');
+    commitFiles(work, source, { 'a.txt': text }, 'one');
+    const c2 = commitFiles(work, source, { 'a.txt': text.replace('line 7 ', 'line seven ') }, 'two');
+    git(source, ['repack', '-q', '-a', '-d', '-f', '--window=10']);
+    const binding: ArtifactsNamespace = {
+      async get() {
+        return Object.assign({ async createToken() { return { plaintext: WRITE }; } }, { async revokeToken() { return true; } });
+      },
+    };
+    const tokens: TokenSource = { readToken: async () => READ, secrets: () => [READ] };
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => fetch(String(input).replace('https://github.com/ivarvong/ply.git', `${srv.url}/src.git`), init);
+    const r = await syncMirror({ repo: 'ply', source: 'https://github.com/ivarvong/ply.git', branch: 'main' }, { binding, tokens, fetchImpl, origin: srv.url });
+    assert.equal(r.outcome, 'updated', JSON.stringify(r));
+    assert.equal(git(mirrorBare, ['rev-parse', 'refs/heads/main']).trim(), c2);
+    git(mirrorBare, ['fsck', '--strict', '--no-dangling']);
+  } finally {
+    await srv.close();
+    cleanup();
+  }
+});
