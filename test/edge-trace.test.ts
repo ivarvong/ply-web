@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { test } from 'node:test'
 import { arrayExporter, Tracer } from 'ply'
-import { EDGE_ATTR, edgeTracingOf, plyTracer } from '../src/edge-trace.ts'
+import { EDGE_ATTR, REQUEST_ATTR, edgeTracingOf, plyTracer, requestStamp, routeStamp, stampRequestSpan } from '../src/edge-trace.ts'
 import { openSpan, type TracingLike } from '../src/flags/telemetry.ts'
 
 type Recorded = { name: string; parent: string | null; attrs: Record<string, unknown>; status: string | null; ended: boolean }
@@ -79,4 +79,51 @@ test('openSpan uses the runtime\'s startSpan, with its receiver', () => {
   }
   assert.ok(openSpan(tracing as unknown as TracingLike, 'ply.viewer'))
   assert.deepEqual(opened, ['ctx.tracing:ply.viewer'])
+})
+
+test('the route and version stamp is on every platform span, and not in ply\'s own export', async () => {
+  const { tracing, spans } = fakeTracing()
+  const exporter = arrayExporter()
+  const tracer = plyTracer({ tracing }, { exporter }, routeStamp('GET /v1/tree', 'v-123'))
+  await tracer.span('git.ls_tree', {}, async span => {
+    span.set({ 'git.ls_tree.entries': 12 })
+    await tracer.span('git.upload-pack fetch', { parent: span }, async () => {})
+  })
+  assert.deepEqual(spans.map(s => [s.name, s.attrs[EDGE_ATTR.route], s.attrs[EDGE_ATTR.version]]), [
+    ['git.ls_tree', 'GET /v1/tree', 'v-123'],
+    ['git.upload-pack fetch', 'GET /v1/tree', 'v-123'],
+  ])
+  assert.equal(spans[0].attrs['git.ls_tree.entries'], 12)
+  assert.equal(JSON.stringify(exporter.lines).includes(EDGE_ATTR.route), false)
+  // No version id (local dev): the key is left out, not filled with a placeholder.
+  assert.deepEqual(routeStamp('viewer', null), { [EDGE_ATTR.route]: 'viewer' })
+  assert.deepEqual(routeStamp('viewer', ''), { [EDGE_ATTR.route]: 'viewer' })
+})
+
+test('stampRequestSpan sets attributes on the runtime\'s active span, and never throws', () => {
+  const attrs: Record<string, unknown> = {}
+  const active = { setAttribute(key: string, value: unknown) { attrs[key] = value } }
+  assert.equal(stampRequestSpan({ tracing: { startActiveSpan() {}, getActiveSpan: () => active } }, { 'ply.route': 'GET /v1/refs' }), true)
+  assert.deepEqual(attrs, { 'ply.route': 'GET /v1/refs' })
+  for (const ctx of [null, {}, { tracing: {} }, { tracing: { getActiveSpan: () => null } }, { tracing: { getActiveSpan: () => ({}) } }, { tracing: { getActiveSpan() { throw new Error('no') } } }]) {
+    assert.equal(stampRequestSpan(ctx, { a: 1 }), false)
+  }
+  const refusing = { setAttribute() { throw new Error('closed') } }
+  assert.equal(stampRequestSpan({ tracing: { getActiveSpan: () => refusing } }, { a: 1 }), false)
+})
+
+test('requestStamp copies the route, version, status, error and ply\'s counts from the request log', () => {
+  assert.deepEqual(requestStamp({ route: 'POST /v1/edit', version: 'v1', surface: 'api', status: 409, log: { code: 'cas_conflict', spans: 7, rtt: 3, wide: 0, cache_hits: 1 } }), {
+    [REQUEST_ATTR.route]: 'POST /v1/edit',
+    [REQUEST_ATTR.version]: 'v1',
+    [REQUEST_ATTR.surface]: 'api',
+    [REQUEST_ATTR.status]: 409,
+    [REQUEST_ATTR.errorCode]: 'cas_conflict',
+    [REQUEST_ATTR.spans]: 7,
+    [REQUEST_ATTR.roundTrips]: 3,
+    [REQUEST_ATTR.wide]: 0,
+    [REQUEST_ATTR.cacheHits]: 1,
+  })
+  const unexpected = requestStamp({ route: 'unmatched', version: null, surface: 'api', status: 500, log: { code: 'internal', error_kind: 'unexpected', spans: Number.NaN, viewer: 1 } })
+  assert.deepEqual(unexpected, { 'ply.route': 'unmatched', 'ply.surface': 'api', 'http.response.status_code': 500, 'ply.error.code': 'internal', 'ply.error.kind': 'unexpected' })
 })

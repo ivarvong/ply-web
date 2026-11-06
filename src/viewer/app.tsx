@@ -10,7 +10,7 @@ import { htmlResponse, SECURITY, statusOf, textResponse } from './http.ts'
 import { VIEWER_CAPS, rateLimitFor, type RateBucket } from './limits.ts'
 import type { RateDecision, TraceModel, ViewerEnv } from './model.ts'
 import { arrayExporter, isPlyCode } from 'ply'
-import { plyTracer } from '../edge-trace.ts'
+import { plyTracer, routeStamp } from '../edge-trace.ts'
 import { createLoopbackFetch, isLoopback, type LoopbackBinding } from '../gitcache.ts'
 import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from '../rays.ts'
 import { parseViewerRequest, routeOptsFromEnv, type ViewerRoute } from './route.ts'
@@ -141,7 +141,8 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
   const limited = await rateGate(req, env, call, route)
   if (limited) return headless(req, limited)
   const collected = arrayExporter()
-  const tracer = plyTracer(call.ctx, { exporter: collected, maxEvents: 48, resource: { 'service.name': 'ply-viewer' } })
+  const versionId = dig(env, ['VERSION', 'id'])
+  const tracer = plyTracer(call.ctx, { exporter: collected, maxEvents: 48, resource: { 'service.name': 'ply-viewer' } }, routeStamp('viewer', versionId.tag === 'some' && typeof versionId.value === 'string' ? versionId.value : null))
   const budget = createBudget()
   const pageSignal = AbortSignal.timeout(VIEWER_CAPS.pageTimeoutMs)
   // The public namespace's read token is attached below the guard: every hop is validated by createViewerFetch first,

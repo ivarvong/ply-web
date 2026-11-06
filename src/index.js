@@ -15,10 +15,10 @@ import { lsRefs } from 'ply';
 import { discover } from 'ply';
 import { createTransport } from 'ply';
 import { arrayExporter, flattenLine } from 'ply';
-import { plyTracer } from './edge-trace.ts';
-import { assertRouteTable } from './api-routes.ts';
+import { plyTracer, requestStamp, routeStamp, stampRequestSpan } from './edge-trace.ts';
+import { API_ROUTES, assertRouteTable } from './api-routes.ts';
 import { RETRY, isPlyCode, plyError } from 'ply';
-import { withLimits } from 'ply';
+import { API_CAPS, API_LIMITS } from './limits.ts';
 import { isWorkerCode, WORKER_RETRY } from './write/errors.ts';
 import { statusOf } from './status.ts';
 import { handleEdit, handleBranchCreate, handleBranchDelete, handleMerge, handleRebase, handleCherryPick, handleRevert, handleTagCreate, handleTagDelete, readCommitOrEmpty, unbornFields } from './write/handle.ts';
@@ -54,32 +54,9 @@ export { checkRemote };
 export { ViewerRateLimit } from './viewer/rate.ts';
 export { GitCache } from './gitcache-entry.ts';
 
-// A Worker isolate has 128 MiB. A buffered pack holds the wire bytes and every inflated object,
-// including delta results resolvePack allocates on top of the instructions (ply #9). Four
-// maximum-sized objects cover a merge-base triple plus the commit that names them, and
-// wire + inflated stays under the isolate. The blob itself is streamed and is not in this total.
-const KIB = 1024;
-const MIB = KIB * KIB;
-const API_OBJECT_BYTES = 16 * MIB;
-const API_PACK_WIRE_BYTES = 32 * MIB;
-const API_HARVEST_BYTES = 16 * MIB;
-const API_INFLATED_OBJECTS = 4;
-const API_INFLATED_TOTAL = API_OBJECT_BYTES * API_INFLATED_OBJECTS;
-// ply's buffered-pack object ceiling. The inflated-byte cap above is the memory bound.
-const API_PACK_OBJECTS = 100_000;
-const API_REQUEST_TIMEOUT_MS = 30_000;
-const MAX_BODY = MIB;
+const MAX_BODY = API_CAPS.maxBodyBytes;
+const LIMITS = API_LIMITS;
 const MS_PER_SECOND = 1000;
-
-const LIMITS = withLimits({
-  maxPackBytes: API_PACK_WIRE_BYTES,
-  maxObjectSize: API_OBJECT_BYTES,
-  maxHarvestBytes: API_HARVEST_BYTES,
-  maxInflatedTotal: API_INFLATED_TOTAL,
-  maxPackObjects: API_PACK_OBJECTS,
-  maxLsRefsBytes: API_PACK_WIRE_BYTES,
-  requestTimeoutMs: API_REQUEST_TIMEOUT_MS,
-});
 
 // Learned server properties per origin, shared with the viewer (src/quirks.ts).
 
@@ -451,10 +428,14 @@ const worker = {
     let scrub = publicScrub;
     const record = { msg: 'ply.request', id, method: req.method, path: url.pathname, colo: unwrapOr(dig(req, ['cf', 'colo']), '') };
     const log = extra => console.log(scrub(JSON.stringify({ ...record, ...extra })));
+    const versionId = dig(env, ['VERSION', 'id']);
+    const version = versionId.tag === 'some' && typeof versionId.value === 'string' && versionId.value ? versionId.value : null;
+    // The route label on the request span and every ply span (src/edge-trace.ts): a known route key, never a raw path.
+    let route = 'unmatched';
     const done = (res, extra = {}) => {
       res.headers.set('x-ply-request-id', id);
-      const versionId = dig(env, ['VERSION', 'id']);
-      if (versionId.tag === 'some' && versionId.value) res.headers.set('x-ply-version', versionId.value);
+      if (version !== null) res.headers.set('x-ply-version', version);
+      stampRequestSpan(ctx, requestStamp({ route, version, surface, status: res.status, log: extra }));
       res.headers.set(BUILD_HEADER, plyBuildValue());
       applySecurityHeaders(res.headers);
       log({ status: res.status, ms: Date.now() - t0, ...extra });
@@ -477,11 +458,12 @@ const worker = {
     const viewerPath = url.pathname === '/view.css' || /^\/view\.[0-9a-f]{12}\.css$/.test(url.pathname) || url.pathname === '/view' || url.pathname.startsWith('/view/') || url.pathname === '/r' || url.pathname.startsWith('/r/');
     return runRequest({
       parse: () => {
-        if (req.method === 'GET' && url.pathname === '/') { surface = 'usage'; return ok({ kind: 'usage' }); }
+        if (req.method === 'GET' && url.pathname === '/') { surface = 'usage'; route = 'GET /'; return ok({ kind: 'usage' }); }
         // Public viewer, including the public-namespace index (/r) and short repo URLs (/r/<name>).
         // Before the token gate, and it never reads Authorization / Git-Token / Cookie.
         if (viewerPath) {
           surface = 'viewer';
+          route = 'viewer';
           if (url.pathname.includes('@') || url.pathname.toLowerCase().includes('%40')) record.path = '/view/redacted';
           const pinKey = isInternal(req) ? null : pinnedViewKey(url, req.method, isPublicViewLoc(env));
           const pin = pinKey ? pinnedBinding(env, ctx) : null;
@@ -489,6 +471,7 @@ const worker = {
         }
         surface = 'api';
         const key = `${req.method} ${url.pathname}`;
+        if (API_ROUTES.includes(key) || url.pathname === '/v1/flags' || url.pathname === '/v1/flags/eval') route = key;
         const publicRead = !req.headers.has('authorization') && !!READS[key] && isPublicReadRemote(url.searchParams.get('remote'));
         return ok({ kind: 'api', key, publicRead });
       },
@@ -567,7 +550,7 @@ const worker = {
           const callerScrub = scrubber(cred.secrets);
           scrub = text => callerScrub(publicScrub(text));
           // Every /v1 route runs under this one tracer: each ply span is also a Workers span under the request span (src/edge-trace.ts).
-          const tracer = plyTracer(ctx, { exporter, resource: { 'service.name': 'ply-worker', 'cloudflare.colo': unwrapOr(dig(req, ['cf', 'colo']), '') } });
+          const tracer = plyTracer(ctx, { exporter, resource: { 'service.name': 'ply-worker', 'cloudflare.colo': unwrapOr(dig(req, ['cf', 'colo']), '') } }, routeStamp(route, version));
           // The public read token is attached below the redirect guard, so each hop is re-validated before it is considered,
           // and only when the request carries no credential of its own (a caller's Git-Token or Git-Authorization wins).
           // Under the guard: public, credential-free upload-pack exchanges go to the cache-enabled GitCache entrypoint

@@ -28,7 +28,8 @@ import { extractRequestPath, rawPathHasUnsafeSegment } from './pathguard.ts';
 import { parseCfRay } from './rays.ts';
 import { publicUploadPackRepo, scrubSecrets, type TokenSource, withPublicReadCredential, type FetchLike } from './public.ts';
 import { ALLOWED_HOSTS } from './viewer/url.ts';
-import { createTransport, fetchPack, Tracer, withLimits } from 'ply';
+import { createTransport, fetchPack, Tracer } from 'ply';
+import { VERIFY_CAPS, VERIFY_LIMITS } from './limits.ts';
 
 export type CacheKind = 'pack' | 'refs' | 'discover';
 
@@ -52,8 +53,7 @@ const FILTER_REFUSAL = /only blob:none is supported|unsupported (git )?fetch fil
 export const MAX_ROUTED_BODY = 4096;
 const MAX_ERROR_BODY = 64 * 1024;
 /** A pack is stored only after GitCache has verified it, and it buffers the pack to do so; bigger ones pass through unstored. */
-export const MAX_VERIFIED_PACK = 16 * 1024 * 1024;
-const VERIFY_LIMITS = withLimits({ maxPackBytes: MAX_VERIFIED_PACK, maxObjectSize: MAX_VERIFIED_PACK, maxInflatedTotal: 4 * MAX_VERIFIED_PACK, maxHarvestBytes: MAX_VERIFIED_PACK, maxPackObjects: 100_000, maxTreeEntries: 1_000_000, requestTimeoutMs: 30_000 });
+export const MAX_VERIFIED_PACK = VERIFY_CAPS.maxPackBytes;
 
 const wantsOf = (body: Uint8Array) => [...latin1(body).matchAll(/[0-9a-f]{4}want ([0-9a-f]{40})\n/g)].map(m => m[1] as string);
 
