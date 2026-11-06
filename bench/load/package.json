@@ -1,0 +1,7 @@
+{
+  "name": "ply-load",
+  "private": true,
+  "type": "module",
+  "description": "Fixed-rate load generators for ply inside Cloudflare (docs/rate-limit.md). Uses the parent's node_modules.",
+  "devDependencies": { "@cloudflare/vite-plugin": "2.0.0-beta.v.5", "cf": "1.0.0-beta.23", "vite": "^8.3.5" }
+}

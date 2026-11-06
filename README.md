@@ -271,9 +271,14 @@ host, is refused there before ply sees it. Upstream `User-Agent` is
 | pack-map rate | 20 / minute / client |
 
 Over any cap the response is an HTML error (413 for a limit, 504 for a timeout), with the trace of the calls that
-did finish. Rate limiting is a Durable Object, `ViewerRateLimit`, declared as a SQLite class. It is sharded by the
-SHA-256 of `CF-Connecting-IP` (clients with no header share one shard). Each shard stores a short list of
-timestamps per bucket, not addresses.
+did finish. Rate limiting is keyed by the SHA-256 of `CF-Connecting-IP` (clients with no header share one key) and
+stores no addresses. `RATE_MODE` picks the limiter. `batched` (the default since 2026-11-06, [docs/rate-limit.md](docs/rate-limit.md)):
+the request reads ONE cached document of blocked clients through the cache-enabled `RateCache` entrypoint
+(`max-age=1, stale-while-revalidate=30`) and never waits on a Durable Object; admitted hits are batched per isolate and
+flushed every 200 ms from `ctx.waitUntil` to the single SQLite Durable Object `RateCounter` with an idempotency key,
+retried with the same key for up to 5 s. The limit is approximate: a client is refused about 1.5 s after it reaches it.
+`legacy`: `ViewerRateLimit`, one SQLite Durable Object per client called before any git work, storing a short list of
+timestamps per bucket.
 Git reads are cached with Workers Caching (see [Caching](#caching-workers-cache)); there is no Cache API anything. HTML is `no-store` and escaped. CSP is `default-src 'none'; style-src 'self'; script-src 'none'; img-src 'none'`,
 plus `X-Content-Type-Options: nosniff`. There is no inline script and `unsafe-inline` is not allowed.
 

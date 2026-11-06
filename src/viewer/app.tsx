@@ -10,7 +10,8 @@ import { htmlResponse, SECURITY, statusOf, textResponse } from './http.ts'
 import { VIEWER_CAPS, rateLimitFor, type RateBucket } from './limits.ts'
 import type { RateDecision, TraceModel, ViewerEnv } from './model.ts'
 import { isPlyCode } from 'ply'
-import { plyTracer, routeStamp, spanList } from '../edge-trace.ts'
+import { EDGE_ATTR, plyTracer, routeStamp, spanList } from '../edge-trace.ts'
+import { admitBatched, inSpan, rateIdentity, versionOf } from '../rate/admit.ts'
 import { createLoopbackFetch, isLoopback, type LoopbackBinding } from '../gitcache.ts'
 import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from '../rays.ts'
 import { parseViewerRequest, routeOptsFromEnv, type ViewerRoute } from './route.ts'
@@ -27,25 +28,39 @@ function callOf(req: Request): ViewerCall {
   return call
 }
 
-async function clientKey(req: Request): Promise<string> {
-  const connecting = req.headers.get('cf-connecting-ip')
-  const ip = connecting === null ? 'unknown' : connecting
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`ply-viewer-rate/1\n${ip}`))
-  let hex = ''
-  for (const byte of new Uint8Array(digest)) hex += byte.toString(16).padStart(2, '0')
-  return hex
-}
-
-/** The viewer's per-client rate limit. /v1 public-namespace reads use it too (index.js). */
-export async function admitClient(req: Request, env: ViewerEnv, bucket: RateBucket, now: number): Promise<RateDecision | 'unconfigured' | 'unavailable'> {
-  const ns = env.VIEWER_RATE
-  if (!ns) return 'unconfigured'
-  try {
-    const stub = ns.get(ns.idFromName(await clientKey(req)))
-    return await stub.admit(bucket, now, rateLimitFor(bucket, envBinding(bucket === 'pack' ? env.VIEWER_PACK_RATE_PER_MIN : env.VIEWER_RATE_PER_MIN)), VIEWER_CAPS.rateWindowMs)
-  } catch {
-    return 'unavailable'
-  }
+/**
+ * The viewer's per-client rate limit. /v1 public-namespace reads use it too (index.js). The limiter is the env's
+ * RATE_MODE (docs/rate-limit.md): `batched` (cached blocked document + batched counter) or `legacy` (ViewerRateLimit,
+ * one Durable Object call per request). Either way one `ply.rate.check` span records mode, decision and latency.
+ */
+export async function admitClient(req: Request, env: ViewerEnv, bucket: RateBucket, now: number, ctx: unknown = null): Promise<RateDecision | 'unconfigured' | 'unavailable'> {
+  const id = await rateIdentity(req, env)
+  const limitFor = (b: RateBucket): number => rateLimitFor(b, envBinding(b === 'pack' ? env.VIEWER_PACK_RATE_PER_MIN : env.VIEWER_RATE_PER_MIN))
+  return inSpan(ctx, 'ply.rate.check', { [EDGE_ATTR.version]: versionOf(env), [EDGE_ATTR.route]: 'rate.check' }, async set => {
+    set('rate.mode', id.mode)
+    set('rate.bucket', bucket)
+    if (id.load) set('rate.load', true)
+    const t0 = performance.now()
+    try {
+      if (id.mode === 'batched') return await admitBatched({ ctx, env, id, bucket, now, limitFor, set })
+      const ns = env.VIEWER_RATE
+      if (!ns) {
+        set('rate.decision', 'unconfigured')
+        return 'unconfigured'
+      }
+      try {
+        const stub = ns.get(ns.idFromName(id.hex))
+        const decision = await stub.admit(bucket, now, limitFor(bucket), VIEWER_CAPS.rateWindowMs)
+        set('rate.decision', decision.ok ? 'allow' : 'deny')
+        return decision
+      } catch {
+        set('rate.decision', 'unavailable')
+        return 'unavailable'
+      }
+    } finally {
+      set('rate.check_ms', Math.round((performance.now() - t0) * 1000) / 1000)
+    }
+  })
 }
 
 function isText(bytes: Uint8Array): boolean {
@@ -97,7 +112,7 @@ async function rateGate(req: Request, env: ViewerEnv, call: ViewerCall, route: E
   const skipRate = chainGet(call.opts, 'skipRate')
   if (skipRate.tag === 'some' && skipRate.value) return null
   const bucket: RateBucket = route.kind === 'repo' && route.pack ? 'pack' : 'page'
-  const decision = await admitClient(req, env, bucket, call.now)
+  const decision = await admitClient(req, env, bucket, call.now, call.ctx)
   if (decision === 'unconfigured' || decision === 'unavailable') {
     const trace = traceOf(call)
     const message = decision === 'unconfigured' ? 'The viewer rate limiter is not configured.' : 'The viewer rate limiter is unavailable.'

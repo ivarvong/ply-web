@@ -119,6 +119,12 @@ export type ViewerEnv = Partial<{
   /** Comma-separated exact hostnames appended to the built-in allowlist. Wildcards are ignored. */
   VIEWER_EXTRA_HOSTS: string;
   VIEWER_RATE_PER_MIN: string;
+  /** `batched` or `legacy` (docs/rate-limit.md). Anything else is legacy. */
+  RATE_MODE: string;
+  /** The batched limiter's one counter (src/rate/counter.ts). */
+  RATE_COUNTER: import('../rate/stub.ts').CounterNamespace;
+  /** Read only to authenticate load-test headers (src/rate/admit.ts). Never forwarded or echoed by the viewer. */
+  PLY_TOKEN: string;
   VIEWER_PACK_RATE_PER_MIN: string;
   PACK_CACHE: string;
   /** Workers version metadata (cloudflare.config.ts). Its id is the `ply.script_version` on the viewer's ply spans. */

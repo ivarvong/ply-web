@@ -30,5 +30,6 @@ declare module 'cloudflare:workers' {
   export interface SqlCursor<T> {
     toArray(): T[];
     one(): T;
+    readonly rowsWritten: number;
   }
 }

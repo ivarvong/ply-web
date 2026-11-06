@@ -52,6 +52,8 @@ export { checkRemote };
 
 export { ViewerRateLimit } from './viewer/rate.ts';
 export { GitCache } from './gitcache-entry.ts';
+export { RateCounter } from './rate/counter.ts';
+export { RateCache } from './rate/cache-entry.ts';
 
 const MAX_BODY = API_CAPS.maxBodyBytes;
 const LIMITS = API_LIMITS;
@@ -478,7 +480,7 @@ const worker = {
         if (parsed.kind === 'usage') return ok(parsed);
         if (parsed.kind === 'viewer') {
           if (!(parsed.pinKey && parsed.pin)) return ok(parsed);
-          const decision = await admitClient(req, env, 'page', Date.now());
+          const decision = await admitClient(req, env, 'page', Date.now(), ctx);
           if (decision === 'unconfigured' || decision === 'unavailable') return err(rawOut(503, 'rate limiter unavailable\n', new Headers({ 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }), { viewer: 1 }));
           if (!decision.ok) {
             const ra = String(Math.max(1, Math.ceil(decision.retryAfterMs / MS_PER_SECOND)));
@@ -490,7 +492,7 @@ const worker = {
           record.public = 1;
           if (req.headers.has('git-token') || req.headers.has('git-authorization')) return err(jsonOut(400, { code: 'bad_request', message: `the ${PUBLIC_NAMESPACE} namespace is read without git credentials; send none, or send Authorization: Bearer <PLY_TOKEN>`, retry: 'no' }));
           // An internal request (Pinned filling the cache) was rate-limited at the front door already.
-          const decision = isInternal(req) ? { ok: true, retryAfterMs: 0 } : await admitClient(req, env, 'page', Date.now());
+          const decision = isInternal(req) ? { ok: true, retryAfterMs: 0 } : await admitClient(req, env, 'page', Date.now(), ctx);
           if (decision === 'unconfigured' || decision === 'unavailable') return err(jsonOut(503, { code: 'unavailable', message: 'the rate limiter is unavailable', retry: 'yes' }));
           if (!decision.ok) {
             const retryAfter = String(Math.max(1, Math.ceil(decision.retryAfterMs / MS_PER_SECOND)));

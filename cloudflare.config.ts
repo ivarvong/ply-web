@@ -27,8 +27,10 @@ const WORKER_NAME = "ply";
 // 656fdd50f0d6428393eb2d9250ceee67. Declaring it here as a live SQLite class, with no lifecycle tombstones,
 // keeps that namespace and its data.
 // Never change `storage` on a live class. Retire or rename a class only with a `state` tombstone.
+// RateCounter (2026-11-06) is new and additive: the one counter behind the batched limiter (docs/rate-limit.md).
 const durableObjects = {
 	ViewerRateLimit: exports.durableObject({ storage: "sqlite" }),
+	RateCounter: exports.durableObject({ storage: "sqlite" }),
 } as const;
 
 // Workers Caching (never the Cache API). The default entrypoint is uncached so it always runs (rate limit, logs, scrub,
@@ -50,6 +52,8 @@ export const entrypoints = {
 	Pinned: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
 	// The one flag ruleset (src/flags/cache.ts). Caching stays off on the default entrypoint, which always runs.
 	FlagsCache: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
+	// The rate limiter's one blocked-clients document (src/rate/doc.ts): max-age 1, stale-while-revalidate 30.
+	RateCache: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
 	// Caching is off by default. An explicit `enabled: false` on a named entrypoint is rejected by the API with 10375.
 	// RPC writes (src/flags/entry.ts): setRollout and setTargeting are not idempotent GETs.
 	FlagControl: exports.worker({} satisfies NamedWorkerOptions),
@@ -57,6 +61,7 @@ export const entrypoints = {
 
 // A binding can only name a class declared live above. src/index.js re-exports it from src/viewer/rate.ts.
 const VIEWER_RATE_CLASS: keyof typeof durableObjects = "ViewerRateLimit";
+const RATE_COUNTER_CLASS: keyof typeof durableObjects = "RateCounter";
 
 const plyWorker = {
 	worker: {
@@ -95,6 +100,10 @@ const plyWorker = {
 			MIRROR_SYNC: bindings.text("on"),
 			// /view rate limits. One SQLite Durable Object class, defined by this Worker.
 			VIEWER_RATE: bindings.durableObject({ worker: WORKER_NAME, exportName: VIEWER_RATE_CLASS }),
+			// The batched limiter (docs/rate-limit.md): "batched" reads one cached document and flushes counts in batches to
+			// RateCounter; "legacy" calls ViewerRateLimit on every request. Flip to "legacy" to roll the limiter back alone.
+			RATE_MODE: bindings.text("batched"),
+			RATE_COUNTER: bindings.durableObject({ worker: WORKER_NAME, exportName: RATE_COUNTER_CLASS }),
 			// The public namespace, served read-only with no token (src/public.ts). The binding is scoped to this one
 			// namespace; the Worker calls only get(<repo>).createToken("read", 3600) and list(). No stored secret.
 			PUBLIC_REPOS: bindings.artifacts({ namespace: PUBLIC_NAMESPACE }),
