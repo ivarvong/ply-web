@@ -16,8 +16,13 @@ export type ProbeCall = {
   readonly auth: boolean
 }
 
-/** Where a harness fault above 0% leaves traffic. Rollback restores `previous` at 100%. */
-export type ProbeFaultAction = 'rollback' | 'hold'
+/**
+ * Where a harness fault above 0% leaves traffic. Rollback restores `previous` at 100%.
+ * `telemetry` does not decide on the probe window at all: the loss is recorded, and the
+ * step is judged on the new version's own telemetry (a probe-tail loss is the harness,
+ * not the Worker). The direct promote uses it.
+ */
+export type ProbeFaultAction = 'rollback' | 'hold' | 'telemetry'
 
 /**
  * Citation for `probe.maxLossRate`, per issue #73: source, window, date, n, and headroom.
@@ -156,10 +161,27 @@ export type TelemetryPolicy = {
 /** Default when the policy omits `telemetry`: fail only when more than half of the smoke is missing. */
 export const DEFAULT_MAX_LOSS_RATE = 0.5
 
+/**
+ * The default rollout (no `--ramp`): after the pinned smoke and its telemetry pass, the
+ * new version goes straight to 100% and is watched for `watchMs` with unpinned probes.
+ * The watch is then judged on the new version's telemetry, polled every `ingestPollMs`
+ * until the probes have landed or `ingestWaitMs` has passed.
+ */
+export type PromotePolicy = {
+  readonly watchMs: number
+  readonly ingestWaitMs: number
+  readonly ingestPollMs: number
+}
+
+export const DEFAULT_PROMOTE: PromotePolicy = { watchMs: 60_000, ingestWaitMs: 30_000, ingestPollMs: 3_000 }
+
 export type RolloutPolicy = {
   readonly steps: readonly RolloutStep[]
   readonly ingestWaitMs: number
+  /** When > 0, the post-dwell ingest wait is polled at this period instead of one fixed sleep; `ingestWaitMs` is the ceiling. */
+  readonly ingestPollMs: number
   readonly warmupMs: number
+  readonly promote: PromotePolicy
   readonly probe: {
     readonly rps: number
     readonly calls: readonly ProbeCall[]
@@ -481,9 +503,35 @@ function telemetryOf(value: unknown): TelemetryPolicy {
   }
 }
 
+function promoteOf(value: unknown): PromotePolicy {
+  const rec = record(value, 'promote')
+  exactKeys(rec, 'promote', ['watchMs', 'ingestWaitMs', 'ingestPollMs'])
+  return {
+    watchMs: integer(rec.watchMs, 'promote.watchMs', 1),
+    ingestWaitMs: integer(rec.ingestWaitMs, 'promote.ingestWaitMs', 0),
+    ingestPollMs: integer(rec.ingestPollMs, 'promote.ingestPollMs', 0),
+  }
+}
+
+/**
+ * The policy the direct promote runs: one step at 100% for `promote.watchMs`, no warm-up,
+ * ingest polled. A probe-loss harness fault defers to the new version's telemetry instead of
+ * rolling back. Every gate, the burn and the share band are the checked-in ones.
+ */
+export function promotePolicy(policy: RolloutPolicy): RolloutPolicy {
+  return {
+    ...policy,
+    steps: [{ percent: 100, dwellMs: policy.promote.watchMs }],
+    warmupMs: 0,
+    ingestWaitMs: policy.promote.ingestWaitMs,
+    ingestPollMs: policy.promote.ingestPollMs,
+    probe: { ...policy.probe, onHarnessFault: 'telemetry' },
+  }
+}
+
 function validate(value: unknown): RolloutPolicy {
   const rec = record(value, 'policy')
-  exactKeys(rec, 'policy', ['steps', 'ingestWaitMs', 'probe', 'gates', 'burn', 'split', 'cleanup'], ['warmupMs', 'telemetry'])
+  exactKeys(rec, 'policy', ['steps', 'ingestWaitMs', 'probe', 'gates', 'burn', 'split', 'cleanup'], ['warmupMs', 'telemetry', 'promote', 'ingestPollMs'])
   const probe = record(rec.probe, 'probe')
   exactKeys(probe, 'probe', [
     'rps',
@@ -503,13 +551,15 @@ function validate(value: unknown): RolloutPolicy {
   if (typeof rps !== 'number' || !Number.isFinite(rps) || rps < 0) reject('probe.rps', 'must be a number >= 0')
   const calls = callsOf(probe.calls)
   if (rps > 0 && calls.length === 0) reject('probe.calls', 'probe rps needs at least one call')
-  const onHarnessFault = oneOf(probe.onHarnessFault, 'probe.onHarnessFault', ['rollback', 'hold'])
+  const onHarnessFault = oneOf(probe.onHarnessFault, 'probe.onHarnessFault', ['rollback', 'hold', 'telemetry'])
   const burn = record(rec.burn, 'burn')
   exactKeys(burn, 'burn', ['fastBurn', 'minSamples'])
   return {
     steps: stepsOf(rec.steps),
     ingestWaitMs: integer(rec.ingestWaitMs, 'ingestWaitMs', 0),
+    ingestPollMs: 'ingestPollMs' in rec ? integer(rec.ingestPollMs, 'ingestPollMs', 0) : 0,
     warmupMs: rec.warmupMs === undefined ? 0 : integer(rec.warmupMs, 'warmupMs', 0),
+    promote: 'promote' in rec ? promoteOf(rec.promote) : DEFAULT_PROMOTE,
     probe: {
       rps,
       calls,
@@ -547,7 +597,9 @@ function policyBody(policy: RolloutPolicy): Json {
   return {
     steps: policy.steps.map(step => ({ percent: step.percent, dwellMs: step.dwellMs })),
     ingestWaitMs: policy.ingestWaitMs,
+    ingestPollMs: policy.ingestPollMs,
     warmupMs: policy.warmupMs,
+    promote: { watchMs: policy.promote.watchMs, ingestWaitMs: policy.promote.ingestWaitMs, ingestPollMs: policy.promote.ingestPollMs },
     probe: {
       rps: policy.probe.rps,
       maxLossRate: policy.probe.maxLossRate,

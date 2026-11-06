@@ -27,7 +27,7 @@ import { readTokenFile } from './token.ts'
 import { parseSince } from './config.ts'
 
 export type Parsed =
-  | { readonly kind: 'cd'; readonly sha: string | null; readonly noBump: boolean }
+  | { readonly kind: 'cd'; readonly sha: string | null; readonly noBump: boolean; readonly ramp: boolean }
   | { readonly kind: 'bump'; readonly sha: string | null }
   | { readonly kind: 'deploy-canary' }
   | { readonly kind: 'smoke'; readonly version: string | null; readonly expectVersion: string | null }
@@ -64,10 +64,15 @@ export function noBumpSha(sha: string, pin: string | null): string | null {
 function parseCd(argv: readonly string[], pin: string | null): Parsed {
   let sha: string | null = null
   let noBump = false
+  let ramp = false
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i] ?? ''
     if (arg === '--no-bump') {
       noBump = true
+      continue
+    }
+    if (arg === '--ramp') {
+      ramp = true
       continue
     }
     if (arg === '--sha') {
@@ -85,7 +90,7 @@ function parseCd(argv: readonly string[], pin: string | null): Parsed {
     const mismatch = noBumpSha(sha, pin)
     if (mismatch) return { kind: 'error', reason: mismatch }
   }
-  return { kind: 'cd', sha, noBump }
+  return { kind: 'cd', sha, noBump, ramp }
 }
 
 export function parseArgs(argv: readonly string[], pin: string | null = null): Parsed {
@@ -151,8 +156,10 @@ export function parseArgs(argv: readonly string[], pin: string | null = null): P
 export function usageText(): string {
   return [
     'usage: npm run cd -- [--policy <path>] [command]',
-    '  cd [--sha <40 hex>] [--no-bump]',
-    '  [--sha <40 hex>] [--no-bump]',
+    '  cd [--sha <40 hex>] [--no-bump] [--ramp]',
+    '  [--sha <40 hex>] [--no-bump] [--ramp]',
+    '     default: 0% canary, pinned smoke + telemetry, promote to 100%, live watch (auto-rollback)',
+    '     --ramp: the stepped schedule in the policy (steps) instead of the direct promote',
     '  bump [--sha <40 hex>]',
     '  deploy-canary',
     '  smoke --version <id> | --expect-version <id>',
@@ -337,7 +344,7 @@ async function dispatch(
 ): Promise<Outcome> {
   if (parsed.kind === 'cd') {
     if (!release) return { code: 1, reason: 'cd: harness_fault bad-ply-sha: release was not read' }
-    const exit = await runPipeline(config, { token, sha: parsed.sha, noBump: parsed.noBump, release, log, runDir, runLog })
+    const exit = await runPipeline(config, { token, sha: parsed.sha, noBump: parsed.noBump, ramp: parsed.ramp, release, log, runDir, runLog })
     return { code: exit.code, reason: exit.reason }
   }
   if (parsed.kind === 'bump') {

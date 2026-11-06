@@ -18,6 +18,8 @@ import { stageRamp } from './stage-ramp.ts'
 import { stageRollback } from './stage-rollback.ts'
 import { stageSmoke } from './stage-smoke.ts'
 import { reportPath, stageTelemetry } from './stage-telemetry.ts'
+import { stageVisual } from './stage-visual.ts'
+import { promotePolicy } from './policy.ts'
 import { readDeployment } from './traffic.ts'
 
 export type PipelineExit = {
@@ -178,12 +180,80 @@ async function span<T>(log: RunLog, name: string, fn: () => Promise<T>): Promise
   }
 }
 
+/** Unpinned requests per convergence round, rounds in a row that must all answer as the new version, and the cap. */
+const CONVERGE_BATCH = 10
+const CONVERGED_ROUNDS = 2
+const CONVERGE_MAX_MS = 30_000
+
+/**
+ * After promotion: the live lifecycle smoke and its telemetry, beside the CDP visual smoke.
+ * Each failure is returned in the order the checks finished; a pass is an empty list.
+ */
+async function liveChecks(
+  config: CdConfig,
+  runLog: RunLog,
+  opts: { readonly version: string; readonly token: string; readonly runDir: string; readonly log: (line: string) => void },
+): Promise<readonly StageResult<unknown>[]> {
+  // The split write returns before every colo serves it (98.74% at 100% on run 2026-11-06T20-11-49-685Z). The unpinned
+  // smoke asserts x-ply-version, so wait until unpinned requests agree; the visual smoke is pinned and need not wait.
+  const converged = async (): Promise<void> => {
+    const started = Date.now()
+    let streak = 0
+    let rounds = 0
+    while (streak < CONVERGED_ROUNDS && Date.now() - started < CONVERGE_MAX_MS) {
+      rounds += 1
+      const seen = await Promise.all(Array.from({ length: CONVERGE_BATCH }, () => fetch(`${config.baseUrl}/`, { signal: AbortSignal.timeout(5_000) })
+        .then(response => response.headers.get('x-ply-version'), () => 'lost')))
+      streak = seen.every(seen1 => seen1 === opts.version) ? streak + 1 : 0
+      if (streak < CONVERGED_ROUNDS) await new Promise(resolve => setTimeout(resolve, 500))
+    }
+    const ms = Date.now() - started
+    opts.log(`promote: unpinned traffic ${streak >= CONVERGED_ROUNDS ? 'converged' : 'NOT converged'} on ${opts.version} after ${ms} ms (${rounds} rounds of ${CONVERGE_BATCH})`)
+    await runLog.observation({
+      measurement: { source: 'split-convergence', converged: streak >= CONVERGED_ROUNDS, ms, rounds, batch: CONVERGE_BATCH },
+      query: { source: 'unpinned GET /', base: config.baseUrl },
+      from: started,
+      to: Date.now(),
+      raw: JSON.stringify({ ms, rounds }),
+    })
+  }
+  const smokeAndTelemetry = async (): Promise<StageResult<unknown>[]> => {
+    await converged()
+    const started = Date.now()
+    const smoke = await span(runLog, 'smoke-live', () => stageSmoke(config, { version: opts.version, pin: false, token: opts.token, runDir: opts.runDir }))
+    if (smoke.kind === 'fail') {
+      opts.log(`smoke: ${smoke.reason}`)
+      return [smoke]
+    }
+    const telemetry = await span(runLog, 'telemetry-live', () => stageTelemetry(config, {
+      version: opts.version,
+      since: started,
+      reportPath: reportPath(opts.runDir, true),
+      runDir: opts.runDir,
+      live: true,
+    }))
+    await writeJson(opts.runDir, 'live-telemetry-stage.json', telemetry, [opts.token])
+    if (telemetry.kind === 'fail') opts.log(`telemetry: ${telemetry.reason}`)
+    else opts.log(telemetry.value.line)
+    return [smoke, telemetry]
+  }
+  const visual = async (): Promise<StageResult<unknown>[]> => {
+    const result = await span(runLog, 'visual', () => stageVisual(config, { runDir: opts.runDir, version: opts.version }))
+    opts.log(result.kind === 'pass' ? (result.value.skipped ? `visual: skipped (${result.value.skipped})` : `visual smoke: ${result.value.pages} views ok`) : `visual: ${result.reason}`)
+    return [result]
+  }
+  const settled = await Promise.all([smokeAndTelemetry(), visual()])
+  return settled.flat()
+}
+
 export async function runPipeline(
   config: CdConfig,
   opts: {
     readonly token: string
     readonly sha: string | null
     readonly noBump: boolean
+    /** The stepped schedule (`--ramp`). Otherwise the direct promote with a live watch. */
+    readonly ramp: boolean
     readonly release: ReleaseId
     readonly log: (line: string) => void
     readonly runDir: string
@@ -211,6 +281,15 @@ export async function runPipeline(
       await runLog.error(result.reason, { stage: result.stage, rolledBack: result.rolledBack, fault: result.fault })
     }
   }
+  const rampOpts = () => ({
+    version,
+    previous,
+    verdictPath: join(runDir, 'telemetry.json'),
+    runDir,
+    token: opts.token,
+    log: opts.log,
+    ...(fromPercent === undefined ? {} : { fromPercent }),
+  })
   while (state.phase !== 'halt' && state.phase !== 'done') {
     if (state.phase === 'bump') {
       if (opts.noBump) {
@@ -317,16 +396,44 @@ export async function runPipeline(
       }
       continue
     }
-    if (state.phase === 'ramp') {
-      const result = await span(runLog, 'ramp', () => stageRamp(config, {
-        version,
-        previous,
-        verdictPath: join(runDir, 'telemetry.json'),
-        runDir,
-        token: opts.token,
-        log: opts.log,
-        ...(fromPercent === undefined ? {} : { fromPercent }),
+    if (state.phase === 'ramp' && !opts.ramp) {
+      // The direct promote: 100% at once, watched with unpinned probes and the new version's telemetry. The live smoke,
+      // its telemetry and the visual smoke start the moment the split is written and run during the watch.
+      let live: Promise<readonly StageResult<unknown>[]> | null = null
+      const result = await span(runLog, 'promote', () => stageRamp(config, rampOpts(), {
+        policy: promotePolicy(config.policy),
+        onApplied: percent => {
+          if (percent < 100 || live) return
+          opts.log(`promote: ${version} at 100% (previous ${previous}); live watch ${config.policy.promote.watchMs} ms beside live smoke + visual smoke`)
+          live = liveChecks(config, runLog, { version, token: opts.token, runDir, log: opts.log })
+        },
       }))
+      const promoted: Promise<readonly StageResult<unknown>[]> | null = live
+      if (result.kind === 'fail') {
+        // Settle the live checks before the verdict so nothing writes into a sealed log; the watch decided.
+        if (promoted) await promoted
+        await note(result)
+        opts.log(`promote: ${result.reason}`)
+        state = nextPhase(state, outcomeOf(result))
+        continue
+      }
+      runLog.patch({ liveAt: isoOffset(new Date()) })
+      // A resumed run whose split was already at 100% promoted nothing here: run the live checks now.
+      const checks = await (promoted === null ? liveChecks(config, runLog, { version, token: opts.token, runDir, log: opts.log }) : promoted)
+      // A Worker failure in any live check rolls back; a harness fault stops with the new version live and says so.
+      const worker = checks.find(check => check.kind === 'fail' && check.fault === 'worker')
+      const harness = checks.find(check => check.kind === 'fail' && check.fault !== 'worker')
+      if (worker) {
+        await note(worker)
+        state = { phase: 'rollback', smoke: state.smoke }
+      } else if (harness) {
+        await note(harness)
+        state = { phase: 'halt', smoke: state.smoke }
+      } else state = { phase: 'done', smoke: state.smoke }
+      continue
+    }
+    if (state.phase === 'ramp') {
+      const result = await span(runLog, 'ramp', () => stageRamp(config, rampOpts()))
       await note(result)
       if (result.kind === 'pass') runLog.patch({ liveAt: isoOffset(new Date()) })
       else opts.log(`ramp: ${result.reason}`)

@@ -180,7 +180,10 @@ export async function stageRamp(
     /** When set, the version is already at this ramp percent. Do not write it again. */
     readonly fromPercent?: number
   },
+  /** The schedule (the direct promote passes `promotePolicy`), and a hook called once each step's split is in place. */
+  schedule: { readonly policy: RolloutPolicy; readonly onApplied: (percent: number) => void } = { policy: config.policy, onApplied: () => {} },
 ): Promise<StageResult<RampValue>> {
+  const rollout = schedule.policy
   // Traffic already on a ramp step means an earlier run opened the canary gate.
   if (opts.fromPercent === undefined) {
     if (!opts.verdictPath) return fail('ramp', 'ramp needs a PASS verdict file (--verdict); traffic was not changed')
@@ -228,12 +231,12 @@ export async function stageRamp(
   if (!previous) return fail('ramp', 'no previous version; traffic was not changed')
   const target = previous
   const steps = fromPercent === undefined
-    ? config.policy.steps
-    : config.policy.steps.filter(step => step.percent >= fromPercent)
+    ? rollout.steps
+    : rollout.steps.filter(step => step.percent >= fromPercent)
   if (fromPercent !== undefined && steps.length === 0) {
     return fail('ramp', `schedule has no step at or above ${fromPercent}%`)
   }
-  const policy = { ...config.policy, steps }
+  const policy = { ...rollout, steps }
   const logPath = join(opts.runDir, 'ramp.jsonl')
   const first = steps[0]
   if (!first) return fail('ramp', 'schedule has no step; traffic was not changed')
@@ -243,8 +246,8 @@ export async function stageRamp(
       now: () => Date.now(),
       sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
       dwell: async (ms, percent) => {
-        const outcomes = await dwell(opts.token, config.baseUrl, ms, config.policy.probe)
-        const loss = accountProbeLoss(outcomes, config.policy.probe.maxLossRate)
+        const outcomes = await dwell(opts.token, config.baseUrl, ms, rollout.probe)
+        const loss = accountProbeLoss(outcomes, rollout.probe.maxLossRate)
         const log = activeLog()
         if (!log) throw new HarnessFault('probe-loss observation with no active log')
         const at = Date.now()
@@ -293,6 +296,7 @@ export async function stageRamp(
           return errorMessage(error)
         }
       },
+      onApplied: schedule.onApplied,
       observe: (from, to, percent) => observe(config, opts.version, target, from, queryTo(to), percent),
       onDecision: async (ref, decision, percent) => {
         const log = activeLog()

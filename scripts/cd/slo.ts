@@ -340,18 +340,20 @@ export function judgeStep(input: {
   const gates = input.policy.gates
   for (const scope of SCOPES) {
     const side = scope.pick(input)
-    // Only treat non-ok outcomes on the new version as a hard gate. Non-ok on the old or aggregate are informational.
-    const nonOkMode = scope.id === 'new' ? gates.nonOk : 'informational'
-    consider(gates.exceptions, countBreach(side.exceptions, 'exception', `max_${scope.id}_exceptions`, scope.scope), hard, notes)
-    consider(gates.fivexx, countBreach(side.fivexx, '5xx response', `max_${scope.id}_5xx`, scope.scope), hard, notes)
-    consider(gates.errorLogs, countBreach(side.errorLogs, 'error log', `max_${scope.id}_error_logs`, scope.scope), hard, notes)
-    consider(nonOkMode, countBreach(side.errors, 'non-ok outcome', `max_${scope.id}_errors`, scope.scope), hard, notes)
+    // Only the new version's own signals can fail its release. The old version (and the aggregate, which is the
+    // old version plus the new one) is informational: run 2026-11-06T20-57-44-803Z rolled back a clean new version
+    // for "1 5xx response on the old version". A new-version breach is already counted on the `new` scope.
+    const own = (mode: 'hard' | 'informational'): 'hard' | 'informational' => scope.id === 'new' ? mode : 'informational'
+    consider(own(gates.exceptions), countBreach(side.exceptions, 'exception', `max_${scope.id}_exceptions`, scope.scope), hard, notes)
+    consider(own(gates.fivexx), countBreach(side.fivexx, '5xx response', `max_${scope.id}_5xx`, scope.scope), hard, notes)
+    consider(own(gates.errorLogs), countBreach(side.errorLogs, 'error log', `max_${scope.id}_error_logs`, scope.scope), hard, notes)
+    consider(own(gates.nonOk), countBreach(side.errors, 'non-ok outcome', `max_${scope.id}_errors`, scope.scope), hard, notes)
     if (gates.burn !== 'hard' && gates.burn !== 'informational') continue
     for (const slo of [AVAILABILITY, READ_LATENCY, WRITE_LATENCY]) {
       const count = countSlo(slo, side.v1)
       if (count.total < input.policy.burn.minSamples || count.burn === null || count.burn <= input.policy.burn.fastBurn) continue
       consider(
-        gates.burn,
+        own(gates.burn),
         {
           reason: `${slo.id} burn ${count.burn.toFixed(2)} > ${input.policy.burn.fastBurn} ${scope.scope}`,
           rule: { name: 'fast_burn', value: input.policy.burn.fastBurn },
@@ -364,15 +366,21 @@ export function judgeStep(input: {
   consider(gates.latency.mode === 'gate' ? 'hard' : 'informational', latencyBreach(input.next.wallMs, input.previous.wallMs, input.policy), hard, notes)
   const first = hard[0]
   if (first) return verdict('rollback', first.reason, [first.rule], burns)
-  const noted = notes.length === 0 ? '' : `; informational: ${notes.join('; ')}`
   const routed = routedShare(input.next.invocations, input.aggregate.invocations, input.targetPercent, input.policy.split.z)
-  if (routed.kind === 'mismatch') {
+  // At 0% or 100% the binomial band has zero width, so any request still served by the other version while the
+  // split propagates is a "mismatch" (runs 2026-11-06T20-01-37-842Z and 20-11-49-685Z: 98.84% and 98.74% at 100%,
+  // both rolled back a clean version). There it is informational; the live smoke checks x-ply-version.
+  const degenerate = input.targetPercent <= 0 || input.targetPercent >= 100
+  if (routed.kind === 'mismatch' && degenerate && routed.share !== null) {
+    notes.push(`routed share ${points(routed.share)}% at target ${input.targetPercent}% (n=${routed.n}): split propagation`)
+  } else if (routed.kind === 'mismatch') {
     const where = routed.share === null
       ? 'new-version requests are not a fraction of the aggregate'
       : `routed share ${points(routed.share)}% is outside ${points(routed.low ?? 0)}..${points(routed.high ?? 0)} of target ${input.targetPercent}% (n=${routed.n})`
     const outcome = input.policy.split.onMismatch === 'rollback' ? 'rollback' : 'hold'
     return verdict(outcome, where, [{ name: 'routed_share', value: input.policy.split.z }], burns)
   }
+  const noted = notes.length === 0 ? '' : `; informational: ${notes.join('; ')}`
   if (routed.kind === 'untested' || routed.newRequests < input.policy.split.minNewRequests) {
     const reason = routed.kind === 'untested'
       ? `insufficient evidence: 0 requests in the window${noted}`

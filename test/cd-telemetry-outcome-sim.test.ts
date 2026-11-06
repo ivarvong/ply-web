@@ -57,7 +57,8 @@ function asStepInput(stats: ReturnType<typeof statsFromEvents>): StepInput {
 
 test('1000x: client-caused outcomes (canceled/clientDisconnected/responseStreamDisconnected) never roll back (old or new)', () => {
   const { policy } = loadPolicy(DEFAULT_POLICY_PATH)
-  const targetPercent = policy.steps.length > 0 ? policy.steps[0].percent : 10
+  // The fixtures split traffic evenly between the versions; judge them at the split they model.
+  const targetPercent = 50
   const rand = randLCG(0x12345678)
   const NEW = 'new-ver'
   const OLD = 'old-ver'
@@ -67,7 +68,8 @@ test('1000x: client-caused outcomes (canceled/clientDisconnected/responseStreamD
   for (let i = 0; i < 1000; i++) {
     const events: CfEvent[] = []
     const nOld = 100 + Math.floor(rand() * 50)
-    const nNew = 100 + Math.floor(rand() * 50)
+    // Within the 50% share band (z=3): the routed-share gate is not what this test is about.
+    const nNew = nOld + Math.floor(rand() * 11) - 5
     for (let j = 0; j < nOld; j++) events.push(fetchEvent(OLD, clientOutcomes[j % clientOutcomes.length]))
     for (let j = 0; j < nNew; j++) events.push(fetchEvent(NEW, clientOutcomes[(j + 1) % clientOutcomes.length]))
     const next = asStepInput(statsFromEvents(events.filter(e => eventVersion(e) === NEW), []))
@@ -81,7 +83,8 @@ test('1000x: client-caused outcomes (canceled/clientDisconnected/responseStreamD
 
 test('1000x: new-version worker faults roll back (exception or 5xx)', () => {
   const { policy } = loadPolicy(DEFAULT_POLICY_PATH)
-  const targetPercent = policy.steps.length > 0 ? policy.steps[0].percent : 10
+  // The fixtures split traffic evenly between the versions; judge them at the split they model.
+  const targetPercent = 50
   const rand = randLCG(0xC0FFEE)
   const NEW = 'new-ver'
   const OLD = 'old-ver'
@@ -124,7 +127,8 @@ test('1000x: new-version worker faults roll back (exception or 5xx)', () => {
 
 test('regression: 021b436e — two timed-out probes (2/2000) do not roll back', () => {
   const { policy } = loadPolicy(DEFAULT_POLICY_PATH)
-  const targetPercent = policy.steps.length > 0 ? policy.steps[0].percent : 10
+  // The fixtures split traffic evenly between the versions; judge them at the split they model.
+  const targetPercent = 50
   const NEW = 'new-ver'
   const OLD = 'old-ver'
   const events: CfEvent[] = []

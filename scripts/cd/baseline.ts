@@ -27,7 +27,8 @@ export const TELEMETRY_CHUNK = 50
 export const TELEMETRY_MAX_PAGES = 50
 /** Ingest lag observed on 2026-10-31 was 10–30s. Wait this long before calling a missing id lost. */
 export const TELEMETRY_WAIT_MS = 60_000
-export const TELEMETRY_POLLS_MS = [5_000, 10_000, 15_000] as const
+/** Re-query periods while smoke ids are missing. Ingest typically lands in 5–15 s, so poll tight then back off. */
+export const TELEMETRY_POLLS_MS = [3_000, 3_000, 3_000, 5_000, 5_000, 10_000] as const
 /** `to` is now plus this, matching scripts/canary-o11y.mjs, so the last events are inside the window. */
 export const QUERY_SLACK_MS = 60_000
 

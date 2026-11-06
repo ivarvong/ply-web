@@ -1,4 +1,4 @@
-export type StageName = 'bump' | 'deploy-canary' | 'smoke' | 'telemetry' | 'ramp' | 'rollback'
+export type StageName = 'bump' | 'deploy-canary' | 'smoke' | 'telemetry' | 'ramp' | 'promote' | 'visual' | 'rollback'
 
 export type Pass<T> = {
   readonly kind: 'pass'

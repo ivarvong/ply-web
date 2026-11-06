@@ -132,9 +132,14 @@ test('any exception, 5xx, error log, or non-ok outcome rolls back before the sam
   const logged = judge(side({ requests: 1, errorLogs: 1 }), side({ requests: 4 }), policy)
   assert.equal(logged.outcome, 'rollback')
   assert.equal(logged.reason, '1 error log on the new version')
-  const old = judge(side({ requests: MIN_SAMPLES }), side({ requests: MIN_SAMPLES, fivexx: 1 }), policy)
-  assert.equal(old.outcome, 'rollback')
-  assert.equal(old.reason, '1 5xx response on the old version')
+})
+
+// Run 2026-11-06T20-57-44-803Z rolled a clean new version back for "1 5xx response on the old version".
+test('the old version and the aggregate never fail the new release; they are named as informational', () => {
+  const policy = checkedPolicy()
+  const old = judge(side({ requests: MIN_SAMPLES }), side({ requests: MIN_SAMPLES, fivexx: 1, exceptions: 1, errorLogs: 1, errors: 1 }), policy)
+  assert.equal(old.outcome, 'advance')
+  assert.match(old.reason, /informational: .*1 5xx response on the old version/)
   const across = judge(
     side({ requests: MIN_SAMPLES }),
     side({ requests: MIN_SAMPLES }),
@@ -142,8 +147,11 @@ test('any exception, 5xx, error log, or non-ok outcome rolls back before the sam
     50,
     side({ requests: MIN_SAMPLES * 2, fivexx: 1 }),
   )
-  assert.equal(across.outcome, 'rollback')
-  assert.equal(across.reason, '1 5xx response across the worker')
+  assert.equal(across.outcome, 'advance')
+  assert.match(across.reason, /informational: .*1 5xx response across the worker/)
+  const newer = judge(side({ requests: MIN_SAMPLES, fivexx: 1 }), side({ requests: MIN_SAMPLES, fivexx: 3 }), policy)
+  assert.equal(newer.outcome, 'rollback')
+  assert.equal(newer.reason, '1 5xx response on the new version')
 })
 
 test('the checked-in policy does not roll back on wall time', () => {

@@ -8,6 +8,11 @@
   ],
   "ingestWaitMs": 20000,
   "warmupMs": 10000,
+  "promote": {
+    "watchMs": 60000,
+    "ingestWaitMs": 30000,
+    "ingestPollMs": 3000
+  },
   "probe": {
     "rps": 25,
     "maxLossRate": 0.0012658227848101266,

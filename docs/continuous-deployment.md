@@ -1,6 +1,36 @@
 # Continuous deployment
 
-You ship ply-web from a Linux box where `cf` is already logged in. One command uploads the commit you have checked out, smokes it at 0%, then walks traffic from 0% to 100%. Each ramp step sends unpinned probes for 40s and then waits 20s so the telemetry tail is ingested. If a hard gate fails, traffic goes back to the previous version and the command exits. GitHub holds the code and the pull request. It does not deploy.
+You ship ply-web from a box where `cf` is already logged in. One command uploads the commit you have checked out at **0%** beside the current 100% version, smokes it pinned with `Cloudflare-Workers-Version-Overrides`, checks the telemetry of those pinned requests, then **promotes it straight to 100%** and watches it live for `promote.watchMs` (60 s). During the watch the live lifecycle smoke, its telemetry and the CDP visual smoke run in parallel. A new-version regression (5xx, exceptions, error logs, non-ok outcomes, burn) in the watch or a failed live check puts the previous version back at 100% and the command exits 1. GitHub holds the code and the pull request. It does not deploy.
+
+```sh
+PLY_TOKEN_FILE=~/.config/ply/worker-token PLY_NODE=<node >= 24.22> env -u CLOUDFLARE_API_TOKEN npm run cd -- --no-bump
+```
+
+Only one `cd.sh` may run against the Worker at a time: check `pgrep -fl 'scripts/cd/main.ts'` first.
+
+### Default: direct promote (since 2026-11-06)
+
+| Stage | What | Typical |
+| --- | --- | --- |
+| bump | pin check (`--no-bump` skips) | 0–9 s |
+| deploy-canary | build, upload, route 0% beside the 100% version, record `version` + `previous` | 12–20 s |
+| smoke | pinned lifecycle smoke against the 0% version | 25–40 s |
+| telemetry | the pinned requests' logs and spans, polled every 3 s until they land | 10–25 s |
+| promote | 100% in one write, then the live watch: unpinned probes for `promote.watchMs`, then the new version's telemetry, polled every `promote.ingestPollMs` until the probes have landed (ceiling `promote.ingestWaitMs`) | 70–90 s |
+| smoke-live, telemetry-live, visual | start the moment the split is at 100% and run inside the watch | (parallel) |
+
+What can fail a release, and what cannot:
+
+- Only the **new** version's own signals are hard. Errors on the old version (stragglers while the split propagates) and on the aggregate are named on the line as `informational` and never roll back (run 2026-11-06T20-57-44-803Z rolled back a clean version for "1 5xx response on the old version").
+- At 0% and 100% the routed-share band has zero width, so a share like 98.74% at 100% is split propagation, noted as informational (runs 2026-11-06T20-01-37-842Z, 20-11-49-685Z). The live smoke and the visual smoke still assert `x-ply-version`.
+- Probe loss in the watch (client aborts, the probe tail) is the harness: under the promote, `probe.onHarnessFault` is `telemetry`, so the loss is recorded and the step is judged on the new version's telemetry. A Worker 5xx is in that telemetry. A harness stall re-runs the window, as before.
+- A live check that could not run (no Chrome, a telemetry query that never returned) is `harness_fault`: the new version stays live, the run says so, nothing is rolled back.
+
+### `--ramp`: the stepped schedule
+
+`npm run cd -- --no-bump --ramp` runs the original ramp in `steps` (10 → 25 → 50 → 75 → 100, 40 s dwell, 10 s warm-up, 20 s ingest wait per step: about 10 minutes), then the live smoke and telemetry after 100%. Use it for a risky change where you want the new version under partial traffic first. The two judgement fixes above apply to it too.
+
+The rest of this page describes the stages one by one; the ramp sections are the `--ramp` path.
 
 ![Operator pipeline. The left column is gate, deploy, smoke, telemetry, ramp, live smoke, live telemetry, done. Failures leave to the right.](img/cd-pipeline.png)
 
@@ -389,7 +419,7 @@ If the rollback request itself does not stick, the last line says so and names t
 
 ## 6. After 100%
 
-`npm run cd` does not stop at the last ramp line. It smokes again with **no** version override (`--expect-version`), then runs telemetry on that live window. Both have to pass.
+`npm run cd` does not stop at 100%. It smokes again with **no** version override (`--expect-version`), then runs telemetry on that live window, and runs the CDP visual smoke (`scripts/visual-smoke.mjs`, 375 + 1280 px, light + dark, every page pinned to the new version; screenshots in `<run>/visual/`, verdict in `<run>/visual.json`). All have to pass. Under the default promote these start the moment the split is written and run during the live watch; under `--ramp` the smoke and telemetry run after the last step. A visual smoke with no Chrome (`CHROME` unset and no macOS Chrome) is recorded as skipped. Events written while the checks run in parallel may carry the label of the stage that last started; the stage timings in the manifest are exact.
 
 Pass is the same `cd: PASS <version id> ply <ply sha> web <ply-web sha>` as the whole run.
 

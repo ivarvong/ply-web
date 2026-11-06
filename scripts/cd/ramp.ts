@@ -208,6 +208,8 @@ export type RampIo = {
   dwell?(ms: number, percent: number): Promise<{ readonly outcomes: readonly ProbeOutcome[] }>
   applySplit(percent: number): Promise<null | string | HeldWrite>
   observe(from: number, to: number, percent: number): Promise<Observation>
+  /** Called once a step's split is written (or already in place). The direct promote starts the live checks here. */
+  onApplied?(percent: number): void
   /** Called with the observation ref. A missing ref is a bug: a decision without an observation. */
   onDecision?(ref: ObservationRef, decision: RampDecision, percent: number): Promise<void>
   rollback(): Promise<null | string | HeldWrite>
@@ -264,6 +266,8 @@ async function settleHarnessFault(
   if (percent <= 0) return { state: { kind: 'stopped', reason, fault: 'harness_fault', traffic: 'held' }, rollbackError: null }
   switch (policy.probe.onHarnessFault) {
     case 'rollback':
+    // A telemetry-unavailable fault under `telemetry` has nothing left to judge on: restore the previous version.
+    case 'telemetry':
       return rollbackTraffic(io, reason)
     case 'hold': {
       if (lastPassed.tag === 'none' || lastPassed.value <= 0) return rollbackTraffic(io, reason)
@@ -371,6 +375,36 @@ async function probeWindows(
   }
 }
 
+/**
+ * Wait for the dwell's tail to be ingested, then observe. With `ingestPollMs` the window is
+ * re-queried every period until the worker has logged as many invocations as probes answered
+ * (they are the bulk of the window) or `ingestWaitMs` has passed; without it, one fixed sleep.
+ * Without probes there is no count to wait for, so the full wait runs.
+ */
+export async function observeAfterIngest(
+  policy: RolloutPolicy,
+  io: Pick<RampIo, 'now' | 'sleep' | 'observe'>,
+  from: number,
+  to: number,
+  percent: number,
+  probes: ProbeLoss | null,
+): Promise<Observation> {
+  if (policy.ingestPollMs <= 0 || probes === null || probes.responded === 0) {
+    await io.sleep(policy.ingestWaitMs)
+    return io.observe(from, to, percent)
+  }
+  const deadline = io.now() + policy.ingestWaitMs
+  for (;;) {
+    await io.sleep(Math.min(policy.ingestPollMs, Math.max(0, deadline - io.now())))
+    const observed = await io.observe(from, to, percent)
+    if (io.now() >= deadline) return observed
+    if (observed.kind === 'sample' && observed.aggregate.invocations >= probes.responded * INGEST_LANDED) return observed
+  }
+}
+
+/** Share of answered probes the worker must have logged before the polled ingest wait stops. Workers Observability drops a few. */
+export const INGEST_LANDED = 0.98
+
 export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLoopResult> {
   const lines: string[] = []
   const steps: RampStepRecord[] = []
@@ -406,6 +440,7 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
       state = { kind: 'rolled-back', reason: splitError }
       break
     }
+    if (io.onApplied) io.onApplied(percent)
     if (policy.warmupMs > 0) await io.sleep(policy.warmupMs)
     const from = io.now()
     let probeLoss = emptyProbeLoss(policy.probe.maxLossRate)
@@ -413,7 +448,10 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
     if (dwell) {
       const window = await probeWindows(policy, io, dwell, step.dwellMs, percent)
       probeLoss = window.loss
-      if (window.kind !== 'ok') {
+      // `telemetry`: a probe-loss fault is the harness (client aborts, probe tail). Record it and judge the step on the
+      // new version's telemetry below; a 5xx the Worker served is in that telemetry.
+      const deferred = window.kind === 'harness_fault' && policy.probe.onHarnessFault === 'telemetry'
+      if (window.kind !== 'ok' && !deferred) {
         const decision = probeWindowDecision(policy, window)
         const noted = withProbeRules(decision, probeLoss)
         const line = progressLine({
@@ -454,8 +492,7 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
     // Wait for the dwell's own tail to land, then query that window. The next step
     // has not started. The checked-in wait is above the 2026-11-01 gaps: 12640ms
     // at 1% and 17313ms at 5% on run 2026-11-01T00-10-02-620Z.
-    await io.sleep(policy.ingestWaitMs)
-    const observed = await io.observe(from, to, percent)
+    const observed = await observeAfterIngest(policy, io, from, to, percent, io.dwell ? probeLoss : null)
     if (observed.kind === 'sample' && observed.previous.wallMs.length >= CARRY_WALL_SAMPLES) carried = observed.previous
     const carriedPrevious = observed.kind === 'sample'
       && percent === 100

@@ -501,6 +501,21 @@
       "value": 1000,
       "status": "PRIOR (uncalibrated)",
       "why": "Clamp on an operator-set rate, not a load threshold."
+    },
+    "policy:promote.watchMs": {
+      "value": 60000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Live watch after the direct promote (2026-11-06, Ivar: green change to 100% in <= 3 min). One minute of unpinned probes at 25 rps x 2 calls is ~3000 probes, above probe.minSamples 1000 and burn.minSamples 100; the live smoke (~45 s on run 2026-11-06T21-06-26-841Z) runs inside it."
+    },
+    "policy:promote.ingestWaitMs": {
+      "value": 30000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Ceiling on the polled ingest wait after the watch. Above the 17313 ms gap measured on run 2026-11-01T00-10-02-620Z (policy:ingestWaitMs) with headroom; the poll usually stops earlier once the probes have landed."
+    },
+    "policy:promote.ingestPollMs": {
+      "value": 3000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Re-query period for the polled ingest wait: each poll is two telemetry queries of ~1 s (run 2026-11-06T21-06-26-841Z), so 3 s keeps the query load under one in flight."
     }
   }
 }
