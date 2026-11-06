@@ -382,6 +382,8 @@ ${phone} {
 .wf-detail { padding: 0 ${S.md} ${S.md}; }
 .detail { margin: 0; padding: ${S.sm} ${S.md}; border-radius: ${R.sm}; background: var(--color-kumo-recessed); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-color-kumo-subtle); font-family: var(--font-mono); font-size: 11px; line-height: 1.5; }
 .wf-pack { display: inline-block; margin-top: ${S.sm}; font-weight: 500; }
+.wf-caption { margin: 0; padding: ${S.sm} ${S.md} 0; color: var(--text-color-kumo-subtle); line-height: 1.5; border-top: 1px solid var(--color-kumo-hairline); }
+.wf-caption + .wf-legend { border-top: 0; }
 .wf-legend { margin: 0; padding: ${S.sm} ${S.md}; display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--text-color-kumo-subtle); border-top: 1px solid var(--color-kumo-hairline); }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: 0; }
 ${wide} {

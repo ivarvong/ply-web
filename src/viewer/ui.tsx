@@ -295,6 +295,14 @@ function callLabel(bar: TraceBar): { name: string; tag: string } {
   return { name, tag }
 }
 
+/** What each git call is for, in plain words (the row's title and the legend under the waterfall). */
+function callPurpose(name: string): string {
+  if (name === 'discover') return 'Capability handshake: which protocol and features the server speaks (GET info/refs)'
+  if (name === 'ls-refs') return 'Branch and tag tips: names to commit ids (protocol v2 ls-refs)'
+  if (name === 'fetch') return 'A packfile: the objects asked for by id, with the filter shown (protocol v2 fetch)'
+  return 'One HTTP round trip to the git server'
+}
+
 export function Waterfall(props: { trace: TraceModel; host: string; repoPath: string; ref: string | null }) {
   const trace = props.trace
   if (!trace.bars.length) return null
@@ -320,7 +328,7 @@ export function Waterfall(props: { trace: TraceModel; host: string; repoPath: st
         return (
           <details class={failed ? 'wf-row err' : 'wf-row'} role="row">
             <summary class="wf-sum">
-              <span class="wf-name" role="cell"><span class="wf-call">{label.name}</span>{label.tag ? <span class="wf-tag">{label.tag}</span> : null}</span>
+              <span class="wf-name" role="cell" title={callPurpose(label.name)}><span class="wf-call">{label.name}</span>{label.tag ? <span class="wf-tag">{label.tag}</span> : null}</span>
               <span class="num wf-status" role="cell">{bar.httpStatus === null ? '—' : String(bar.httpStatus)}</span>
               <span class="num" role="cell">{bar.bytes === null ? '—' : formatBytes(bar.bytes)}{bar.cache === 'HIT' ? <span class="wf-hit" title="Served from Workers Cache"> · hit</span> : null}</span>
               <span class="num wf-ms" role="cell">{formatDuration(bar.durMs)}</span>
@@ -335,6 +343,7 @@ export function Waterfall(props: { trace: TraceModel; host: string; repoPath: st
           </details>
         )
       })}
+      <p class="wf-caption">Each row is one HTTP round trip ply made to the git server for this page, on one timeline. <span class="mono">discover</span> asks what the server speaks, <span class="mono">ls-refs</span> lists branch tips, <span class="mono">fetch</span> brings objects by id. A hit was served by Workers Cache. Tap a row for its wire details.</p>
       <p class="wf-legend" aria-hidden="true">
         <span><i class="dot c-discover"></i>handshake</span>
         <span><i class="dot c-fetch"></i>fetch</span>

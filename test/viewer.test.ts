@@ -410,6 +410,9 @@ test('header identity: public-v0 leads with namespace / repo; GitHub with owner 
   assert.match(text, /^ply 3 git calls 200 ms 29 KiB 1 cached protocol v2$/)
   assert.equal(inner.split('class="wf-bar ').length - 1, 3)
   assert.ok(strip.indexOf('class="ply-strip"') < strip.indexOf('class="files"'), 'strip sits above the listing')
+  // the waterfall explains itself: a caption, and each call's purpose as its title
+  assert.match(strip, /<p class="wf-caption">Each row is one HTTP round trip ply made/)
+  assert.match(strip, /<span class="wf-name" role="cell" title="Branch and tag tips: names to commit ids \(protocol v2 ls-refs\)">/)
 })
 
 test('rate and byte caps clamp and fail closed', () => {
