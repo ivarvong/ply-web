@@ -55,7 +55,7 @@ const MAX_ERROR_BODY = 64 * 1024;
 /** A pack is stored only after GitCache has verified it, and it buffers the pack to do so; bigger ones pass through unstored. */
 export const MAX_VERIFIED_PACK = VERIFY_CAPS.maxPackBytes;
 
-const wantsOf = (body: Uint8Array) => [...latin1(body).matchAll(/[0-9a-f]{4}want ([0-9a-f]{40})\n/g)].map(m => m[1] as string);
+const wantsOf = (text: string) => [...text.matchAll(/[0-9a-f]{4}want ([0-9a-f]{40})\n/g)].map(m => m[1] as string);
 
 /**
  * Verify a buffered upload-pack fetch answer with ply's own parser: frame it, parse the pack, resolve every delta and
@@ -63,10 +63,11 @@ const wantsOf = (body: Uint8Array) => [...latin1(body).matchAll(/[0-9a-f]{4}want
  * retry-past-the-cache, so an unverified pack must never be stored as immutable.
  */
 export async function verifyPackResponse(url: string, body: Uint8Array, bytes: Uint8Array, contentType: string): Promise<{ ok: true; objects: number } | { ok: false; reason: string }> {
-  const wants = wantsOf(body);
+  const text = latin1(body);
+  const wants = wantsOf(text);
   if (!wants.length) return { ok: false, reason: 'no wants' };
-  const deepen = captureGroup(/[0-9a-f]{4}deepen (\d+)\n/.exec(latin1(body)), 1);
-  const filter = captureGroup(/[0-9a-f]{4}filter ([^\n]+)\n/.exec(latin1(body)), 1);
+  const deepen = captureGroup(/[0-9a-f]{4}deepen (\d+)\n/.exec(text), 1);
+  const filter = captureGroup(/[0-9a-f]{4}filter ([^\n]+)\n/.exec(text), 1);
   const replay = async () => new Response(bytes.slice(), { status: 200, headers: { 'content-type': contentType } });
   try {
     const made = createTransport(url, { tracer: new Tracer({ exporter: () => {}, maxEvents: 0, resource: {} }), fetchImpl: replay, userAgent: 'ply-gitcache', limits: VERIFY_LIMITS, signal: AbortSignal.timeout(30_000), quirks: {} });
@@ -117,32 +118,49 @@ export function cacheableUpstream(method: string, url: string): boolean {
   return publicUploadPackRepo(method, url) !== null || forgeUploadPack(method, url);
 }
 
-const latin1 = (b: Uint8Array) => { let s = ''; for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i] as number); return s; };
+// One char per byte, in chunks (a routed body is at most MAX_ROUTED_BODY): the old per-byte `s +=` built a rope of 4096
+// one-char strings per call, and the loopback built it twice per exchange (classify, then base64).
+const latin1 = (b: Uint8Array) => {
+  let s = '';
+  for (let i = 0; i < b.length; i += 1024) s += String.fromCharCode.apply(null, b.subarray(i, i + 1024) as unknown as number[]);
+  return s;
+};
+
+// pkt-lines: 4 hex length, then the payload; anchor to the length prefix so text inside a payload can't match.
+const LS_REFS = /[0-9a-f]{4}command=ls-refs\n/;
+const FETCH = /[0-9a-f]{4}command=fetch\n/;
+const NOT_PURE = /[0-9a-f]{4}(have [0-9a-f]{40}\n|want-ref |deepen-(since|not) |shallow [0-9a-f]{40}\n)/;
+const WANT = /[0-9a-f]{4}want [0-9a-f]{40}\n/;
+
+/** classify on a body already read as latin1 text (`null`: no body). */
+function classifyText(method: string, url: string, t: string | null): CacheKind | null {
+  if (method.toUpperCase() === 'GET') return url.endsWith('/info/refs?service=git-upload-pack') && t === null ? 'discover' : null;
+  if (t === null) return null;
+  if (LS_REFS.test(t)) return 'refs';
+  if (!FETCH.test(t)) return null;
+  if (NOT_PURE.test(t)) return null;
+  return WANT.test(t) ? 'pack' : null;
+}
 
 /** Which cache policy an upload-pack exchange gets, or null when it is not a pure function of its request. */
 export function classify(method: string, url: string, body: Uint8Array | null): CacheKind | null {
-  if (method.toUpperCase() === 'GET') return url.endsWith('/info/refs?service=git-upload-pack') && !body ? 'discover' : null;
-  if (!body) return null;
-  const t = latin1(body);
-  // pkt-lines: 4 hex length, then the payload; anchor to the length prefix so text inside a payload can't match.
-  const has = (re: RegExp) => re.test(t);
-  if (has(/[0-9a-f]{4}command=ls-refs\n/)) return 'refs';
-  if (!has(/[0-9a-f]{4}command=fetch\n/)) return null;
-  if (has(/[0-9a-f]{4}have [0-9a-f]{40}\n/) || has(/[0-9a-f]{4}want-ref /) || has(/[0-9a-f]{4}deepen-(since|not) /) || has(/[0-9a-f]{4}shallow [0-9a-f]{40}\n/)) return null;
-  return has(/[0-9a-f]{4}want [0-9a-f]{40}\n/) ? 'pack' : null;
+  return classifyText(method, url, body === null ? null : latin1(body));
 }
 
-function toBase64(b: Uint8Array): string { return btoa(latin1(b)); }
 function fromBase64(s: string): Uint8Array { const bin = atob(s); const out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; }
 
+const HEX = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0'));
+const ENCODER = new TextEncoder();
+
 export async function keyHash(kind: CacheKind, url: string, gitProtocol: string, body: Uint8Array | null): Promise<string> {
-  const head = new TextEncoder().encode(`ply-gitcache\n${kind}\n${url}\n${gitProtocol}\n`);
-  const all = new Uint8Array(head.length + (body === null ? 0 : body.length));
-  all.set(head);
-  if (body) all.set(body, head.length);
-  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', all));
+  const head = `ply-gitcache\n${kind}\n${url}\n${gitProtocol}\n`;
+  // UTF-8 is at most 3 bytes per UTF-16 unit: one buffer for head and body, no second copy.
+  const all = new Uint8Array(head.length * 3 + (body === null ? 0 : body.length));
+  const { written } = ENCODER.encodeInto(head, all);
+  if (body) all.set(body, written);
+  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', all.subarray(0, written + (body === null ? 0 : body.length))));
   let hex = '';
-  for (const x of d) hex += x.toString(16).padStart(2, '0');
+  for (let i = 0; i < d.length; i++) hex += HEX[d[i] as number];
   return hex;
 }
 
@@ -176,19 +194,21 @@ export function createLoopbackFetch(direct: FetchLike, loopback: (() => Loopback
     const methodField = chainGet(init, 'method');
     const method = methodField.tag === 'some' && typeof methodField.value === 'string' ? methodField.value : 'GET';
     const headerField = chainGet(init, 'headers');
-    const headers = headerField.tag === 'some' ? new Headers(headerField.value as HeadersInit) : new Headers();
+    // ply hands a Headers; read it in place rather than copying it per exchange.
+    const headers = headerField.tag === 'none' ? new Headers() : headerField.value instanceof Headers ? headerField.value : new Headers(headerField.value as HeadersInit);
     if (headers.has('authorization')) return direct(input, init);
     if (!cacheableUpstream(method, url)) return direct(input, init);
     const bodyField = chainGet(init, 'body');
     const body = bodyField.tag === 'some' && bodyField.value instanceof Uint8Array ? bodyField.value : null;
     if (bodyField.tag === 'some' && bodyField.value && body === null) return direct(input, init);
     if (body && body.length > MAX_ROUTED_BODY) return direct(input, init);
-    const kind = classify(method, url, body);
+    const text = body === null ? null : latin1(body);
+    const kind = classifyText(method, url, text);
     if (!kind) return direct(input, init);
     const proto = unwrapOr(header(headers, 'git-protocol'), '');
     const hash = await keyHash(kind, url, proto, body);
     const carry = new Headers({ [H_URL]: url, [H_PROTO]: proto, [H_UA]: unwrapOr(header(headers, 'user-agent'), '') });
-    if (body) carry.set(H_BODY, toBase64(body));
+    if (text !== null) carry.set(H_BODY, btoa(text));
     const signalField = chainGet(init, 'signal');
     const carried = { headers: carry, redirect: 'manual' as const, ...(signalField.tag === 'some' ? { signal: signalField.value as AbortSignal } : {}) };
     if (headers.get('x-ply-cache') === 'bust') {
