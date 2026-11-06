@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url'
 import type { Json } from './log.ts'
 
 /** Checked-in rollout policy. Override a run with `--policy <path>`. */
+// Every numeric threshold in the policy file has a provenance entry in scripts/calibrate/thresholds.json: a cited
+// distribution or `PRIOR (uncalibrated)` (issue #73, test/calibrate-provenance.test.ts).
 export const DEFAULT_POLICY_PATH = fileURLToPath(new URL('./cd.policy.json', import.meta.url))
 
 export type SignalMode = 'hard' | 'informational'

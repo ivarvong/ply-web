@@ -1,5 +1,6 @@
 // Caps for the public viewer. They are not environment-tunable: a mis-set var must not raise them.
 // Rate limits are the exception (tests lower them); even those are clamped.
+// Every number in VIEWER_CAPS has a provenance entry in scripts/calibrate/thresholds.json (issue #73).
 import { withLimits } from 'ply';
 import type { Option } from '../option.ts';
 

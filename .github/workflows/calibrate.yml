@@ -1,0 +1,95 @@
+name: Calibrate
+
+# Weekly re-calibration (issue #73): read the last seven days of span telemetry from Workers Observability, judge every
+# threshold in scripts/calibrate/thresholds.json that names a metric against it, and open an issue when one has left its
+# band or a threshold has no provenance. The query needs a Cloudflare API token with Workers Observability read access
+# and the account id, as repository secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID (the variables `cf`, which
+# the CD uses, reads). Without them the run reports that it was skipped and passes.
+
+on:
+  schedule:
+    # Mondays 14:17 UTC, off the hour.
+    - cron: "17 14 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: calibrate
+  cancel-in-progress: false
+
+jobs:
+  calibrate:
+    permissions:
+      contents: read
+      issues: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CF_SEND_TELEMETRY: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # cf needs Node ^22.23, ^24.22 or ^26.12. A bare major can resolve to an older cached release.
+          node-version: 24.22
+          cache: npm
+      # package-lock resolves ply as git+ssh. Actions has no SSH key; the repo is public.
+      - name: Fetch GitHub git dependencies over HTTPS
+        run: |
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/"
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+      - run: npm ci
+      - name: Provenance (no credentials needed)
+        run: node --experimental-strip-types --import ./test/register-tsx.mjs --test test/calibrate-provenance.test.ts
+      - name: Re-calibrate from the last seven days
+        id: calibrate
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -uo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID}" ]; then
+            echo "::notice::CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID is not set; re-calibration skipped"
+            echo "outcome=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          node --experimental-strip-types scripts/calibrate/main.ts --since 7d --check --no-histogram \
+            --report "$RUNNER_TEMP/drift.md" --json "$RUNNER_TEMP/calibrate.json" | tee "$RUNNER_TEMP/calibrate.txt"
+          code=${PIPESTATUS[0]}
+          case "$code" in
+            0) echo "outcome=in-band" >> "$GITHUB_OUTPUT" ;;
+            1) echo "outcome=drift" >> "$GITHUB_OUTPUT" ;;
+            *) echo "outcome=error" >> "$GITHUB_OUTPUT" ;;
+          esac
+          exit "$code"
+      - name: Open or update the drift issue
+        if: failure() && steps.calibrate.outputs.outcome == 'drift'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Calibration drift: a threshold left its band"
+          printf '\n%s\n' "Run: ${RUN_URL}" >> "$RUNNER_TEMP/drift.md"
+          existing=$(gh issue list --state open --search "\"${title}\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body-file "$RUNNER_TEMP/drift.md"
+          else
+            gh issue create --title "${title}" --body-file "$RUNNER_TEMP/drift.md"
+          fi
+      - name: Keep the report
+        if: always() && steps.calibrate.outputs.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: calibrate
+          path: |
+            ${{ runner.temp }}/calibrate.txt
+            ${{ runner.temp }}/calibrate.json
+            ${{ runner.temp }}/drift.md
+          if-no-files-found: ignore

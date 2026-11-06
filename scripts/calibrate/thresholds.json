@@ -1,0 +1,500 @@
+{
+  "$comment": [
+    "Provenance of every threshold in scripts/cd/cd.policy.json and ply-web's limits (src/limits.ts, src/viewer/limits.ts), issue #73.",
+    "Each entry is either status 'calibrated' with source, query, window, date, n, percentile and headroom, or status 'PRIOR (uncalibrated)' with why.",
+    "value must equal the threshold's current value: changing a threshold without updating its citation fails test/calibrate-provenance.test.ts.",
+    "metric names the distribution that calibrates it (attribute, route or '*', quantile, headroom multiplier, band ratio); scripts/calibrate --check reads it.",
+    "Key form: '<source>:<path>'; policy paths may use [*] for every array element, with value the array of element values."
+  ],
+  "minN": {
+    "value": 30,
+    "status": "PRIOR (uncalibrated)",
+    "why": "Fewest samples in a route's group before scripts/calibrate --check judges a band; below it the result is insufficient, never drift. A round floor."
+  },
+  "thresholds": {
+    "policy:steps[*].percent": {
+      "value": [
+        10,
+        25,
+        50,
+        75,
+        100
+      ],
+      "status": "PRIOR (uncalibrated)",
+      "why": "Ramp schedule chosen by hand; no step-size study. Calibrate from the per-step detectable effect (scripts/cd/forecast.ts lines) once enough ramps are logged."
+    },
+    "policy:steps[*].dwellMs": {
+      "value": [
+        40000,
+        40000,
+        40000,
+        40000,
+        40000
+      ],
+      "status": "PRIOR (uncalibrated)",
+      "why": "Round dwell; the forecast line of each step prints the detectable effect this dwell buys at the measured request rate."
+    },
+    "policy:ingestWaitMs": {
+      "value": 20000,
+      "status": "calibrated",
+      "source": "run 2026-11-01T00-10-02-620Z",
+      "query": "per-step ingest gap: last event timestamp minus dwell end, Workers Observability events view, service ply",
+      "window": "1% and 5% ramp steps",
+      "date": "2026-11-01",
+      "n": 2,
+      "percentile": "max of two measured gaps (12640ms, 17313ms); not a percentile",
+      "headroom": "20000 is 1.16x the larger gap"
+    },
+    "policy:warmupMs": {
+      "value": 0,
+      "status": "PRIOR (uncalibrated)",
+      "why": "No warmup: nothing measured needed one."
+    },
+    "policy:probe.rps": {
+      "value": 25,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Round probe rate; it sets the probe sample count per dwell (rps x calls x dwell), not derived from a distribution."
+    },
+    "policy:probe.maxLossRate": {
+      "value": 0.0012658227848101266,
+      "status": "calibrated",
+      "source": "run 2026-11-01T17-06-08-780Z",
+      "query": "probe outcomes (scripts/cd/probe.ts) lost / issued",
+      "window": "100% ramp step",
+      "date": "2026-11-01",
+      "n": 790,
+      "percentile": "one measured step (1/790), not a percentile",
+      "headroom": "none above the measured loss; a greater rate is a fault (cd.policy.json probe.calibration)"
+    },
+    "policy:probe.timeoutMs": {
+      "value": 2000,
+      "status": "calibrated",
+      "source": "run 2026-11-01T19-40-35-485Z",
+      "query": "probe latencyMs by outcome (scripts/cd/probe.ts)",
+      "window": "50% ramp step",
+      "date": "2026-11-01",
+      "n": 118,
+      "percentile": "healthy response p50 41-101ms on both versions",
+      "headroom": "above 10x the healthy p50 upper bound (1010ms), below the 69830ms stall (cd.policy.json probe.schedule)"
+    },
+    "policy:probe.maxInFlight": {
+      "value": 50,
+      "status": "PRIOR (uncalibrated)",
+      "why": "cd.policy.json probe.schedule.headroom: the previous cap was one second of ticks times 2 calls; healthy in-flight is about 5."
+    },
+    "policy:probe.minSamples": {
+      "value": 1000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "cd.policy.json probe.schedule.headroom: a round floor above the 128-sample stalled window and below the ~1990 of a healthy step."
+    },
+    "policy:probe.stallLatencyMs": {
+      "value": 1000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "cd.policy.json probe.schedule.headroom: a round threshold above the 101ms p50 and below timeoutMs."
+    },
+    "policy:probe.windowAttempts": {
+      "value": 2,
+      "status": "calibrated",
+      "source": "run 2026-11-01T19-40-35-485Z",
+      "query": "stalled probe windows per step (scripts/cd/probe.ts judgeProbeWindow retry)",
+      "window": "50% ramp step",
+      "date": "2026-11-01",
+      "n": 1,
+      "percentile": "one stalled window observed, not a percentile",
+      "headroom": "the stalled window plus one re-run"
+    },
+    "policy:probe.windowBackoffMs": {
+      "value": 1000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "cd.policy.json probe.schedule.headroom: the run did not wait between windows."
+    },
+    "policy:burn.fastBurn": {
+      "value": 14.4,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Google SRE workbook fast-burn multiple (scripts/cd/slo.ts FAST_BURN): an external convention, not a ply-web distribution."
+    },
+    "policy:burn.minSamples": {
+      "value": 100,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Round floor before a burn rate is judged (scripts/cd/slo.ts MIN_SAMPLES)."
+    },
+    "policy:split.z": {
+      "value": 3,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Three standard errors on the routed-share binomial band; a convention, not fitted to observed split noise."
+    },
+    "policy:split.minNewRequests": {
+      "value": 100,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Round floor of new-version requests before a step can advance."
+    },
+    "policy:telemetry.maxLossRate": {
+      "value": 0.5,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Default (scripts/cd/policy.ts DEFAULT_MAX_LOSS_RATE): fail only when more than half the smoke ids are missing. Calibrate from the telemetry-loss observations the CD logs per run."
+    },
+    "policy:telemetry.query.attempts": {
+      "value": 3,
+      "status": "calibrated",
+      "source": "run 2026-11-01T19-17-18-170Z",
+      "query": "cf o11y telemetry query exit status per invocation (scripts/cd/query-retry.ts)",
+      "window": "100% ramp step",
+      "date": "2026-11-01",
+      "n": 1,
+      "percentile": "one measured timeout, not a percentile",
+      "headroom": "two attempts past the single timeout that rolled the step back"
+    },
+    "policy:telemetry.query.backoffMs": {
+      "value": 1000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "cd.policy.json telemetry.query.calibration.headroom: the run did not retry."
+    },
+    "policy:cleanup.attempts": {
+      "value": 3,
+      "status": "calibrated",
+      "source": "run 2026-11-01T17-29-43-122Z",
+      "query": "cf artifacts repo delete exit status (scripts/cd/cleanup.ts)",
+      "window": "post-ramp scratch repo delete",
+      "date": "2026-11-01",
+      "n": 1,
+      "percentile": "one measured delete (103000ms timeout, then 404), not a percentile",
+      "headroom": "one attempt past the timeout-then-404 that confirmed deletion"
+    },
+    "policy:cleanup.backoffMs": {
+      "value": 1000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "cd.policy.json cleanup.calibration.headroom: the confirming retry was immediate."
+    },
+    "policy:cleanup.staleMinutes": {
+      "value": 60,
+      "status": "PRIOR (uncalibrated)",
+      "why": "cd.policy.json cleanup.calibration.headroom: the previous sweep age, not a measured leak age."
+    },
+    "api:maxObjectSize": {
+      "value": 16777216,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Derived from the 128 MiB isolate budget (src/limits.ts), not from a request distribution.",
+      "metric": {
+        "attribute": "git.read.blob.size",
+        "route": "api",
+        "quantile": 0.999,
+        "headroom": 4,
+        "band": 2
+      }
+    },
+    "api:maxPackBytes": {
+      "value": 33554432,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Derived from the 128 MiB isolate budget (src/limits.ts), not from a request distribution.",
+      "metric": {
+        "attribute": "git.pack.bytes",
+        "route": "api",
+        "quantile": 0.999,
+        "headroom": 4,
+        "band": 2
+      }
+    },
+    "api:maxHarvestBytes": {
+      "value": 16777216,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Derived from the 128 MiB isolate budget (src/limits.ts), not from a request distribution."
+    },
+    "api:maxInflatedTotal": {
+      "value": 67108864,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Four maximum-sized objects (merge-base triple plus commit) under the isolate budget; not from a distribution.",
+      "metric": {
+        "attribute": "git.pack.inflated.bytes",
+        "route": "api",
+        "quantile": 0.999,
+        "headroom": 4,
+        "band": 2
+      }
+    },
+    "api:maxPackObjects": {
+      "value": 100000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "ply's buffered-pack object ceiling; the inflated-byte cap is the memory bound.",
+      "metric": {
+        "attribute": "git.pack.objects",
+        "route": "api",
+        "quantile": 0.999,
+        "headroom": 4,
+        "band": 2
+      }
+    },
+    "api:maxLsRefsBytes": {
+      "value": 33554432,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Shares the pack byte cap: one ref listing is buffered.",
+      "metric": {
+        "attribute": "git.response.bytes",
+        "route": "GET /v1/refs",
+        "quantile": 0.999,
+        "headroom": 4,
+        "band": 2
+      }
+    },
+    "api:requestTimeoutMs": {
+      "value": 30000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Round per-request upstream deadline.",
+      "metric": {
+        "attribute": "git.response.duration_ms",
+        "route": "api",
+        "quantile": 0.999,
+        "headroom": 10,
+        "band": 2
+      }
+    },
+    "api:maxBodyBytes": {
+      "value": 1048576,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Round JSON request body cap."
+    },
+    "mirror:maxPackBytes": {
+      "value": 33554432,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Mirror cron sizes (src/limits.ts MIRROR_CAPS) chosen for the two mirrored repos; no sync-size distribution yet."
+    },
+    "mirror:maxObjectSize": {
+      "value": 16777216,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Mirror cron sizes (src/limits.ts MIRROR_CAPS) chosen for the two mirrored repos; no sync-size distribution yet."
+    },
+    "mirror:maxInflatedTotal": {
+      "value": 100663296,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Mirror cron sizes (src/limits.ts MIRROR_CAPS) chosen for the two mirrored repos; no sync-size distribution yet."
+    },
+    "mirror:maxHarvestBytes": {
+      "value": 16777216,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Mirror cron sizes (src/limits.ts MIRROR_CAPS) chosen for the two mirrored repos; no sync-size distribution yet."
+    },
+    "mirror:maxPackObjects": {
+      "value": 50000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Mirror cron sizes (src/limits.ts MIRROR_CAPS) chosen for the two mirrored repos; no sync-size distribution yet."
+    },
+    "mirror:requestTimeoutMs": {
+      "value": 30000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Mirror cron sizes (src/limits.ts MIRROR_CAPS) chosen for the two mirrored repos; no sync-size distribution yet."
+    },
+    "verify:maxPackBytes": {
+      "value": 16777216,
+      "status": "PRIOR (uncalibrated)",
+      "why": "GitCache verification buffers the pack (src/limits.ts VERIFY_CAPS); sized to the isolate, not to a cached-pack distribution.",
+      "metric": {
+        "attribute": "git.pack.bytes",
+        "route": "*",
+        "quantile": 0.999,
+        "headroom": 4,
+        "band": 2
+      }
+    },
+    "verify:maxObjectSize": {
+      "value": 16777216,
+      "status": "PRIOR (uncalibrated)",
+      "why": "GitCache verification buffers the pack (src/limits.ts VERIFY_CAPS); sized to the isolate, not to a cached-pack distribution."
+    },
+    "verify:maxInflatedTotal": {
+      "value": 67108864,
+      "status": "PRIOR (uncalibrated)",
+      "why": "GitCache verification buffers the pack (src/limits.ts VERIFY_CAPS); sized to the isolate, not to a cached-pack distribution."
+    },
+    "verify:maxHarvestBytes": {
+      "value": 16777216,
+      "status": "PRIOR (uncalibrated)",
+      "why": "GitCache verification buffers the pack (src/limits.ts VERIFY_CAPS); sized to the isolate, not to a cached-pack distribution."
+    },
+    "verify:maxPackObjects": {
+      "value": 100000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "GitCache verification buffers the pack (src/limits.ts VERIFY_CAPS); sized to the isolate, not to a cached-pack distribution."
+    },
+    "verify:maxTreeEntries": {
+      "value": 1000000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Verification must not refuse a tree the reader accepted; set far above any read cap."
+    },
+    "verify:requestTimeoutMs": {
+      "value": 30000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "GitCache verification buffers the pack (src/limits.ts VERIFY_CAPS); sized to the isolate, not to a cached-pack distribution."
+    },
+    "viewer:maxUpstreamBytes": {
+      "value": 4194304,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:maxPackBytes": {
+      "value": 2097152,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution.",
+      "metric": {
+        "attribute": "git.pack.bytes",
+        "route": "viewer",
+        "quantile": 0.999,
+        "headroom": 4,
+        "band": 2
+      }
+    },
+    "viewer:maxPackObjects": {
+      "value": 400,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution.",
+      "metric": {
+        "attribute": "git.pack.objects",
+        "route": "viewer",
+        "quantile": 0.999,
+        "headroom": 4,
+        "band": 2
+      }
+    },
+    "viewer:maxInflatedTotal": {
+      "value": 4194304,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution.",
+      "metric": {
+        "attribute": "git.pack.inflated.bytes",
+        "route": "viewer",
+        "quantile": 0.999,
+        "headroom": 4,
+        "band": 2
+      }
+    },
+    "viewer:maxObjectSize": {
+      "value": 1048576,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:maxFileDisplayBytes": {
+      "value": 262144,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:maxDeltaChain": {
+      "value": 32,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution.",
+      "metric": {
+        "attribute": "git.pack.chain.max",
+        "route": "viewer",
+        "quantile": 0.999,
+        "headroom": 4,
+        "band": 2
+      }
+    },
+    "viewer:maxDeltaResult": {
+      "value": 1048576,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:requestTimeoutMs": {
+      "value": 12000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution.",
+      "metric": {
+        "attribute": "git.response.duration_ms",
+        "route": "viewer",
+        "quantile": 0.999,
+        "headroom": 10,
+        "band": 2
+      }
+    },
+    "viewer:pageTimeoutMs": {
+      "value": 20000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:maxSubrequests": {
+      "value": 16,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:maxRedirects": {
+      "value": 2,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Protocol-safety bound, not a load threshold."
+    },
+    "viewer:maxRefs": {
+      "value": 2000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution.",
+      "metric": {
+        "attribute": "git.ls_refs.count",
+        "route": "viewer",
+        "quantile": 0.999,
+        "headroom": 4,
+        "band": 2
+      }
+    },
+    "viewer:maxBranchesShown": {
+      "value": 200,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:maxTagsShown": {
+      "value": 100,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:hintNearbyRefs": {
+      "value": 4,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:maxTreeEntries": {
+      "value": 2000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Back to 2,000 after ply #47 (src/viewer/limits.ts); a design value, not from a tree-size distribution."
+    },
+    "viewer:maxTreeShown": {
+      "value": 500,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:maxLogCommits": {
+      "value": 10,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:maxPreviewChars": {
+      "value": 2000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:maxUrlLength": {
+      "value": 2048,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:maxLineRows": {
+      "value": 4000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:ratePerMinute": {
+      "value": 60,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:packRatePerMinute": {
+      "value": 20,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:rateWindowMs": {
+      "value": 60000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Public viewer cap chosen by hand (src/viewer/limits.ts); not from a viewer request distribution."
+    },
+    "viewer:rateCeiling": {
+      "value": 1000,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Clamp on an operator-set rate, not a load threshold."
+    }
+  }
+}
