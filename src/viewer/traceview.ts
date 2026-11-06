@@ -1,30 +1,9 @@
 import { atIndex, chainGet, fromAbsent, fromNullable } from '../absent.ts';
-import { fromAny } from 'ply';
-import type { AnyValue } from 'ply/otel';
+import type { FlatSpan } from 'ply';
 import type { FilterName, TraceBar, TraceModel } from './model.ts';
 
-type Kv = { key: string; value: unknown };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
-
-// fromAny reads one OTLP AnyValue, in this field order. A span attribute that is not one is omitted.
-function isAnyValue(value: unknown): value is AnyValue {
-  if (!isRecord(value)) return false;
-  if ('stringValue' in value) return typeof value.stringValue === 'string';
-  if ('intValue' in value) return typeof value.intValue === 'string';
-  if ('doubleValue' in value) return typeof value.doubleValue === 'number';
-  if ('boolValue' in value) return typeof value.boolValue === 'boolean';
-  if ('arrayValue' in value) return isAnyArray(value.arrayValue);
-  if ('bytesValue' in value) return typeof value.bytesValue === 'string';
-  return false;
-}
-
-function isAnyArray(value: unknown): value is { readonly values: readonly AnyValue[] } {
-  if (!isRecord(value) || !Array.isArray(value.values)) return false;
-  return value.values.every(isAnyValue);
-}
+/** One of the request's ended spans, as ply hands it to Tracer `onEnd` (an EndedSpan): plain attribute values. */
+export type TraceSpan = Pick<FlatSpan, 'name' | 'status' | 'attrs'> & { readonly startTimeUnixNano: string; readonly endTimeUnixNano: string };
 
 type RawSpan = {
   name: string;
@@ -48,46 +27,20 @@ const SHOW = [
   'git.ls_refs.count', 'git.ls_refs.head', 'error.type', 'git.viewer.blob.too_big', 'git.viewer.blob.size',
 ] as const;
 
-function flattenAttrs(list: unknown): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  const present = fromNullable(list);
-  const entries = present.tag === 'none' ? [] : present.value as Kv[];
-  for (const entry of entries) if (isAnyValue(entry.value)) out[entry.key] = fromAny(entry.value);
-  return out;
-}
 
-function spansOf(lines: unknown[]): RawSpan[] {
-  const spans: RawSpan[] = [];
-  for (const line of lines) {
-    const resourceField = chainGet(line, 'resourceSpans');
-    const resourceSpans = resourceField.tag === 'none' ? [] : resourceField.value as readonly unknown[];
-    for (const resource of resourceSpans) {
-      const scopeField = chainGet(resource, 'scopeSpans');
-      const scopes = scopeField.tag === 'none' ? [] : scopeField.value as readonly unknown[];
-      for (const scope of scopes) {
-        const spanField = chainGet(scope, 'spans');
-        const rawSpans = spanField.tag === 'none' ? [] : spanField.value as readonly Record<string, unknown>[];
-        for (const span of rawSpans) {
-          const startText = chainGet(span, 'startTimeUnixNano');
-          const start = BigInt(String(startText.tag === 'some' ? startText.value : '0'));
-          const endText = chainGet(span, 'endTimeUnixNano');
-          const end = BigInt(String(endText.tag === 'some' ? endText.value : start));
-          const status = chainGet(span, 'status');
-          const code = status.tag === 'some' ? chainGet(status.value, 'code') : fromNullable(null);
-          const statusMessage = status.tag === 'some' ? chainGet(status.value, 'message') : fromNullable(null);
-          const name = chainGet(span, 'name');
-          spans.push({
-            name: String(name.tag === 'some' ? name.value : ''),
-            startMs: Number(start / 1_000_000n),
-            durMs: Math.max(0, Number((end - start) / 1_000_000n)),
-            status: code.tag === 'some' && code.value === 2 ? 'error' : 'ok',
-            message: String(statusMessage.tag === 'some' ? statusMessage.value : '').slice(0, 180),
-            attrs: flattenAttrs(span.attributes),
-          });
-        }
-      }
-    }
-  }
+function spansOf(ended: readonly TraceSpan[]): RawSpan[] {
+  const spans: RawSpan[] = ended.map(span => {
+    const start = BigInt(span.startTimeUnixNano);
+    const end = BigInt(span.endTimeUnixNano);
+    return {
+      name: span.name,
+      startMs: Number(start / 1_000_000n),
+      durMs: Math.max(0, Number((end - start) / 1_000_000n)),
+      status: span.status.code === 2 ? 'error' : 'ok',
+      message: (span.status.code === 2 ? span.status.message : '').slice(0, 180),
+      attrs: span.attrs,
+    };
+  });
   spans.sort((a, b) => a.startMs - b.startMs || a.name.localeCompare(b.name));
   return spans;
 }
@@ -129,8 +82,8 @@ function isRoundTrip(name: string): boolean {
   return name.startsWith('git.upload-pack') || name.startsWith('git.receive-pack');
 }
 
-export function buildTrace(lines: unknown[], cfRay: string, requestId: string): TraceModel {
-  const raw = spansOf(lines);
+export function buildTrace(ended: readonly TraceSpan[], cfRay: string, requestId: string): TraceModel {
+  const raw = spansOf(ended);
   const trips = raw.filter(span => isRoundTrip(span.name));
   const shown = trips.length ? trips : raw;
   const bars: TraceBar[] = shown.map(span => {

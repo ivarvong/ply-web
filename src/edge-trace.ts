@@ -1,6 +1,7 @@
 // ply's spans in Workers tracing (Workers Observability), live, nested under the request span as ply nests them.
 //
-// ply records every span on its own Tracer (OTLP/JSON lines; src/rays.ts and ?trace=1 read them). Nothing there reaches
+// ply records every span on its own Tracer (ply-web keeps the ended spans of a request, `spanList()`; src/rays.ts,
+// ?trace=1 and the viewer's trace read them). Nothing there reaches
 // the platform. Workers Observability shows a custom span only when the Worker opens it on `ctx.tracing`, the runtime's
 // user-tracing API (.cloudflare/types/index.d.ts `interface Tracing`, workerd `workerd::api::Tracing`): a span opened
 // there is a child of the span active in the current async context (the request span when none is), its start and end
@@ -8,24 +9,34 @@
 //
 // `plyTracer(ctx, options)` is the one Tracer the /v1 API (src/index.js) and the viewer (src/viewer/app.tsx) construct.
 // With `ctx.tracing` it mirrors each ply span onto a platform span when ply opens it, and closes that span with ply's
-// attributes, status, and ids when ply ends it. Parentage is ply's, not whatever happens to be active: each platform span
+// attributes, status, and ids when ply ends it: ply hands over the ended span as plain values (Tracer `onEnd`, an
+// EndedSpan; no OTLP is built), and the platform span takes all of ply's attributes in one `setAttributes` call and the
+// stamp, ids and duration in a second. (Until 2026-11-06 this rebuilt an OTLP document per span, flattened it back and
+// made one setAttribute call per attribute: about 7% of the Worker's CPU on 59f39490.) Parentage is ply's, not whatever happens to be active: each platform span
 // is opened with `startActiveSpan`, and the async context inside that callback (where it is the active span) is kept with
 // `AsyncLocalStorage.snapshot()`. A ply child is opened inside its parent's snapshot, so the runtime makes it that span's
 // child. A ply root (`git.edit`, a bare wire span) is opened in the caller's context: a child of the request span. A span
 // that follows another (`git.read.blob` after `git.read`) nests under it while it is open.
 // Without `ctx.tracing` (node tests, a runtime without user tracing) it is ply's plain Tracer.
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { Tracer, flattenLine } from 'ply'
+import { Tracer } from 'ply'
+import type { EndedSpan, SpanSink } from 'ply'
 import { chainGet } from './absent.ts'
 
 type PlySpan = ReturnType<Tracer['start']>
 type TracerOptions = ConstructorParameters<typeof Tracer>[0]
 type StartOptions = Parameters<Tracer['start']>[1]
-type OtlpSpan = Parameters<Tracer['export']>[0]
 
-/** The platform span: what `ctx.tracing.startActiveSpan` hands its callback. */
+/** Attribute values the platform span takes. */
+type EdgeValue = string | number | boolean
+type EdgeAttrs = Readonly<Record<string, EdgeValue>>
+
+/**
+ * The platform span: what `ctx.tracing.startActiveSpan` hands its callback. The runtime's span also has
+ * `setAttributes(record)` (one call for many attributes); closeEdge uses it when it is there.
+ */
 export type EdgeSpan = {
-  setAttribute(key: string, value: string | number | boolean): unknown
+  setAttribute(key: string, value: EdgeValue): unknown
   setStatus(status: { code: 'ok' | 'error'; message: string }): unknown
   end(): void
 }
@@ -115,27 +126,50 @@ function quietly(fn: () => void): void {
   try { fn() } catch { /* the runtime refused the span call; the request goes on */ }
 }
 
-function attributeValue(value: unknown): string | number | boolean {
-  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value
-  return JSON.stringify(value)
+/**
+ * What the platform span takes beside ply's attributes: each array attribute as JSON (the runtime would join an array
+ * with commas; this record is set second, so its JSON replaces that), the stamp, ply's ids, the span it follows, and
+ * the duration.
+ */
+function extraAttrs(ended: EndedSpan, stamp: EdgeStamp): EdgeAttrs {
+  const out: Record<string, EdgeValue> = { ...stamp }
+  const attrs = ended.attrs
+  for (const key in attrs) {
+    const value = attrs[key]
+    if (typeof value === 'object') out[key] = JSON.stringify(value)
+  }
+  out[EDGE_ATTR.spanId] = ended.spanId
+  out[EDGE_ATTR.traceId] = ended.traceId
+  if (ended.parentSpanId !== null) out[EDGE_ATTR.parentSpanId] = ended.parentSpanId
+  const follows = ended.links.find(link => link.attrs['ply.link'] === FOLLOWS_FROM)
+  if (follows) out[EDGE_ATTR.followsSpanId] = follows.spanId
+  out[EDGE_ATTR.durationMs] = Math.round(ended.durationMs * 1000) / 1000
+  return out
+}
+
+/** A runtime without `setAttributes`: one call per attribute, arrays as JSON. */
+function setEach(edge: EdgeSpan, attrs: Readonly<Record<string, unknown>>): void {
+  for (const key in attrs) {
+    const value = attrs[key]
+    edge.setAttribute(key, typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' ? value : JSON.stringify(value))
+  }
 }
 
 /** ply's ended span onto the platform span: every attribute, ply's ids and duration, and an error status. */
-function closeEdge(edge: EdgeSpan, otlp: OtlpSpan, tracer: Tracer, stamp: EdgeStamp): void {
-  const [flat] = flattenLine({ resourceSpans: [{ resource: tracer.resource, scopeSpans: [{ scope: tracer.scope, spans: [otlp] }] }] })
-  if (flat) {
-    quietly(() => {
-      for (const [key, value] of Object.entries(stamp)) edge.setAttribute(key, value)
-      for (const [key, value] of Object.entries(flat.attrs)) edge.setAttribute(key, attributeValue(value))
-      edge.setAttribute(EDGE_ATTR.spanId, flat.spanId)
-      edge.setAttribute(EDGE_ATTR.traceId, flat.traceId)
-      if (flat.parentSpanId !== null) edge.setAttribute(EDGE_ATTR.parentSpanId, flat.parentSpanId)
-      const follows = flat.links.find(link => link.attrs['ply.link'] === FOLLOWS_FROM)
-      if (follows) edge.setAttribute(EDGE_ATTR.followsSpanId, follows.spanId)
-      edge.setAttribute(EDGE_ATTR.durationMs, Math.round(flat.durationMs * 1000) / 1000)
-      if (flat.status.code === OTLP_ERROR) edge.setStatus({ code: 'error', message: flat.status.message })
-    })
-  }
+function closeEdge(edge: EdgeSpan, ended: EndedSpan, stamp: EdgeStamp): void {
+  quietly(() => {
+    const extra = extraAttrs(ended, stamp)
+    const bulk = chainGet(edge, 'setAttributes')
+    if (bulk.tag === 'some' && typeof bulk.value === 'function') {
+      const setAll = bulk.value as (attrs: Readonly<Record<string, unknown>>) => unknown
+      setAll.call(edge, ended.attrs)
+      setAll.call(edge, extra)
+    } else {
+      setEach(edge, ended.attrs)
+      setEach(edge, extra)
+    }
+    if (ended.status.code === OTLP_ERROR) edge.setStatus({ code: 'error', message: ended.status.message })
+  })
   quietly(() => edge.end())
 }
 
@@ -156,12 +190,21 @@ class EdgeTracer extends Tracer {
   readonly #tracing: EdgeTracing
   /** Platform spans of ply spans still open, by ply span id. */
   readonly #open = new Map<string, Opened>()
-  readonly #stamp: EdgeStamp
 
   constructor(options: TracerOptions, tracing: EdgeTracing, stamp: EdgeStamp) {
     super(options)
     this.#tracing = tracing
-    this.#stamp = stamp
+    // ply calls onEnd as each span ends: close its platform span, then hand the span to the caller's onEnd.
+    const given = this.onEnd
+    const close: SpanSink = ended => {
+      const opened = this.#open.get(ended.spanId)
+      if (opened) {
+        this.#open.delete(ended.spanId)
+        closeEdge(opened.edge, ended, stamp)
+      }
+      if (given !== null) given(ended)
+    }
+    this.onEnd = close
   }
 
   override start(name: string, options: StartOptions): PlySpan {
@@ -179,24 +222,26 @@ class EdgeTracer extends Tracer {
     if (opened !== null) this.#open.set(span.spanId, opened)
     return span
   }
-
-  override export(otlp: OtlpSpan): void {
-    super.export(otlp)
-    const opened = this.#open.get(otlp.spanId)
-    if (!opened) return
-    this.#open.delete(otlp.spanId)
-    closeEdge(opened.edge, otlp, this, this.#stamp)
-  }
 }
 
 /**
- * The Tracer for one Worker request. Every span it records still goes to `options.exporter`; with `ctx.tracing` each
- * one is also a platform span under the request span (see the top of this file), carrying `stamp` (the route and
- * version, EDGE_ATTR) beside ply's attributes. ply's own export (rays, ?trace=1) is not stamped.
+ * The Tracer for one Worker request. Every span it records goes to `options.onEnd` (and to `options.exporter`, when
+ * one is given); with `ctx.tracing` each one is also a platform span under the request span (see the top of this
+ * file), carrying `stamp` (the route and version, EDGE_ATTR) beside ply's attributes. The spans ply-web keeps for
+ * itself (rays, ?trace=1, the viewer's trace) are not stamped.
  */
 export function plyTracer(ctx: unknown, options: TracerOptions, stamp: EdgeStamp = {}): Tracer {
   const tracing = edgeTracingOf(ctx)
   return tracing === null ? new Tracer(options) : new EdgeTracer(options, tracing, stamp)
+}
+
+/** The spans one request keeps (its stats, ?trace=1, the rays join, the viewer's trace), as ply ended them. */
+export type SpanList = { readonly spans: EndedSpan[]; readonly onEnd: SpanSink }
+
+/** A fresh SpanList: pass `onEnd` to the request's Tracer. Each span is ply's plain-value form; no OTLP is built. */
+export function spanList(): SpanList {
+  const spans: EndedSpan[] = []
+  return { spans, onEnd: ended => { spans.push(ended) } }
 }
 
 /** The route and version stamp for one request. A missing version id (local dev, tests) is left out, not faked. */

@@ -116,19 +116,21 @@ test('headers and spans use the same tokens, and CORS exposure is opt-in', () =>
   assert.equal(bare.get('x-artifacts-ray'), null);
   assert.equal(bare.get('server-timing'), 'total;dur=12');
 
-  const line = { resourceSpans: [{ scopeSpans: [{ spans: [
-    { name: 'git.ls_tree', startTimeUnixNano: '1', attributes: [{ key: 'keep', value: { stringValue: 'yes' } }] },
-    { name: 'git.upload-pack fetch', startTimeUnixNano: '10', attributes: [] },
-  ] }] }] };
-  stampUpstreamSpans([line], report);
-  const scope = slot(line.resourceSpans[0], 'scopeSpans');
-  const spans = fill(slot(slot(scope, '0'), 'spans'), [] as { name: string; attributes: { length: number } }[]);
-  const tree = spans.find(span => span.name === 'git.ls_tree');
-  const fetchSpan = spans.find(span => span.name === 'git.upload-pack fetch');
-  assert.equal(tree == null ? void 0 : tree.attributes.length, 1, 'a non-exchange span is left alone');
-  assert.deepEqual(fetchSpan == null ? void 0 : fetchSpan.attributes, [
-    { key: 'git.upstream.cf_ray', value: { stringValue: 'dddddddddddddddd-IAD' } },
-    { key: 'git.upstream.phase', value: { stringValue: 'fetch' } },
-    { key: 'git.upstream.dur_ms', value: { intValue: '9' } },
-  ]);
+  // The request's ended spans (ply's EndedSpan): the stamp writes plain values onto the exchange spans' attributes.
+  const tree = { name: 'git.ls_tree', startTimeUnixNano: '1', attrs: { keep: 'yes' } as Record<string, unknown> };
+  const fetchSpan = { name: 'git.upload-pack fetch', startTimeUnixNano: '10', attrs: {} as Record<string, unknown> };
+  stampUpstreamSpans([fetchSpan, tree], report);
+  assert.deepEqual(tree.attrs, { keep: 'yes' }, 'a non-exchange span is left alone');
+  assert.deepEqual(fetchSpan.attrs, { 'git.upstream.cf_ray': 'dddddddddddddddd-IAD', 'git.upstream.phase': 'fetch', 'git.upstream.dur_ms': 9 });
+});
+
+test('exchanges pair with spans in start order, and a POST span skips the advertisement before it', () => {
+  const entry = (ray: string, durMs: number, advertisement: boolean) => ({ phase: 'fetch' as const, ray: parseCfRay(ray), durMs: durationMs(0, durMs), delivered: true, advertisement });
+  const report: RayReport = { kind: 'within', entries: [entry('aaaaaaaaaaaaaaaa-IAD', 1, true), entry('bbbbbbbbbbbbbbbb-IAD', 2, false), entry('cccccccccccccccc-IAD', 3, false)] };
+  const later = { name: 'git.upload-pack fetch', startTimeUnixNano: '200', attrs: {} as Record<string, unknown> };
+  const first = { name: 'git.upload-pack ls-refs', startTimeUnixNano: '100', attrs: { 'http.request.method': 'POST' } as Record<string, unknown> };
+  stampUpstreamSpans([later, first], report);
+  assert.equal(first.attrs['git.upstream.cf_ray'], 'bbbbbbbbbbbbbbbb-IAD', 'the POST span skipped the GET info/refs before it');
+  assert.equal(later.attrs['git.upstream.cf_ray'], 'cccccccccccccccc-IAD');
+  assert.equal(later.attrs['git.upstream.dur_ms'], 3);
 });

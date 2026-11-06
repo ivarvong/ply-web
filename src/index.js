@@ -14,8 +14,7 @@ import { readFile, listTree, refCandidates } from 'ply';
 import { lsRefs } from 'ply';
 import { discover } from 'ply';
 import { createTransport } from 'ply';
-import { arrayExporter, flattenLine } from 'ply';
-import { plyTracer, requestStamp, routeStamp, stampRequestSpan } from './edge-trace.ts';
+import { plyTracer, requestStamp, routeStamp, spanList, stampRequestSpan } from './edge-trace.ts';
 import { API_ROUTES, assertRouteTable } from './api-routes.ts';
 import { RETRY, isPlyCode, plyError } from 'ply';
 import { API_CAPS, API_LIMITS } from './limits.ts';
@@ -443,13 +442,13 @@ const worker = {
     };
     let surface = 'api';
     let rays = null;
-    let exporter = null;
-    const spans = () => (exporter ? exporter.lines.flatMap(flattenLine) : []);
+    let collected = null;
+    const spans = () => (collected ? collected.spans : []);
     const statsOf = s => ({ spans: s.length, rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length, wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length, cache_hits: s.filter(x => x.attrs['git.response.cache'] === 'HIT').length });
     const stamp = headers => {
-      if (!rays || !exporter) return;
+      if (!rays || !collected) return;
       const report = rays.report();
-      stampUpstreamSpans(exporter.lines, report);
+      stampUpstreamSpans(collected.spans, report);
       applyUpstreamHeaders(headers, report, Date.now() - t0);
     };
     const jsonOut = (status, obj, headers = {}, extra = {}) => ({ kind: 'json', status, obj, headers, log: extra });
@@ -533,7 +532,7 @@ const worker = {
         const handler = unwrapOr(orElse(recordGet(READS, key), recordGet(WRITES, key)), null);
         if (!handler) return err(jsonOut(Object.keys({ ...READS, ...WRITES }).some(k => k.endsWith(` ${url.pathname}`)) ? 405 : 404, { code: 'not_found', message: `no route ${key}`, retry: 'no' }));
         if (WRITES[key] && !writes) return err(jsonOut(501, { code: 'unsupported', message: 'writes are disabled on this deployment', retry: 'no' }));
-        exporter = arrayExporter();
+        collected = spanList();
         try {
           const body = WRITES[key] ? await readJson(req) : {};
           const allowText = envBinding(env.ALLOW_REMOTE_ORIGINS);
@@ -550,7 +549,7 @@ const worker = {
           const callerScrub = scrubber(cred.secrets);
           scrub = text => callerScrub(publicScrub(text));
           // Every /v1 route runs under this one tracer: each ply span is also a Workers span under the request span (src/edge-trace.ts).
-          const tracer = plyTracer(ctx, { exporter, resource: { 'service.name': 'ply-worker', 'cloudflare.colo': unwrapOr(dig(req, ['cf', 'colo']), '') } }, routeStamp(route, version));
+          const tracer = plyTracer(ctx, { onEnd: collected.onEnd, resource: { 'service.name': 'ply-worker', 'cloudflare.colo': unwrapOr(dig(req, ['cf', 'colo']), '') } }, routeStamp(route, version));
           // The public read token is attached below the redirect guard, so each hop is re-validated before it is considered,
           // and only when the request carries no credential of its own (a caller's Git-Token or Git-Authorization wins).
           // Under the guard: public, credential-free upload-pack exchanges go to the cache-enabled GitCache entrypoint
@@ -622,7 +621,7 @@ const worker = {
       if (!result.ok && result.error.kind === 'ply') {
         const e = result.error.error;
         const payload = errorBody(e);
-        if (rays && exporter) stampUpstreamSpans(exporter.lines, rays.report());
+        if (rays && collected) stampUpstreamSpans(collected.spans, rays.report());
         if (url.searchParams.get('trace') === '1') payload.trace = spans().map(spanView);
         const res = json(statusOf(e), payload, scrub);
         if (rays) applyUpstreamHeaders(res.headers, rays.report(), Date.now() - t0);

@@ -156,8 +156,9 @@ type-checked exhaustive against ply's `CODES`).
 
 ## Tracing
 
-- `?trace=1` on a JSON endpoint adds `trace: [{name, ms, status, attrs, events}]` with ply's spans, the same OTLP
-  spans ply emits anywhere.
+- `?trace=1` on a JSON endpoint adds `trace: [{name, ms, status, attrs, events}]` with ply's spans: the
+  spans ply's Tracer hands its `onEnd` (the plain-value form of the OTLP spans ply emits anywhere; no OTLP is built
+  for a request).
 - `/v1/read` streams raw bytes and has no JSON to carry spans. Instead, `?trace=1` adds an `x-ply-trace` header
   summarising every span that finished before the first byte, as `name;dur=ms, …`. The blob's own span finishes after
   the response is sent, so it shows up only in the request's log line (`stream: ok|error`).

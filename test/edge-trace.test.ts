@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { test } from 'node:test'
 import { arrayExporter, Tracer } from 'ply'
-import { EDGE_ATTR, REQUEST_ATTR, edgeTracingOf, plyTracer, requestStamp, routeStamp, stampRequestSpan } from '../src/edge-trace.ts'
+import { EDGE_ATTR, REQUEST_ATTR, edgeTracingOf, plyTracer, requestStamp, routeStamp, spanList, stampRequestSpan } from '../src/edge-trace.ts'
 import { openSpan, type TracingLike } from '../src/flags/telemetry.ts'
 
 type Recorded = { name: string; parent: string | null; attrs: Record<string, unknown>; status: string | null; ended: boolean }
@@ -62,6 +62,64 @@ test('each ply span is a platform span, closed with ply\'s attributes, ids and e
   assert.equal(blob.attrs[EDGE_ATTR.parentSpanId], edit.attrs[EDGE_ATTR.spanId])
   assert.equal(typeof blob.attrs[EDGE_ATTR.durationMs], 'number')
   assert.equal(blob.status, null)
+})
+
+/** The fake with workerd's `setAttributes`: every call is recorded, so the test counts platform calls per span. */
+function bulkTracing() {
+  const spans: (Recorded & { calls: string[] })[] = []
+  const active = new AsyncLocalStorage<string>()
+  const tracing = {
+    startActiveSpan<T>(name: string, fn: (span: unknown) => T): T {
+      const parent = active.getStore()
+      const rec = { name, parent: typeof parent === 'string' ? parent : null, attrs: {} as Record<string, unknown>, status: null as string | null, ended: false, calls: [] as string[] }
+      spans.push(rec)
+      return active.run(name, () => fn({
+        setAttribute(key: string, value: unknown) { rec.calls.push('setAttribute'); rec.attrs[key] = value },
+        // workerd joins an array with commas (measured: workerd 1.20261018.1); the JSON in the second call replaces it
+        setAttributes(attrs: Record<string, unknown>) { rec.calls.push('setAttributes'); for (const [k, v] of Object.entries(attrs)) rec.attrs[k] = Array.isArray(v) ? v.join(',') : v },
+        setStatus(status: { code: string }) { rec.calls.push('setStatus'); rec.status = status.code },
+        end() { rec.calls.push('end'); rec.ended = true },
+      }))
+    },
+  }
+  return { tracing, spans }
+}
+
+test('with setAttributes a span costs two attribute calls, and lands the same attributes as one call each', async () => {
+  const run = async (fake: { tracing: unknown; spans: Recorded[] }) => {
+    const kept = spanList()
+    const tracer = plyTracer({ tracing: fake.tracing }, { onEnd: kept.onEnd }, routeStamp('GET /v1/tree', 'v-9'))
+    const root = tracer.start('git.read', { attrs: { 'git.read.path': 'a.txt', 'git.read.bytes': 12n, 'git.read.none': null } })
+    const wire = tracer.start('git.upload-pack fetch', { parent: root, attrs: { 'git.fetch.wants': ['a', 'b'], 'git.fetch.filter': 'tree:0', 'git.fetch.done': true, 'git.response.duration_ms': 1.5 } })
+    wire.end()
+    root.end()
+    const follower = tracer.start('git.read.blob', { follows: root })
+    follower.error(Object.assign(new Error('cut'), { code: 'http' }))
+    follower.end()
+    return { kept, spans: fake.spans }
+  }
+  const bulk = await run(bulkTracing())
+  const each = await run(fakeTracing())
+  assert.equal(bulk.kept.spans.length, 3, 'the caller\'s onEnd still gets every span')
+  assert.deepEqual(bulk.spans.map(s => s.name), ['git.read', 'git.upload-pack fetch', 'git.read.blob'])
+  for (const s of bulk.spans as (Recorded & { calls: string[] })[]) assert.deepEqual(s.calls.filter(c => c.startsWith('setAttribute')), ['setAttributes', 'setAttributes'], s.name)
+  const strip = (attrs: Record<string, unknown>) => Object.fromEntries(Object.entries(attrs).filter(([k]) => k !== EDGE_ATTR.spanId && k !== EDGE_ATTR.traceId && k !== EDGE_ATTR.parentSpanId && k !== EDGE_ATTR.followsSpanId && k !== EDGE_ATTR.durationMs && !k.startsWith('ply.isolate.')))
+  bulk.spans.forEach((s, i) => assert.deepEqual(strip(s.attrs), strip(each.spans[i]!.attrs), s.name))
+  const [read, wire, blob] = bulk.spans
+  assert.ok(read && wire && blob)
+  assert.equal(wire.attrs['git.fetch.wants'], '["a","b"]', 'an array is JSON, as before')
+  assert.equal(read.attrs['git.read.bytes'], 12)
+  assert.equal(read.attrs['git.read.none'], '')
+  assert.equal(wire.attrs[EDGE_ATTR.route], 'GET /v1/tree')
+  assert.equal(wire.attrs[EDGE_ATTR.version], 'v-9')
+  assert.equal(wire.attrs[EDGE_ATTR.parentSpanId], read.attrs[EDGE_ATTR.spanId])
+  assert.equal(wire.attrs[EDGE_ATTR.traceId], read.attrs[EDGE_ATTR.traceId])
+  assert.equal(blob.attrs[EDGE_ATTR.followsSpanId], read.attrs[EDGE_ATTR.spanId])
+  assert.equal(blob.status, 'error')
+  assert.equal(blob.attrs['error.type'], 'http')
+  assert.equal(typeof wire.attrs[EDGE_ATTR.durationMs], 'number')
+  assert.ok(bulk.spans.every(s => s.ended))
+  assert.equal(JSON.stringify(bulk.kept.spans.map(s => s.attrs)).includes(EDGE_ATTR.route), false, 'the kept spans are not stamped')
 })
 
 test('a runtime that throws on span calls does not fail the request', async () => {

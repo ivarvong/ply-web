@@ -237,11 +237,12 @@ export function observeUpstream(inner: UpstreamFetch, log: RayLog): UpstreamFetc
   };
 }
 
-type OtlpAttribute = { key: string; value: { stringValue: string } | { intValue: string } };
-type OtlpSpan = Partial<{ name: string; startTimeUnixNano: string; attributes: OtlpAttribute[] }>;
-type OtlpScope = Partial<{ spans: OtlpSpan[] }>;
-type OtlpResource = Partial<{ scopeSpans: OtlpScope[] }>;
-type OtlpLine = Partial<{ resourceSpans: OtlpResource[] }>;
+/** What the stamp reads and writes on one of the request's ended spans (ply's EndedSpan has these). */
+export type StampableSpan = {
+  readonly name: string;
+  readonly startTimeUnixNano: string;
+  readonly attrs: Record<string, unknown>;
+};
 
 /**
  * Span names that wrap exactly one git HTTP exchange, in the order those exchanges start.
@@ -256,12 +257,6 @@ const SPAN_PHASE: Readonly<Record<string, Phase>> = {
   'git.receive-pack advertise': 'receive-pack',
 };
 
-function listed(value: unknown, key: string): unknown[] {
-  const found = chainGet(value, key);
-  if (found.tag === 'none') return [];
-  return found.value as unknown[];
-}
-
 const ATTR_RAY = 'git.upstream.cf_ray';
 const ATTR_PHASE = 'git.upstream.phase';
 const ATTR_DUR = 'git.upstream.dur_ms';
@@ -275,20 +270,11 @@ function isPreamble(entry: Option<RayEntry>): boolean {
   return entry.tag === 'some' && entry.value.advertisement;
 }
 
-export function stampUpstreamSpans(lines: readonly unknown[], report: RayReport): void {
-  const spans: { start: bigint; span: OtlpSpan }[] = [];
-  for (const line of lines as OtlpLine[]) {
-    for (const resource of listed(line, 'resourceSpans')) {
-      for (const scope of listed(resource, 'scopeSpans')) {
-        for (const span of listed(scope, 'spans') as OtlpSpan[]) {
-          const name = chainGet(span, 'name');
-          if (name.tag === 'none' || typeof name.value !== 'string' || name.value.length === 0 || !(name.value in SPAN_PHASE)) continue;
-          const started = chainGet(span, 'startTimeUnixNano');
-          const nanos = started.tag === 'none' ? '0' : String(started.value);
-          spans.push({ start: BigInt(nanos), span });
-        }
-      }
-    }
+export function stampUpstreamSpans(ended: readonly StampableSpan[], report: RayReport): void {
+  const spans: { start: bigint; span: StampableSpan }[] = [];
+  for (const span of ended) {
+    if (span.name.length === 0 || !(span.name in SPAN_PHASE)) continue;
+    spans.push({ start: BigInt(span.startTimeUnixNano), span });
   }
   spans.sort((a, b) => {
     if (a.start < b.start) return -1;
@@ -297,22 +283,17 @@ export function stampUpstreamSpans(lines: readonly unknown[], report: RayReport)
   });
   const delivered = report.entries.filter(entry => entry.delivered);
   let next = 0;
-  for (const span of spans) {
-    const foundAttributes = chainGet(span.span, 'attributes');
-    const attributes = foundAttributes.tag === 'some' ? foundAttributes.value as OtlpAttribute[] : [];
+  for (const { span } of spans) {
     // A span that ended on a POST read the POST: an advertisement before it was ply's initial GET info/refs, in this span.
-    const posted = attributes.some(a => a.key === 'http.request.method' && 'stringValue' in a.value && a.value.stringValue === 'POST');
+    const posted = span.attrs['http.request.method'] === 'POST';
     while (posted && next + 1 < delivered.length && isPreamble(atIndex(delivered, next))) next += 1;
     const found = atIndex(delivered, next);
     if (found.tag === 'none') break;
     const entry = found.value;
     next += 1;
-    if (foundAttributes.tag === 'none') span.span.attributes = attributes;
-    attributes.push(
-      { key: ATTR_RAY, value: { stringValue: renderRay(entry.ray) } },
-      { key: ATTR_PHASE, value: { stringValue: entry.phase } },
-      { key: ATTR_DUR, value: { intValue: String(entry.durMs) } },
-    );
+    span.attrs[ATTR_RAY] = renderRay(entry.ray);
+    span.attrs[ATTR_PHASE] = entry.phase;
+    span.attrs[ATTR_DUR] = entry.durMs;
   }
 }
 

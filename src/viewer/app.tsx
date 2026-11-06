@@ -9,8 +9,8 @@ import { hintFromError } from './hint.ts'
 import { htmlResponse, SECURITY, statusOf, textResponse } from './http.ts'
 import { VIEWER_CAPS, rateLimitFor, type RateBucket } from './limits.ts'
 import type { RateDecision, TraceModel, ViewerEnv } from './model.ts'
-import { arrayExporter, isPlyCode } from 'ply'
-import { plyTracer, routeStamp } from '../edge-trace.ts'
+import { isPlyCode } from 'ply'
+import { plyTracer, routeStamp, spanList } from '../edge-trace.ts'
 import { createLoopbackFetch, isLoopback, type LoopbackBinding } from '../gitcache.ts'
 import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from '../rays.ts'
 import { parseViewerRequest, routeOptsFromEnv, type ViewerRoute } from './route.ts'
@@ -140,9 +140,9 @@ function cssResponse(call: ViewerCall, req: Request): Response {
 async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: Extract<ViewerRoute, { kind: 'repo' }>): Promise<Response> {
   const limited = await rateGate(req, env, call, route)
   if (limited) return headless(req, limited)
-  const collected = arrayExporter()
+  const collected = spanList()
   const versionId = dig(env, ['VERSION', 'id'])
-  const tracer = plyTracer(call.ctx, { exporter: collected, maxEvents: 48, resource: { 'service.name': 'ply-viewer' } }, routeStamp('viewer', versionId.tag === 'some' && typeof versionId.value === 'string' ? versionId.value : null))
+  const tracer = plyTracer(call.ctx, { onEnd: collected.onEnd, maxEvents: 48, resource: { 'service.name': 'ply-viewer' } }, routeStamp('viewer', versionId.tag === 'some' && typeof versionId.value === 'string' ? versionId.value : null))
   const budget = createBudget()
   const pageSignal = AbortSignal.timeout(VIEWER_CAPS.pageTimeoutMs)
   // The public namespace's read token is attached below the guard: every hop is validated by createViewerFetch first,
@@ -172,8 +172,8 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
   let stamped = false
   const traced = () => {
     const report = rays.report()
-    if (!stamped) { stampUpstreamSpans(collected.lines, report); stamped = true }
-    return { ...buildTrace(collected.lines, call.cfRay, call.requestId), expanded: new URL(req.url).searchParams.get('trace') === '1' }
+    if (!stamped) { stampUpstreamSpans(collected.spans, report); stamped = true }
+    return { ...buildTrace(collected.spans, call.cfRay, call.requestId), expanded: new URL(req.url).searchParams.get('trace') === '1' }
   }
   const attach = (res: Response): Response => {
     applyUpstreamHeaders(res.headers, rays.report(), Date.now() - call.now)
