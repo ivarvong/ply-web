@@ -163,6 +163,9 @@ joined by trace, filtered by `ply.script_version`. Synthetic clients each stay u
 | lat4 · a020b1b1 (25 ms read budget) | batched | 15,099 | **3 / 12 / 25 / 25** | 16 / 71 / 3049 |
 | lat5 · 78ddd5c3 (promoted, unpinned) | legacy | 10,778 | 13 / 424 / 584 / 819 | 26 / 531 / 2739 |
 | lat5 · 78ddd5c3 (promoted, unpinned) | default (batched) | 10,782 | **3 / 12 / 25 / 25** | 15 / 193 / 2747 |
+| lat6 · 2a4741c0 (pinned, interleaved) | batched | 13,571 | 3 / 14 / 25 / 25 | 12 / 165 / 4690 |
+| lat6 · 2a4741c0 (pinned, interleaved) | memo | 13,572 | **0 / 0 / 0 / 0** | 9 / 153 / 4702 |
+| lat7 · 2a4741c0 (pinned, memo only) | memo | 13,583 | 0 / 0 / 0 / 0 | 10 / 69 / 1302 |
 
 The page p99.9 (≈3 s in both arms) is git work, not the limiter (lat1, A/A legacy, has the same tail).
 
@@ -187,3 +190,25 @@ The page p99.9 (≈3 s in both arms) is git work, not the limiter (lat1, A/A leg
   0 replays, 0 deadline); RPC p50 / p99 / p99.9 150 / 290 / 453 ms, a much tighter tail than lat4's 762 / 1363. Real
   (non-load) traffic on batched in the window: 58 checks, p99 5 ms. DO `rows_written` p50 6, p99.9 519, max 3983: the
   large ones are the retention prunes (`rate_hits`, `rate_batches` older than 10 min), not hit writes.
+- **Memo mode (2a4741c0, 2026-11-07; ply-load ad3db19e).** lat6: batched vs memo interleaved per request, pinned,
+  27,200 requests (13,600/arm), all 200. The memo check is a map lookup: `rate.check_ms` 0 at every percentile (Workers
+  clocks only advance on I/O, so the page wall from `ply.request` joined by trace is the comparison). Page wall memo −
+  batched, bootstrap 95% CI (400 resamples): p50 −3 ms [−3, −3], p90 −3 [−4, −3], p99 −12 [−39, +12]. So a 3 ms win at
+  the median and no measurable change at p99, which is git work. Batched reads: ok 13,542, LATE 29 (7 `fail_open`).
+  The interleaved memo arm shares the isolate's document with the batched arm (it is module state), which keeps it
+  fresh: memo_age p50 200 ms, 26 refreshes. So refresh and lag were measured memo-only. lat7, memo only, 13,583
+  checks: memo_fresh 9,046, memo_stale_refresh 4,495, cold 42 (`fail_open`; batched lat6: 7). memo_age p50/p99/p99.9
+  400 / 602 / 653 ms. 4,517 refreshes (one per 3 requests), refresh ms p50/p99/p99.9/max 4 / 8 / 50 / 301, RateCache
+  HIT 2,944, UPDATING 1,569, EXPIRED 4. 20 single-flight joins (max 5 on one flight).
+- **Enforcement, memo vs batched (2a4741c0, 12 clients at 2× the limit, 100 s, client-side lag quantised by the 500 ms
+  request gap):** abuse3 interleaved (memo kept fresh by batched): batched lag p50 500 / max 1500 ms, overshoot p50 1 /
+  max 3; memo the same. abuse5 batched only: lag p50 500 / max 1500 ms, overshoot max 3, DO `peak − limit` 3. abuse4
+  memo only: **lag p50 1500 / max 2000 ms, overshoot p50 3 / max 4**, DO `peak − limit` 4. Memo adds about one request
+  gap plus ≤ 500 ms of memo age on top of the cache's max-age and SWR.
+- **Decision:** memo stays opt-in (`x-ply-rate-mode: memo` / `RATE_MODE=memo`) and the default stays batched. Its page
+  p99 gain is not measurable and its lag max (2.0 s) is over the ~1.5 s bar. 2a4741c0 was promoted with the default
+  unchanged, which ships the bounded prune.
+- **Counter prune bound (PRUNE_BATCH_ROWS 128).** `ply.rate.apply` rows_written max before: 12,892 (78ddd5c3), 7,915
+  (a020b1b1). After: lat8, 2a4741c0 at 100% unpinned, default arm, 13,600 requests all 200, starting on the backlog
+  that lat6/lat7 left: 6,550 applies, rows_written median 9 / p99 140 / max 268.
+
