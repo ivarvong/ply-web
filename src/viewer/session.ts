@@ -287,7 +287,7 @@ export async function listPageRefs(transport: Transport, ref: string | null): Pr
   return unwrap(await lsRefs(transport, refPrefixes(ref, false)));
 }
 
-async function loadTree(transport: Transport, route: Extract<ViewerRoute, { kind: 'repo' }>, server: ServerInfo, quirks: Quirks, budget: Budget, tracer: Tracer): Promise<Loaded> {
+async function loadTree(transport: Transport, route: Extract<ViewerRoute, { kind: 'repo' }>, advertised: Promise<ServerInfo>, quirks: Quirks, budget: Budget, tracer: Tracer): Promise<Loaded> {
   // A full object id names the commit without the ref listing (resolveRef never reads it then), so the listing, which
   // only fills the branch and tag picker, runs beside the window fetch instead of before it, and a raw read skips it.
   // An ls-refs miss is 140-490 ms on /r pages (59f39490).
@@ -299,9 +299,13 @@ async function loadTree(transport: Transport, route: Extract<ViewerRoute, { kind
   };
   let resolved: { name: string; commit: string };
   let held: Map<string, Held> | null;
+  // ls-refs does not wait for discover (ply-web#120; ply#220 has the two share one GET): nothing before the header needs the advertisement. The first
+  // filtered fetch (the window) still waits for it, because discover is what tells ply's transport a server takes no
+  // `filter` at all.
+  if (!(direct && route.raw)) refsNow().catch(() => {});
+  const server = await advertised;
   if (direct) {
     resolved = { name: route.ref as string, commit: route.ref as string };
-    if (!route.raw) refsNow().catch(() => {});
     // Raw bytes need no history: read the commit alone. Every page reads the window (it replaces the commit read).
     held = route.raw ? null : await loadWindow(transport, resolved.commit, quirks);
   } else {
@@ -418,8 +422,7 @@ async function loadPack(transport: Transport, route: Extract<ViewerRoute, { kind
 export async function loadRepo(route: Extract<ViewerRoute, { kind: 'repo' }>, deps: SessionDeps): Promise<Loaded> {
   const quirks = quirksFor(route.loc.origin);
   const transport = openTransport(route.loc.url, route.loc.allowedHosts, { tracer: deps.tracer, fetchImpl: deps.fetchImpl, signal: deps.signal, quirks });
-  const info = unwrap(await discover(transport));
-  const server = serverOf(info);
-  if (route.pack) return loadPack(transport, route, server, quirks);
-  return loadTree(transport, route, server, quirks, deps.budget, deps.tracer);
+  const advertised = discover(transport).then(info => serverOf(unwrap(info)));
+  if (route.pack) return loadPack(transport, route, await advertised, quirks);
+  return loadTree(transport, route, advertised, quirks, deps.budget, deps.tracer);
 }
