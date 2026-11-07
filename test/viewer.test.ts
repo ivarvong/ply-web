@@ -1,7 +1,7 @@
 // Public viewer: URL/SSRF rules, caps, escaping, a real pack fixture, the credential-stripping fetch,
 // a local git http-backend, the SQLite rate-limit object under workerd, and (when reachable) GitHub.
 import { beforeEach, test } from 'node:test';
-import { resetQuirks } from '../src/quirks.ts';
+import { quirksFor, resetQuirks } from '../src/quirks.ts';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, copyFileSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
@@ -1221,4 +1221,10 @@ test('stylesheet URL is content-hashed and immutable; HTML is no-store and links
   // Icons carry intrinsic sizes, so even an unstyled page never draws a giant SVG.
   const html = String(renderLoaded(treeFixture({}), { bars: [], totalMs: 0, cfRay: 'r', requestId: 'q' }));
   for (const m of html.matchAll(/<svg class="i [^"]*"([^>]*)>/g)) assert.match(fill(m[1], ''), /width="16" height="16"/);
+});
+
+test('quirks: the public namespace (Cloudflare Artifacts, blob:none only) starts on blob:none; any other origin starts on tree:0', () => {
+  assert.equal(quirksFor(`https://${PUBLIC_GIT_HOST}`).treeFilter, 'blob:none');
+  assert.equal(quirksFor('https://github.com').treeFilter, 'tree:0');
+  assert.equal(quirksFor('https://acct.artifacts.cloudflare.net').treeFilter, 'tree:0', 'only the configured public namespace host is seeded');
 });
