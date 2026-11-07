@@ -11,7 +11,7 @@
 // Watcher (DO, locationHint): observes a URL (regex group 1 of the body) every pollMs, records every change.
 import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
 
-type Env = { PLY_TOKEN: string; W: DurableObjectNamespace<Watcher>; VERSION: { id: string } };
+type Env = { PLY_TOKEN: string; LOAD_TOKEN: string; W: DurableObjectNamespace<Watcher>; VERSION: { id: string } };
 type Obs = { t: number; value: string; status: number; cache: string; colo: string; ver: string; ms: number };
 
 function json(obj: unknown, status = 200): Response {
@@ -71,7 +71,10 @@ export class Watcher extends DurableObject<Env> {
     while (Date.now() - start < durMs) {
       const k = i % targets.length;
       const tgt = targets[k] as { url: string; headers: Record<string, string> };
-      const o = await observe(tgt.url, tgt.headers, regex);
+      // A rotating rate identity (x-ply-rate-client, honoured only with the load token): 32 clients per watcher, each
+      // well under ply's 60 pages/min.
+      const headers = 'x-ply-load-token' in tgt.headers ? { ...tgt.headers, 'x-ply-rate-client': `fresh:${colo}:${k}:${i % 32}` } : tgt.headers;
+      const o = await observe(tgt.url, headers, regex);
       polls[k] = (polls[k] as number) + 1;
       if (o.value !== last[k]) { (changes[k] as Obs[]).push(o); last[k] = o.value; }
       i++;
@@ -81,8 +84,9 @@ export class Watcher extends DurableObject<Env> {
   }
   /** A long watch (up to the alarm's 15 min): started here, run in alarm(), read with result(). */
   async start(cfg: { targets: { url: string; headers: Record<string, string> }[]; regex: string; pollMs: number; durMs: number }): Promise<{ ok: true }> {
-    // '$PLY_TOKEN' in a header value is this Worker's PLY_TOKEN (the load-test bypass header), so it never rides the request.
-    const targets = cfg.targets.map(t => ({ url: t.url, headers: Object.fromEntries(Object.entries(t.headers).map(([k, v]) => [k, v === '$PLY_TOKEN' ? this.env.PLY_TOKEN : v])) }));
+    // '$LOAD_TOKEN' in a header value is ply's PLY_LOAD_TOKEN (x-ply-load-token, the load-test rate identity), held here as a
+    // secret so it never rides the request.
+    const targets = cfg.targets.map(t => ({ url: t.url, headers: Object.fromEntries(Object.entries(t.headers).map(([k, v]) => [k, v === '$LOAD_TOKEN' ? this.env.LOAD_TOKEN : v])) }));
     await this.ctx.storage.put('cfg', { ...cfg, targets });
     await this.ctx.storage.delete('result');
     await this.ctx.storage.setAlarm(Date.now() + 500);

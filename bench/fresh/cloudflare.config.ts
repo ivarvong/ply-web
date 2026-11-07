@@ -14,6 +14,8 @@ export default defineConfig({
 		observability: { enabled: true, headSamplingRate: 1, logs: { enabled: true, invocationLogs: false }, traces: { enabled: false } },
 		env: {
 			PLY_TOKEN: bindings.secret(),
+			// ply's PLY_LOAD_TOKEN: sent as x-ply-load-token on watched /r requests (their own rate identity). Never logged.
+			LOAD_TOKEN: bindings.secret(),
 			W: bindings.durableObject({ worker: "ply-fresh", exportName: "Watcher" }),
 			VERSION: bindings.versionMetadata(),
 		},
