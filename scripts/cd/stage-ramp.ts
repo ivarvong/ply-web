@@ -5,7 +5,7 @@ import type { CdConfig } from './config.ts'
 import { isTrafficSplit, sameSplit, trafficSplit, type VersionShare } from './deploy-plan.ts'
 import { notSpanFilter, queryCapturedSliced, telemetryQueryRetry } from './o11y.ts'
 import { errorMessage } from './proc.ts'
-import { activeLog } from './log.ts'
+import { activeLog, BLOB_DIR } from './log.ts'
 import { readPassVerdict, runRamp, type Observation } from './ramp.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import type { RolloutPolicy } from './policy.ts'
@@ -35,7 +35,7 @@ async function observe(config: CdConfig, version: string, previous: string, from
     // Invocations and logs only, in parallel 10 s slices. The unscoped span query paged past TELEMETRY_MAX_PAGES under
     // load (run 2026-11-06T21-37-46-183Z); spans only fed fetchMs, which gates nothing here.
     const all = await queryCapturedSliced('events', from, to, [service, notSpanFilter()], retry)
-    const spans = { events: [] as unknown[], raw: '', query: all.query }
+    const spans = { events: [] as unknown[], query: all.query }
     const next = statsFromEvents(eventsFor(all.events, version), spans.events)
     const prior = statsFromEvents(eventsFor(all.events, previous), spans.events)
     const aggregate = statsFromEvents(all.events, spans.events)
@@ -68,7 +68,8 @@ async function observe(config: CdConfig, version: string, previous: string, from
       query: { events: all.query, spans: spans.query },
       from,
       to,
-      raw: JSON.stringify({ events: all.raw, spans: spans.raw }),
+      // The pages are the command captures already; cite them by digest instead of embedding a second, escaped copy.
+      raw: JSON.stringify({ pages: all.pages.map(digest => `${BLOB_DIR}/${digest}.gz`) }),
     })
     return { kind: 'sample', next, previous: prior, aggregate, ref }
   } catch (error) {

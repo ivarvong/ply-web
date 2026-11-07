@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
+import { gunzipSync } from 'node:zlib'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { chartPng } from '../scripts/cd/charts.ts'
@@ -20,6 +21,14 @@ const PREVIOUS = '1aa0bb11-2222-4333-8444-555566667777'
 
 async function temp(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'ply-cd-'))
+}
+
+/** The stored capture of command event `seq`'s stdout or stderr, ungzipped. */
+async function capture(log: RunLog, seq: number, stream: 'stdout' | 'stderr'): Promise<string> {
+  const event = log.recorded().find(item => item.seq === seq)
+  if (!event || event.kind !== 'command') throw new Error(`no command ${seq}`)
+  const path = stream === 'stdout' ? event.payload.stdoutPath : event.payload.stderrPath
+  return gunzipSync(await readFile(join(log.dir, path))).toString('utf8')
 }
 
 test('cf runs from the repo directory', () => {
@@ -143,9 +152,9 @@ test('a v2 token never reaches captures', async () => {
     stderr: exact.reveal(),
   })
   await log.finish(0, null)
-  const cap1 = await readFile(join(runDir, 'captures', '1.stdout'), 'utf8')
-  const cap2 = await readFile(join(runDir, 'captures', '2.stdout'), 'utf8')
-  const cap2err = await readFile(join(runDir, 'captures', '2.stderr'), 'utf8')
+  const cap1 = await capture(log, 1, 'stdout')
+  const cap2 = await capture(log, 2, 'stdout')
+  const cap2err = await capture(log, 2, 'stderr')
   const events = await readFile(join(runDir, 'events.jsonl'), 'utf8')
   assert.equal(cap1.includes(v2), false)
   assert.equal(cap1.includes('art_v2_'), false)
@@ -173,7 +182,7 @@ test('a Secret never appears in an event', async () => {
   await assert.rejects(log.error('boom', { leaked: secret }))
   await log.finish(0, null)
   const text = await readFile(join(runDir, 'events.jsonl'), 'utf8')
-  const captured = await readFile(join(runDir, 'captures', '1.stdout'), 'utf8')
+  const captured = await capture(log, 1, 'stdout')
   assert.equal(text.includes('art_v1_NEVER_LOG_THIS_TOKEN'), false)
   assert.equal(text.includes('plain-secret-value'), false)
   assert.equal(captured.includes('art_v1_NEVER_LOG_THIS_TOKEN'), false)
@@ -214,7 +223,9 @@ test('debrief cites the decision, its rule, and writes charts', async () => {
   assert.match(markdown, /Informational unless a policy event sets latency to gate/)
   assert.match(markdown, /fast_burn/)
   assert.match(markdown, /14\.4/)
-  assert.match(markdown, /raw\/2\.json/)
+  assert.match(markdown, /blobs\/[0-9a-f]{64}\.gz/)
+  // A clean pass dropped its blobs at seal; the debrief says so instead of linking a missing file.
+  assert.match(markdown, /1 cited capture not kept/)
   const png = await readFile(join(dir, 'run.debrief', 'burn.png'))
   assert.equal(png[0], 137)
   assert.equal(png.subarray(1, 4).toString(), 'PNG')
