@@ -1,7 +1,8 @@
 # Rate limit: batched writes, cached reads
 
-Status: design, 2026-11-06. Replaces the per-request `ViewerRateLimit` call on the request path. Measurements land in
-the Results section with version ids and run ids.
+Status: live. Batched since 78ddd5c3 (2026-11-06); memo (no I/O on the request path) is the default since dbabbca6
+(2026-11-07). Replaces the per-request `ViewerRateLimit` call on the request path. Measurements land in the Results
+section with version ids and run ids.
 
 ## Why
 
@@ -34,9 +35,12 @@ Nothing on the request path waits for the Durable Object except a cache MISS/EXP
   opens a batch and schedules its flush 200 ms later (`LINGER_MS`) from `ctx.waitUntil`. Workers runs no timers
   outside an invocation, so the waitUntil is what keeps the isolate alive through the linger and the retries. Every
   request that joins the batch also `waitUntil`s the same promise (free, and the batch survives any one request
-  context ending). A batch that reaches 2048 keys (`MAX_BATCH_KEYS`) is closed and flushed at once, so memory is
-  bounded at `MAX_INFLIGHT` (64) batches × 2048 keys. Beyond 64 in-flight batches a new batch is dropped and
-  recorded (`rate.batch.dropped=overflow`).
+  context ending). A batch that reaches 2048 keys (`MAX_BATCH_KEYS`) is closed and flushed at once. At most
+  `MAX_INFLIGHT` (64) batches flush at once (beyond: dropped, `rate.batch.dropped=overflow`), and at most
+  `MAX_KEYS_HELD` (16,384) distinct keys are held across the open batch and every flushing batch (since e6baadd; the
+  old bound was 64 × 2048 = 131,072 while the counter is slow). A hit for a new key past it is dropped and recorded
+  (`rate.batch.dropped=budget`); a key already in the open batch still counts. `rate.batch.keys_held` is on every
+  check. Node 24, 200k random keys with every flush stuck: 3.0 MB held at the budget vs 20.7 MB unbounded.
 - **Idempotency key.** `<isolate uuid>:<seq>`. The uuid is minted on the isolate's first request (randomness is not
   available at global scope). The DO inserts the id into `rate_batches` in the same synchronous SQL transaction that adds
   the counts, so an id applies at most once. Ids are kept 10 min (`DEDUPE_RETENTION_MS`), 120× the client's 5 s deadline;
@@ -68,10 +72,17 @@ Nothing on the request path waits for the Durable Object except a cache MISS/EXP
 - **Blocked set.** After applying, every touched key whose window sum is ≥ its limit is upserted into `rate_blocked`
   with `until` (the time the sum next drops below the limit), `crossed` (when it first went over) and `peak` (the
   highest admitted sum). `peak − limit` is the measured overshoot.
-- **Pruning** every ≥ 5 s inside `apply`: expired slots, ids older than 10 min, ended blocks, at most 128 rows per table
-  per apply (`PRUNE_BATCH_ROWS`). A full slice leaves a backlog and the next apply prunes again instead of waiting 5 s,
-  so a backlog (an idle spell, a restarted object) drains in bounded slices. Before this bound one apply on 78ddd5c3
-  wrote 12,892 rows.
+- **Pruning** every ≥ 5 s inside `apply`: expired slots, ids older than 10 min, ended blocks. Per table at most 128
+  rows (`PRUNE_BATCH_ROWS`) plus the rows the apply itself added (rate_hits: + its entries; rate_blocked: + its new
+  blocks; since e6baadd). A full slice leaves a backlog and the next apply prunes again instead of waiting 5 s, so a
+  backlog (an idle spell, a restarted object) drains in bounded slices, and it shrinks under any inflow: each apply
+  takes out at least what it put in (unit test: 61,440 expired rows drained by full 2,048-key applies while the
+  inflow continued). One apply writes at most its own rows + its own entries + 128 per table. Before the bound one
+  apply on 78ddd5c3 wrote 12,892 rows. `ply.rate.apply` logs `pruned_hits/batches/blocked` and `prune_backlog`;
+  `ply.rate.stats` (every 30 s) logs the expired rows still stored per table and `databaseSize`.
+- **Index.** `rate_blocked(until)` (e6baadd) serves the document query (`WHERE until > ? ORDER BY until DESC LIMIT
+  4096`, every revalidation) and the blocked prune; before it the plan was `SCAN rate_blocked | USE TEMP B-TREE FOR
+  ORDER BY` (node:sqlite EXPLAIN QUERY PLAN; asserted in test/rate.test.ts).
 - **Budget.** Flush RPCs/s ≤ isolates × 5. Measured in Results (apply ms, rows written, DO CPU per invocation).
 
 ## Read side
@@ -79,7 +90,11 @@ Nothing on the request path waits for the Durable Object except a cache MISS/EXP
 - **One document, one key.** `RateCache` is a cache-enabled named entrypoint (the GitCache / Pinned / FlagsCache pattern;
   never `caches.default`). `GET https://rate.internal/blocked/v1` answers `RateCounter.blockedDoc()`: every blocked
   `[key16, bucket, until, crossed]`, newest 4096 (`MAX_DOC_ENTRIES`), with
-  `Cache-Control: public, max-age=1, stale-while-revalidate=30`.
+  `Cache-Control: public, max-age=1, stale-while-revalidate=30`. A full document is 208,947 bytes; parse + index p50 /
+  p99 1.05 / 2.21 ms (Node 24, 300 runs), ~228 KB of index.
+- **Reader bound (e6baadd).** The isolate reads the body streamed and stops past 512 KiB (`MAX_DOC_BYTES`: the body is
+  cancelled, the read is `TOO_LARGE`, the last document stays in use) and indexes at most 4096 entries
+  (`rate.doc_truncated`). `rate.doc_bytes` is on refresh spans. A bad or oversized document cannot grow the isolate.
 - **Why not per-client keys.** A per-client key misses on every new client and on every client's first request after each
   TTL: the median viewer client makes a handful of requests, so the hit ratio would sit near the miss path and every
   miss is a DO round trip on the request path, which is the cost being removed. One document is one MISS per colo per
@@ -91,7 +106,7 @@ Nothing on the request path waits for the Durable Object except a cache MISS/EXP
   the budget the request decides from the isolate's last document (any age ≤ 5 min), or admits when the isolate has
   none, and the fetch completes in `waitUntil`, refreshing that document. Extra lag this adds: only in an isolate that
   has never read the document, for ≤ one DO read (~0.5 s); measured in Results.
-- **Memo mode (`RATE_MODE=memo`, or `x-ply-rate-mode: memo`).** The batched read's p99 (12 ms on a020b1b1 / 78ddd5c3)
+- **Memo mode (`RATE_MODE=memo`, the default since 2026-11-07, dbabbca6; or `x-ply-rate-mode: memo`).** The batched read's p99 (12 ms on a020b1b1 / 78ddd5c3)
   is the loopback fetch itself: of 401 checks ≥ 10 ms, 363 were cache HIT or UPDATING. In memo mode the request never
   fetches: it looks its key up in the isolate's parsed document. When that document is ≥ 500 ms old
   (`MEMO_REFRESH_MS`) the request still decides from it and starts ONE refresh through the same `RateCache` entrypoint
@@ -163,12 +178,19 @@ so the smoke and the error gates pass. `scripts/cd/rate-gate.ts` runs inside the
 route: rate-checked, no git work) as a load client with no mode header, then the version's own spans since the stage
 began, by aggregate count. It fails the version when
 
-- any default-mode check (`rate.mode_source` default) ran a limiter other than `rate.expectMode` (batched);
+- any default-mode check (`rate.mode_source` default) ran a limiter other than `rate.expectMode` (memo since
+  2026-11-07; test/cd-rate-gate.test.ts asserts it equals `RATE_MODE` in cloudflare.config.ts);
 - warm default-mode checks (not `rate.cold_isolate`) failed open above 10% (with ≥ 20 of them; fewer is a harness fault);
 - any flush was dropped (deadline) or any batch overflowed without an injected fault.
 
 The thresholds and their evidence (7 days of spans, 128,753 flushes, every version since the limiter shipped) are in
-`scripts/cd/cd.policy.json` `rate`. A deliberate `RATE_MODE=legacy` rollback changes `rate.expectMode` too.
+`scripts/cd/cd.policy.json` `rate`. A deliberate `RATE_MODE` rollback (batched or legacy) changes `rate.expectMode`
+too, in the same commit, shipped through the pipeline: a `cf` var or secret edit creates and deploys a version at 100%
+directly (d4e3eea6 did).
+
+Memo start-up: an isolate's first check, and any memo check that is cold while that isolate's first refresh is still
+in flight, carry `rate.cold_isolate` and are not judged. A cold read after a refresh has settled with no document
+(the read path is broken) is a warm `fail_open` and counts.
 
 ## Results
 
@@ -227,7 +249,7 @@ The page p99.9 (≈3 s in both arms) is git work, not the limiter (lat1, A/A leg
   max 3; memo the same. abuse5 batched only: lag p50 500 / max 1500 ms, overshoot max 3, DO `peak − limit` 3. abuse4
   memo only: **lag p50 1500 / max 2000 ms, overshoot p50 3 / max 4**, DO `peak − limit` 4. Memo adds about one request
   gap plus ≤ 500 ms of memo age on top of the cache's max-age and SWR.
-- **Decision:** memo stays opt-in (`x-ply-rate-mode: memo` / `RATE_MODE=memo`) and the default stays batched. Its page
+- **Decision (superseded 2026-11-07, below):** memo stays opt-in (`x-ply-rate-mode: memo` / `RATE_MODE=memo`) and the default stays batched. Its page
   p99 gain is not measurable and its lag max (2.0 s) is over the ~1.5 s bar. 2a4741c0 was promoted with the default
   unchanged, which ships the bounded prune.
 - **Counter prune bound (PRUNE_BATCH_ROWS 128).** `ply.rate.apply` rows_written max before: 12,892 (78ddd5c3), 7,915
@@ -240,3 +262,46 @@ The page p99.9 (≈3 s in both arms) is git work, not the limiter (lat1, A/A leg
   0.5-1.8 s, max 4.5 s. The counter stayed healthy: every flush one attempt, 0 timeouts / replays / drops, apply RPC
   p99 ≤ 294 ms, CPU p99 ≤ 4 ms, rows_written p99 ≤ 51; denied requests never flush. The most a client's requests landed
   in one colo before it was refused was 59, so a per-isolate pre-count at the limit would not have bitten here.
+- **Memo becomes the default (2026-11-07; Ivar: "Overshoot is not horrible, we budget that into the limit. I care
+  most about hot path perf.").** Commits 53a8e47 (RATE_MODE memo, gate expects memo) + e6baadd (memory bounds). Canary
+  dbabbca6-b606-4c97-856b-22423a4a65da at 0% beside 935e8eb1-bdb5-4572-b7de-058d4c51492e (batched; it already ran
+  REFS_POLICY=watched, so the arms differ only in the limiter). ply-load de344fdb, both versions pinned, interleaved
+  per request, GET /r/ply, load checks joined to `ply.request` by trace:
+
+  | run · arm | checks | check p50 / p99 / p99.9 / max ms | pages | wall p50 / p90 / p99 / p99.9 ms |
+  |---|---|---|---|---|
+  | memoab1 · 935e8eb1 batched | 14,138 | 3 / 8 / 25 / 25 | 13,874 | 11 / 15 / 34 / 755 |
+  | memoab1 · dbabbca6 memo | 14,142 | **0 / 0 / 0 / 0** | 13,976 | **9 / 14 / 30 / 562** |
+  | mem1m2 · 935e8eb1 batched | 531,656 | 3 / 19 / 25 / 25 | 531,764 | 14 / – / 154 / 295 |
+  | mem1m2 · dbabbca6 memo | 531,728 | **0 / 0 / 0 / 0** | 531,598 | **11 / – / 139 / 256** |
+
+  memoab1: 6 regions × 4 generators × 4 req/s × 300 s, 16 colos. Memo − batched, bootstrap 95%: check −3 [−3, −3] /
+  −4 [−4, −4] (p90) / −8 [−8, −8] / −25 [−25, −25]; wall p50 −2 [−2, −2], p90 −1 [−2, −1], p99 −4 [−8, −1], p99.9
+  −193 [−720, +409] (the tail is git work). mem1m2 (48 generators × 25 req/s × 900 s, a new client per request,
+  1,063,558 distinct): every percentile lower on memo (Workers Observability calculations). Memo reads (memoab1):
+  memo_fresh 3,200, memo_stale_refresh 10,918, cold 24 (all start-up, `rate.cold_isolate`); warm fail_open 0 vs 1 on
+  batched. Refreshes 10,977 (one per 1.3 requests), all ok, HIT 80% / UPDATING 20%, ms p50 / p99 / p99.9 / max
+  3 / 8 / 40 / 173; memo age p50 / p99 500 / 1001 ms. Promoted with `npm run cd` (canary + live rate gate: memo on every
+  default check, warm fail_open 0/26 and 0/37, 0 drops; visual smoke 32/32). Previous: 935e8eb1.
+- **Enforcement with memo (the overshoot budget).** abuse6 (dbabbca6 pinned, 12 clients at 2 req/s = 2× the limit,
+  4 regions, 100 s): lag p50 / p90 / max 1000 / 2000 / 2500 ms (client clock, quantised by the 500 ms gap), overshoot
+  p50 / p90 / max 2 / 4 / 5 requests per 60 s window; DO `peak` max 65. blk2 (1,536 clients at 1.2× the limit, each on
+  one version, under counter load): batched lag p50 / p99 / max 833 / 1667 / 2500 ms, overshoot max 3; memo 833 /
+  2500 / 3334 ms, overshoot max 4. Budget about +5 per 60/min client at 2× and ≈ rate × 1–3 s for bursts.
+- **A million distinct clients (mem1m1, mem1m2, 2026-11-07).** keys held per isolate p50 / p99 / max 6 / 18 / 40
+  (mem1m2), max 81 (mem1m1): far under MAX_KEYS_HELD; 0 budget or overflow drops. Heap profiles (12 captures of
+  dbabbca6 under mem1m2, 10 s each; the profile carries allocation samples, not a live peak): rate code is 0.10% of
+  allocation (4.5 of 4,626 MiB); the page render dominates. **The one counter is the ceiling:** at ~1,180 admitted
+  req/s from ~50 colos (mem1m2) flush p50 / p99 / p99.9 321 / 1766 / 4167 ms, 4,692 attempt timeouts and 195 batches
+  dropped at the 5 s deadline (under-count; requests unaffected). At ~470 req/s (mem1m1) it was 212 / 948 / 1360 ms
+  with 0 drops. So ≥ 5k concurrently blocked clients (≥ 5k admitted req/s) is beyond one RateCounter; the largest
+  measured document was 1,488 entries / 75,937 bytes (blk2), refresh p99 36 ms. A 0% canary's Durable Object calls
+  run the 100% version's code, so the counter changes in e6baadd (index, adaptive prune, stats) are measured after
+  promotion (below).
+
+- **Counter after promotion (do1, dbabbca6 at 100%, 48 generators × 20 req/s × 300 s, a new client per request,
+  283,913 sent).** 17,167 apply logs: rows_written p50 / p99 / max 18 / 151 / 296; pruned per apply max 138 rate_hits,
+  129 rate_batches (the budgets). The mem runs had left 30,662 expired `rate_batches` rows (one id per apply at ~330
+  applies/s outran the old 128-row prune); `ply.rate.stats` showed 30,662 → 1,037 → 377 → 152 within 3.5 min while
+  the inflow continued; expired rate_hits 0; databaseSize 7.8–10.2 MB. Flushes 64,289 ok + 66 dropped, flush p50 / p99
+  214 / 2051 ms at ~950 admitted req/s: the throughput ceiling is the one object's commits, not its prune.
