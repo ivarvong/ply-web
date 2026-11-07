@@ -460,9 +460,24 @@ cd: FAIL rollback: rollback to 1aa0bb11-… failed: …
 | `telemetry.json` | The pass/fail the ramp reads. A ramp with a fail here does not change traffic. |
 | `ramp.jsonl` | One JSON object per step: `{ "line": "ramp step=…", "probe_loss": { "percent", "count", "rate", "total", "responded", "ids" } }` |
 | `events.jsonl` | Append-only log. One typed event per line. This is the record a debrief reads |
-| `manifest.json` | sha256 of every other file, written after `run_finished`. The directory is not modified after this |
-| `captures/` | stdout and stderr of each command, redacted |
-| `raw/` | The response body behind each observation |
+| `manifest.json` | sha256 of every other file, written after `run_finished`, and `blobs`: `dropped` (a clean pass) or `kept`. The pipeline does not modify the directory after this; only retention (below) does |
+| `blobs/<sha256>.gz` | Kept only when the run failed or rolled back. Every command's stdout and stderr (redacted) and every observation's body, gzipped and stored once by content: a command event's `stdoutDigest` is the file name. A ramp observation's body lists the digests of the telemetry pages it read instead of copying them |
+| `visual/` | CDP screenshots |
+| `pruned.json` | Present only on a compacted run: its status, what retention removed, bytes freed |
+
+The gates read only an observation's `measurement` (counts, errors, latencies, shares), and that is in `events.jsonl`, so a clean pass loses nothing it decided on by dropping `blobs/`. Before 2026-11-07 every telemetry poll wrote its full stdout to `captures/<seq>.stdout` (up to 2.7 MB) and again, escaped inside a JSON string, to `raw/<seq>.json` (up to 29 MB): a ramp run was 120-135 MB, and about 50 runs filled the disk twice.
+
+### Retention
+
+Every run that creates a directory prunes `PLY_CD_RUN_DIR` first (`scripts/cd/retention.ts`, `RETENTION`) and prints `retention: N whole, N compacted, N removed, X MB freed`. A run's status is the last `run_finished` in its `events.jsonl`; a rollback is a failure, and an unfinished run older than 24 h counts as a failure (younger ones, and the run being resumed, are not touched).
+
+| Tier | Which runs | What stays |
+| --- | --- | --- |
+| Whole | The newest 10 passes and the newest 10 failures | Everything. A pass also loses any leftover `blobs/`, `captures/`, `raw/` |
+| Compacted | The next 500 runs, newest first | Top-level summary files only (`verdict.json`, `telemetry.*`, `smoke.*`, `live-smoke.*`, `visual.json`, `deploy.json`, `ramp.*`): tens of KB. `events.jsonl` (its lines are in the ledger), `manifest.json`, and every subdirectory go; `pruned.json` records it |
+| Removed | Older | The directory and its `.debrief/`. The ledger still has every event |
+
+`ledger.jsonl` is never pruned. `liveSmokeAlreadyPassed` reads `live-smoke.json`, which compaction keeps; `--sha` resumes only an unfinished run, which is whole for 24 h. A debrief of a pass or compacted run lists the captures it cites as not kept.
 
 ## When it fails
 
@@ -558,7 +573,7 @@ The event log is the record of the run. Every line is one JSON object:
 | --- | --- |
 | `lifecycle` | `run_started` (config, node/cf/git versions, ply and ply-web shas, host, and `release` as `{ply, web}` or null), `resumed` (the same run id, the ply sha, and the release pair), or `run_finished` (verdict, rollback, smoke counts, stage timings, per-step burns, live/fail/restore times, `fault`, and the release pair) |
 | `command` | argv with secrets already replaced by `<redacted>`, cwd, exit code, duration, sha256 of stdout and stderr, and the paths of those captures |
-| `observation` | The measurement, the exact `cf o11y` query (or the smoke source) and its window, and `responsePath` of the raw body under `raw/` |
+| `observation` | The measurement, the exact `cf o11y` query (or the smoke source) and its window, and `responsePath` of the raw body (`blobs/<sha256>.gz`; `raw/<seq>.json` before 2026-11-07) |
 | `decision` | `inputs` (one or more earlier observation seqs), `rules` (`name` and `value` from the policy or `slo.ts`, the smoke rule, or `reconcile` with the next stage), `outcome` (`advance`, `hold`, `insufficient_data`, `insufficient_samples`, `rollback`, `stop`, `harness_fault`, `state_conflict`, `cleanup_leak`), and `reason`. `cleanup_leak` names a scratch repo and does not fail the run |
 | `policy` | `sha256` of the policy file bytes, the path, the body that ran, and the release pair (`ply`, `web`) or null. The debrief prints this first so the rules of that run are the ones you read |
 | `state_change` | Traffic split before and after, and the deployment id when cf returned one |
@@ -570,13 +585,13 @@ A decision cannot be written unless `inputs` cites an earlier `observation`. A `
 
 The ramp emits `insufficient_data` when the new version was not seen enough times and the policy holds, and `hold` when a routed-share miss is configured to hold. The checked-in file rolls a share miss back and holds on thin evidence. `stop` is a gate that leaves traffic where it is (the pinned smoke failure, while smoke is hard). `rollback` is traffic returned to the previous version.
 
-After `run_finished` the run writes `manifest.json` with the sha256 of every other file and then refuses further appends. Do not edit the run directory. A debrief writes beside it:
+After `run_finished` the run drops `blobs/` on a clean pass, writes `manifest.json` with the sha256 of every other file, and then refuses further appends. Do not edit the run directory; retention compacts it later. A debrief writes beside it:
 
 ```sh
 npm run cd -- debrief ~/.local/state/ply-cd/runs/2026-10-31T21-05-00-123Z
 ```
 
-That prints `debrief: ~/.local/state/ply-cd/runs/2026-10-31T21-05-00-123Z.debrief/debrief.md`. The markdown stands alone: the policy body and its sha256, a timeline, every decision with the rule and the observations it used, every traffic change, three charts (`split.png` is every `state_change`, including the 0% canary, against `routedNewShare` from telemetry, `latency.png` wall p99 by version labeled with the run's latency mode, `burn.png` burn per SLO with a line at the policy's fast-burn multiple), and links back to `events.jsonl`, `raw/`, and `captures/`.
+That prints `debrief: ~/.local/state/ply-cd/runs/2026-10-31T21-05-00-123Z.debrief/debrief.md`. The markdown stands alone: the policy body and its sha256, a timeline, every decision with the rule and the observations it used, every traffic change, three charts (`split.png` is every `state_change`, including the 0% canary, against `routedNewShare` from telemetry, `latency.png` wall p99 by version labeled with the run's latency mode, `burn.png` burn per SLO with a line at the policy's fast-burn multiple), and links back to `events.jsonl` and to whichever cited blobs were kept (`raw/` and `captures/` in a pre-2026-11-07 run).
 
 ## Later
 

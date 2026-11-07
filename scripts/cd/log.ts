@@ -1,7 +1,9 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { createHash } from 'node:crypto'
-import { appendFile, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, relative } from 'node:path'
+import { promisify } from 'node:util'
+import { gzip } from 'node:zlib'
 import { asRecord } from './json.ts'
 import { RUN_ID } from './run-dir.ts'
 import { redact } from './redact.ts'
@@ -171,6 +173,21 @@ export function isoOffset(date: Date): string {
   const sign = offset >= 0 ? '+' : '-'
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}${sign}${pad(Math.trunc(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}`
 }
+
+const gzipAsync = promisify(gzip)
+
+/** A Node fs error with this `code`. */
+export function hasCode(error: unknown, code: string): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && (error as { readonly code: unknown }).code === code
+}
+
+/**
+ * Bulky bytes (command stdout and stderr, observation bodies) are stored once each, gzipped, at `blobs/<sha256>.gz`.
+ * A run that passes without a rollback deletes `blobs/` before it seals: the gates read only `measurement`, which
+ * is in events.jsonl. A failed or rolled-back run keeps them. Before 2026-11-07 every poll wrote a plain
+ * captures/<seq>.stdout and a raw/<seq>.json copy of the same pages, 100-400 MB per run.
+ */
+export const BLOB_DIR = 'blobs'
 
 function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex')
@@ -509,6 +526,7 @@ export class RunLog {
   #started = false
   #finished = false
   #sealed = false
+  #verdict: 'pass' | 'fail' | null = null
   readonly facts: RunFacts = {
     versionId: null,
     plySha: null,
@@ -634,6 +652,7 @@ export class RunLog {
     await this.#enqueue(async () => {
       if (this.#finished) return
       this.#finished = true
+      this.#verdict = code === 0 ? 'pass' : 'fail'
       const payload: LifecycleFinished = {
         event: 'run_finished',
         verdict: code === 0 ? 'pass' : 'fail',
@@ -657,18 +676,30 @@ export class RunLog {
     })
   }
 
-  /** Hash every file except the manifest, then refuse further writes. */
+  /** True when this run's blobs are kept at seal: it failed or rolled back. */
+  get keepsBlobs(): boolean {
+    return this.#verdict !== 'pass' || this.facts.rolledBack
+  }
+
+  /** sha256 of `text` as a capture of it is stored: after redaction. Matches `stdoutDigest` and the blob name. */
+  digest(text: string): string {
+    return sha256(scrub(text, this.#concealed))
+  }
+
+  /** Drop the blobs of a clean pass, hash every file except the manifest, then refuse further writes. */
   async seal(): Promise<void> {
     await this.#enqueue(async () => {
       if (!this.#finished) throw new Error('seal requires run_finished')
       if (this.#sealed) return
+      const blobs = this.keepsBlobs ? 'kept' : 'dropped'
+      if (blobs === 'dropped') await rm(join(this.#dir, BLOB_DIR), { recursive: true, force: true })
       const files = await filesIn(this.#dir)
       const listed: { [path: string]: string } = {}
       for (const file of files) {
         const bytes = await readFile(join(this.#dir, file))
         listed[file] = createHash('sha256').update(bytes).digest('hex')
       }
-      const manifest = { run_id: this.#runId, sealed_at: isoOffset(new Date()), files: listed }
+      const manifest = { run_id: this.#runId, sealed_at: isoOffset(new Date()), blobs, files: listed }
       await writeFile(join(this.#dir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n')
       this.#sealed = true
     })
@@ -676,25 +707,21 @@ export class RunLog {
 
   async noteCommand(note: CommandNote): Promise<void> {
     await this.#enqueue(async () => {
-      const seq = this.#seq
       for (const part of note.argv) if (isSecret(part)) this.conceal(part.reveal())
       const argv = note.argv.map(part => (isSecret(part) ? '<redacted>' : part))
       const stdout = scrub(note.stdout, this.#concealed)
       const stderr = scrub(note.stderr, this.#concealed)
-      const stdoutPath = `captures/${seq}.stdout`
-      const stderrPath = `captures/${seq}.stderr`
-      await mkdir(join(this.#dir, 'captures'), { recursive: true })
-      await writeFile(join(this.#dir, stdoutPath), stdout)
-      await writeFile(join(this.#dir, stderrPath), stderr)
+      const out = await this.#blob(stdout)
+      const err = await this.#blob(stderr)
       await this.#append('command', {
         argv,
         cwd: note.cwd,
         exitCode: note.exitCode,
         durationMs: note.durationMs,
-        stdoutDigest: sha256(stdout),
-        stderrDigest: sha256(stderr),
-        stdoutPath,
-        stderrPath,
+        stdoutDigest: out.digest,
+        stderrDigest: err.digest,
+        stdoutPath: out.path,
+        stderrPath: err.path,
       })
     })
   }
@@ -708,9 +735,7 @@ export class RunLog {
   }): Promise<ObservationRef> {
     return this.#enqueue(async () => {
       const seq = this.#seq
-      const responsePath = `raw/${seq}.json`
-      await mkdir(join(this.#dir, 'raw'), { recursive: true })
-      await writeFile(join(this.#dir, responsePath), scrub(input.raw, this.#concealed))
+      const { path: responsePath } = await this.#blob(scrub(input.raw, this.#concealed))
       await this.#append('observation', {
         measurement: input.measurement,
         query: input.query,
@@ -776,6 +801,19 @@ export class RunLog {
     await this.#enqueue(async () => {
       await this.#append('error', { message, context })
     })
+  }
+
+  /** Store already-redacted `text` once by content. A second write of the same bytes is a no-op. */
+  async #blob(text: string): Promise<{ readonly digest: string; readonly path: string }> {
+    const digest = sha256(text)
+    const path = `${BLOB_DIR}/${digest}.gz`
+    await mkdir(join(this.#dir, BLOB_DIR), { recursive: true })
+    try {
+      await writeFile(join(this.#dir, path), await gzipAsync(text), { flag: 'wx' })
+    } catch (error) {
+      if (!hasCode(error, 'EEXIST')) throw error
+    }
+    return { digest, path }
   }
 
   #enqueue<T>(job: () => Promise<T>): Promise<T> {

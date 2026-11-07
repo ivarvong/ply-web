@@ -1,15 +1,21 @@
+import { createHash } from 'node:crypto'
 import { dig } from '../../src/absent.ts'
 import { assertNever } from '../../src/never.ts'
 import { TELEMETRY_MAX_PAGES, TELEMETRY_PAGE } from './baseline.ts'
 import { runCf } from './cf.ts'
 import { extractJson } from './json.ts'
+import { activeLog } from './log.ts'
 import type { RolloutPolicy } from './policy.ts'
 import { currentLog, recordQueryAttempt, retryQuery, type QueryAttempt, type QueryBound } from './query-retry.ts'
 import { pageCursor, telemetryQuery, unwrapEvents, type Filter } from './telemetry.ts'
 
 export type CapturedQuery = {
   readonly events: unknown[]
-  readonly raw: string
+  /**
+   * sha256 of each page's stdout as the run log stored it (its command `stdoutDigest`, blob `blobs/<sha256>.gz`).
+   * An observation cites pages by digest instead of embedding them again.
+   */
+  readonly pages: readonly string[]
   readonly query: ReturnType<typeof telemetryQuery>
 }
 
@@ -60,7 +66,7 @@ async function queryPage(
   }
 }
 
-/** Every page of one observability query, plus the raw pages and the first query body. */
+/** Every page of one observability query, plus each page's capture digest and the first query body. */
 export async function queryCaptured(
   view: 'events' | 'traces',
   from: number,
@@ -77,14 +83,15 @@ export async function queryCaptured(
     const body = telemetryQuery(view, from, to, filters, offset)
     if (!first) first = body
     const stdout = await queryPage(body, secrets, retry)
-    pages.push(stdout)
+    const log = activeLog()
+    pages.push(log ? log.digest(stdout) : createHash('sha256').update(stdout).digest('hex'))
     const events = unwrapEvents(extractJson(stdout))
     out.push(...events)
     // A short page is the last page. On 2026-11-01 the ramp pages were short of
     // TELEMETRY_PAGE because the index held that many rows: the series sum equalled
     // the page, sampleInterval was 1, and statistics.abr_level was 1.
     if (events.length < TELEMETRY_PAGE) {
-      return { events: out, raw: pages.join('\n'), query: first }
+      return { events: out, pages, query: first }
     }
     const cursor = pageCursor(events)
     if (!cursor) throw new Error('a full telemetry page has no $metadata.id cursor')
@@ -142,7 +149,7 @@ export async function queryCapturedSliced(
   }
   const first = parts[0]
   if (!first) throw new Error('sliced query with no slice')
-  return { events, raw: parts.map(part => part.raw).join('\n'), query: telemetryQuery(view, from, to, filters, null) }
+  return { events, pages: parts.flatMap(part => part.pages), query: telemetryQuery(view, from, to, filters, null) }
 }
 
 function metaId(event: unknown): string {

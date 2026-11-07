@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, relative } from 'node:path'
 import { atIndex, chainGet, mapGet } from '../../src/absent.ts'
@@ -313,13 +314,21 @@ export async function writeDebrief(runDir: string, outDir = join(dirname(runDir)
   lines.push('## Raw files', '')
   lines.push(`- [events.jsonl](${link(outDir, join(runDir, 'events.jsonl'))})`)
   lines.push(`- [manifest.json](${link(outDir, join(runDir, 'manifest.json'))})`)
+  // Blobs are content-addressed, so many events cite one file. A clean pass drops them at seal; retention compacts old runs.
+  const cited = new Set<string>()
   for (const event of events) {
-    if (event.kind === 'observation') lines.push(`- [${event.payload.responsePath}](${link(outDir, join(runDir, event.payload.responsePath))})`)
+    if (event.kind === 'observation') cited.add(event.payload.responsePath)
     if (event.kind === 'command') {
-      lines.push(`- [${event.payload.stdoutPath}](${link(outDir, join(runDir, event.payload.stdoutPath))})`)
-      lines.push(`- [${event.payload.stderrPath}](${link(outDir, join(runDir, event.payload.stderrPath))})`)
+      cited.add(event.payload.stdoutPath)
+      cited.add(event.payload.stderrPath)
     }
   }
+  let missing = 0
+  for (const path of cited) {
+    if (existsSync(join(runDir, path))) lines.push(`- [${path}](${link(outDir, join(runDir, path))})`)
+    else missing += 1
+  }
+  if (missing > 0) lines.push(`- ${missing} cited capture${missing === 1 ? '' : 's'} not kept (a clean pass drops its blobs; see manifest.json \`blobs\`)`)
   lines.push('')
   const markdownPath = join(outDir, 'debrief.md')
   await writeFile(markdownPath, lines.join('\n'))

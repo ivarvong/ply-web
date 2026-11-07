@@ -13,6 +13,7 @@ import { runPipeline } from './pipeline.ts'
 import { binaryNodeVersion, checkNode, NODE_IMAGE_BIN, nodeSatisfies, pathWithNodeBin, selectNode } from './preflight.ts'
 import { errorMessage, run } from './proc.ts'
 import { unfinishedRunDir } from './reconcile.ts'
+import { pruneRuns, retentionLine } from './retention.ts'
 import { checkoutReason, isReleaseId, readCheckout, releaseId, releasePair, type ReleaseId } from './release.ts'
 import { reportLedger } from './report.ts'
 import { createRunDir, RUN_ID, writeJson } from './run-dir.ts'
@@ -285,6 +286,12 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
     }
   }
   const existing = parsed.kind === 'cd' && release ? await unfinishedRunDir(config.runRoot, release) : null
+  try {
+    log(retentionLine(await pruneRuns(config.runRoot, existing ? [basename(existing)] : [])))
+  } catch (error) {
+    // Retention never blocks a deploy. The next run tries again.
+    log(`retention: skipped: ${errorMessage(error)}`)
+  }
   const runDir = existing ?? await createRunDir(config.runRoot)
   const runLog = existing
     ? await RunLog.reopen(runDir, config.ledgerPath)
