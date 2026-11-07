@@ -152,7 +152,7 @@ export class Generator extends DurableObject<Env> {
     this.#rows.push([t, armIndex, client, status, ttfb, Date.now() - sent, verOk, ti]);
   }
 
-  report(): { state: string; colo: string; cfg: ShardCfg | null; shed: number; restarts: number; rows: Row[] } {
+  report(): { state: string; colo: string; cfg: ShardCfg | null; shed: number; restarts: number; t0: number; rows: Row[] } {
     const raw = this.#get('cfg');
     const rows: Row[] = [];
     for (const r of this.ctx.storage.sql.exec<{ data: string }>(`SELECT data FROM rows ORDER BY seq`).toArray()) rows.push(...(JSON.parse(r.data) as Row[]));
@@ -162,6 +162,8 @@ export class Generator extends DurableObject<Env> {
       cfg: raw === null ? null : (JSON.parse(raw) as ShardCfg),
       shed: Number(this.#get('shed') || '0'),
       restarts: Number(this.#get('restarts') || '0'),
+      // Epoch ms of the shard's row clock (t = 0): rows from shards in different regions merge on t0 + t.
+      t0: Number(this.#get('t0') || '0'),
       rows,
     };
   }
@@ -212,7 +214,7 @@ export default {
       for (const hint of regions) {
         for (let shard = 0; shard < shards; shard++) {
           const r = await shardStub(env, m[1], hint, shard).report();
-          out.push({ hint, shard, state: r.state, colo: r.colo, shed: r.shed, restarts: r.restarts, n: r.rows.length, rows: rowsWanted ? r.rows : [] });
+          out.push({ hint, shard, state: r.state, colo: r.colo, shed: r.shed, restarts: r.restarts, t0: r.t0, n: r.rows.length, rows: rowsWanted ? r.rows : [] });
         }
       }
       return json({ ok: true, shards: out });
