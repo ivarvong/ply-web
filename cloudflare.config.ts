@@ -105,7 +105,7 @@ const plyWorker = {
 			PACK_CACHE: bindings.text("on"),
 			// "watched": public-namespace ls-refs answers are cached for minutes and purged by RefsWatch when a ref moves
 			// (src/refs-watch.ts). Anything else keeps every refs answer at max-age 5 + stale-while-revalidate 10.
-			REFS_POLICY: bindings.text("off"),
+			REFS_POLICY: bindings.text("watched"),
 			MIRROR_SYNC: bindings.text("on"),
 			// /view rate limits. One SQLite Durable Object class, defined by this Worker.
 			VIEWER_RATE: bindings.durableObject({ worker: WORKER_NAME, exportName: VIEWER_RATE_CLASS }),
