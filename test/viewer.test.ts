@@ -1082,6 +1082,56 @@ test('history in one call: on a tree:0 server the page fetches the head and its 
   }
 });
 
+test('path walk (ply walkCommit, #222): a server that takes combine:blob:none+tree:K gets the commit and two tree levels beside the window', async () => {
+  const { root, cleanup } = tmpRoot();
+  const srv = await startGitServer(root);
+  try {
+    const bare = makeBareRepo(root, 'walk');
+    const work = join(root, 'w-walk');
+    mkdirSync(work);
+    git(work, ['init', '-q', '-b', 'main']);
+    commitFiles(work, bare, { 'README.md': 'walk\n', 'a/b/c/f.txt': 'deep\n', 'a/x.txt': 'x\n' }, 'seed');
+    const calls: string[] = [];
+    const dial = rewriteAllowlisted(srv.url);
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const body = slot(init, 'body');
+      const text = body instanceof Uint8Array ? Buffer.from(body).toString('latin1') : '';
+      const filter = /filter ([^\n]+)\n/.exec(text);
+      const deepen = /deepen (\d+)\n/.exec(text);
+      calls.push(text === '' ? 'GET' : text.includes('command=ls-refs') ? 'ls-refs' : `fetch ${filter ? filter[1] : 'none'}${deepen ? ` d${deepen[1]}` : ''}`);
+      return dial(input, init);
+    };
+    const page = async (): Promise<string[]> => {
+      calls.length = 0;
+      const res = await handleViewer(new Request('https://ply.ivar.workers.dev/view/github.com/walk.git?path=a/b/c/f.txt'), viewerEnv(), {}, { fetchImpl });
+      assert.equal(res.status, 200);
+      assert.match(await res.text(), /deep/);
+      return calls.slice();
+    };
+    // first contact: nothing known about tree:0, so the walk starts from the window's commit, one tree per level
+    const first = await page();
+    assert.equal(first.filter(c => c.startsWith('fetch combine')).length, 0, first.join(' | '));
+    assert.equal(first.filter(c => c === 'fetch tree:0').length, 4, first.join(' | '));
+    // tree:0 known: walkCommit beside the window races the combined fetch once (and its tree:0 commit read)
+    const second = await page();
+    assert.deepEqual(second.filter(c => c.startsWith('fetch combine')), ['fetch combine:blob:none+tree:2 d1'], second.join(' | '));
+    // learned: the combined fetch alone brings the root and a/; a/b and a/b/c are read per level, then the blob
+    const third = await page();
+    const fetches = (cs: string[]) => [...cs.filter(c => c.startsWith('fetch'))].sort();
+    assert.deepEqual(fetches(third), ['fetch combine:blob:none+tree:2 d1', 'fetch none', 'fetch tree:0', 'fetch tree:0', `fetch tree:0 d${VIEWER_CAPS.maxLogCommits}`].sort(), third.join(' | '));
+    assert.deepEqual(fetches(first), ['fetch none', 'fetch tree:0', 'fetch tree:0', 'fetch tree:0', 'fetch tree:0', `fetch tree:0 d${VIEWER_CAPS.maxLogCommits}`].sort(), first.join(' | '));
+    // a missing component keeps the viewer's hint
+    const missing = await handleViewer(new Request('https://ply.ivar.workers.dev/view/github.com/walk.git?path=a/nope'), viewerEnv(), {}, { fetchImpl });
+    assert.equal(missing.status, 404);
+    assert.match(await missing.text(), /No entry named nope/);
+    const notDir = await handleViewer(new Request('https://ply.ivar.workers.dev/view/github.com/walk.git?path=a/x.txt/y'), viewerEnv(), {}, { fetchImpl });
+    assert.equal(notDir.status, 404);
+  } finally {
+    await srv.close();
+    cleanup();
+  }
+});
+
 test('scraping contract: li[data-oid] rows equal git ls-tree, and the commit card carries data-commit', async () => {
   // External monitors (ply issue #44) count these rows and compare the oids to the forge's tree API.
   // A redesign may restyle anything, but must keep: li[data-oid][data-mode][data-type][data-name], ul.files[data-entries],

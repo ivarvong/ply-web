@@ -1,9 +1,11 @@
 // One public page: discover, then either a pack map or a ref → commit → tree walk → optional blob.
 // Quirks are the isolate's per-origin map (src/quirks.ts), shared with /v1: a server that refuses tree:0 costs that 400
 // once per isolate, not once per page. The trace still names the fallback on every fetch that uses it.
-import { atIndex, chainGet, fromNullable, mapGet } from '../absent.ts';
+import { chainGet, fromNullable, mapGet } from '../absent.ts';
 import { unwrapOr } from '../option.ts';
-import { commitView, concat, createTransport, discover, entryType, fetchObject, fetchPack, hashObject, inflate, isFilterRejection, limitError, lsMode, lsRefs, packStream, parseTree, plyError, refCandidates, spFinish, spInit, spStep, TYPE } from 'ply';
+import { commitView, concat, createTransport, discover, entryType, fetchObject, fetchPack, hashObject, inflate, isFilterRejection, limitError, lsMode, lsRefs, packStream, parseTree, plyError, refCandidates, spFinish, spInit, spStep, TYPE, walkCommit, walkPath } from 'ply';
+import type { Walked } from 'ply/read';
+import { pathTreesOf, tree0Taken } from 'ply/transport';
 import type { SpState, Tracer, Transport } from 'ply';
 import type { SpStepped } from 'ply/fetch';
 import { unwrap, type OkOf } from '../ply-result.ts';
@@ -152,6 +154,23 @@ async function loadTreeBytes(transport: Transport, oid: string, cache: Map<strin
   return obj.data;
 }
 
+// ply's walk answer, or its not_found carrying the viewer's path hint (the page names the missing component and the
+// directory it was looked for in).
+function walkResult<T>(r: { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown }): T {
+  if (r.ok) return r.value;
+  const e = r.error;
+  const miss = chainGet(e, 'miss');
+  const kind = textOrEmpty(unwrapOr(chainGet(miss.tag === 'some' ? miss.value : null, 'kind'), ''));
+  const field = (key: string) => textOrEmpty(unwrapOr(chainGet(miss.tag === 'some' ? miss.value : null, key), ''));
+  if (kind === 'path') throw withHint(e as object, { nearby: [], path: { missing: field('missing'), existingPath: field('existingPath'), notDirectory: false } });
+  if (kind === 'not_directory') {
+    const parts = field('path').split('/');
+    const missing = unwrapOr(fromNullable(parts.pop()), '');
+    throw withHint(e as object, { nearby: [], path: { missing, existingPath: parts.join('/'), notDirectory: true } });
+  }
+  throw e;
+}
+
 function listed(entries: { name: string; mode: string; oid: string }[]): { shown: TreeEntry[]; truncated: number } {
   if (entries.length > VIEWER_GIT_LIMITS.maxTreeEntries) throw limitError('tree entries', entries.length, VIEWER_GIT_LIMITS.maxTreeEntries);
   const mapped: TreeEntry[] = entries.map(entry => ({ name: entry.name, mode: lsMode(entry.mode), oid: entry.oid, type: entryType(entry.mode) }));
@@ -297,50 +316,47 @@ async function loadTree(transport: Transport, route: Extract<ViewerRoute, { kind
     if (listing === null) listing = listPageRefs(transport, route.ref);
     return listing;
   };
-  let resolved: { name: string; commit: string };
-  let held: Map<string, Held> | null;
-  // ls-refs does not wait for discover (ply-web#120; ply#220 has the two share one GET): nothing before the header needs the advertisement. The first
-  // filtered fetch (the window) still waits for it, because discover is what tells ply's transport a server takes no
-  // `filter` at all.
+  // ls-refs does not wait for discover (ply-web#120; ply#220 makes the two share one advertisement GET): nothing before
+  // the header needs the advertisement. The window and the walk still wait for it, because discover is what tells ply's
+  // transport a server takes no `filter` at all.
   if (!(direct && route.raw)) refsNow().catch(() => {});
   const server = await advertised;
-  if (direct) {
-    resolved = { name: route.ref as string, commit: route.ref as string };
-    // Raw bytes need no history: read the commit alone. Every page reads the window (it replaces the commit read).
-    held = route.raw ? null : await loadWindow(transport, resolved.commit, quirks);
-  } else {
-    resolved = resolveRef(await refsNow(), route.ref);
-    held = route.raw ? null : await loadWindow(transport, resolved.commit, quirks);
-  }
+  const resolved: { name: string; commit: string } = direct
+    ? { name: route.ref as string, commit: route.ref as string }
+    : resolveRef(await refsNow(), route.ref);
+  const comps = route.path ? route.path.split('/') : [];
+  const cache = new Map<string, Uint8Array>();
+  // Raw bytes need no history: no window, and the walk is ply's walkCommit. Every other page reads the window (history,
+  // and on a blob:none or unfiltered host every tree too). On a host ply knows takes tree:0 and has not seen refuse
+  // `combine:blob:none+tree:K` (GitLab, Codeberg), walkCommit runs beside the window: the commit and the path's first two
+  // tree levels in one fetch (ply#219/#222). Anywhere else (GitHub refuses the combined filter; a first contact knows
+  // nothing yet) walkCommit's commit fetch would only repeat the window's, so the walk starts from the window's commit.
+  const windowed = route.raw ? Promise.resolve(null) : loadWindow(transport, resolved.commit, quirks);
+  const beside = route.raw || (tree0Taken(quirks) && pathTreesOf(quirks) !== 'refused');
+  const walking = beside ? walkCommit(transport, resolved.commit, comps, { cache }) : null;
+  const held = await windowed;
   const catalog = route.raw && direct ? { branches: [], branchesTruncated: 0, tags: [], tagsTruncated: 0 } : refCatalog(await refsNow());
-  const headObj = held === null ? null : unwrapOr(mapGet(held, resolved.commit), null);
-  const commitData = headObj && headObj.type === TYPE.COMMIT
-    ? headObj.data
-    : unwrap(await fetchObject(transport, { oid: resolved.commit, filter: 'tree:0', deepen: 1, expectType: TYPE.COMMIT })).data;
+  let commitData: Uint8Array;
+  let walked: Walked;
+  if (walking) {
+    const got = walkResult(await walking);
+    commitData = got.data;
+    walked = got;
+  } else {
+    for (const [oid, obj] of held === null ? [] : held) if (obj.type === TYPE.TREE) cache.set(oid, obj.data);
+    const headObj = held === null ? null : unwrapOr(mapGet(held, resolved.commit), null);
+    commitData = headObj && headObj.type === TYPE.COMMIT
+      ? headObj.data
+      : unwrap(await fetchObject(transport, { oid: resolved.commit, filter: 'tree:0', deepen: 1, expectType: TYPE.COMMIT })).data;
+    walked = walkResult(await walkPath(transport, toCommit(resolved.commit, commitData).tree, comps, { cache }));
+  }
   const commit = toCommit(resolved.commit, commitData);
   const header = headerFor(route.loc, resolved.name, resolved.commit, server);
-  const cache = new Map<string, Uint8Array>();
-  for (const [oid, obj] of held === null ? [] : held) if (obj.type === TYPE.TREE) cache.set(oid, obj.data);
-  const comps = route.path ? route.path.split('/') : [];
   let treeOid = commit.tree;
   let file: { mode: string; oid: string } | null = null;
-  for (let depth = 0; depth < comps.length; depth++) {
-    const name = unwrapOr(atIndex(comps, depth), '');
-    const data = await loadTreeBytes(transport, treeOid, cache);
-    const entries = unwrap(parseTree(data, VIEWER_GIT_LIMITS));
-    if (entries.length > VIEWER_GIT_LIMITS.maxTreeEntries) throw limitError('tree entries', entries.length, VIEWER_GIT_LIMITS.maxTreeEntries);
-    const entry = entries.find((item: { name: string }) => item.name === name);
-    const existingPath = comps.slice(0, depth).join('/');
-    if (!entry) throw withHint(plyError('not_found', `path component ${name} not found`, { miss: { kind: 'path', missing: name, existingPath } }), { nearby: [], path: { missing: name, existingPath, notDirectory: false } });
-    const last = depth === comps.length - 1;
-    if (!last) {
-      const walked = existingPath === '' ? name : `${existingPath}/${name}`;
-      if (entry.mode !== '40000') throw withHint(plyError('not_found', `${name} is not a directory`, { miss: { kind: 'not_directory', path: walked, mode: entry.mode } }), { nearby: [], path: { missing: name, existingPath, notDirectory: true } });
-      treeOid = entry.oid;
-      continue;
-    }
-    if (entry.mode === '40000') treeOid = entry.oid;
-    else file = { mode: entry.mode, oid: entry.oid };
+  if (walked.entry) {
+    if (walked.entry.mode === '40000') treeOid = walked.entry.oid;
+    else file = { mode: walked.entry.mode, oid: walked.entry.oid };
   }
   if (file) {
     const mode = lsMode(file.mode);
