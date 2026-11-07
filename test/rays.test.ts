@@ -46,9 +46,9 @@ test('encodeRayHeader keeps start order, renders a missing ray as "-", and does 
   assert.ok(ls !== null && fetch !== null && push !== null);
   const bad = parseCfRay('https://user:tok@github.com/secret/repo.git');
   assert.equal(bad.kind, 'missing');
-  log.fill(push, parseCfRay('cccccccccccccccc-IAD'), durationMs(0, 180), true);
-  log.fill(ls, bad, durationMs(0, 212), true);
-  log.fill(fetch, { kind: 'no_response' }, durationMs(0, 301), true);
+  log.fill(push, parseCfRay('cccccccccccccccc-IAD'), durationMs(0, 180), true, null);
+  log.fill(ls, bad, durationMs(0, 212), true, null);
+  log.fill(fetch, { kind: 'no_response' }, durationMs(0, 301), true, null);
   const header = encodeRayHeader(log.report());
   assert.equal(header, 'ls-refs=-;dur=212, fetch=no-response;dur=301, receive-pack=cccccccccccccccc-IAD;dur=180');
   assert.match(header, HEADER);
@@ -61,7 +61,7 @@ test('the ray log caps entries and counts the rest', () => {
   const log = createRayLog();
   for (let i = 0; i < MAX_RAY_ENTRIES + 3; i++) {
     const index = log.reserve('fetch', false);
-    if (index !== null) log.fill(index, parseCfRay('0123456789abcdef-IAD'), durationMs(0, i + 1), true);
+    if (index !== null) log.fill(index, parseCfRay('0123456789abcdef-IAD'), durationMs(0, i + 1), true, null);
   }
   const report = log.report();
   assert.equal(report.kind, 'overflow');
@@ -98,8 +98,8 @@ test('observeUpstream records a ray, a missing ray, a redirect, and a failure be
 
 test('headers and spans use the same tokens, and CORS exposure is opt-in', () => {
   const entries = [
-    { phase: 'fetch' as const, ray: parseCfRay('https://user:tok@github.com/secret/repo.git'), durMs: durationMs(0, 4), delivered: false, advertisement: false },
-    { phase: 'fetch' as const, ray: parseCfRay('dddddddddddddddd-IAD'), durMs: durationMs(0, 9), delivered: true, advertisement: false },
+    { phase: 'fetch' as const, ray: parseCfRay('https://user:tok@github.com/secret/repo.git'), durMs: durationMs(0, 4), delivered: false, advertisement: false, refs: null },
+    { phase: 'fetch' as const, ray: parseCfRay('dddddddddddddddd-IAD'), durMs: durationMs(0, 9), delivered: true, advertisement: false, refs: null },
   ];
   const report: RayReport = { kind: 'within', entries };
   const headers = new Headers({ 'server-timing': 'total;dur=8, app;dur=1', 'access-control-allow-origin': 'https://app.example' });
@@ -125,7 +125,7 @@ test('headers and spans use the same tokens, and CORS exposure is opt-in', () =>
 });
 
 test('exchanges pair with spans in start order, and a POST span skips the advertisement before it', () => {
-  const entry = (ray: string, durMs: number, advertisement: boolean) => ({ phase: 'fetch' as const, ray: parseCfRay(ray), durMs: durationMs(0, durMs), delivered: true, advertisement });
+  const entry = (ray: string, durMs: number, advertisement: boolean) => ({ phase: 'fetch' as const, ray: parseCfRay(ray), durMs: durationMs(0, durMs), delivered: true, advertisement, refs: null });
   const report: RayReport = { kind: 'within', entries: [entry('aaaaaaaaaaaaaaaa-IAD', 1, true), entry('bbbbbbbbbbbbbbbb-IAD', 2, false), entry('cccccccccccccccc-IAD', 3, false)] };
   const later = { name: 'git.upload-pack fetch', startTimeUnixNano: '200', attrs: {} as Record<string, unknown> };
   const first = { name: 'git.upload-pack ls-refs', startTimeUnixNano: '100', attrs: { 'http.request.method': 'POST' } as Record<string, unknown> };

@@ -31,6 +31,9 @@ const WORKER_NAME = "ply";
 const durableObjects = {
 	ViewerRateLimit: exports.durableObject({ storage: "sqlite" }),
 	RateCounter: exports.durableObject({ storage: "sqlite" }),
+	// RefsWatch (2026-11-07) is new and additive: grants and purges the public namespace's long-lived refs cache
+	// (src/refs-watch.ts). Reached through ctx.exports.RefsWatch, never an env binding (same reason as RateCounter).
+	RefsWatch: exports.durableObject({ storage: "sqlite" }),
 } as const;
 
 // Workers Caching (never the Cache API). The default entrypoint is uncached so it always runs (rate limit, logs, scrub,
@@ -100,6 +103,9 @@ const plyWorker = {
 			WRITES: bindings.text("on"),
 			// "off" sends every upstream exchange direct, past GitCache (Workers Caching).
 			PACK_CACHE: bindings.text("on"),
+			// "watched": public-namespace ls-refs answers are cached for minutes and purged by RefsWatch when a ref moves
+			// (src/refs-watch.ts). Anything else keeps every refs answer at max-age 5 + stale-while-revalidate 10.
+			REFS_POLICY: bindings.text("off"),
 			MIRROR_SYNC: bindings.text("on"),
 			// /view rate limits. One SQLite Durable Object class, defined by this Worker.
 			VIEWER_RATE: bindings.durableObject({ worker: WORKER_NAME, exportName: VIEWER_RATE_CLASS }),

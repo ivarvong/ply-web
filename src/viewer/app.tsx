@@ -189,7 +189,7 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
     }
   }
   const rays = createRayLog()
-  const fetchImpl: FetchLike = createViewerFetch(observeUpstream(createLoopbackFetch(direct, loopback), rays), route.loc.url, route.loc.allowedHosts, budget, pageSignal)
+  const fetchImpl: FetchLike = createViewerFetch(observeUpstream(createLoopbackFetch(direct, loopback, { watchedRefs: env.REFS_POLICY === 'watched' }), rays), route.loc.url, route.loc.allowedHosts, budget, pageSignal)
   let stamped = false
   const traced = () => {
     const report = rays.report()

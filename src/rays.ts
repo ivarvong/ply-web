@@ -57,6 +57,8 @@ export type RayEntry = {
   readonly durMs: DurationMs;
   /** False for a 3xx (a redirect ply followed or reported). The header still lists it; the span gets the hop ply read. */
   readonly delivered: boolean;
+  /** A refs exchange's cache policy and age (`x-ply-refs`, src/gitcache.ts refsState); null for any other exchange. */
+  readonly refs: string | null;
   /**
    * A GET info/refs. With followRedirects 'initial' ply advertises before a transport's first POST, inside that POST's
    * span: a POST span is paired with the exchange after such a preamble, not with the preamble.
@@ -157,11 +159,12 @@ type Slot = {
   delivered: boolean;
   advertisement: boolean;
   filled: boolean;
+  refs: string | null;
 };
 
 export type RayLog = {
   reserve(phase: Phase, advertisement: boolean): number | null;
-  fill(index: number, ray: Ray, durMs: DurationMs, delivered: boolean): void;
+  fill(index: number, ray: Ray, durMs: DurationMs, delivered: boolean, refs: string | null): void;
   report(): RayReport;
 };
 
@@ -171,12 +174,13 @@ export function createRayLog(): RayLog {
   return {
     reserve(phase, advertisement) {
       if (slots.length >= MAX_RAY_ENTRIES) { omitted += 1; return null; }
-      slots.push({ phase, ray: { kind: 'no_response' }, durMs: durationMs(0, 0), delivered: true, advertisement, filled: false });
+      slots.push({ phase, ray: { kind: 'no_response' }, durMs: durationMs(0, 0), delivered: true, advertisement, filled: false, refs: null });
       return slots.length - 1;
     },
-    fill(index, ray, durMs, delivered) {
+    fill(index, ray, durMs, delivered, refs) {
       const slot = slots[index];
       if (!slot) return;
+      slot.refs = refs;
       slot.ray = ray;
       slot.durMs = durMs;
       slot.delivered = delivered;
@@ -185,6 +189,7 @@ export function createRayLog(): RayLog {
     report() {
       const entries: RayEntry[] = slots.filter(slot => slot.filled).map(slot => ({
         phase: slot.phase, ray: slot.ray, durMs: slot.durMs, delivered: slot.delivered, advertisement: slot.advertisement,
+        refs: slot.refs,
       }));
       return omitted === 0 ? { kind: 'within', entries } : { kind: 'overflow', entries, omitted };
     },
@@ -227,11 +232,11 @@ export function observeUpstream(inner: UpstreamFetch, log: RayLog): UpstreamFetc
       const res = await inner(input, init);
       if (index !== null) {
         const delivered = res.status < REDIRECT_MIN || res.status >= REDIRECT_MAX;
-        log.fill(index, parseCfRay(res.headers.get('cf-ray')), durationMs(start, Date.now()), delivered);
+        log.fill(index, parseCfRay(res.headers.get('cf-ray')), durationMs(start, Date.now()), delivered, res.headers.get(REFS_HEADER));
       }
       return res;
     } catch (err) {
-      if (index !== null) log.fill(index, { kind: 'no_response' }, durationMs(start, Date.now()), true);
+      if (index !== null) log.fill(index, { kind: 'no_response' }, durationMs(start, Date.now()), true, null);
       throw err;
     }
   };
@@ -260,6 +265,11 @@ const SPAN_PHASE: Readonly<Record<string, Phase>> = {
 const ATTR_RAY = 'git.upstream.cf_ray';
 const ATTR_PHASE = 'git.upstream.phase';
 const ATTR_DUR = 'git.upstream.dur_ms';
+/** The refs cache policy of an ls-refs (`watched;ok`, `short;new`, `short;ttl`…) and its age in seconds when served. */
+export const ATTR_REFS_POLICY = 'git.refs.policy';
+export const ATTR_REFS_AGE = 'git.refs.age_s';
+/** src/gitcache.ts REFS_STATE_HEADER (not imported: rays.ts stays free of the cache module). */
+const REFS_HEADER = 'x-ply-refs';
 
 /**
  * Copy each delivered exchange onto the span that performed it, in start order.
@@ -294,6 +304,11 @@ export function stampUpstreamSpans(ended: readonly StampableSpan[], report: RayR
     span.attrs[ATTR_RAY] = renderRay(entry.ray);
     span.attrs[ATTR_PHASE] = entry.phase;
     span.attrs[ATTR_DUR] = entry.durMs;
+    if (entry.refs !== null) {
+      const at = entry.refs.lastIndexOf(';age=');
+      span.attrs[ATTR_REFS_POLICY] = at < 0 ? entry.refs : entry.refs.slice(0, at);
+      if (at >= 0) span.attrs[ATTR_REFS_AGE] = Number(entry.refs.slice(at + 5));
+    }
   }
 }
 

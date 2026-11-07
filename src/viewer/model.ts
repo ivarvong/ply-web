@@ -129,6 +129,8 @@ export type ViewerEnv = Partial<{
   PLY_LOAD_TOKEN: string;
   VIEWER_PACK_RATE_PER_MIN: string;
   PACK_CACHE: string;
+  /** `watched`: public-namespace refs are cached long and purged on change (src/refs-watch.ts). Anything else: 5 s + 10 s. */
+  REFS_POLICY: string;
   /** Workers version metadata (cloudflare.config.ts). Its id is the `ply.script_version` on the viewer's ply spans. */
   VERSION: { readonly id: string };
 }>;

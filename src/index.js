@@ -26,6 +26,7 @@ import { checkRemote, createGuardedFetch, redirectOptions } from './remote.ts';
 import { applySecurityHeaders } from './security-headers.ts';
 import { quirksFor } from './quirks.ts';
 import { createLoopbackFetch } from './gitcache.ts';
+import { WATCH_NAME } from './refs-watch.ts';
 import { syncAll } from './mirror.ts';
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { asPinned, isInternal, pinnedViewKey, requestForKey, viaPinned } from './pinned.ts';
@@ -52,6 +53,7 @@ export { checkRemote };
 
 export { ViewerRateLimit } from './viewer/rate.ts';
 export { GitCache } from './gitcache-entry.ts';
+export { RefsWatch } from './refs-watch-entry.ts';
 export { RateCounter } from './rate/counter.ts';
 export { RateCache } from './rate/cache-entry.ts';
 
@@ -407,17 +409,30 @@ function classifyViewLoc(env, url) {
   }
 }
 const isPublicViewLoc = env => url => classifyViewLoc(env, url).kind === 'public';
+/** The one RefsWatch object through ctx.exports (no env binding: see the RateCounter note in cloudflare.config.ts). */
+const refsWatchStub = ctx => {
+  const ns = unwrapOr(dig(ctx, ['exports', 'RefsWatch']), null);
+  if (ns === null || typeof ns.idFromName !== 'function') return null;
+  return ns.get(ns.idFromName(WATCH_NAME));
+};
 const pinnedBinding = (env, ctx) => (env.PACK_CACHE === 'off' ? null : unwrapOr(dig(ctx, ['exports', 'Pinned']), null));
 
 const worker = {
   // Cron (cloudflare.config.ts): keep the public-v0 mirrors on their GitHub branch (src/mirror.ts). One log line per mirror.
   async scheduled(controller, env, ctx) {
-    if (env.MIRROR_SYNC !== 'on' || !env.PUBLIC_REPOS) return;
-    const tokens = tokenSourceFor(env.PUBLIC_REPOS);
-    const scrub = text => scrubSecrets(tokens === null ? [] : tokens.secrets())(text);
-    const results = await syncAll({ binding: env.PUBLIC_REPOS, tokens, fetchImpl: null, origin: null });
-    for (const r of results) console.log(scrub(JSON.stringify({ msg: 'ply.mirror', cron: unwrapOr(chainGet(controller, 'cron'), ''), scheduledTime: unwrapOr(chainGet(controller, 'scheduledTime'), 0), ...r })));
-    void ctx;
+    // RefsWatch (src/refs-watch-entry.ts): restart its alarm if it stopped; after a mirror push, poll at once.
+    const watch = refsWatchStub(ctx);
+    const ensured = watch === null ? Promise.resolve(null) : watch.ensure().catch(e => ({ error: String((e && e.message) || e).slice(0, 120) }));
+    let pushed = [];
+    if (env.MIRROR_SYNC === 'on' && env.PUBLIC_REPOS) {
+      const tokens = tokenSourceFor(env.PUBLIC_REPOS);
+      const scrub = text => scrubSecrets(tokens === null ? [] : tokens.secrets())(text);
+      const results = await syncAll({ binding: env.PUBLIC_REPOS, tokens, fetchImpl: null, origin: null });
+      pushed = results.filter(r => r.outcome === 'updated').map(r => r.repo);
+      if (watch !== null && pushed.length > 0) await watch.poke(pushed).catch(() => {});
+      for (const r of results) console.log(scrub(JSON.stringify({ msg: 'ply.mirror', cron: unwrapOr(chainGet(controller, 'cron'), ''), scheduledTime: unwrapOr(chainGet(controller, 'scheduledTime'), 0), ...r })));
+    }
+    console.log(JSON.stringify({ msg: 'ply.refswatch', event: 'cron', ensure: await ensured, poked: pushed }));
   },
   async fetch(req, env, ctx) {
     const t0 = Date.now();
@@ -567,7 +582,7 @@ const worker = {
           rays = createRayLog();
           // Inside the guard, so each exchange (a 3xx included) is one entry. The guard never follows a 3xx: ply follows the
           // first GET info/refs (git's http.followRedirects=initial), vetted by allowUrl; a 3xx on a POST is an error.
-          const fetchImpl = createGuardedFetch(observeUpstream(createLoopbackFetch(direct, loopback), rays), remoteUrl, allow);
+          const fetchImpl = createGuardedFetch(observeUpstream(createLoopbackFetch(direct, loopback, { watchedRefs: env.REFS_POLICY === 'watched' }), rays), remoteUrl, allow);
           const opts = { ...(credential.tag === 'some' ? { auth: credential.value } : {}), tracer, limits: LIMITS, quirks: quirksFor(remoteUrl.origin), fetchImpl, ...redirectOptions(remoteUrl, allow) };
           // ply's operation() (readFile, listTree, the writes) builds its transport from auth/fetchImpl/limits only, so it
           // would not follow a redirect. It is handed this one, built with the redirect options; the request's operations

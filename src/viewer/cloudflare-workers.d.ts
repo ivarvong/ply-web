@@ -12,6 +12,7 @@ declare module 'cloudflare:workers' {
     ctx: DurableObjectState;
     env: Env;
     constructor(ctx: DurableObjectState, env: Env);
+    alarm?(): Promise<void>;
   }
   export interface DurableObjectState {
     storage: DurableObjectStorage;
@@ -21,6 +22,8 @@ declare module 'cloudflare:workers' {
     get<T>(key: string): Promise<T | PlatformAbsent>;
     put<T>(key: string, value: T): Promise<void>;
     put<T>(key: string, value: T, options: { allowUnconfirmed: boolean }): Promise<void>;
+    getAlarm(): Promise<number | null>;
+    setAlarm(scheduledTime: number): Promise<void>;
     sql: SqlStorage;
   }
   export interface SqlStorage {

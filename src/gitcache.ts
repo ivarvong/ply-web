@@ -6,6 +6,10 @@
 //   pack      POST git-upload-pack, command=fetch, wants only (no have / shallow / want-ref / deepen-since / deepen-not):
 //             a pure function of (url, body). Objects are named by their hash, so  public, max-age=31536000, immutable.
 //   refs      POST git-upload-pack, command=ls-refs: refs move.           public, max-age=REFS_MAX_AGE_S, swr=REFS_SWR_S
+//   wrefs     ls-refs of a public-namespace repo when the watched policy is on (createLoopbackFetch `watchedRefs`): stored
+//             WATCHED_REFS_CACHE (minutes) and tagged refsTag(repo) when RefsWatch grants a lease, else the refs policy.
+//             RefsWatch purges the tag when the repo's refs move (src/refs-watch.ts). Its own key kind, so a version
+//             without the policy never reads a long-lived answer, and one with it never reads a short one.
 //   discover  GET info/refs?service=git-upload-pack: a v2 answer is the capability list (no refs), so it is long-lived;
 //             a v0 answer carries the refs, so it gets the refs policy.
 //
@@ -26,12 +30,13 @@ import { err, httpReply, isUnexpected, ok, responseOf, runRequest, type HttpRepl
 import { unwrapOr } from './option.ts';
 import { extractRequestPath, rawPathHasUnsafeSegment } from './pathguard.ts';
 import { parseCfRay } from './rays.ts';
-import { publicUploadPackRepo, scrubSecrets, type TokenSource, withPublicReadCredential, type FetchLike } from './public.ts';
+import { isPublicRepoName, publicUploadPackRepo, scrubSecrets, type TokenSource, withPublicReadCredential, type FetchLike } from './public.ts';
 import { ALLOWED_HOSTS } from './viewer/url.ts';
 import { createTransport, fetchPack, Tracer } from 'ply';
+import { LEASE_TIMEOUT_MS, MAX_PURGE_TAGS, REFS_FILL_TIMEOUT_MS, WATCH_NAME, WATCHED_REFS_CACHE, parseLsRefsAnswer, refsTag, type LeaseAnswer } from './refs-watch.ts';
 import { VERIFY_CAPS, VERIFY_LIMITS } from './limits.ts';
 
-export type CacheKind = 'pack' | 'refs' | 'discover';
+export type CacheKind = 'pack' | 'refs' | 'wrefs' | 'discover';
 
 export const REFS_MAX_AGE_S = 5;
 export const REFS_SWR_S = 10;
@@ -100,6 +105,12 @@ const H_URL = 'x-ply-gc-url';
 const H_BODY = 'x-ply-gc-body';
 const H_PROTO = 'x-ply-gc-proto';
 const H_UA = 'x-ply-gc-ua';
+/** On a refs or wrefs answer: when GitCache stored it (ms), so a hit's age is known. */
+export const H_FILLED = 'x-ply-gc-filled';
+/** On a wrefs answer: `watched;<reason>` or `short;<reason>` (the lease answer). */
+export const H_REFS_POLICY = 'x-ply-gc-refs';
+/** What the loopback reports for a refs exchange: `<policy>;age=<s>`. observeUpstream puts it on the span. */
+export const REFS_STATE_HEADER = 'x-ply-refs';
 /** Set by GitCache on its upstream request, so tests can tell a cached path from a direct one. Carries no secret. */
 export const VIA_HEADER = 'x-ply-via';
 
@@ -189,7 +200,24 @@ function requestUrl(input: RequestInfo | URL): string {
  * with no Authorization goes to GitCache; everything else goes to `direct` unchanged. `loopback` is null when the
  * cache is off (PACK_CACHE=off) or there is no ctx.exports (node tests).
  */
-export function createLoopbackFetch(direct: FetchLike, loopback: (() => LoopbackBinding | null) | null): FetchLike {
+export type LoopbackOptions = { readonly watchedRefs: boolean };
+
+/** The key kind of an exchange: a public-namespace ls-refs is `wrefs` when the watched policy is on. */
+export function routedKind(kind: CacheKind | null, method: string, url: string, options: LoopbackOptions): CacheKind | null {
+  if (kind === 'refs' && options.watchedRefs && publicUploadPackRepo(method, url) !== null) return 'wrefs';
+  return kind;
+}
+
+/** `<policy>;age=<s>` for a refs answer: the policy GitCache stored it under and how long ago. */
+export function refsState(kind: CacheKind, headers: Headers, now: number): string | null {
+  if (kind !== 'refs' && kind !== 'wrefs') return null;
+  const filled = Number(headers.get(H_FILLED));
+  const age = Number.isFinite(filled) && filled > 0 ? Math.max(0, Math.round((now - filled) / 1000)) : -1;
+  const policy = kind === 'refs' ? 'short;ttl' : unwrapOr(header(headers, H_REFS_POLICY), 'none');
+  return `${policy};age=${age}`;
+}
+
+export function createLoopbackFetch(direct: FetchLike, loopback: (() => LoopbackBinding | null) | null, options: LoopbackOptions = { watchedRefs: false }): FetchLike {
   return async (input, init) => {
     if (loopback === null) return direct(input, init);
     const binding = loopback();
@@ -207,7 +235,7 @@ export function createLoopbackFetch(direct: FetchLike, loopback: (() => Loopback
     if (bodyField.tag === 'some' && bodyField.value && body === null) return direct(input, init);
     if (body && body.length > MAX_ROUTED_BODY) return direct(input, init);
     const text = body === null ? null : latin1(body);
-    const kind = classifyText(method, url, text);
+    const kind = routedKind(classifyText(method, url, text), method, url, options);
     if (!kind) return direct(input, init);
     const proto = unwrapOr(header(headers, 'git-protocol'), '');
     const hash = await keyHash(kind, url, proto, body);
@@ -226,11 +254,15 @@ export function createLoopbackFetch(direct: FetchLike, loopback: (() => Loopback
     // The cache tier, in the header ply turns into the `git.response.cache` span attribute.
     const out = new Headers(res.headers);
     out.set('x-ply-pack-cache', unwrapOr(header(res.headers, 'cf-cache-status'), 'NONE'));
+    const state = refsState(kind, res.headers, Date.now());
+    if (state !== null) out.set(REFS_STATE_HEADER, state);
     return new Response(res.body, { status: res.status, statusText: res.statusText, headers: out });
   };
 }
 
 export type GitCacheEnv = { PUBLIC_REPOS: unknown };
+/** What GitCache needs of RefsWatch (src/refs-watch-entry.ts). */
+export type RefsWatchRpc = { lease(repo: string): Promise<LeaseAnswer>; seen(repo: string, refs: [string, string][]): Promise<boolean> };
 export type PurgeCtx = object;
 
 function plain(status: number, text: string): HttpReply {
@@ -266,7 +298,7 @@ function decodeCacheBody(value: string): { readonly kind: 'text'; readonly value
 function parseGitCache(req: Request): Result<CacheRequest, GitCacheFailure> {
   if (req.method !== 'GET' && req.method !== 'HEAD') return err({ kind: 'method' });
   const path = new URL(req.url).pathname;
-  const match = /^\/v(\d+)\/(bust\/)?(pack|refs|discover)\/([0-9a-f]{64})$/.exec(path);
+  const match = /^\/v(\d+)\/(bust\/)?(pack|refs|wrefs|discover)\/([0-9a-f]{64})$/.exec(path);
   const version = captureGroup(match, 1);
   const kindText = captureGroup(match, 3);
   const hashText = captureGroup(match, 4);
@@ -292,7 +324,9 @@ function parseGitCache(req: Request): Result<CacheRequest, GitCacheFailure> {
 
 async function authorizeGitCache(parsed: CacheRequest): Promise<Result<CacheRequest, GitCacheFailure>> {
   const method = parsed.cacheKind === 'discover' ? 'GET' : 'POST';
-  if (!cacheableUpstream(method, parsed.url) || classify(method, parsed.url, parsed.body) !== parsed.cacheKind) {
+  const classified = classify(method, parsed.url, parsed.body);
+  const watched = parsed.cacheKind === 'wrefs' && classified === 'refs' && publicUploadPackRepo(method, parsed.url) !== null;
+  if (!cacheableUpstream(method, parsed.url) || (classified !== parsed.cacheKind && !watched)) {
     return err({ kind: 'not_public' });
   }
   if ((await keyHash(parsed.cacheKind, parsed.url, parsed.proto, parsed.body)) !== parsed.hash) return err({ kind: 'mismatch' });
@@ -363,6 +397,9 @@ async function executeGitCache(req: Request, parsed: CacheRequest, tokens: Token
     return ok(httpReply(204, null, new Headers({ 'cache-control': NO_STORE })));
   }
   const method = cacheKind === 'discover' ? 'GET' : 'POST';
+  // A watched fill asks RefsWatch for the long policy while its upstream request is in flight.
+  const repo = cacheKind === 'wrefs' ? publicUploadPackRepo(method, url) : null;
+  const leased = repo === null ? null : askLease(ctx, repo);
   const headers = new Headers({ [VIA_HEADER]: 'gitcache' });
   if (proto) headers.set('git-protocol', proto);
   if (ua) headers.set('user-agent', ua);
@@ -370,7 +407,8 @@ async function executeGitCache(req: Request, parsed: CacheRequest, tokens: Token
   const fetchUp = withPublicReadCredential(upstream, tokens);
   let res: Response;
   try {
-    const upstreamInit: RequestInit = { method, headers, redirect: 'manual', signal: req.signal };
+    const signal = repo === null ? req.signal : AbortSignal.any([req.signal, AbortSignal.timeout(REFS_FILL_TIMEOUT_MS)]);
+    const upstreamInit: RequestInit = { method, headers, redirect: 'manual', signal };
     if (body !== null) upstreamInit.body = body as BodyInit;
     res = await fetchUp(url, upstreamInit);
   } catch (e) {
@@ -424,10 +462,72 @@ async function executeGitCache(req: Request, parsed: CacheRequest, tokens: Token
   }
   if (cacheKind === 'refs') {
     out.set('cache-control', REFS_CACHE);
+    out.set(H_FILLED, String(Date.now()));
     return ok(httpReply(200, res.body, out));
+  }
+  if (cacheKind === 'wrefs' && repo !== null && leased !== null) {
+    // Buffered (a ref listing is small): the refs stored are reported to RefsWatch.
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const lease = await leased;
+    out.set('cache-control', lease.grant ? WATCHED_REFS_CACHE : REFS_CACHE);
+    out.set('cache-tag', `${unwrapOr(header(out, 'cache-tag'), '')},${refsTag(repo)}`);
+    out.set(H_REFS_POLICY, `${lease.grant ? 'watched' : 'short'};${lease.reason}`);
+    out.set(H_FILLED, String(Date.now()));
+    if (lease.grant) reportSeen(ctx, repo, parseLsRefsAnswer(bytes));
+    return ok(httpReply(200, bytes, out));
   }
   // discover: buffer the (small) advertisement to tell a v2 capability list from a v0 ref advertisement
   const bytes = new Uint8Array(await res.arrayBuffer());
   out.set('cache-control', /(^|[0-9a-f]{4})version 2\n/.test(latin1(bytes.subarray(0, 128))) ? DISCOVER_V2_CACHE : REFS_CACHE);
   return ok(httpReply(200, bytes, out));
+}
+
+function watchStub(ctx: PurgeCtx): RefsWatchRpc | null {
+  const ns = dig(ctx, ['exports', 'RefsWatch']);
+  if (ns.tag === 'none' || !ns.value) return null;
+  const space = ns.value as { idFromName(name: string): unknown; get(id: unknown): RefsWatchRpc };
+  if (typeof space.idFromName !== 'function') return null;
+  return space.get(space.idFromName(WATCH_NAME));
+}
+
+/** RefsWatch's lease answer, or a refusal when it is absent, errs, or takes longer than LEASE_TIMEOUT_MS. */
+export async function askLease(ctx: PurgeCtx, repo: string): Promise<LeaseAnswer> {
+  const stub = watchStub(ctx);
+  if (stub === null) return { grant: false, reason: 'unpolled' };
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const timeout = new Promise<LeaseAnswer>(resolve => { timers.push(setTimeout(() => resolve({ grant: false, reason: 'stale' }), LEASE_TIMEOUT_MS)); });
+  try {
+    return await Promise.race([stub.lease(repo).catch((): LeaseAnswer => ({ grant: false, reason: 'stale' })), timeout]);
+  } finally {
+    for (const t of timers) clearTimeout(t);
+  }
+}
+
+function reportSeen(ctx: PurgeCtx, repo: string, refs: [string, string][]): void {
+  const stub = watchStub(ctx);
+  if (stub === null || refs.length === 0) return;
+  const sent = stub.seen(repo, refs).catch(() => false);
+  const wait = dig(ctx, ['waitUntil']);
+  if (wait.tag === 'some' && typeof wait.value === 'function') (wait.value as (p: Promise<unknown>) => void).call(ctx, sent);
+}
+
+/** GitCache.purgeRefs: purge the refs tag of each repo, inside GitCache (tags are scoped to the entrypoint that stored them). */
+export async function purgeRefsTags(ctx: PurgeCtx, repos: readonly string[]): Promise<{ ok: boolean; ms: number; error: string }> {
+  const names = repos.filter(isPublicRepoName);
+  if (names.length === 0) return { ok: true, ms: 0, error: '' };
+  if (names.length > MAX_PURGE_TAGS) return { ok: false, ms: 0, error: `more than ${MAX_PURGE_TAGS} tags` };
+  const cache = dig(ctx, ['cache']);
+  if (cache.tag === 'none' || !cache.value) return { ok: false, ms: 0, error: 'no ctx.cache' };
+  const t0 = Date.now();
+  try {
+    const result = await (cache.value as { purge(o: { tags: string[] }): Promise<unknown> }).purge({ tags: names.map(refsTag) });
+    const success = chainGet(result, 'success');
+    if (success.tag === 'some' && success.value === false) {
+      const errors = chainGet(result, 'errors');
+      return { ok: false, ms: Date.now() - t0, error: JSON.stringify(errors.tag === 'some' ? errors.value : null).slice(0, 200) };
+    }
+    return { ok: true, ms: Date.now() - t0, error: '' };
+  } catch (e) {
+    return { ok: false, ms: Date.now() - t0, error: failureText(e).slice(0, 200) };
+  }
 }
