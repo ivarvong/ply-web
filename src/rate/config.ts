@@ -15,6 +15,12 @@ export const RETRY_BACKOFF_MS = 50;
 export const MAX_BATCH_KEYS = 2_048;
 /** Batches flushing (lingering or retrying) at once per isolate. A batch beyond this is dropped and recorded. */
 export const MAX_INFLIGHT = 64;
+/**
+ * Distinct client keys held per isolate across the open batch and every batch still flushing. Without it the bound is
+ * MAX_INFLIGHT × MAX_BATCH_KEYS = 131,072 Map entries while the counter is slow (5 s of retries). A hit for a NEW key
+ * past this is dropped and recorded (`rate.batch.dropped=budget`); a key already in the open batch still counts.
+ */
+export const MAX_KEYS_HELD = 16_384;
 
 export const SLOT_MS = 10_000;
 export const WINDOW_MS = 60_000;
@@ -29,6 +35,11 @@ export const PRUNE_EVERY_MS = 5_000;
 export const PRUNE_BATCH_ROWS = 128;
 /** The blocked document holds at most this many entries (newest `until` first). */
 export const MAX_DOC_ENTRIES = 4_096;
+/**
+ * The reader's bound on the document (defence against a bad or oversized one): bytes read and entries indexed. A full
+ * document is MAX_DOC_ENTRIES × ~52 bytes ≈ 213 KB; a bigger body is not read, and the isolate keeps its last document.
+ */
+export const MAX_DOC_BYTES = 512 * 1024;
 
 /** The read side's Cache-Control: fresh for 1 s, then served stale for up to 30 s while one request revalidates. */
 export const DOC_MAX_AGE_S = 1;

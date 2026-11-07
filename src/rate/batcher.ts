@@ -3,7 +3,7 @@
 // raced against a per-attempt timer and retried with the same key until acked or FLUSH_DEADLINE_MS have passed.
 // No platform import: the clock, the timer and the RPC are passed in, so the tests drive every path.
 import type { ApplyRequest, ApplyResult, BatchEntry, Fault } from './core.ts';
-import { ATTEMPT_TIMEOUT_MS, FLUSH_DEADLINE_MS, LINGER_MS, MAX_BATCH_KEYS, MAX_INFLIGHT, RETRY_BACKOFF_MS } from './config.ts';
+import { ATTEMPT_TIMEOUT_MS, FLUSH_DEADLINE_MS, LINGER_MS, MAX_BATCH_KEYS, MAX_INFLIGHT, MAX_KEYS_HELD, RETRY_BACKOFF_MS } from './config.ts';
 
 export type AttemptOutcome = 'ok' | 'timeout' | 'error';
 export type Attempt = { readonly outcome: AttemptOutcome; readonly ms: number; readonly error: string };
@@ -43,10 +43,12 @@ export type BatcherDeps = {
   readonly deadlineMs: number;
   readonly maxKeys: number;
   readonly maxInflight: number;
+  /** Distinct keys held across the open batch and every flushing batch (MAX_KEYS_HELD). */
+  readonly maxKeysHeld: number;
 };
 
-export function defaultTuning(): Pick<BatcherDeps, 'lingerMs' | 'attemptTimeoutMs' | 'deadlineMs' | 'maxKeys' | 'maxInflight'> {
-  return { lingerMs: LINGER_MS, attemptTimeoutMs: ATTEMPT_TIMEOUT_MS, deadlineMs: FLUSH_DEADLINE_MS, maxKeys: MAX_BATCH_KEYS, maxInflight: MAX_INFLIGHT };
+export function defaultTuning(): Pick<BatcherDeps, 'lingerMs' | 'attemptTimeoutMs' | 'deadlineMs' | 'maxKeys' | 'maxInflight' | 'maxKeysHeld'> {
+  return { lingerMs: LINGER_MS, attemptTimeoutMs: ATTEMPT_TIMEOUT_MS, deadlineMs: FLUSH_DEADLINE_MS, maxKeys: MAX_BATCH_KEYS, maxInflight: MAX_INFLIGHT, maxKeysHeld: MAX_KEYS_HELD };
 }
 
 type OpenBatch = {
@@ -75,6 +77,11 @@ export class Batcher {
   #inflight = 0;
   /** Batches dropped because MAX_INFLIGHT were already flushing. */
   overflowDrops = 0;
+  /** Hits for a new key dropped because maxKeysHeld keys were already held. */
+  budgetDrops = 0;
+  /** Why the last add/addIsolated returned null. */
+  lastDrop: 'overflow' | 'budget' | null = null;
+  #keysHeld = 0;
 
   constructor(deps: BatcherDeps) {
     this.#deps = deps;
@@ -82,6 +89,11 @@ export class Batcher {
 
   get inflight(): number {
     return this.#inflight;
+  }
+
+  /** Distinct keys held now: the open batch plus every batch still flushing (released when its flush ends). */
+  get keysHeld(): number {
+    return this.#keysHeld;
   }
 
   /** The keys and hits waiting in the open batch (tests, and the bound). */
@@ -97,14 +109,22 @@ export class Batcher {
   add(key: string, bucket: number, fault: Fault | null, owner: unknown = null): Promise<FlushReport> | null {
     if (fault !== null) return this.addIsolated(key, bucket, fault, owner);
     let b = this.#open;
+    const slot = `${key}:${bucket}`;
+    const known = b !== null && b.counts.has(slot);
+    if (!known && this.#keysHeld >= this.#deps.maxKeysHeld) {
+      this.budgetDrops++;
+      this.lastDrop = 'budget';
+      return null;
+    }
     if (b === null) {
       if (this.#inflight >= this.#deps.maxInflight) {
         this.overflowDrops++;
+        this.lastDrop = 'overflow';
         return null;
       }
       b = this.#start(owner);
     }
-    const slot = `${key}:${bucket}`;
+    if (!known) this.#keysHeld++;
     b.counts.set(slot, (b.counts.get(slot) || 0) + 1);
     b.hits++;
     if (b.counts.size >= this.#deps.maxKeys) {
@@ -120,11 +140,18 @@ export class Batcher {
    * and flush on their own schedule. Same id scheme, same in-flight bound. Null when over maxInflight.
    */
   addIsolated(key: string, bucket: number, fault: Fault, owner: unknown = null): Promise<FlushReport> | null {
+    if (this.#keysHeld >= this.#deps.maxKeysHeld) {
+      this.budgetDrops++;
+      this.lastDrop = 'budget';
+      return null;
+    }
     if (this.#inflight >= this.#deps.maxInflight) {
       this.overflowDrops++;
+      this.lastDrop = 'overflow';
       return null;
     }
     const b = this.#start(owner, false);
+    this.#keysHeld++;
     b.counts.set(`${key}:${bucket}`, 1);
     b.hits = 1;
     b.fault = fault;
@@ -158,6 +185,7 @@ export class Batcher {
     this.#pendingRelease.delete(b);
     void this.#flush(b).then(r => {
       this.#inflight--;
+      this.#keysHeld -= b.counts.size;
       try { this.#deps.report(r); } catch { /* a report hook never fails a flush */ }
       if (release) release(r);
     });

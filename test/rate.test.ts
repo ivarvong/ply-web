@@ -811,3 +811,109 @@ test('identity: x-ply-rate-mode memo with the token; RATE_MODE=memo as the defau
   const unbound = await rateIdentity(new Request('https://x/'), { RATE_MODE: 'memo' }, null);
   assert.equal(unbound.mode, 'legacy');
 });
+
+// ---- memory and storage bounds under many distinct clients (a million client addresses a minute) ----
+
+test('batcher: distinct keys held across open + flushing batches are bounded; a new key past it is dropped (budget)', async () => {
+  let release: () => void = () => {};
+  const gate = new Promise<void>(r => { release = r; });
+  const h = harness(async ({ clock, core }, r) => { await gate; return core.apply(r, clock.now()); }, { maxKeys: 2, maxKeysHeld: 3 });
+  const key = (i: number) => i.toString(16).padStart(KEY_HEX, '0');
+  assert.ok(h.batcher.add(key(1), 0, null));
+  assert.ok(h.batcher.add(key(2), 0, null), 'fills batch 1 (maxKeys 2): it flushes and stays held until acked');
+  assert.ok(h.batcher.add(key(3), 0, null));
+  assert.equal(h.batcher.keysHeld, 3);
+  assert.equal(h.batcher.add(key(4), 0, null), null, 'a fourth distinct key is over the budget');
+  assert.equal(h.batcher.lastDrop, 'budget');
+  assert.equal(h.batcher.budgetDrops, 1);
+  assert.ok(h.batcher.add(key(3), 0, null), 'a key already in the open batch still counts (no new memory)');
+  assert.equal(h.batcher.keysHeld, 3);
+  release();
+  await h.clock.advance(1_000);
+  await new Promise(r => setTimeout(r, 0));
+  assert.equal(h.batcher.keysHeld, 0, 'acked batches release their keys');
+  assert.ok(h.batcher.add(key(4), 0, null));
+});
+
+test('doc reader: entries over the cap are cut (newest until first is kept); a text over the byte cap is refused', () => {
+  const entries = Array.from({ length: 10 }, (_, i) => [i.toString(16).padStart(KEY_HEX, '0'), 0, 2_000 - i, 1]);
+  const text = JSON.stringify({ v: 1, gen: 1, at: 1, entries });
+  const cut = indexDoc(text, { maxBytes: 1 << 20, maxEntries: 4 });
+  assert.equal(cut.entries, 4);
+  assert.equal(cut.truncated, true);
+  assert.ok(cut.index.has(`${'0'.repeat(KEY_HEX)}:0`));
+  assert.equal(indexDoc(text).truncated, false);
+  assert.throws(() => indexDoc(text, { maxBytes: text.length - 1, maxEntries: 4_096 }), /too large/);
+});
+
+test('doc reader: an oversized body is not read into the isolate (TOO_LARGE), and the last document stays in use', async () => {
+  resetRateState();
+  const ok = await serveDoc(new Request(DOC_URL), { blockedDoc: async () => ({ v: 1 as const, gen: 1, at: Date.now(), entries: [[K1, 0, Date.now() + 60_000, Date.now()] as const] }) });
+  const okText = await ok.text();
+  let big = false;
+  const ctx = {
+    waitUntil: () => {},
+    exports: {
+      RateCache: {
+        fetch: async () => {
+          if (!big) return new Response(okText, { headers: { etag: '"g1"' } });
+          // No content-length: a stream of 64 KiB chunks, far past MAX_DOC_BYTES. The reader must stop and cancel it.
+          let sent = 0;
+          const body = new ReadableStream<Uint8Array>({ pull(c) { sent++; c.enqueue(new Uint8Array(65_536).fill(32)); if (sent > 1_000) c.close(); } });
+          return new Response(body, { headers: { etag: '"g2"' } });
+        },
+      },
+    },
+  };
+  const first = await readDoc(ctx, Date.now());
+  assert.equal(first.read, 'ok');
+  big = true;
+  const second = await readDoc(ctx, Date.now());
+  assert.equal(second.read, 'memo', 'fell back to the last good document');
+  assert.equal(second.cache, 'TOO_LARGE');
+  assert.ok(second.memo !== null && second.memo.index.has(`${K1}:0`));
+  resetRateState();
+});
+
+test('core: the document query and the blocked prune use the until index (no scan + sort)', () => {
+  const db = new DatabaseSync(':memory:');
+  const exec: SqlExec = (q, ...b) => {
+    const stmt = db.prepare(q);
+    if (/^\s*select/i.test(q)) { const rows = stmt.all(...b) as Record<string, SqlValue>[]; return { toArray: () => rows, rowsWritten: 0 }; }
+    const r = stmt.run(...b);
+    return { toArray: () => [], rowsWritten: Number(r.changes) };
+  };
+  new CounterCore(exec);
+  const plan = (q: string) => (db.prepare(`EXPLAIN QUERY PLAN ${q}`).all(1, 4_096) as { detail: string }[]).map(r => r.detail).join(' | ');
+  const doc = plan('SELECT k, b, until, crossed FROM rate_blocked WHERE until > ? ORDER BY until DESC LIMIT ?');
+  assert.match(doc, /USING (COVERING )?INDEX rate_blocked_until/, doc);
+  assert.doesNotMatch(doc, /TEMP B-TREE/, doc);
+  const prune = plan('SELECT rowid AS r FROM rate_blocked WHERE until <= ? ORDER BY until LIMIT ?');
+  assert.match(prune, /USING (COVERING )?INDEX rate_blocked_until/, prune);
+});
+
+test('core: under a million-clients-a-minute inflow the prune takes out at least what each apply puts in', () => {
+  const core = new CounterCore(sqlite());
+  const t = 1_000_000_000_000;
+  let n = 0;
+  const fresh = (count: number) => Array.from({ length: count }, () => [(n++).toString(16).padStart(KEY_HEX, '0'), 0, 1] as const);
+  // A minute of full batches (2,048 distinct clients each): 30 applies, 61,440 hit rows.
+  for (let i = 0; i < 30; i++) core.apply(req(`m1:${i}`, fresh(2_048)), t + i * 2_000);
+  // Two minutes later all of it is expired, and the inflow goes on at the same rate.
+  let now = t + 3 * 60_000;
+  let backlog = core.backlog(now).hits;
+  assert.equal(backlog, 61_440);
+  let maxRows = 0;
+  for (let i = 0; i < 40; i++) {
+    const r = core.apply(req(`m3:${i}`, fresh(2_048)), now);
+    maxRows = Math.max(maxRows, r.rowsWritten);
+    assert.ok(r.pruned.hits >= Math.min(2_048, backlog), `apply ${i} pruned ${r.pruned.hits} of backlog ${backlog}`);
+    const next = core.backlog(now).hits;
+    assert.ok(next <= Math.max(0, backlog - 2_048), 'the backlog shrinks by at least the inflow + 128 per apply');
+    backlog = next;
+    now += 50;
+  }
+  assert.equal(backlog, 0, 'drained while the inflow continued');
+  // Bounded: an apply writes its own entries, its batch row, and at most entries + 128 (+1, + new blocks) pruned per table.
+  assert.ok(maxRows <= 2 * 2_048 + 3 * PRUNE_BATCH_ROWS + 10, `max rows written ${maxRows}`);
+});

@@ -40,6 +40,8 @@ export type ApplyResult = {
   readonly rowsWritten: number;
   readonly gen: number;
   readonly over: readonly OverKey[];
+  /** Rows this apply's prune deleted, per table, and whether a slice came back full (more expired rows waiting). */
+  readonly pruned: { readonly hits: number; readonly batches: number; readonly blocked: number; readonly backlog: boolean };
 };
 /** [key16, bucket, until ms, crossed ms]. */
 export type DocEntry = readonly [string, number, number, number];
@@ -107,6 +109,9 @@ export class CounterCore {
     sql(`CREATE TABLE IF NOT EXISTS rate_batches (id TEXT PRIMARY KEY, at INTEGER NOT NULL, hits INTEGER NOT NULL)`);
     sql(`CREATE INDEX IF NOT EXISTS rate_batches_at ON rate_batches (at)`);
     sql(`CREATE TABLE IF NOT EXISTS rate_blocked (k TEXT NOT NULL, b INTEGER NOT NULL, until INTEGER NOT NULL, crossed INTEGER NOT NULL, peak INTEGER NOT NULL, PRIMARY KEY (k, b))`);
+    // Serves the document (`WHERE until > ? ORDER BY until DESC LIMIT 4096`, on every revalidation) and the blocked prune
+    // (`until <= ?`) without a scan of every block and a sort.
+    sql(`CREATE INDEX IF NOT EXISTS rate_blocked_until ON rate_blocked (until)`);
     sql(`CREATE TABLE IF NOT EXISTS rate_meta (name TEXT PRIMARY KEY, v INTEGER NOT NULL)`);
   }
 
@@ -133,7 +138,7 @@ export class CounterCore {
     let hits = 0;
     for (const e of req.entries) hits += e[2];
     if (run(`SELECT 1 AS x FROM rate_batches WHERE id = ?`, req.id).length > 0) {
-      return { replay: true, keys: req.entries.length, hits, newBlocks: 0, rowsWritten: written, gen: this.gen(), over: [] };
+      return { replay: true, keys: req.entries.length, hits, newBlocks: 0, rowsWritten: written, gen: this.gen(), over: [], pruned: { hits: 0, batches: 0, blocked: 0, backlog: this.#pruneBacklog } };
     }
     run(`INSERT INTO rate_batches (id, at, hits) VALUES (?, ?, ?)`, req.id, now, hits);
     const slot = Math.floor(now / SLOT_MS);
@@ -160,24 +165,33 @@ export class CounterCore {
       }
       over.push({ k, b, sum, limit, crossed, peak });
     }
+    const pruned = { hits: 0, batches: 0, blocked: 0, backlog: this.#pruneBacklog };
     if (this.#pruneBacklog || now - this.#lastPrune >= PRUNE_EVERY_MS) {
-      // Bounded: at most PRUNE_BATCH_ROWS rows per table per apply. A full slice means more is waiting; the next apply
-      // prunes again (#pruneBacklog) instead of waiting PRUNE_EVERY_MS.
+      // Bounded and adaptive: per table at most PRUNE_BATCH_ROWS plus the rows this apply added to it. Under backlog every
+      // apply prunes, and it takes out at least what it put in, so the backlog cannot grow with traffic (1M clients a
+      // minute is ~1M rate_hits rows in, at up to MAX_BATCH_KEYS per apply); an apply's prune never writes more than
+      // its own inserts + 128 rows, so a quiet spell is not followed by a multi-thousand-row apply. A full slice means
+      // more is waiting; the next apply prunes again (#pruneBacklog) instead of waiting PRUNE_EVERY_MS.
       this.#lastPrune = now;
-      const slice = (table: string, where: string, order: string, bound: number): number => {
-        const victims = run(`SELECT rowid AS r FROM ${table} WHERE ${where} ORDER BY ${order} LIMIT ?`, bound, PRUNE_BATCH_ROWS);
+      const slice = (table: string, where: string, order: string, bound: number, budget: number): number => {
+        const victims = run(`SELECT rowid AS r FROM ${table} WHERE ${where} ORDER BY ${order} LIMIT ?`, bound, budget);
         if (victims.length === 0) return 0;
-        run(`DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE ${where} ORDER BY ${order} LIMIT ?)`, bound, PRUNE_BATCH_ROWS);
+        run(`DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE ${where} ORDER BY ${order} LIMIT ?)`, bound, budget);
         return victims.length;
       };
-      const hitsGone = slice('rate_hits', 'slot < ?', 'slot', live);
-      const batchesGone = slice('rate_batches', 'at < ?', 'at', now - DEDUPE_RETENTION_MS);
-      const blocksGone = slice('rate_blocked', 'until <= ?', 'until', now);
-      if (blocksGone > 0) changed = true;
-      this.#pruneBacklog = hitsGone === PRUNE_BATCH_ROWS || batchesGone === PRUNE_BATCH_ROWS || blocksGone === PRUNE_BATCH_ROWS;
+      // Each entry adds at most one rate_hits row (its key's current slot).
+      const hitsBudget = PRUNE_BATCH_ROWS + req.entries.length;
+      const batchesBudget = PRUNE_BATCH_ROWS + 1;
+      const blockedBudget = PRUNE_BATCH_ROWS + newBlocks;
+      pruned.hits = slice('rate_hits', 'slot < ?', 'slot', live, hitsBudget);
+      pruned.batches = slice('rate_batches', 'at < ?', 'at', now - DEDUPE_RETENTION_MS, batchesBudget);
+      pruned.blocked = slice('rate_blocked', 'until <= ?', 'until', now, blockedBudget);
+      if (pruned.blocked > 0) changed = true;
+      this.#pruneBacklog = pruned.hits === hitsBudget || pruned.batches === batchesBudget || pruned.blocked === blockedBudget;
+      pruned.backlog = this.#pruneBacklog;
     }
     const gen = changed ? this.#bumpGen() : this.gen();
-    return { replay: false, keys: req.entries.length, hits, newBlocks, rowsWritten: written, gen, over };
+    return { replay: false, keys: req.entries.length, hits, newBlocks, rowsWritten: written, gen, over, pruned };
   }
 
   /** The read side's one document: every block still in force, newest `until` first. */
@@ -190,5 +204,15 @@ export class CounterCore {
   sizes(): { hits: number; batches: number; blocked: number } {
     const c = (t: string): number => num(this.#sql(`SELECT COUNT(*) AS c FROM ${t}`).toArray()[0], 'c');
     return { hits: c('rate_hits'), batches: c('rate_batches'), blocked: c('rate_blocked') };
+  }
+
+  /** Expired rows still stored (the prune backlog), per table. Index range counts. */
+  backlog(now: number): { hits: number; batches: number; blocked: number } {
+    const c = (q: string, bound: number): number => num(this.#sql(q, bound).toArray()[0], 'c');
+    return {
+      hits: c(`SELECT COUNT(*) AS c FROM rate_hits WHERE slot < ?`, firstLiveSlot(now)),
+      batches: c(`SELECT COUNT(*) AS c FROM rate_batches WHERE at < ?`, now - DEDUPE_RETENTION_MS),
+      blocked: c(`SELECT COUNT(*) AS c FROM rate_blocked WHERE until <= ?`, now),
+    };
   }
 }

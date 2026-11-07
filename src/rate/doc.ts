@@ -1,7 +1,7 @@
 // The read side's one document over Workers Cache (docs/rate-limit.md "Read side"). RateCache (src/rate/cache-entry.ts)
 // is a cache-enabled named entrypoint; serveDoc is what it runs on a MISS, EXPIRED or background revalidation.
 // Never the Cache API: test/gitcache.test.ts fails on any `caches.` in src/.
-import { DOC_MAX_AGE_S, DOC_PATH, DOC_SWR_S, DOC_TAG } from './config.ts';
+import { DOC_MAX_AGE_S, DOC_PATH, DOC_SWR_S, DOC_TAG, MAX_DOC_BYTES, MAX_DOC_ENTRIES } from './config.ts';
 import type { BlockedDoc } from './core.ts';
 
 export type DocSource = { blockedDoc(): Promise<BlockedDoc> };
@@ -44,17 +44,25 @@ export async function serveDoc(req: Request, source: DocSource | null): Promise<
 /** key16:bucket → [until, crossed]. */
 export type DocIndex = Map<string, readonly [number, number]>;
 
-export function indexDoc(text: string): { index: DocIndex; gen: number; at: number; entries: number } {
+/**
+ * Parse and index the document, bounded (the reader's defence; the counter already caps it): a text over MAX_DOC_BYTES
+ * is refused before parsing, and at most MAX_DOC_ENTRIES entries are indexed (the counter sends newest `until` first,
+ * so the cut keeps the longest blocks). `truncated` reports a cut.
+ */
+export function indexDoc(text: string, limits: { readonly maxBytes: number; readonly maxEntries: number } = { maxBytes: MAX_DOC_BYTES, maxEntries: MAX_DOC_ENTRIES }): { index: DocIndex; gen: number; at: number; entries: number; truncated: boolean } {
+  if (text.length > limits.maxBytes) throw new Error('rate document too large');
   const parsed: unknown = JSON.parse(text);
   const index: DocIndex = new Map();
   if (parsed === null || typeof parsed !== 'object') throw new Error('rate document is not an object');
   const doc = parsed as { v: unknown; gen: unknown; at: unknown; entries: unknown };
   if (doc.v !== 1 || typeof doc.gen !== 'number' || typeof doc.at !== 'number' || !Array.isArray(doc.entries)) throw new Error('rate document shape');
+  let truncated = false;
   for (const e of doc.entries as unknown[]) {
+    if (index.size >= limits.maxEntries) { truncated = true; break; }
     if (!Array.isArray(e) || e.length !== 4) continue;
     const [k, b, until, crossed] = e as [unknown, unknown, unknown, unknown];
     if (typeof k !== 'string' || typeof b !== 'number' || typeof until !== 'number' || typeof crossed !== 'number') continue;
     index.set(`${k}:${b}`, [until, crossed]);
   }
-  return { index, gen: doc.gen, at: doc.at, entries: index.size };
+  return { index, gen: doc.gen, at: doc.at, entries: index.size, truncated };
 }

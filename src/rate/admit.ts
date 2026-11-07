@@ -4,7 +4,7 @@
 import { dig } from '../absent.ts';
 import { EDGE_ATTR, edgeTracingOf, type EdgeSpan } from '../edge-trace.ts';
 import { Batcher, defaultTuning, type FlushReport } from './batcher.ts';
-import { BUCKET_PACK, BUCKET_PAGE, DOC_URL, KEY_HEX, MEMO_FALLBACK_MS, MEMO_REFRESH_ABANDON_MS, MEMO_REFRESH_MS, READ_BUDGET_MS } from './config.ts';
+import { BUCKET_PACK, BUCKET_PAGE, DOC_URL, KEY_HEX, MAX_DOC_BYTES, MEMO_FALLBACK_MS, MEMO_REFRESH_ABANDON_MS, MEMO_REFRESH_MS, READ_BUDGET_MS } from './config.ts';
 import type { Fault } from './core.ts';
 import { DOC_AT_HEADER, indexDoc, type DocIndex } from './doc.ts';
 import { counterNamespace, counterOf } from './stub.ts';
@@ -136,7 +136,7 @@ export async function inSpan<T>(ctx: unknown, name: string, stamp: Readonly<Reco
 
 // ---- read side ----
 
-type Memo = { etag: string; index: DocIndex; gen: number; at: number; entries: number; fetchedAt: number };
+type Memo = { etag: string; index: DocIndex; gen: number; at: number; entries: number; fetchedAt: number; bytes: number; truncated: boolean };
 let memo: Memo | null = null;
 
 export type DocRead = { readonly read: 'ok' | 'memo' | 'fail' | 'late_memo' | 'late_open'; readonly cache: string; readonly memo: Memo | null; readonly parsed: boolean };
@@ -147,6 +147,25 @@ function rateCacheOf(ctx: unknown): CacheBinding | null {
   const found = dig(ctx, ['exports', 'RateCache']);
   if (found.tag === 'none' || found.value === null) return null;
   return found.value as CacheBinding;
+}
+
+/** The body as text, or null (and the body cancelled) once it passes `max` bytes: never buffers more than max + a chunk. */
+async function boundedText(res: Response, max: number): Promise<string | null> {
+  if (res.body === null) return '';
+  const reader = res.body.getReader();
+  const parts: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) { await reader.cancel().catch(() => {}); return null; }
+    parts.push(value);
+  }
+  const all = new Uint8Array(size);
+  let at = 0;
+  for (const p of parts) { all.set(p, at); at += p.byteLength; }
+  return new TextDecoder().decode(all);
 }
 
 async function fetchDoc(ctx: unknown, now: number): Promise<DocRead> {
@@ -165,6 +184,12 @@ async function fetchDoc(ctx: unknown, now: number): Promise<DocRead> {
     if (res.body !== null) await res.body.cancel();
     return fallback(cache);
   }
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > MAX_DOC_BYTES) {
+    // Not read: an oversized body must not reach the isolate's heap. The last document (if any) stays in use.
+    if (res.body !== null) await res.body.cancel();
+    return fallback('TOO_LARGE');
+  }
   const etag = res.headers.get('etag');
   const atHeader = Number(res.headers.get(DOC_AT_HEADER));
   if (etag !== null && memo !== null && memo.etag === etag) {
@@ -173,8 +198,10 @@ async function fetchDoc(ctx: unknown, now: number): Promise<DocRead> {
     return { read: 'ok', cache, memo, parsed: false };
   }
   try {
-    const d = indexDoc(await res.text());
-    memo = { etag: etag === null ? '' : etag, index: d.index, gen: d.gen, at: d.at, entries: d.entries, fetchedAt: now };
+    const text = await boundedText(res, MAX_DOC_BYTES);
+    if (text === null) return fallback('TOO_LARGE');
+    const d = indexDoc(text);
+    memo = { etag: etag === null ? '' : etag, index: d.index, gen: d.gen, at: d.at, entries: d.entries, fetchedAt: now, bytes: text.length, truncated: d.truncated };
     return { read: 'ok', cache, memo, parsed: true };
   } catch {
     return fallback(cache);
@@ -251,6 +278,8 @@ export function refreshMemo(ctx: unknown, env: unknown, trigger: 'cold' | 'stale
     set('rate.refresh.ms', report.ms);
     set('rate.refresh.joins', report.joins);
     if (r.memo !== null) {
+      set('rate.doc_bytes', r.memo.bytes);
+      if (r.memo.truncated) set('rate.doc_truncated', true);
       set('rate.doc_entries', r.memo.entries);
       set('rate.doc_gen', r.memo.gen);
       set('rate.doc_age_ms', Math.max(0, Date.now() - r.memo.at));
@@ -415,8 +444,9 @@ export async function admitBatched(input: {
   const version = versionOf(env);
   const joined = id.fault !== null ? batch.addIsolated(key, b, id.fault, ctx) : batch.add(key, b, null, ctx);
   const waitUntil = waitUntilOf(ctx);
+  set('rate.batch.keys_held', batch.keysHeld);
   if (joined === null) {
-    set('rate.batch.dropped', 'overflow');
+    set('rate.batch.dropped', batch.lastDrop === null ? 'overflow' : batch.lastDrop);
   } else if (before) {
     // This request opened the batch: its waitUntil keeps the isolate alive through the linger and the retries.
     const flushSpan = inSpan(ctx, 'ply.rate.flush', { [EDGE_ATTR.version]: version, [EDGE_ATTR.route]: 'rate.flush' }, async fset => {
