@@ -205,6 +205,11 @@ export async function readDoc(ctx: unknown, now: number, budgetMs: number | null
 export type RefreshReport = { readonly read: DocRead['read']; readonly cache: string; readonly parsed: boolean; readonly ms: number; readonly joins: number };
 type Flight = { promise: Promise<RefreshReport>; readonly startedAt: number; joins: number };
 let flight: Flight | null = null;
+/**
+ * Refreshes this isolate has finished (settled either way, or abandoned). Zero means its first read is still in flight:
+ * a cold check then is the isolate's start-up, not a broken read path (the CD rate gate counts it as a cold isolate).
+ */
+let refreshesSettled = 0;
 
 function waitUntilOf(ctx: unknown): (p: Promise<unknown>) => void {
   const found = dig(ctx, ['waitUntil']);
@@ -226,6 +231,7 @@ export function refreshMemo(ctx: unknown, env: unknown, trigger: 'cold' | 'stale
     keep(flight.promise);
     return { started: false, promise: flight.promise };
   }
+  if (flight !== null) refreshesSettled++; // abandoned: a hung first read is no longer start-up
   const mine: Flight = { promise: Promise.resolve({ read: 'fail', cache: 'NONE', parsed: false, ms: 0, joins: 0 }), startedAt: now, joins: 0 };
   flight = mine;
   const run = inSpan(ctx, 'ply.rate.refresh', { [EDGE_ATTR.version]: versionOf(env), [EDGE_ATTR.route]: 'rate.refresh' }, async set => {
@@ -236,6 +242,7 @@ export function refreshMemo(ctx: unknown, env: unknown, trigger: 'cold' | 'stale
       r = await fetchDoc(ctx, now);
     } finally {
       if (flight === mine) flight = null;
+      refreshesSettled++;
     }
     const report: RefreshReport = { read: r.read, cache: r.cache, parsed: r.parsed, ms: Math.round((performance.now() - t0) * 1000) / 1000, joins: mine.joins };
     set('rate.refresh.read', report.read);
@@ -259,18 +266,26 @@ export function refreshMemo(ctx: unknown, env: unknown, trigger: 'cold' | 'stale
 }
 
 /** The memo-mode read: never a fetch on the request path. */
-export type MemoRead = { readonly read: 'memo_fresh' | 'memo_stale_refresh' | 'cold'; readonly memo: Memo | null; readonly memoAgeMs: number | null; readonly started: boolean };
+export type MemoRead = {
+  readonly read: 'memo_fresh' | 'memo_stale_refresh' | 'cold';
+  readonly memo: Memo | null;
+  readonly memoAgeMs: number | null;
+  readonly started: boolean;
+  /** Cold, and no refresh of this isolate has settled yet: its first read is in flight. */
+  readonly firstRead: boolean;
+};
 
 export function readMemo(ctx: unknown, env: unknown, now: number): MemoRead {
   const held = memo !== null && now - memo.fetchedAt < MEMO_FALLBACK_MS ? memo : null;
   if (held === null) {
+    const firstRead = refreshesSettled === 0;
     const { started } = refreshMemo(ctx, env, 'cold');
-    return { read: 'cold', memo: null, memoAgeMs: null, started };
+    return { read: 'cold', memo: null, memoAgeMs: null, started, firstRead };
   }
   const age = Math.max(0, now - held.fetchedAt);
-  if (age < MEMO_REFRESH_MS) return { read: 'memo_fresh', memo: held, memoAgeMs: age, started: false };
+  if (age < MEMO_REFRESH_MS) return { read: 'memo_fresh', memo: held, memoAgeMs: age, started: false, firstRead: false };
   const { started } = refreshMemo(ctx, env, 'stale');
-  return { read: 'memo_stale_refresh', memo: held, memoAgeMs: age, started };
+  return { read: 'memo_stale_refresh', memo: held, memoAgeMs: age, started, firstRead: false };
 }
 
 // ---- write side: the isolate's one batcher ----
@@ -339,6 +354,7 @@ export function resetRateState(): void {
   batcher = null;
   memo = null;
   flight = null;
+  refreshesSettled = 0;
   isolate = '';
 }
 
@@ -369,6 +385,8 @@ export async function admitBatched(input: {
     set('rate.cache', 'MEMO');
     if (m.memoAgeMs !== null) set('rate.memo_age_ms', m.memoAgeMs);
     if (m.read !== 'memo_fresh') set('rate.refresh.started', m.started);
+    // Cold while the isolate's first read is still in flight (or about to start): start-up, judged as a cold isolate.
+    if (m.read === 'cold' && m.firstRead) set('rate.cold_isolate', true);
     held = m.memo;
     open = m.read === 'cold';
   } else {

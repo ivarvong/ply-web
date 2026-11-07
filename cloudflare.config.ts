@@ -109,11 +109,14 @@ const plyWorker = {
 			MIRROR_SYNC: bindings.text("on"),
 			// /view rate limits. One SQLite Durable Object class, defined by this Worker.
 			VIEWER_RATE: bindings.durableObject({ worker: WORKER_NAME, exportName: VIEWER_RATE_CLASS }),
-			// The batched limiter (docs/rate-limit.md): "batched" reads one cached document and flushes counts in batches to
-			// RateCounter; "legacy" calls ViewerRateLimit on every request. Flip to "legacy" to roll the limiter back alone.
+			// The limiter (docs/rate-limit.md). "memo" (default since 2026-11-07) decides from the isolate's copy of the cached
+			// blocked document and refreshes it in waitUntil (no I/O on the request path); "batched" fetches that document on
+			// every request (25 ms budget); both flush counts in batches to RateCounter. "legacy" calls ViewerRateLimit on every
+			// request. Roll the limiter back alone by setting "batched" (or "legacy") here AND rate.expectMode in
+			// scripts/cd/cd.policy.json, then ship through the pipeline (a `cf` var edit would deploy straight to 100%).
 			// RateCounter is reached through ctx.exports.RateCounter, not a binding: the versions API refuses a binding to a class
 			// that no deploy has provisioned yet (checked 2026-11-06 on the first upload of RateCounter).
-			RATE_MODE: bindings.text("batched"),
+			RATE_MODE: bindings.text("memo"),
 			// The public namespace, served read-only with no token (src/public.ts). The binding is scoped to this one
 			// namespace; the Worker calls only get(<repo>).createToken("read", 3600) and list(). No stored secret.
 			PUBLIC_REPOS: bindings.artifacts({ namespace: PUBLIC_NAMESPACE }),

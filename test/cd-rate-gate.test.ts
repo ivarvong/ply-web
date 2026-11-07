@@ -26,7 +26,7 @@ function check(c: Check, version = V): unknown {
     const got = recordGet(c, key)
     return got.tag === 'some' ? String(got.value) : fallback
   }
-  const rate: Record<string, unknown> = { mode: field('mode', 'batched'), decision: field('decision', 'allow'), mode_source: field('source', 'default'), bucket: 'page' }
+  const rate: Record<string, unknown> = { mode: field('mode', 'memo'), decision: field('decision', 'allow'), mode_source: field('source', 'default'), bucket: 'page' }
   if (c.cold) rate.cold_isolate = true
   if (c.dropped) rate.batch = { dropped: c.dropped }
   return { $metadata: { spanName: 'ply.rate.check', type: 'span' }, source: { name: 'ply.rate.check', rate, ply: { script_version: version, route: 'rate.check' } } }
@@ -45,7 +45,7 @@ function times<T>(n: number, f: () => T): T[] {
 const HEALTHY = [check({ cold: true, decision: 'fail_open' }), ...times(40, () => check({})), ...times(30, () => flush('ok'))]
 
 test('policy: cd.policy.json carries the rate gate with its evidence', () => {
-  assert.equal(POLICY.expectMode, 'batched')
+  assert.equal(POLICY.expectMode, 'memo')
   assert.equal(POLICY.maxDroppedFlushes, 0)
   assert.ok(POLICY.maxFailOpenRate > 0 && POLICY.maxFailOpenRate < 1)
   assert.ok(POLICY.minChecks <= POLICY.probes)
@@ -59,32 +59,44 @@ test('policy: cd.policy.json carries the rate gate with its evidence', () => {
   assert.throws(() => parsePolicy(JSON.stringify(unknown)), /unknown field/)
 })
 
+test('cloudflare.config.ts RATE_MODE is the mode the gate expects (one edit cannot ship without the other)', () => {
+  const config = readFileSync(new URL('../cloudflare.config.ts', import.meta.url), 'utf8')
+  const found = /RATE_MODE: bindings\.text\("(\w+)"\)/.exec(config)
+  assert.ok(found, 'RATE_MODE binding in cloudflare.config.ts')
+  assert.equal(found[1], POLICY.expectMode)
+  assert.equal(DEFAULT_RATE_GATE.expectMode, POLICY.expectMode)
+})
+
 test('59926117 / e61a5742: the silent fallback to legacy fails the version (real spans)', () => {
   for (const version of [V59926117, VE61A5742]) {
     const counts = countsFromSpans(SILENT, version)
     assert.ok(unwrapOr(recordGet(counts.modes, 'legacy'), 0) > 0, version)
     assert.equal(unwrapOr(recordGet(counts.modes, 'batched'), 0), 0)
+    assert.equal(unwrapOr(recordGet(counts.modes, 'memo'), 0), 0)
     const verdict = judgeRate(counts, POLICY)
     assert.equal(verdict.kind, 'worker', `${version}: ${verdict.line}`)
-    assert.match(verdict.line, /mode: legacy \d+ of \d+ default-mode checks ran a limiter other than batched/)
+    assert.match(verdict.line, /mode: legacy \d+ of \d+ default-mode checks ran a limiter other than memo/)
   }
 })
 
 test('mode: a single default-mode check on the wrong limiter fails, with no minimum sample', () => {
   const verdict = judgeRate(countsFromSpans([check({ mode: 'legacy' })], V), POLICY)
   assert.equal(verdict.kind, 'worker')
-  const memo = judgeRate(countsFromSpans([...HEALTHY, check({ mode: 'memo' })], V), POLICY)
-  assert.equal(memo.kind, 'worker', 'memo is not the configured default either')
+  const batched = judgeRate(countsFromSpans([...HEALTHY, check({ mode: 'batched' })], V), POLICY)
+  assert.equal(batched.kind, 'worker', 'batched is not the configured default either')
+  // A deliberate rollback edits expectMode with RATE_MODE: the same spans then pass on batched.
+  const rolledBack = judgeRate(countsFromSpans(times(30, () => check({ mode: 'batched' })), V), { ...POLICY, expectMode: 'batched' })
+  assert.equal(rolledBack.kind, 'pass', rolledBack.line)
 })
 
 test('mode: load requests that chose their arm with x-ply-rate-mode are not judged', () => {
-  const arms = [...HEALTHY, ...times(50, () => check({ mode: 'legacy', source: 'header' })), ...times(50, () => check({ mode: 'memo', source: 'header', decision: 'fail_open' }))]
+  const arms = [...HEALTHY, ...times(50, () => check({ mode: 'legacy', source: 'header' })), ...times(50, () => check({ mode: 'batched', source: 'header', decision: 'fail_open' }))]
   const verdict = judgeRate(countsFromSpans(arms, V), POLICY)
   assert.equal(verdict.kind, 'pass', verdict.line)
   assert.equal(verdict.kind === 'pass' ? verdict.counts.headerChecks : -1, 100)
 })
 
-test('healthy: batched everywhere, cold fail_open excluded, no drops → pass', () => {
+test('healthy: memo everywhere, cold fail_open excluded, no drops → pass', () => {
   const verdict = judgeRate(countsFromSpans(HEALTHY, V), POLICY)
   assert.equal(verdict.kind, 'pass', verdict.line)
   assert.match(verdict.line, /fail_open warm 0\/40/)
@@ -156,7 +168,7 @@ test('countsFromRows (the production aggregate path) agrees with countsFromSpans
     ...times(7, () => check({ decision: 'fail_open' })),
     ...times(3, () => check({ cold: true })),
     ...times(4, () => check({ mode: 'legacy', source: 'header' })),
-    ...times(2, () => check({ mode: 'memo', source: 'header', decision: 'fail_open', cold: true })),
+    ...times(2, () => check({ mode: 'batched', source: 'header', decision: 'fail_open', cold: true })),
     check({ dropped: 'overflow' }),
     flush('dropped'),
     flush('dropped', 'error=0;attempts=2'),

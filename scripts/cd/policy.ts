@@ -204,7 +204,7 @@ export type RateCalibration = {
 }
 
 export const DEFAULT_RATE_GATE: RateGatePolicy = {
-  expectMode: 'batched',
+  expectMode: 'memo',
   probes: 30,
   probeGapMs: 300,
   probePath: '/view?remote=https%3A%2F%2F5ad2236b39de4c8bd8f6270ea63f3ea9.artifacts.cloudflare.net%2Fgit%2Fpublic-v0%2Fply.git',

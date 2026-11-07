@@ -694,6 +694,36 @@ test('memo: a cold isolate admits at once (fail_open, read cold) and refreshes i
   resetRateState();
 });
 
+test('memo: cold while the first read is in flight is start-up (rate.cold_isolate); cold after a failed read is not', async () => {
+  resetRateState();
+  const rig = memoRig(60);
+  await rig.admit('a');
+  assert.equal(rig.attrs['rate.cold_isolate'], true, 'the isolate\'s first check');
+  delete rig.attrs['rate.cold_isolate'];
+  await rig.admit('b');
+  assert.equal(rig.attrs['rate.read'], 'cold');
+  assert.equal(rig.attrs['rate.cold_isolate'], true, 'joined the first read, still start-up');
+  await rig.settle();
+  resetRateState();
+  // A broken read path: the first refresh settles with no document. Later cold checks are degradation, not start-up.
+  const env = { RATE_MODE: 'memo', RATE_COUNTER: fakeNamespace(new CounterCore(sqlite())) };
+  const waits: Promise<unknown>[] = [];
+  const ctx = { waitUntil: (p: Promise<unknown>) => { waits.push(p); }, exports: { RateCache: { fetch: async () => new Response('no', { status: 503 }) } } };
+  const attrs: Record<string, string | number | boolean> = {};
+  const set = (k: string, v: string | number | boolean) => { attrs[k] = v; };
+  const id = { hex: 'c'.repeat(64), mode: 'memo' as const, fault: null, load: false, modeSource: 'default' as const };
+  await admitBatched({ ctx, env, id, bucket: 'page', now: Date.now(), limitFor: () => 60, set });
+  assert.equal(attrs['rate.cold_isolate'], true);
+  await Promise.all(waits);
+  delete attrs['rate.cold_isolate'];
+  await admitBatched({ ctx, env, id, bucket: 'page', now: Date.now(), limitFor: () => 60, set });
+  assert.equal(attrs['rate.read'], 'cold');
+  assert.equal(attrs['rate.decision'], 'fail_open');
+  assert.equal('rate.cold_isolate' in attrs, false, 'the first read settled with nothing: a warm fail_open the CD gate counts');
+  await Promise.all(waits);
+  resetRateState();
+});
+
 test('memo: refresh is single-flight — concurrent stale requests join the one in flight', async () => {
   resetRateState();
   const rig = memoRig(80);

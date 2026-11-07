@@ -31,8 +31,9 @@ function callOf(req: Request): ViewerCall {
 
 /**
  * The viewer's per-client rate limit. /v1 public-namespace reads use it too (index.js). The limiter is the env's
- * RATE_MODE (docs/rate-limit.md): `batched` (cached blocked document + batched counter) or `legacy` (ViewerRateLimit,
- * one Durable Object call per request). Either way one `ply.rate.check` span records mode, decision and latency.
+ * RATE_MODE (docs/rate-limit.md): `memo` (the default: the isolate's copy of the blocked document, refreshed in
+ * waitUntil, + batched counter), `batched` (the cached document read per request + batched counter) or `legacy`
+ * (ViewerRateLimit, one Durable Object call per request). Either way one `ply.rate.check` span records mode, decision and latency.
  */
 export async function admitClient(req: Request, env: ViewerEnv, bucket: RateBucket, now: number, ctx: unknown = null): Promise<RateDecision | 'unconfigured' | 'unavailable'> {
   const id = await rateIdentity(req, env, ctx)
