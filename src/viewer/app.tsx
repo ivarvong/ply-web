@@ -207,7 +207,9 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
     const pending = loadRepo(route, { tracer, fetchImpl, signal: AbortSignal.any([pageSignal, stop.signal]), budget })
     if (short) {
       pending.catch(() => {})
-      const exists = await publicRepoExistsMemo(env.PUBLIC_REPOS, short, call.now)
+      const waitUntil = dig(call.ctx, ['waitUntil'])
+      const defer = waitUntil.tag === 'some' && typeof waitUntil.value === 'function' ? (p: Promise<unknown>) => { (waitUntil.value as (p: Promise<unknown>) => void).call(call.ctx, p) } : null
+      const exists = await publicRepoExistsMemo(env.PUBLIC_REPOS, short, call.now, defer)
       if (exists === false) {
         stop.abort()
         throw Object.assign(new Error(`no repository ${short} in ${PUBLIC_NAMESPACE}`), { code: 'not_found' })

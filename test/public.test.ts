@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import {
   PUBLIC_GIT_HOST, PUBLIC_GIT_ORIGIN, PUBLIC_NAMESPACE, READ_TOKEN_REFRESH_S, READ_TOKEN_TTL_S,
   createTokenSource, EMPTY_PUBLIC_REPOS, isPublicNamespaceRemote, isPublicRepoName, listPublicRepos, publicRemote, publicRepoOfRemote, publicUploadPackRepo,
-  scrubSecrets, withPublicReadCredential, type ArtifactsNamespace, EXISTS_TTL_MS, publicRepoExistsMemo,
+  scrubSecrets, withPublicReadCredential, type ArtifactsNamespace, EXISTS_TTL_MS, EXISTS_REFRESH_AHEAD_MS, publicRepoExistsMemo,
 } from '../src/public.ts';
 import { PUBLIC_NAMESPACE as CONFIG_NAMESPACE } from '../src/public-namespace.ts';
 
@@ -177,6 +177,39 @@ test('token source: read scope only, one mint per repo while fresh, shared by co
   await assert.rejects(createTokenSource(fakeBinding({ now, fail: new Error('boom') }).binding, now).readToken('ply'), { code: 'upstream_5xx' });
 });
 
+// The Workers binding's get() returns an RpcPromise: a method called on it is pipelined into the same round trip.
+function pipelinedBinding(opts: { known: string[] }) {
+  const log: string[] = [];
+  let disposed = 0;
+  const binding = {
+    get(name: string) {
+      log.push(`get ${name}`);
+      const known = opts.known.includes(name);
+      const handle = { async createToken() { throw new Error('the handle was awaited: not pipelined'); }, [Symbol.dispose]() { disposed += 1; } };
+      // get answers only after a tick, so a pipelined createToken must not wait for it
+      const p = new Promise<typeof handle>((resolve, reject) => { setTimeout(() => (known ? resolve(handle) : reject(new Error(`repo not found: ${name}`))), 5); });
+      return Object.assign(p, {
+        async createToken(scope: 'read' | 'write', ttl: number) {
+          log.push(`createToken ${scope} ${ttl} (pipelined)`);
+          if (!known) throw new Error(`repo not found: ${name}`);
+          return { plaintext: `art_v1_${'1'.repeat(40)}?expires=${Math.floor(Date.now() / 1000) + ttl}` };
+        },
+      });
+    },
+  } as unknown as ArtifactsNamespace;
+  return { binding, log, disposed: () => disposed };
+}
+
+test('token source: on a pipelining binding, createToken rides get\'s round trip; the handle is still released', async () => {
+  const fake = pipelinedBinding({ known: ['ply'] });
+  const src = createTokenSource(fake.binding);
+  const t = await src.readToken('ply');
+  assert.match(t, /^art_v1_1{40}\?expires=\d+$/);
+  assert.deepEqual(fake.log, ['get ply', `createToken read ${READ_TOKEN_TTL_S} (pipelined)`]);
+  assert.equal(fake.disposed(), 1, 'the repo handle is released');
+  await assert.rejects(src.readToken('nope'), { code: 'not_found' });
+});
+
 test('withPublicReadCredential: adds Bearer only on a public upload-pack URL with no Authorization; a caller credential wins', async () => {
   const fake = fakeBinding({ now: Date.now });
   const src = createTokenSource(fake.binding);
@@ -229,4 +262,37 @@ test('publicRepoExistsMemo remembers a yes for a minute and never remembers a no
   assert.equal(calls, 5, 'the memo is per binding object');
   assert.equal(await publicRepoExistsMemo(null, 'ply'), 'unknown');
   assert.equal(await publicRepoExistsMemo(binding, '../x'), false);
+});
+
+test('publicRepoExistsMemo refreshes ahead in the background: never blocks on the binding while the memo is live, never trusts a yes past its minute', async () => {
+  let present = true;
+  let calls = 0;
+  const binding = { async get(name: string) { calls += 1; if (!present) throw new Error(`repo not found: ${name}`); return {}; } };
+  const deferred: Promise<unknown>[] = [];
+  const defer = (p: Promise<unknown>) => { deferred.push(p); };
+  assert.equal(await publicRepoExistsMemo(binding, 'ply', 1_000, defer), true);
+  assert.equal(calls, 1, 'a cold memo asks the binding on the request path');
+  assert.equal(await publicRepoExistsMemo(binding, 'ply', 1_000 + EXISTS_TTL_MS - EXISTS_REFRESH_AHEAD_MS - 1, defer), true);
+  assert.equal(deferred.length, 0, 'before the refresh window: no refresh');
+  const late = 1_000 + EXISTS_TTL_MS - 5;
+  assert.equal(await publicRepoExistsMemo(binding, 'ply', late, defer), true, 'inside the window: answered from the memo');
+  assert.equal(await publicRepoExistsMemo(binding, 'ply', late, defer), true);
+  assert.equal(deferred.length, 1, 'one refresh in flight at a time');
+  await Promise.all(deferred);
+  assert.equal(calls, 2);
+  assert.equal(await publicRepoExistsMemo(binding, 'ply', 1_000 + EXISTS_TTL_MS + 10, null), true, 'the refresh extended the memo from when it started');
+  assert.equal(calls, 2);
+  // a refresh that finds the repo gone drops the memo at once: the next request asks again and gets the 404
+  present = false;
+  const late2 = late + EXISTS_TTL_MS - 5;
+  assert.equal(await publicRepoExistsMemo(binding, 'ply', late2, defer), true);
+  await Promise.all(deferred);
+  assert.equal(await publicRepoExistsMemo(binding, 'ply', late2 + 1, defer), false);
+  // without a waitUntil the memo just expires, as before
+  present = true;
+  const other = { async get() { calls += 1; return {}; } };
+  await publicRepoExistsMemo(other, 'ply', 0, null);
+  const before = calls;
+  assert.equal(await publicRepoExistsMemo(other, 'ply', EXISTS_TTL_MS - 1, null), true);
+  assert.equal(calls, before);
 });

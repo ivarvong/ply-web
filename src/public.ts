@@ -83,18 +83,40 @@ export async function publicRepoExists(binding: unknown, name: string): Promise<
 export const EXISTS_TTL_MS = 60_000;
 const MAX_EXISTS_MEMO = 256;
 const existsMemo = new WeakMap<object, Map<string, number>>();
+/** The memo's last stretch in which a request refreshes it in the background instead of letting it expire. */
+export const EXISTS_REFRESH_AHEAD_MS = 20_000;
+const existsFlights = new WeakMap<object, Set<string>>();
 
 /**
  * publicRepoExists, with a `true` remembered per isolate (and per binding object) for EXISTS_TTL_MS. Each /r page asked
  * the binding first, before any git: 37 of a 105 ms page (trace 7dc622ba…, 59f39490). Only `true` is kept, so a
  * new repo is seen at once and a deleted one is a 404 within the minute; `false` and `unknown` always ask again.
  */
-export async function publicRepoExistsMemo(binding: unknown, name: string, now: number = Date.now()): Promise<RepoPresence> {
+export async function publicRepoExistsMemo(binding: unknown, name: string, now: number = Date.now(), defer: ((p: Promise<unknown>) => void) | null = null): Promise<RepoPresence> {
   if (binding === null || typeof binding !== 'object') return publicRepoExists(binding, name);
   let memo = existsMemo.get(binding);
   if (!memo) { memo = new Map(); existsMemo.set(binding, memo); }
   const until = mapGet(memo, name);
-  if (until.tag === 'some' && until.value > now) return true;
+  if (until.tag === 'some' && until.value > now) {
+    // Refresh ahead: in the memo's last EXISTS_REFRESH_AHEAD_MS a request still answers from it (a `true` is never used
+    // past its minute) and asks the binding again in waitUntil. An expired memo put the binding's get on the page's
+    // critical path: 80 of the 271 slowest /r/ply pages (p99 cut 47 ms) waited 200-513 ms for it after git had finished
+    // (2a4741c0, run tail1).
+    if (defer !== null && until.value - now <= EXISTS_REFRESH_AHEAD_MS) {
+      let flying = existsFlights.get(binding);
+      if (!flying) { flying = new Set(); existsFlights.set(binding, flying); }
+      if (!flying.has(name)) {
+        flying.add(name);
+        const set = memo;
+        const started = now;
+        defer(publicRepoExists(binding, name).then(found => {
+          if (found === true) { set.delete(name); set.set(name, started + EXISTS_TTL_MS); }
+          else if (found === false) set.delete(name);
+        }).catch(() => {}).finally(() => { flying.delete(name); }));
+      }
+    }
+    return true;
+  }
   const found = await publicRepoExists(binding, name);
   if (found === true) {
     memo.delete(name);
@@ -213,9 +235,18 @@ export function createTokenSource(binding: ArtifactsNamespace, now: () => number
   const pending = new Map<string, Promise<string>>();
   const retired: string[] = [];
   const mint = async (repo: string): Promise<string> => {
-    const handle = await binding.get(repo);
+    const asked = binding.get(repo);
+    asked.catch(() => {});
+    let handle: Awaited<typeof asked> | null = null;
     try {
-      const minted = await handle.createToken('read', READ_TOKEN_TTL_S);
+      // Workers RPC promise pipelining: on the real binding get() returns an RpcPromise, and createToken called on it
+      // rides the same round trip as get (one RPC to Artifacts, not two in series). Serial, a GitCache miss from APAC
+      // paid get 243 ms + createToken 484 ms before its upstream request (trace 827ee16c…, 2a4741c0, run tail1). A plain
+      // Promise (tests, a binding without pipelining) has no createToken: wait for the handle first.
+      const piped = (asked as unknown as Record<string, unknown>)['createToken'];
+      const minted = typeof piped === 'function'
+        ? await (asked as unknown as Awaited<typeof asked>).createToken('read', READ_TOKEN_TTL_S)
+        : await (handle = await asked).createToken('read', READ_TOKEN_TTL_S);
       const token = presentText(minted);
       if (token.length < 8) throw plyError('upstream_5xx', 'the public namespace did not return a read token');
       const old = cache.get(repo);
@@ -234,7 +265,8 @@ export function createTokenSource(binding: ArtifactsNamespace, now: () => number
       cache.set(repo, { token, expiresAtMs: expiryMs(exp.tag === 'some' ? exp.value : null, token, now()) });
       return token;
     } finally {
-      try { releaseStub(handle); } catch { /* releasing the RPC stub is best effort */ }
+      if (handle === null) handle = await asked.catch(() => null);
+      try { if (handle !== null) releaseStub(handle); } catch { /* releasing the RPC stub is best effort */ }
     }
   };
   return {
