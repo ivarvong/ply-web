@@ -92,6 +92,10 @@ const plyWorker = {
 			// cf uploads it as an `inherit` binding with bindings_inherit=strict, so a deploy keeps the stored value
 			// and the API refuses an upload when the Worker has no PLY_TOKEN.
 			PLY_TOKEN: bindings.secret(),
+			// The load-test credential (docs/rate-limit.md "Load-test controls"): unlocks x-ply-rate-client / -mode / -fault and
+			// nothing else. ply-load holds this one, never PLY_TOKEN. Set with
+			// `cf workers secrets update PLY_LOAD_TOKEN --worker ply --type secret_text`; local copy ~/.config/ply/load-token (0600).
+			PLY_LOAD_TOKEN: bindings.secret(),
 			// "on" enables the POST/DELETE endpoints. Anything else answers 501.
 			WRITES: bindings.text("on"),
 			// "off" sends every upstream exchange direct, past GitCache (Workers Caching).

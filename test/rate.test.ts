@@ -320,11 +320,51 @@ test('batcher: an isolate that dies before its flush loses only that batch', asy
   assert.equal(sum, 7 + 1 + 52, 'the 3 hits in the open batch are the whole under-count');
 });
 
-test('batcher: a fault rides on the batch', async () => {
+test('batcher: a fault rides only on its own batch, flushed at once', async () => {
   const h = harness(instant);
   h.batcher.add(K1, 0, { kind: 'slow-ack', ms: 1500, attempts: 1 });
-  await h.clock.advance(250);
+  await h.clock.advance(0);
+  assert.equal(h.sends.length, 1, 'no linger: the faulted hit is sent at once');
   assert.deepEqual(h.sends[0].fault, { kind: 'slow-ack', ms: 1500, attempts: 1 });
+  assert.deepEqual(h.sends[0].entries, [[K1, 0, 1]]);
+  await h.clock.advance(250);
+});
+
+test('batcher: a faulted hit never joins, and never taints, the shared batch real clients are in', async () => {
+  // Every attempt carrying a fault errors (as the DO does for error;attempts=n): the faulted batch is retried to its
+  // deadline and dropped. The real clients' batch, open in the same isolate at the same time, is unaffected.
+  const h = harness(({ clock, core }, r) => (r.fault !== null ? Promise.reject(new Error('injected')) : Promise.resolve(core.apply(r, clock.now()))));
+  h.batcher.add(K1, 0, null);
+  const faulted = h.batcher.add('000000000000000f', 0, { kind: 'error', ms: 0, attempts: 99 });
+  h.batcher.add(K2, 0, null);
+  assert.equal(h.batcher.pending().hits, 2, 'the open batch holds only the real hits');
+  assert.equal(h.batcher.inflight, 2);
+  await h.clock.advance(6_000);
+  const shared = h.reports.find(r => r.fault === null);
+  const own = h.reports.find(r => r.fault !== null);
+  assert.ok(shared && own);
+  assert.equal(shared.outcome, 'ok');
+  assert.equal(shared.hits, 2);
+  assert.deepEqual(shared.attempts.map(a => a.outcome), ['ok']);
+  assert.equal(own.outcome, 'dropped');
+  assert.equal(own.hits, 1);
+  assert.equal(own.keys, 1);
+  const faultedReport = await faulted;
+  assert.ok(faultedReport);
+  assert.equal(faultedReport.id, own.id);
+  assert.notEqual(own.id, shared.id);
+  assert.equal(h.sends.filter(s => s.fault === null).every(s => s.entries.every(e => e[0] !== '000000000000000f')), true);
+  // The real counts reached the counter exactly once.
+  assert.equal(h.core.apply(req('probe:x', [[K1, 0, 58]]), h.clock.now()).over.length, 0);
+  assert.equal(h.core.apply(req('probe:y', [[K1, 0, 1]]), h.clock.now()).over[0].sum, 60);
+});
+
+test('batcher: an isolated (faulted) batch respects the in-flight bound', async () => {
+  const h = harness(({ clock }) => clock.sleep(60_000).then(() => { throw new Error('x'); }), { maxInflight: 1 });
+  assert.notEqual(h.batcher.add(K1, 0, { kind: 'error', ms: 0, attempts: 9 }), null);
+  assert.equal(h.batcher.add(K2, 0, { kind: 'error', ms: 0, attempts: 9 }), null);
+  assert.equal(h.batcher.overflowDrops, 1);
+  await h.clock.advance(6_000);
 });
 
 test('fault header parse', () => {
@@ -357,19 +397,43 @@ test('doc: served with max-age + SWR, one path only, and indexed by key and buck
 // ---- identity ----
 
 test('identity: load-test headers count only with the right token', async () => {
-  const env = { PLY_TOKEN: 'secret-token-123', RATE_MODE: 'legacy', RATE_COUNTER: fakeNamespace(new CounterCore(sqlite())) };
+  const env = { PLY_LOAD_TOKEN: 'secret-token-123', RATE_MODE: 'legacy', RATE_COUNTER: fakeNamespace(new CounterCore(sqlite())) };
   const plain = await rateIdentity(new Request('https://x/', { headers: { 'cf-connecting-ip': '198.51.100.1', [LOAD_CLIENT_HEADER]: 'c1', [LOAD_MODE_HEADER]: 'batched' } }), env, null);
   assert.equal(plain.load, false);
   assert.equal(plain.mode, 'legacy');
+  assert.equal(plain.modeSource, 'default');
   const wrong = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'nope', [LOAD_CLIENT_HEADER]: 'c1', [LOAD_MODE_HEADER]: 'batched' } }), env, null);
   assert.equal(wrong.load, false);
   const right = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'secret-token-123', [LOAD_CLIENT_HEADER]: 'c1', [LOAD_MODE_HEADER]: 'batched' } }), env, null);
   assert.equal(right.load, true);
   assert.equal(right.mode, 'batched');
+  assert.equal(right.modeSource, 'header');
   const other = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'secret-token-123', [LOAD_CLIENT_HEADER]: 'c2' } }), env, null);
   assert.notEqual(right.hex, other.hex);
   assert.equal(other.mode, 'legacy');
+  assert.equal(other.modeSource, 'default', 'a load request with no mode header runs the default, like a real one');
   assert.equal(right.hex.length, 64);
+});
+
+test('identity: PLY_TOKEN (the /v1 bearer) does not unlock the load-test headers', async () => {
+  const fault = { 'x-ply-rate-fault': 'error;attempts=3' };
+  const apiOnly = { PLY_TOKEN: 'api-bearer-456', RATE_MODE: 'batched', RATE_COUNTER: fakeNamespace(new CounterCore(sqlite())) };
+  const withApi = await rateIdentity(new Request('https://x/', { headers: { 'cf-connecting-ip': '198.51.100.7', [LOAD_TOKEN_HEADER]: 'api-bearer-456', [LOAD_CLIENT_HEADER]: 'c1', [LOAD_MODE_HEADER]: 'legacy', ...fault } }), apiOnly, null);
+  assert.equal(withApi.load, false, 'no PLY_LOAD_TOKEN bound: nothing is a load request, whatever is presented');
+  assert.equal(withApi.mode, 'batched');
+  assert.equal(withApi.fault, null);
+  const plainIp = await rateIdentity(new Request('https://x/', { headers: { 'cf-connecting-ip': '198.51.100.7' } }), apiOnly, null);
+  assert.equal(withApi.hex, plainIp.hex, 'keyed by the address, the label ignored');
+  const both = { ...apiOnly, PLY_LOAD_TOKEN: 'load-only-789' };
+  const apiPresented = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'api-bearer-456', [LOAD_MODE_HEADER]: 'legacy', ...fault } }), both, null);
+  assert.equal(apiPresented.load, false, 'PLY_TOKEN presented while PLY_LOAD_TOKEN is bound: still refused');
+  assert.equal(apiPresented.fault, null);
+  const loadPresented = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'load-only-789', [LOAD_MODE_HEADER]: 'legacy', ...fault } }), both, null);
+  assert.equal(loadPresented.load, true);
+  assert.equal(loadPresented.mode, 'legacy');
+  assert.deepEqual(loadPresented.fault, { kind: 'error', ms: 0, attempts: 3 });
+  const empty = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: '' } }), { ...apiOnly, PLY_LOAD_TOKEN: '' }, null);
+  assert.equal(empty.load, false, 'an empty PLY_LOAD_TOKEN matches nothing');
 });
 
 // ---- end to end with a fake ctx: Workers Cache emulated with max-age, the DO as CounterCore ----
@@ -386,7 +450,7 @@ test('admit: the client over its limit is refused once its batch is flushed and 
   resetRateState();
   const core = new CounterCore(sqlite());
   const ns = fakeNamespace(core);
-  const env = { RATE_MODE: 'batched', RATE_COUNTER: ns, PLY_TOKEN: 't' };
+  const env = { RATE_MODE: 'batched', RATE_COUNTER: ns, PLY_LOAD_TOKEN: 't' };
   let cached: { body: string; etag: string; at: string; storedAt: number } | null = null;
   let docReads = 0;
   const waits: Promise<unknown>[] = [];
@@ -405,7 +469,7 @@ test('admit: the client over its limit is refused once its batch is flushed and 
       },
     },
   };
-  const id = { hex: 'c'.repeat(64), mode: 'batched' as const, fault: null, load: true };
+  const id = { hex: 'c'.repeat(64), mode: 'batched' as const, fault: null, load: true, modeSource: 'default' as const };
   const limitFor = (b: 'page' | 'pack') => (b === 'page' ? 3 : 20);
   const attrs: Record<string, string | number | boolean> = {};
   const set = (k: string, v: string | number | boolean) => { attrs[k] = v; };
@@ -436,7 +500,7 @@ test('admit: a failed read uses the last good document, and with none admits (fa
   const r = await readDoc(ctx, Date.now());
   assert.equal(r.read, 'fail');
   const attrs: Record<string, string | number | boolean> = {};
-  const d = await admitBatched({ ctx, env, id: { hex: 'e'.repeat(64), mode: 'batched', fault: null, load: false }, bucket: 'page', now: Date.now(), limitFor: () => 60, set: (k, v) => { attrs[k] = v; } });
+  const d = await admitBatched({ ctx, env, id: { hex: 'e'.repeat(64), mode: 'batched', fault: null, load: false, modeSource: 'default' }, bucket: 'page', now: Date.now(), limitFor: () => 60, set: (k, v) => { attrs[k] = v; } });
   assert.equal(d.ok, true);
   assert.equal(attrs['rate.decision'], 'fail_open');
   resetRateState();
@@ -474,7 +538,8 @@ const config :Workerd.Config = (
     durableObjectNamespaces = [ (className = "ViewerRateLimit", uniqueKey = "viewer-rate-test", enableSql = true), (className = "RateCounter", uniqueKey = "rate-counter-test", enableSql = true) ],
     durableObjectStorage = (localDisk = "do-disk"),
     bindings = [
-      (name = "PLY_TOKEN", text = "${token}"),
+      (name = "PLY_TOKEN", text = "api-${token}"),
+      (name = "PLY_LOAD_TOKEN", text = "${token}"),
       (name = "WRITES", text = "off"),
       (name = "PACK_CACHE", text = "off"),
       (name = "VIEWER_RATE_PER_MIN", text = "3"),
@@ -520,6 +585,10 @@ const config :Workerd.Config = (
     // A forged token is ignored: the headers do nothing and the request is keyed by its (absent) address.
     const forged = await fetch(`http://127.0.0.1:${port}/view`, { headers: { [LOAD_TOKEN_HEADER]: 'nope', [LOAD_CLIENT_HEADER]: 'c1' } });
     assert.equal(forged.status, 200);
+    // The /v1 bearer is not the load token: presented as one, the label is ignored (keyed by the absent address, which
+    // the forged request above already counted once), so c1's block does not apply to it.
+    const apiAsLoad = await fetch(`http://127.0.0.1:${port}/view`, { headers: { [LOAD_TOKEN_HEADER]: `api-${token}`, [LOAD_CLIENT_HEADER]: 'c1' } });
+    assert.equal(apiAsLoad.status, 200, 'PLY_TOKEN does not unlock x-ply-rate-client');
     if (!withBinding) return;
     // workerd prints a Durable Object's console only when it is reached through an env binding, so the fault half runs there.
     // Fault: the DO applies and holds its answer 1.5 s; the 1 s attempt timer fires, the retry with the same id is a replay.
@@ -533,6 +602,7 @@ const config :Workerd.Config = (
     assert.equal(replays[0].replay, true);
     assert.equal(replays[0].attempt, 2);
     assert.equal(logs.includes(token), false, 'the load token never reaches a log');
+    assert.equal(faulted[0].keys, 1, 'the faulted request flushed in a batch of its own');
   } finally {
     if (process.env.RATE_TEST_LOG) writeFileSync(process.env.RATE_TEST_LOG, logs);
     if (proc.pid) { try { process.kill(-proc.pid, 'SIGKILL'); } catch { proc.kill('SIGKILL'); } }
@@ -566,7 +636,7 @@ test('admit: the read never waits past its budget — late reads use the isolate
   const waits: Promise<unknown>[] = [];
   // Every read is a slow MISS: 100 ms, four times the budget.
   const ctx = { waitUntil: (p: Promise<unknown>) => { waits.push(p); }, exports: { RateCache: { fetch: async (r: Request) => { await new Promise(res => setTimeout(res, 100)); return serveDoc(r, ns.get()); } } } };
-  const id = { hex: 'f'.repeat(64), mode: 'batched' as const, fault: null, load: true };
+  const id = { hex: 'f'.repeat(64), mode: 'batched' as const, fault: null, load: true, modeSource: 'default' as const };
   const attrs: Record<string, string | number | boolean> = {};
   const set = (k: string, v: string | number | boolean) => { attrs[k] = v; };
   const t0 = Date.now();
@@ -596,7 +666,7 @@ function memoRig(fetchDelayMs: number) {
   };
   const attrs: Record<string, string | number | boolean> = {};
   const set = (k: string, v: string | number | boolean) => { attrs[k] = v; };
-  const id = (c: string) => ({ hex: c.repeat(64), mode: 'memo' as const, fault: null, load: true });
+  const id = (c: string) => ({ hex: c.repeat(64), mode: 'memo' as const, fault: null, load: true, modeSource: 'header' as const });
   const admit = (c: string) => admitBatched({ ctx, env, id: id(c), bucket: 'page', now: Date.now(), limitFor: () => 60, set });
   return { core, env, ctx, waits, attrs, admit, fetches: () => fetches, settle: () => Promise.all(waits) };
 }
@@ -701,7 +771,7 @@ test('memo: a hung refresh is abandoned after MEMO_REFRESH_ABANDON_MS, so the fl
 
 test('identity: x-ply-rate-mode memo with the token; RATE_MODE=memo as the default', async () => {
   const ns = fakeNamespace(new CounterCore(sqlite()));
-  const env = { PLY_TOKEN: 'secret-token-123', RATE_MODE: 'batched', RATE_COUNTER: ns };
+  const env = { PLY_LOAD_TOKEN: 'secret-token-123', RATE_MODE: 'batched', RATE_COUNTER: ns };
   const asked = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'secret-token-123', [LOAD_MODE_HEADER]: 'memo' } }), env, null);
   assert.equal(asked.mode, 'memo');
   const forged = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'nope', [LOAD_MODE_HEADER]: 'memo' } }), env, null);

@@ -1,16 +1,18 @@
 // ply-load: open-loop, fixed-rate request generators inside Cloudflare (one Durable Object per region × shard).
-// Control (bearer = PLY_TOKEN):
-//   POST /run   {runId, target, version, workload, rate, seconds, arms, clients, fault, regions, shards, targets?, versions?}
+// Control (bearer = PLY_LOAD_TOKEN, the load-test credential; this Worker never holds PLY_TOKEN, the /v1 bearer):
+//   POST /run   {runId, target, version, workload, rate, seconds, arms, clients, fault, regions, shards, targets?, versions?, shared?}
+//               shared: client labels omit region and shard, so every generator in the run sends as the SAME clients
+//               (a burst from one client spread over regions). Default: each (region, shard) has its own clients.
 //               versions: request i is pinned to versions[i % n]; the row's arm index is then the version index.
 //               targets: request i goes to targets[(i + per-shard offset) % n]; its index is the row's last field.
 //   GET  /run/<runId>?regions=a,b&shards=n   → every shard's state and raw rows
 // Workloads: "latency" spreads requests over many synthetic clients, each well under the limit; "abuse" gives each
 // client a fixed rate (e.g. 2× the limit) and keeps every (t, status) so the laptop computes enforcement lag and overshoot.
-// Requests carry x-ply-load-token (the ply bearer), x-ply-rate-client, x-ply-rate-mode (the arm) and, pinned,
+// Requests carry x-ply-load-token (PLY_LOAD_TOKEN), x-ply-rate-client, x-ply-rate-mode (the arm) and, pinned,
 // Cloudflare-Workers-Version-Overrides. No address is involved: the client label is the rate identity.
 import { DurableObject } from 'cloudflare:workers';
 
-type Env = { PLY_TOKEN: string; GEN: DurableObjectNamespace<Generator> };
+type Env = { PLY_LOAD_TOKEN: string; GEN: DurableObjectNamespace<Generator> };
 type Arm = 'legacy' | 'batched' | 'memo' | 'default';
 type Fault = { header: string; fromS: number; toS: number };
 type ShardCfg = {
@@ -30,6 +32,8 @@ type ShardCfg = {
   targets?: string[];
   /** Optional: request i is pinned to versions[i % n] (the row's arm index is the version index): a per-request interleaved A/B. */
   versions?: string[];
+  /** Optional: one set of client labels for the whole run (no region/shard in the label). */
+  shared?: boolean;
 };
 /** [t ms since start, arm index, client index, status, ttfb ms, total ms, version ok 1/0, target index] */
 type Row = [number, number, number, number, number, number, number, number];
@@ -120,8 +124,8 @@ export class Generator extends DurableObject<Env> {
     // latency: rotate over many clients; abuse: every client sends at the shard rate / clients.
     const client = Math.floor(i / cfg.arms.length) % cfg.clients;
     const headers: Record<string, string> = {
-      'x-ply-load-token': this.env.PLY_TOKEN,
-      'x-ply-rate-client': `${cfg.runId}:${cfg.hint}:${cfg.shard}:${arm}:${client}`,
+      'x-ply-load-token': this.env.PLY_LOAD_TOKEN,
+      'x-ply-rate-client': cfg.shared ? `${cfg.runId}:shared:${arm}:${client}` : `${cfg.runId}:${cfg.hint}:${cfg.shard}:${arm}:${client}`,
       'user-agent': 'ply-load/1',
     };
     if (arm !== 'default') headers['x-ply-rate-mode'] = arm;
@@ -163,9 +167,15 @@ export class Generator extends DurableObject<Env> {
   }
 }
 
-function authorized(req: Request, env: Env): boolean {
+const enc = new TextEncoder();
+
+/** Constant time: both sides hashed to equal-length digests, compared with the platform's timingSafeEqual. */
+async function authorized(req: Request, env: Env): Promise<boolean> {
+  const secret = typeof env.PLY_LOAD_TOKEN === 'string' ? env.PLY_LOAD_TOKEN : '';
+  if (secret.length === 0) return false;
   const h = req.headers.get('authorization') || '';
-  return env.PLY_TOKEN.length > 0 && h === `Bearer ${env.PLY_TOKEN}`;
+  const [x, y] = await Promise.all([crypto.subtle.digest('SHA-256', enc.encode(h)), crypto.subtle.digest('SHA-256', enc.encode(`Bearer ${secret}`))]);
+  return crypto.subtle.timingSafeEqual(x, y);
 }
 
 function json(obj: unknown, status = 200): Response {
@@ -178,7 +188,7 @@ function shardStub(env: Env, runId: string, hint: string, shard: number) {
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
-    if (!authorized(req, env)) return json({ error: 'unauthorized' }, 401);
+    if (!(await authorized(req, env))) return json({ error: 'unauthorized' }, 401);
     const url = new URL(req.url);
     if (req.method === 'POST' && url.pathname === '/run') {
       const body = (await req.json()) as Omit<ShardCfg, 'hint' | 'shard'> & { regions: string[]; shards: number };

@@ -95,6 +95,7 @@ export class Batcher {
    * dropped on overflow (recorded in overflowDrops).
    */
   add(key: string, bucket: number, fault: Fault | null, owner: unknown = null): Promise<FlushReport> | null {
+    if (fault !== null) return this.addIsolated(key, bucket, fault, owner);
     let b = this.#open;
     if (b === null) {
       if (this.#inflight >= this.#deps.maxInflight) {
@@ -106,7 +107,6 @@ export class Batcher {
     const slot = `${key}:${bucket}`;
     b.counts.set(slot, (b.counts.get(slot) || 0) + 1);
     b.hits++;
-    if (fault !== null) b.fault = fault;
     if (b.counts.size >= this.#deps.maxKeys) {
       b.early = true;
       this.#close(b);
@@ -114,15 +114,35 @@ export class Batcher {
     return b.done;
   }
 
-  #start(owner: unknown): OpenBatch {
+  /**
+   * A fault-injected hit (a load-test request): a batch of its own, flushed at once, never shared. Fault injection then
+   * slows, errors or drops only that request's count; real clients' hits in the same isolate stay in the shared batch
+   * and flush on their own schedule. Same id scheme, same in-flight bound. Null when over maxInflight.
+   */
+  addIsolated(key: string, bucket: number, fault: Fault, owner: unknown = null): Promise<FlushReport> | null {
+    if (this.#inflight >= this.#deps.maxInflight) {
+      this.overflowDrops++;
+      return null;
+    }
+    const b = this.#start(owner, false);
+    b.counts.set(`${key}:${bucket}`, 1);
+    b.hits = 1;
+    b.fault = fault;
+    this.#close(b);
+    return b.done;
+  }
+
+  #start(owner: unknown, shared = true): OpenBatch {
     const deps = this.#deps;
     this.#inflight++;
     let release: (r: FlushReport) => void = () => {};
     const done = new Promise<FlushReport>(resolve => { release = resolve; });
     const b: OpenBatch = { seq: ++this.#seq, openedAt: deps.now(), counts: new Map(), hits: 0, fault: null, owner, closed: false, early: false, done };
-    this.#open = b;
-    // #close starts the flush and resolves `done` when it ends, whichever path closed the batch (linger or size).
+    // #close starts the flush and resolves `done` when it ends, whichever path closed the batch (linger, size, isolated).
     this.#pendingRelease.set(b, release);
+    // An isolated batch is closed by its caller at once: it is never the open batch and has no linger.
+    if (!shared) return b;
+    this.#open = b;
     void deps.sleep(deps.lingerMs).then(() => {
       if (!b.closed) this.#close(b);
     });

@@ -19,6 +19,11 @@ export type RateIdentity = {
   readonly fault: Fault | null;
   /** The request proved the load-test token. */
   readonly load: boolean;
+  /**
+   * Where `mode` came from: `default` is the env's RATE_MODE (what every real request runs), `header` is a load request's
+   * `x-ply-rate-mode`. The CD rate gate (scripts/cd/rate-gate.ts) judges only `default` checks against the configured mode.
+   */
+  readonly modeSource: 'default' | 'header';
 };
 
 export const LOAD_TOKEN_HEADER = 'x-ply-load-token';
@@ -70,24 +75,39 @@ export function defaultMode(env: unknown, ctx: unknown): RateMode {
 }
 
 /**
- * The client's rate identity. Load-test headers count only with `x-ply-load-token` equal to PLY_TOKEN (constant time);
- * the token is never forwarded, logged or echoed.
+ * The secret that unlocks the load-test headers: PLY_LOAD_TOKEN, a credential of its own. PLY_TOKEN (the /v1 bearer)
+ * does not unlock them, so the load generator (ply-load) never holds the API credential.
+ */
+export const LOAD_TOKEN_BINDING = 'PLY_LOAD_TOKEN';
+
+/**
+ * The client's rate identity. Load-test headers count only with `x-ply-load-token` equal to PLY_LOAD_TOKEN (constant
+ * time); the token is never forwarded, logged or echoed. With no PLY_LOAD_TOKEN bound, no request is a load request.
  */
 export async function rateIdentity(req: Request, env: unknown, ctx: unknown): Promise<RateIdentity> {
   let mode = defaultMode(env, ctx);
   const presented = req.headers.get(LOAD_TOKEN_HEADER);
-  const secret = textBinding(env, 'PLY_TOKEN');
+  const secret = textBinding(env, LOAD_TOKEN_BINDING);
   if (presented !== null && secret.length > 0 && (await tokenEqual(presented, secret))) {
     const label = req.headers.get(LOAD_CLIENT_HEADER);
     const asked = req.headers.get(LOAD_MODE_HEADER);
-    if (asked === 'legacy') mode = 'legacy';
-    if ((asked === 'batched' || asked === 'memo') && counterNamespace(env, ctx) !== null) mode = asked;
+    let modeSource: RateIdentity['modeSource'] = 'default';
+    if (asked === 'legacy') { mode = 'legacy'; modeSource = 'header'; }
+    if ((asked === 'batched' || asked === 'memo') && counterNamespace(env, ctx) !== null) { mode = asked; modeSource = 'header'; }
     const hex = await sha256Hex(`ply-viewer-rate/1\n${label === null ? 'load' : `load:${label.slice(0, 128)}`}`);
-    return { hex, mode, fault: parseFault(req.headers.get(LOAD_FAULT_HEADER)), load: true };
+    return { hex, mode, fault: parseFault(req.headers.get(LOAD_FAULT_HEADER)), load: true, modeSource };
   }
   const connecting = req.headers.get('cf-connecting-ip');
   const hex = await sha256Hex(`ply-viewer-rate/1\n${connecting === null ? 'unknown' : connecting}`);
-  return { hex, mode, fault: null, load: false };
+  return { hex, mode, fault: null, load: false, modeSource: 'default' };
+}
+
+let checks = 0;
+
+/** Count this isolate's rate checks; true for its first. A cold isolate's first batched read may fail open by design. */
+export function firstCheckInIsolate(): boolean {
+  checks++;
+  return checks === 1;
 }
 
 // ---- the span helper: Workers spans stamped like ply's (src/edge-trace.ts EDGE_ATTR) ----
@@ -315,6 +335,7 @@ function batcherFor(env: unknown, limitFor: (bucket: 'page' | 'pack') => number)
 
 /** Tests: forget the isolate's batcher, memo and refresh flight. */
 export function resetRateState(): void {
+  checks = 0;
   batcher = null;
   memo = null;
   flight = null;
@@ -371,9 +392,10 @@ export async function admitBatched(input: {
   }
   set('rate.decision', open ? 'fail_open' : 'allow');
   const batch = batcherFor(env, input.limitFor);
-  const before = batch.pending().keys === 0 && batch.pending().hits === 0;
+  // A faulted (load-test) hit never joins the shared batch: it flushes alone, so a fault slows or drops only its own count.
+  const before = id.fault !== null || (batch.pending().keys === 0 && batch.pending().hits === 0);
   const version = versionOf(env);
-  const joined = batch.add(key, b, id.fault, ctx);
+  const joined = id.fault !== null ? batch.addIsolated(key, b, id.fault, ctx) : batch.add(key, b, null, ctx);
   const waitUntil = waitUntilOf(ctx);
   if (joined === null) {
     set('rate.batch.dropped', 'overflow');

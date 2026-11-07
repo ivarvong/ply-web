@@ -123,8 +123,10 @@ export type ViewerEnv = Partial<{
   RATE_MODE: string;
   /** The batched limiter's one counter (src/rate/counter.ts). */
   RATE_COUNTER: import('../rate/stub.ts').CounterNamespace;
-  /** Read only to authenticate load-test headers (src/rate/admit.ts). Never forwarded or echoed by the viewer. */
+  /** The /v1 bearer. The viewer never reads it: load-test headers are unlocked by PLY_LOAD_TOKEN alone. */
   PLY_TOKEN: string;
+  /** Read only to authenticate load-test headers (src/rate/admit.ts). Never forwarded or echoed by the viewer. */
+  PLY_LOAD_TOKEN: string;
   VIEWER_PACK_RATE_PER_MIN: string;
   PACK_CACHE: string;
   /** Workers version metadata (cloudflare.config.ts). Its id is the `ply.script_version` on the viewer's ply spans. */
