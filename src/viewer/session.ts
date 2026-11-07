@@ -3,7 +3,7 @@
 // once per isolate, not once per page. The trace still names the fallback on every fetch that uses it.
 import { chainGet, fromNullable, mapGet } from '../absent.ts';
 import { unwrapOr } from '../option.ts';
-import { commitView, concat, createTransport, discover, entryType, fetchObject, fetchPack, hashObject, inflate, isFilterRejection, limitError, lsMode, lsRefs, packStream, parseTree, plyError, refCandidates, spFinish, spInit, spStep, TYPE, walkCommit, walkPath } from 'ply';
+import { commitView, concat, createTransport, discover, entryType, fetchObject, fetchPack, fetchPackFiltered, hashObject, inflate, isFilterRejection, limitError, lsMode, lsRefs, packStream, parseTree, plyError, refCandidates, spFinish, spInit, spStep, TYPE, walkCommit, walkPath } from 'ply';
 import type { Walked } from 'ply/read';
 import { pathTreesOf, tree0Taken } from 'ply/transport';
 import type { SpState, Tracer, Transport } from 'ply';
@@ -258,19 +258,10 @@ type Held = { type: number; data: Uint8Array };
  * after the first commit on any server that refuses tree:0, which is every Artifacts page.
  * Returns null when the window does not fit the caps; the caller then reads the commit alone.
  */
-async function loadWindow(transport: Transport, head: string, quirks: Quirks): Promise<Map<string, Held> | null> {
-  const common = { wants: [head], deepen: VIEWER_CAPS.maxLogCommits, ofsDelta: true as const, thinPack: false as const };
-  const wide = (learned: boolean) => fetchPack(transport, { ...common, filter: 'blob:none' }, {
-    attrs: { 'git.fetch.filter.fallback': 'blob:none', 'git.fetch.filter.requested': 'tree:0', 'git.fetch.filter.learned': learned, 'git.viewer.window': VIEWER_CAPS.maxLogCommits },
-  });
-  const narrow = quirks.treeFilter !== 'blob:none';
-  let result = narrow
-    ? await fetchPack(transport, { ...common, filter: 'tree:0' }, { attrs: { 'git.viewer.window': VIEWER_CAPS.maxLogCommits } })
-    : await wide(false);
-  if (narrow && !result.ok && isFilterRejection(result.error)) {
-    quirks.treeFilter = 'blob:none';
-    result = await wide(true);
-  }
+async function loadWindow(transport: Transport, head: string): Promise<Map<string, Held> | null> {
+  // ply picks the filter from what it learned about the server (fetchPackFiltered): tree:0, blob:none after a refusal
+  // (Artifacts), or none where the advertisement lists no `filter` (git.sr.ht, stock git; ply-web#121).
+  const result = await fetchPackFiltered(transport, { wants: [head], filter: 'tree:0', deepen: VIEWER_CAPS.maxLogCommits });
   if (!result.ok) {
     const error = result.error;
     // Too big for the window (a huge tree under blob:none): fall back to the single-commit read. Timeouts and aborts end the page.
@@ -331,7 +322,7 @@ async function loadTree(transport: Transport, route: Extract<ViewerRoute, { kind
   // `combine:blob:none+tree:K` (GitLab, Codeberg), walkCommit runs beside the window: the commit and the path's first two
   // tree levels in one fetch (ply#219/#222). Anywhere else (GitHub refuses the combined filter; a first contact knows
   // nothing yet) walkCommit's commit fetch would only repeat the window's, so the walk starts from the window's commit.
-  const windowed = route.raw ? Promise.resolve(null) : loadWindow(transport, resolved.commit, quirks);
+  const windowed = route.raw ? Promise.resolve(null) : loadWindow(transport, resolved.commit);
   const beside = route.raw || (tree0Taken(quirks) && pathTreesOf(quirks) !== 'refused');
   const walking = beside ? walkCommit(transport, resolved.commit, comps, { cache }) : null;
   const held = await windowed;

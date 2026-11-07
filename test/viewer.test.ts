@@ -1132,6 +1132,38 @@ test('path walk (ply walkCommit, #222): a server that takes combine:blob:none+tr
   }
 });
 
+test('a server that advertises no filter (git.sr.ht, stock git; #121): pages read the window and trees without a filter', async () => {
+  const { root, cleanup } = tmpRoot();
+  const srv = await startGitServer(root);
+  try {
+    const bare = makeBareRepo(root, 'nofilter');
+    git(bare, ['config', 'uploadpack.allowFilter', 'false']);
+    const work = join(root, 'w-nofilter');
+    mkdirSync(work);
+    git(work, ['init', '-q', '-b', 'main']);
+    commitFiles(work, bare, { 'README.md': 'no filter here\n', 'src/a.txt': 'a\n' }, 'first');
+    commitFiles(work, bare, { 'src/b.txt': 'b\n' }, 'second');
+    const filters: string[] = [];
+    const dial = rewriteAllowlisted(srv.url);
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const body = slot(init, 'body');
+      const text = body instanceof Uint8Array ? Buffer.from(body).toString('latin1') : '';
+      if (text.includes('command=fetch')) filters.push(fill(slot(/filter ([^\n]+)\n/.exec(text), '1'), 'none'));
+      return dial(input, init);
+    };
+    for (const path of ['', 'src', 'src/b.txt']) {
+      const res = await handleViewer(new Request(`https://ply.ivar.workers.dev/view/github.com/nofilter.git${path ? `?path=${path}` : ''}`), viewerEnv(), {}, { fetchImpl });
+      const html = await res.text();
+      assert.equal(res.status, 200, html.slice(0, 400));
+      if (path === '') { assert.match(html, /no filter here/); assert.match(html, /second/); assert.match(html, /first/); }
+    }
+    assert.deepEqual([...new Set(filters)], ['none'], filters.join(' | '));
+  } finally {
+    await srv.close();
+    cleanup();
+  }
+});
+
 test('scraping contract: li[data-oid] rows equal git ls-tree, and the commit card carries data-commit', async () => {
   // External monitors (ply issue #44) count these rows and compare the oids to the forge's tree API.
   // A redesign may restyle anything, but must keep: li[data-oid][data-mode][data-type][data-name], ul.files[data-entries],
