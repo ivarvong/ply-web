@@ -233,4 +233,10 @@ The page p99.9 (≈3 s in both arms) is git work, not the limiter (lat1, A/A leg
 - **Counter prune bound (PRUNE_BATCH_ROWS 128).** `ply.rate.apply` rows_written max before: 12,892 (78ddd5c3), 7,915
   (a020b1b1). After: lat8, 2a4741c0 at 100% unpinned, default arm, 13,600 requests all 200, starting on the backlog
   that lat6/lat7 left: 6,550 applies, rows_written median 9 / p99 140 / max 268.
-
+- **Bursts (2026-11-07, canary 9d33f400 pinned, ply-load de344fdb, runs burst2-c{1,5}-r{50,100,200}).** One client
+  (shared label, 4 regions × 2 generators) at 50 / 100 / 200 req/s for 60 s: admitted in a 60 s window 116 / 125 / 140
+  (overshoot 56 / 65 / 80; the DO's `peak` equals the client's count every time). Five clients at 10 / 20 / 40 req/s
+  each: overshoot 6-10 / 14-20 / 28-32. Overshoot ≈ client rate × 0.4-1.1 s. DO crossing → first deny per colo p50
+  0.5-1.8 s, max 4.5 s. The counter stayed healthy: every flush one attempt, 0 timeouts / replays / drops, apply RPC
+  p99 ≤ 294 ms, CPU p99 ≤ 4 ms, rows_written p99 ≤ 51; denied requests never flush. The most a client's requests landed
+  in one colo before it was refused was 59, so a per-isolate pre-count at the limit would not have bitten here.
