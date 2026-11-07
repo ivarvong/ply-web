@@ -1,6 +1,7 @@
 // ply-load: open-loop, fixed-rate request generators inside Cloudflare (one Durable Object per region × shard).
 // Control (bearer = PLY_TOKEN):
-//   POST /run   {runId, target, version, workload, rate, seconds, arms, clients, fault, regions, shards}
+//   POST /run   {runId, target, version, workload, rate, seconds, arms, clients, fault, regions, shards, targets?}
+//               targets: request i goes to targets[(i + per-shard offset) % n]; its index is the row's last field.
 //   GET  /run/<runId>?regions=a,b&shards=n   → every shard's state and raw rows
 // Workloads: "latency" spreads requests over many synthetic clients, each well under the limit; "abuse" gives each
 // client a fixed rate (e.g. 2× the limit) and keeps every (t, status) so the laptop computes enforcement lag and overshoot.
@@ -24,12 +25,15 @@ type ShardCfg = {
   hint: string;
   shard: number;
   maxInFlight: number;
+  /** Optional: request i goes to targets[(i + shard offset) % n] instead of `target` (e.g. one old commit per request, cold upstream). */
+  targets?: string[];
 };
-/** [t ms since start, arm index, client index, status, ttfb ms, total ms, version ok 1/0] */
-type Row = [number, number, number, number, number, number, number];
+/** [t ms since start, arm index, client index, status, ttfb ms, total ms, version ok 1/0, target index] */
+type Row = [number, number, number, number, number, number, number, number];
 
 const CHUNK = 900;
-const HINTS = new Set(['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'oc', 'afr', 'me']);
+const HINT_ORDER = ['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'oc', 'afr', 'me'];
+const HINTS = new Set(HINT_ORDER);
 
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, Math.max(0, ms)));
@@ -123,8 +127,12 @@ export class Generator extends DurableObject<Env> {
     let status = 0;
     let ttfb = 0;
     let verOk = 0;
+    const list = cfg.targets && cfg.targets.length ? cfg.targets : null;
+    // Each (region, shard) starts at a different offset, so with a list no two generators ask for the same URL first.
+    const ti = list ? (i + cfg.shard * 7919 + HINT_ORDER.indexOf(cfg.hint) * 104729) % list.length : -1;
+    const target = list ? (list[ti] as string) : cfg.target;
     try {
-      const res = await fetch(cfg.target, { headers, signal: AbortSignal.timeout(20_000) });
+      const res = await fetch(target, { headers, signal: AbortSignal.timeout(20_000) });
       ttfb = Date.now() - sent;
       status = res.status;
       verOk = !cfg.version || res.headers.get('x-ply-version') === cfg.version ? 1 : 0;
@@ -132,7 +140,7 @@ export class Generator extends DurableObject<Env> {
     } catch {
       status = -1;
     }
-    this.#rows.push([t, armIndex, client, status, ttfb, Date.now() - sent, verOk]);
+    this.#rows.push([t, armIndex, client, status, ttfb, Date.now() - sent, verOk, ti]);
   }
 
   report(): { state: string; colo: string; cfg: ShardCfg | null; shed: number; restarts: number; rows: Row[] } {
