@@ -21,6 +21,12 @@ export const WINDOW_MS = 60_000;
 /** Idempotency keys are kept this long: 120× the client deadline. */
 export const DEDUPE_RETENTION_MS = 600_000;
 export const PRUNE_EVERY_MS = 5_000;
+/**
+ * One prune deletes at most this many rows per table (rate_hits, rate_batches, rate_blocked). On 78ddd5c3 one apply
+ * wrote 12,892 rows: an unbounded retention prune after an idle spell. A full batch leaves a backlog, and the next apply
+ * prunes again instead of waiting PRUNE_EVERY_MS, so the backlog drains a bounded slice per apply.
+ */
+export const PRUNE_BATCH_ROWS = 128;
 /** The blocked document holds at most this many entries (newest `until` first). */
 export const MAX_DOC_ENTRIES = 4_096;
 
@@ -37,6 +43,14 @@ export const DOC_TAG = 'rate-blocked';
 export const READ_BUDGET_MS = 25;
 /** After a failed read, the isolate's last good document is used for this long; then the request fails open. */
 export const MEMO_FALLBACK_MS = 300_000;
+/**
+ * Memo mode (no fetch on the request path): a request whose isolate memo is at least this old still decides from it,
+ * and starts one single-flight refresh of the cached document in ctx.waitUntil. Adds ≤ this much (plus the refresh's
+ * own read and the isolate's gap between requests) to the enforcement lag.
+ */
+export const MEMO_REFRESH_MS = 500;
+/** A refresh still unsettled after this long is abandoned (a hung loopback must not pin the single flight forever). */
+export const MEMO_REFRESH_ABANDON_MS = 10_000;
 
 /** The one RateCounter object. */
 export const COUNTER_NAME = 'global-v1';

@@ -4,12 +4,12 @@
 import { dig } from '../absent.ts';
 import { EDGE_ATTR, edgeTracingOf, type EdgeSpan } from '../edge-trace.ts';
 import { Batcher, defaultTuning, type FlushReport } from './batcher.ts';
-import { BUCKET_PACK, BUCKET_PAGE, DOC_URL, KEY_HEX, MEMO_FALLBACK_MS, READ_BUDGET_MS } from './config.ts';
+import { BUCKET_PACK, BUCKET_PAGE, DOC_URL, KEY_HEX, MEMO_FALLBACK_MS, MEMO_REFRESH_ABANDON_MS, MEMO_REFRESH_MS, READ_BUDGET_MS } from './config.ts';
 import type { Fault } from './core.ts';
 import { DOC_AT_HEADER, indexDoc, type DocIndex } from './doc.ts';
 import { counterNamespace, counterOf } from './stub.ts';
 
-export type RateMode = 'legacy' | 'batched';
+export type RateMode = 'legacy' | 'batched' | 'memo';
 export type SpanSet = (key: string, value: string | number | boolean) => void;
 
 export type RateIdentity = {
@@ -62,9 +62,11 @@ export function parseFault(raw: string | null): Fault | null {
   return null;
 }
 
-/** The env's default mode. Batched needs the counter binding; otherwise legacy. */
+/** The env's default mode. Batched and memo need the counter binding; otherwise legacy. */
 export function defaultMode(env: unknown, ctx: unknown): RateMode {
-  return textBinding(env, 'RATE_MODE') === 'batched' && counterNamespace(env, ctx) !== null ? 'batched' : 'legacy';
+  const asked = textBinding(env, 'RATE_MODE');
+  if ((asked === 'batched' || asked === 'memo') && counterNamespace(env, ctx) !== null) return asked;
+  return 'legacy';
 }
 
 /**
@@ -79,7 +81,7 @@ export async function rateIdentity(req: Request, env: unknown, ctx: unknown): Pr
     const label = req.headers.get(LOAD_CLIENT_HEADER);
     const asked = req.headers.get(LOAD_MODE_HEADER);
     if (asked === 'legacy') mode = 'legacy';
-    if (asked === 'batched' && counterNamespace(env, ctx) !== null) mode = 'batched';
+    if ((asked === 'batched' || asked === 'memo') && counterNamespace(env, ctx) !== null) mode = asked;
     const hex = await sha256Hex(`ply-viewer-rate/1\n${label === null ? 'load' : `load:${label.slice(0, 128)}`}`);
     return { hex, mode, fault: parseFault(req.headers.get(LOAD_FAULT_HEADER)), load: true };
   }
@@ -178,6 +180,79 @@ export async function readDoc(ctx: unknown, now: number, budgetMs: number | null
   return late;
 }
 
+// ---- memo mode: decide from the isolate's document, refresh it single-flight in waitUntil ----
+
+export type RefreshReport = { readonly read: DocRead['read']; readonly cache: string; readonly parsed: boolean; readonly ms: number; readonly joins: number };
+type Flight = { promise: Promise<RefreshReport>; readonly startedAt: number; joins: number };
+let flight: Flight | null = null;
+
+function waitUntilOf(ctx: unknown): (p: Promise<unknown>) => void {
+  const found = dig(ctx, ['waitUntil']);
+  if (found.tag === 'some' && typeof found.value === 'function') return p => (found.value as (p: Promise<unknown>) => void).call(ctx, p);
+  return () => {};
+}
+
+/**
+ * At most one refresh of the isolate's document in flight. The request that starts it keeps it alive with
+ * ctx.waitUntil, inside a `ply.rate.refresh` span; a request that finds one in flight joins it (counted, and also
+ * waitUntil'd: free, and the refresh survives the starter's context ending). A flight older than
+ * MEMO_REFRESH_ABANDON_MS is abandoned and replaced. Returns whether this call started a new flight.
+ */
+export function refreshMemo(ctx: unknown, env: unknown, trigger: 'cold' | 'stale'): { started: boolean; promise: Promise<RefreshReport> } {
+  const now = Date.now();
+  const keep = waitUntilOf(ctx);
+  if (flight !== null && now - flight.startedAt < MEMO_REFRESH_ABANDON_MS) {
+    flight.joins++;
+    keep(flight.promise);
+    return { started: false, promise: flight.promise };
+  }
+  const mine: Flight = { promise: Promise.resolve({ read: 'fail', cache: 'NONE', parsed: false, ms: 0, joins: 0 }), startedAt: now, joins: 0 };
+  flight = mine;
+  const run = inSpan(ctx, 'ply.rate.refresh', { [EDGE_ATTR.version]: versionOf(env), [EDGE_ATTR.route]: 'rate.refresh' }, async set => {
+    const t0 = performance.now();
+    set('rate.refresh.trigger', trigger);
+    let r: DocRead;
+    try {
+      r = await fetchDoc(ctx, now);
+    } finally {
+      if (flight === mine) flight = null;
+    }
+    const report: RefreshReport = { read: r.read, cache: r.cache, parsed: r.parsed, ms: Math.round((performance.now() - t0) * 1000) / 1000, joins: mine.joins };
+    set('rate.refresh.read', report.read);
+    set('rate.refresh.cache', report.cache);
+    set('rate.refresh.parsed', report.parsed);
+    set('rate.refresh.ms', report.ms);
+    set('rate.refresh.joins', report.joins);
+    if (r.memo !== null) {
+      set('rate.doc_entries', r.memo.entries);
+      set('rate.doc_gen', r.memo.gen);
+      set('rate.doc_age_ms', Math.max(0, Date.now() - r.memo.at));
+    }
+    return report;
+  });
+  mine.promise = run.catch((): RefreshReport => {
+    if (flight === mine) flight = null;
+    return { read: 'fail', cache: 'ERROR', parsed: false, ms: 0, joins: mine.joins };
+  });
+  keep(mine.promise);
+  return { started: true, promise: mine.promise };
+}
+
+/** The memo-mode read: never a fetch on the request path. */
+export type MemoRead = { readonly read: 'memo_fresh' | 'memo_stale_refresh' | 'cold'; readonly memo: Memo | null; readonly memoAgeMs: number | null; readonly started: boolean };
+
+export function readMemo(ctx: unknown, env: unknown, now: number): MemoRead {
+  const held = memo !== null && now - memo.fetchedAt < MEMO_FALLBACK_MS ? memo : null;
+  if (held === null) {
+    const { started } = refreshMemo(ctx, env, 'cold');
+    return { read: 'cold', memo: null, memoAgeMs: null, started };
+  }
+  const age = Math.max(0, now - held.fetchedAt);
+  if (age < MEMO_REFRESH_MS) return { read: 'memo_fresh', memo: held, memoAgeMs: age, started: false };
+  const { started } = refreshMemo(ctx, env, 'stale');
+  return { read: 'memo_stale_refresh', memo: held, memoAgeMs: age, started };
+}
+
 // ---- write side: the isolate's one batcher ----
 
 let isolate = '';
@@ -238,17 +313,19 @@ function batcherFor(env: unknown, limitFor: (bucket: 'page' | 'pack') => number)
   return batcher;
 }
 
-/** Tests: forget the isolate's batcher and memo. */
+/** Tests: forget the isolate's batcher, memo and refresh flight. */
 export function resetRateState(): void {
   batcher = null;
   memo = null;
+  flight = null;
   isolate = '';
 }
 
 export type BatchedDecision = { ok: boolean; remaining: number; retryAfterMs: number };
 
 /**
- * The batched decision. `set` is the ply.rate.check span's attribute setter.
+ * The batched and memo decisions (id.mode). Batched reads the cached document within READ_BUDGET_MS; memo decides from
+ * the isolate's document with no fetch and refreshes it in waitUntil (readMemo). `set` is the ply.rate.check span's attribute setter.
  * Denied requests are not counted (as legacy). A failed read with no usable memo admits (fail open).
  */
 export async function admitBatched(input: {
@@ -263,30 +340,41 @@ export async function admitBatched(input: {
   const { ctx, env, id, bucket, now, set } = input;
   const key = id.hex.slice(0, KEY_HEX);
   const b = bucket === 'pack' ? BUCKET_PACK : BUCKET_PAGE;
-  const doc = await readDoc(ctx, now, READ_BUDGET_MS);
-  set('rate.read', doc.read);
-  set('rate.cache', doc.cache);
-  set('rate.doc_parsed', doc.parsed);
-  if (doc.memo !== null) {
-    set('rate.doc_entries', doc.memo.entries);
-    set('rate.doc_gen', doc.memo.gen);
-    set('rate.doc_age_ms', Math.max(0, Date.now() - doc.memo.at));
-    const hit = doc.memo.index.get(`${key}:${b}`);
+  let held: Memo | null;
+  let open: boolean;
+  if (id.mode === 'memo') {
+    const m = readMemo(ctx, env, now);
+    set('rate.read', m.read);
+    set('rate.cache', 'MEMO');
+    if (m.memoAgeMs !== null) set('rate.memo_age_ms', m.memoAgeMs);
+    if (m.read !== 'memo_fresh') set('rate.refresh.started', m.started);
+    held = m.memo;
+    open = m.read === 'cold';
+  } else {
+    const doc = await readDoc(ctx, now, READ_BUDGET_MS);
+    set('rate.read', doc.read);
+    set('rate.cache', doc.cache);
+    set('rate.doc_parsed', doc.parsed);
+    held = doc.memo;
+    open = doc.read === 'fail' || doc.read === 'late_open';
+  }
+  if (held !== null) {
+    set('rate.doc_entries', held.entries);
+    set('rate.doc_gen', held.gen);
+    set('rate.doc_age_ms', Math.max(0, Date.now() - held.at));
+    const hit = held.index.get(`${key}:${b}`);
     if (hit !== void 0 && hit[0] > now) {
       set('rate.decision', 'deny');
       set('rate.blocked_for_ms', Math.max(0, now - hit[1]));
       return { ok: false, remaining: 0, retryAfterMs: hit[0] - now };
     }
   }
-  set('rate.decision', doc.read === 'fail' || doc.read === 'late_open' ? 'fail_open' : 'allow');
+  set('rate.decision', open ? 'fail_open' : 'allow');
   const batch = batcherFor(env, input.limitFor);
   const before = batch.pending().keys === 0 && batch.pending().hits === 0;
   const version = versionOf(env);
   const joined = batch.add(key, b, id.fault, ctx);
-  const waitUntil = (p: Promise<unknown>): void => {
-    const found = dig(ctx, ['waitUntil']);
-    if (found.tag === 'some' && typeof found.value === 'function') (found.value as (p: Promise<unknown>) => void).call(ctx, p);
-  };
+  const waitUntil = waitUntilOf(ctx);
   if (joined === null) {
     set('rate.batch.dropped', 'overflow');
   } else if (before) {

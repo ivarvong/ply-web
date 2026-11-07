@@ -68,7 +68,10 @@ Nothing on the request path waits for the Durable Object except a cache MISS/EXP
 - **Blocked set.** After applying, every touched key whose window sum is ≥ its limit is upserted into `rate_blocked`
   with `until` (the time the sum next drops below the limit), `crossed` (when it first went over) and `peak` (the
   highest admitted sum). `peak − limit` is the measured overshoot.
-- **Pruning** every ≥ 5 s inside `apply`: expired slots, ids older than 10 min, ended blocks.
+- **Pruning** every ≥ 5 s inside `apply`: expired slots, ids older than 10 min, ended blocks, at most 128 rows per table
+  per apply (`PRUNE_BATCH_ROWS`). A full slice leaves a backlog and the next apply prunes again instead of waiting 5 s,
+  so a backlog (an idle spell, a restarted object) drains in bounded slices. Before this bound one apply on 78ddd5c3
+  wrote 12,892 rows.
 - **Budget.** Flush RPCs/s ≤ isolates × 5. Measured in Results (apply ms, rows written, DO CPU per invocation).
 
 ## Read side
@@ -88,6 +91,14 @@ Nothing on the request path waits for the Durable Object except a cache MISS/EXP
   the budget the request decides from the isolate's last document (any age ≤ 5 min), or admits when the isolate has
   none, and the fetch completes in `waitUntil`, refreshing that document. Extra lag this adds: only in an isolate that
   has never read the document, for ≤ one DO read (~0.5 s); measured in Results.
+- **Memo mode (`RATE_MODE=memo`, or `x-ply-rate-mode: memo`).** The batched read's p99 (12 ms on a020b1b1 / 78ddd5c3)
+  is the loopback fetch itself: of 401 checks ≥ 10 ms, 363 were cache HIT or UPDATING. In memo mode the request never
+  fetches: it looks its key up in the isolate's parsed document. When that document is ≥ 500 ms old
+  (`MEMO_REFRESH_MS`) the request still decides from it and starts ONE refresh through the same `RateCache` entrypoint
+  in `ctx.waitUntil` (single flight: a request that finds one in flight joins it; a flight unsettled after 10 s,
+  `MEMO_REFRESH_ABANDON_MS`, is abandoned). An isolate with no document (or one older than 5 min) admits
+  (`fail_open`, `rate.read=cold`) and refreshes. Extra lag over batched: ≤ 500 ms + the refresh's read + the
+  isolate's own gap between requests (the memo only refreshes when a request arrives).
 - **Failure.** If the read fails, the last good document (≤ 5 min old) is used; with none, the request is admitted (fail
   open) and recorded. Today's limiter fails closed (503); with one object instead of one per client, failing closed would
   turn a DO incident into a viewer outage. The limit bounds cost; it is not an access control.
@@ -116,7 +127,7 @@ stored and cached. No address is stored. The blocked document is served only ove
 
 A request carrying `x-ply-load-token: <PLY_TOKEN>` (compared in constant time; never forwarded, logged or echoed) may
 also send `x-ply-rate-client` (a label hashed in place of the address, so one generator can be many clients),
-`x-ply-rate-mode: legacy|batched` (choose the limiter for this request: an A/B inside one version), and
+`x-ply-rate-mode: legacy|batched|memo` (choose the limiter for this request: an A/B inside one version), and
 `x-ply-rate-fault` (fault injection on the DO, below). Without a valid token those headers are ignored.
 
 `x-ply-rate-fault: slow-ack=<ms>;attempts=<n>` makes the DO apply, then hold its answer `<ms>` on attempts ≤ n
@@ -130,6 +141,8 @@ Workers spans (`ctx.tracing`), each stamped with `ply.route` and `ply.script_ver
 | span | attributes |
 |---|---|
 | `ply.rate.check` | `rate.mode` legacy/batched, `rate.bucket`, `rate.decision` allow/deny/fail_open, `rate.check_ms`, `rate.cache` (HIT/STALE/MISS/EXPIRED/…), `rate.read` ok/memo/fail, `rate.doc_entries`, `rate.doc_age_ms`, `rate.blocked_for_ms` (deny: now − crossed) |
+| `ply.rate.check` (memo) | `rate.read` memo_fresh / memo_stale_refresh / cold, `rate.cache` MEMO, `rate.memo_age_ms` (now − the isolate's last read), `rate.doc_age_ms` (now − the DO's `at`), `rate.refresh.started` |
+| `ply.rate.refresh` | `rate.refresh.trigger` cold/stale, `.read` ok/memo/fail, `.cache` (the RateCache read's cf-cache-status), `.parsed`, `.ms`, `.joins` (requests that found it in flight), `rate.doc_age_ms` |
 | `ply.rate.flush` | `rate.batch.id`, `.keys`, `.hits`, `.linger_ms`, `.attempts`, `.attempt_log` (`ok:34,timeout:1000,…`), `.timeouts`, `.errors`, `.outcome` ok/dropped, `.deadline_hit`, `.replay` (DO said duplicate), `.flush_ms`, `.alive_ms` (batch open → flush end, the waitUntil lifetime), `rate.do.apply_ms`, `rate.do.rows_written`, `rate.do.new_blocks` |
 
 DO log lines: `ply.rate.apply` (id, attempt, replay, keys, hits, apply_ms, rows_written, new_blocks, fault) and

@@ -9,7 +9,7 @@
 import { DurableObject } from 'cloudflare:workers';
 
 type Env = { PLY_TOKEN: string; GEN: DurableObjectNamespace<Generator> };
-type Arm = 'legacy' | 'batched' | 'default';
+type Arm = 'legacy' | 'batched' | 'memo' | 'default';
 type Fault = { header: string; fromS: number; toS: number };
 type ShardCfg = {
   runId: string;
@@ -119,7 +119,7 @@ export class Generator extends DurableObject<Env> {
     if (cfg.version) headers['cloudflare-workers-version-overrides'] = `ply="${cfg.version}"`;
     const sent = Date.now();
     const t = sent - t0;
-    if (cfg.fault !== null && arm === 'batched' && t >= cfg.fault.fromS * 1000 && t < cfg.fault.toS * 1000) headers['x-ply-rate-fault'] = cfg.fault.header;
+    if (cfg.fault !== null && (arm === 'batched' || arm === 'memo') && t >= cfg.fault.fromS * 1000 && t < cfg.fault.toS * 1000) headers['x-ply-rate-fault'] = cfg.fault.header;
     let status = 0;
     let ttfb = 0;
     let verOk = 0;

@@ -12,10 +12,10 @@ import { fileURLToPath } from 'node:url';
 import { copyCfBundle } from './cf-bundle.js';
 import { CounterCore, InvalidBatch, blockedUntil, firstLiveSlot, type ApplyRequest, type ApplyResult, type SqlExec, type SqlValue } from '../src/rate/core.ts';
 import { Batcher, defaultTuning, type BatcherDeps, type FlushReport } from '../src/rate/batcher.ts';
-import { SLOT_MS, WINDOW_MS, DOC_PATH, DOC_URL, KEY_HEX } from '../src/rate/config.ts';
+import { SLOT_MS, WINDOW_MS, DOC_PATH, DOC_URL, KEY_HEX, MEMO_FALLBACK_MS, MEMO_REFRESH_ABANDON_MS, MEMO_REFRESH_MS, PRUNE_BATCH_ROWS, DEDUPE_RETENTION_MS } from '../src/rate/config.ts';
 import { indexDoc, serveDoc } from '../src/rate/doc.ts';
 import { counterNamespace } from '../src/rate/stub.ts';
-import { admitBatched, parseFault, rateIdentity, readDoc, resetRateState, LOAD_CLIENT_HEADER, LOAD_MODE_HEADER, LOAD_TOKEN_HEADER } from '../src/rate/admit.ts';
+import { admitBatched, parseFault, rateIdentity, readDoc, readMemo, refreshMemo, resetRateState, LOAD_CLIENT_HEADER, LOAD_MODE_HEADER, LOAD_TOKEN_HEADER } from '../src/rate/admit.ts';
 
 function sqlite(): SqlExec {
   const db = new DatabaseSync(':memory:');
@@ -110,6 +110,30 @@ test('core: pruning removes old ids, slots and ended blocks', () => {
   core.apply(req('p:2', [[K2, 0, 1]]), t + 11 * 60_000);
   assert.deepEqual(core.sizes(), { hits: 1, batches: 1, blocked: 0 });
   // p:1 is gone from the dedupe table after retention: documented bound, far beyond the 5 s client deadline.
+});
+
+test('core: a retention backlog is pruned in bounded slices, never thousands of rows in one apply', () => {
+  const core = new CounterCore(sqlite());
+  const t = 1_000_000_000_000;
+  // 2,000 batches and 2,000 hit slots, all past retention by the time the next apply runs (an idle spell).
+  for (let i = 0; i < 2_000; i++) core.apply(req(`old:${i}`, [[i.toString(16).padStart(KEY_HEX, '0'), 0, 1]]), t);
+  assert.deepEqual(core.sizes(), { hits: 2_000, batches: 2_000, blocked: 0 });
+  let now = t + DEDUPE_RETENTION_MS + 60_000;
+  let applies = 0;
+  let maxRows = 0;
+  while (core.sizes().batches > 1 + applies || core.sizes().hits > 1 + applies) {
+    const r = core.apply(req(`new:${applies}`, [[K1, 0, 1]]), now);
+    maxRows = Math.max(maxRows, r.rowsWritten);
+    applies++;
+    now += 10; // far inside PRUNE_EVERY_MS: the backlog, not the timer, keeps the prune going
+    assert.ok(applies < 100, 'the backlog drains');
+  }
+  // One apply: its own few writes + at most PRUNE_BATCH_ROWS per table.
+  assert.ok(maxRows <= 3 * PRUNE_BATCH_ROWS + 5, `max rows written per apply ${maxRows}`);
+  assert.equal(applies, Math.ceil(2_000 / PRUNE_BATCH_ROWS));
+  // Drained: the next apply after the timer prunes nothing old.
+  const quiet = core.apply(req('after', [[K2, 0, 1]]), now + 6_000);
+  assert.ok(quiet.rowsWritten <= 5);
 });
 
 test('core: rejects what an isolate would never send', () => {
@@ -484,6 +508,15 @@ const config :Workerd.Config = (
     // Legacy arm through the same headers: its own per-client object.
     for (let i = 0; i < 3; i++) assert.equal((await hit('c3', { [LOAD_MODE_HEADER]: 'legacy' })).status, 200);
     assert.equal((await hit('c3', { [LOAD_MODE_HEADER]: 'legacy' })).status, 429);
+    // Memo arm: decides from the isolate's document with no fetch. The first request after the flush still decides
+    // from a document read before it (the memo's lag) and refreshes it; a later one is refused.
+    for (let i = 0; i < 3; i++) assert.equal((await hit('c5', { [LOAD_MODE_HEADER]: 'memo' })).status, 200);
+    await sleep(700);
+    assert.equal((await hit('c5', { [LOAD_MODE_HEADER]: 'memo' })).status, 200, 'decided from the stale memo; refresh started');
+    await sleep(300);
+    const memoRefused = await hit('c5', { [LOAD_MODE_HEADER]: 'memo' });
+    assert.equal(memoRefused.status, 429);
+    assert.ok(Number(memoRefused.headers.get('retry-after')) >= 50);
     // A forged token is ignored: the headers do nothing and the request is keyed by its (absent) address.
     const forged = await fetch(`http://127.0.0.1:${port}/view`, { headers: { [LOAD_TOKEN_HEADER]: 'nope', [LOAD_CLIENT_HEADER]: 'c1' } });
     assert.equal(forged.status, 200);
@@ -547,4 +580,134 @@ test('admit: the read never waits past its budget — late reads use the isolate
   assert.equal(attrs['rate.read'], 'late_memo');
   await Promise.all(waits);
   resetRateState();
+});
+
+// ---- memo mode: the decision is a lookup into the isolate's document; refreshes are single-flight in waitUntil ----
+
+function memoRig(fetchDelayMs: number) {
+  const core = new CounterCore(sqlite());
+  const ns = fakeNamespace(core);
+  const env = { RATE_MODE: 'memo', RATE_COUNTER: ns };
+  const waits: Promise<unknown>[] = [];
+  let fetches = 0;
+  const ctx = {
+    waitUntil: (p: Promise<unknown>) => { waits.push(p); },
+    exports: { RateCache: { fetch: async (r: Request) => { fetches++; await new Promise(res => setTimeout(res, fetchDelayMs)); return serveDoc(r, ns.get()); } } },
+  };
+  const attrs: Record<string, string | number | boolean> = {};
+  const set = (k: string, v: string | number | boolean) => { attrs[k] = v; };
+  const id = (c: string) => ({ hex: c.repeat(64), mode: 'memo' as const, fault: null, load: true });
+  const admit = (c: string) => admitBatched({ ctx, env, id: id(c), bucket: 'page', now: Date.now(), limitFor: () => 60, set });
+  return { core, env, ctx, waits, attrs, admit, fetches: () => fetches, settle: () => Promise.all(waits) };
+}
+
+test('memo: a cold isolate admits at once (fail_open, read cold) and refreshes in waitUntil; then denies from the memo', async () => {
+  resetRateState();
+  const rig = memoRig(100);
+  rig.core.apply(req('m:1', [['a'.repeat(KEY_HEX), 0, 60]]), Date.now());
+  const t0 = Date.now();
+  const first = await rig.admit('a');
+  assert.ok(Date.now() - t0 < 50, 'no fetch on the request path');
+  assert.equal(first.ok, true, 'cold: admitted, though the document would refuse it');
+  assert.equal(rig.attrs['rate.read'], 'cold');
+  assert.equal(rig.attrs['rate.decision'], 'fail_open');
+  assert.equal(rig.attrs['rate.refresh.started'], true);
+  await rig.settle();
+  const second = await rig.admit('a');
+  assert.equal(second.ok, false, 'deny from the memo');
+  assert.equal(rig.attrs['rate.read'], 'memo_fresh');
+  assert.equal(rig.attrs['rate.decision'], 'deny');
+  assert.ok(second.retryAfterMs > 50_000);
+  assert.equal((await rig.admit('b')).ok, true, 'another client is admitted from the same memo');
+  assert.equal(rig.fetches(), 1, 'fresh memo: no further reads');
+  await rig.settle();
+  resetRateState();
+});
+
+test('memo: refresh is single-flight — concurrent stale requests join the one in flight', async () => {
+  resetRateState();
+  const rig = memoRig(80);
+  const a = refreshMemo(rig.ctx, rig.env, 'cold');
+  assert.equal(a.started, true);
+  const joined = [refreshMemo(rig.ctx, rig.env, 'stale'), refreshMemo(rig.ctx, rig.env, 'stale'), refreshMemo(rig.ctx, rig.env, 'stale')];
+  for (const j of joined) assert.equal(j.started, false);
+  const report = await a.promise;
+  assert.equal(rig.fetches(), 1);
+  assert.equal(report.joins, 3);
+  assert.equal(report.read, 'ok');
+  for (const j of joined) assert.equal(await j.promise, report, 'joiners see the same refresh');
+  assert.equal(rig.waits.length, 4, 'every joiner keeps the flight alive with waitUntil');
+  // Settled: the next stale request starts a new flight.
+  assert.equal(refreshMemo(rig.ctx, rig.env, 'stale').started, true);
+  await rig.settle();
+  assert.equal(rig.fetches(), 2);
+  // Through admit: stale memo, many requests, one fetch.
+  const realNow = Date.now;
+  try {
+    const base = realNow();
+    Date.now = () => base + MEMO_REFRESH_MS + 1;
+    const before = rig.fetches();
+    await Promise.all([rig.admit('c'), rig.admit('d'), rig.admit('e'), rig.admit('f')]);
+    assert.equal(rig.attrs['rate.read'], 'memo_stale_refresh');
+    Date.now = realNow;
+    await rig.settle();
+    assert.equal(rig.fetches() - before, 1);
+  } finally {
+    Date.now = realNow;
+  }
+  resetRateState();
+});
+
+test('memo: age bounds — fresh below MEMO_REFRESH_MS, stale-and-refresh above, no memo beyond MEMO_FALLBACK_MS', async () => {
+  resetRateState();
+  const rig = memoRig(1);
+  rig.core.apply(req('m:2', [['a'.repeat(KEY_HEX), 0, 60]]), Date.now());
+  const fetchedBy = Date.now();
+  await refreshMemo(rig.ctx, rig.env, 'cold').promise;
+  const fresh = readMemo(rig.ctx, rig.env, fetchedBy + MEMO_REFRESH_MS - 50);
+  assert.equal(fresh.read, 'memo_fresh');
+  assert.equal(rig.fetches(), 1);
+  const stale = readMemo(rig.ctx, rig.env, Date.now() + MEMO_REFRESH_MS);
+  assert.equal(stale.read, 'memo_stale_refresh');
+  assert.equal(stale.started, true);
+  assert.notEqual(stale.memo, null, 'a stale memo still decides');
+  await rig.settle();
+  const expired = readMemo(rig.ctx, rig.env, Date.now() + MEMO_FALLBACK_MS + 1);
+  assert.equal(expired.read, 'cold', 'older than the 5 min bound: treated as no memo');
+  assert.equal(expired.memo, null);
+  await rig.settle();
+  resetRateState();
+});
+
+test('memo: a hung refresh is abandoned after MEMO_REFRESH_ABANDON_MS, so the flight cannot pin forever', async () => {
+  resetRateState();
+  let calls = 0;
+  const ctx = { waitUntil: () => {}, exports: { RateCache: { fetch: () => { calls++; return new Promise<Response>(() => {}); } } } };
+  const env = { RATE_MODE: 'memo', RATE_COUNTER: fakeNamespace(new CounterCore(sqlite())) };
+  assert.equal(refreshMemo(ctx, env, 'cold').started, true);
+  assert.equal(refreshMemo(ctx, env, 'cold').started, false);
+  const realNow = Date.now;
+  const base = realNow();
+  try {
+    Date.now = () => base + MEMO_REFRESH_ABANDON_MS + 1;
+    assert.equal(refreshMemo(ctx, env, 'cold').started, true);
+  } finally {
+    Date.now = realNow;
+  }
+  await new Promise(r => setTimeout(r, 5));
+  assert.equal(calls, 2);
+  resetRateState();
+});
+
+test('identity: x-ply-rate-mode memo with the token; RATE_MODE=memo as the default', async () => {
+  const ns = fakeNamespace(new CounterCore(sqlite()));
+  const env = { PLY_TOKEN: 'secret-token-123', RATE_MODE: 'batched', RATE_COUNTER: ns };
+  const asked = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'secret-token-123', [LOAD_MODE_HEADER]: 'memo' } }), env, null);
+  assert.equal(asked.mode, 'memo');
+  const forged = await rateIdentity(new Request('https://x/', { headers: { [LOAD_TOKEN_HEADER]: 'nope', [LOAD_MODE_HEADER]: 'memo' } }), env, null);
+  assert.equal(forged.mode, 'batched');
+  const byEnv = await rateIdentity(new Request('https://x/'), { ...env, RATE_MODE: 'memo' }, null);
+  assert.equal(byEnv.mode, 'memo');
+  const unbound = await rateIdentity(new Request('https://x/'), { RATE_MODE: 'memo' }, null);
+  assert.equal(unbound.mode, 'legacy');
 });

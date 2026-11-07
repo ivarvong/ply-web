@@ -8,6 +8,7 @@ import {
   KEY_HEX,
   MAX_BATCH_KEYS,
   MAX_DOC_ENTRIES,
+  PRUNE_BATCH_ROWS,
   PRUNE_EVERY_MS,
   SLOT_MS,
   WINDOW_MS,
@@ -97,6 +98,7 @@ function num(row: SqlRow | void, col: string): number {
 export class CounterCore {
   readonly #sql: SqlExec;
   #lastPrune = 0;
+  #pruneBacklog = false;
 
   constructor(sql: SqlExec) {
     this.#sql = sql;
@@ -158,14 +160,21 @@ export class CounterCore {
       }
       over.push({ k, b, sum, limit, crossed, peak });
     }
-    if (now - this.#lastPrune >= PRUNE_EVERY_MS) {
+    if (this.#pruneBacklog || now - this.#lastPrune >= PRUNE_EVERY_MS) {
+      // Bounded: at most PRUNE_BATCH_ROWS rows per table per apply. A full slice means more is waiting; the next apply
+      // prunes again (#pruneBacklog) instead of waiting PRUNE_EVERY_MS.
       this.#lastPrune = now;
-      run(`DELETE FROM rate_hits WHERE slot < ?`, live);
-      run(`DELETE FROM rate_batches WHERE at < ?`, now - DEDUPE_RETENTION_MS);
-      if (run(`SELECT 1 AS x FROM rate_blocked WHERE until <= ? LIMIT 1`, now).length > 0) {
-        run(`DELETE FROM rate_blocked WHERE until <= ?`, now);
-        changed = true;
-      }
+      const slice = (table: string, where: string, order: string, bound: number): number => {
+        const victims = run(`SELECT rowid AS r FROM ${table} WHERE ${where} ORDER BY ${order} LIMIT ?`, bound, PRUNE_BATCH_ROWS);
+        if (victims.length === 0) return 0;
+        run(`DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE ${where} ORDER BY ${order} LIMIT ?)`, bound, PRUNE_BATCH_ROWS);
+        return victims.length;
+      };
+      const hitsGone = slice('rate_hits', 'slot < ?', 'slot', live);
+      const batchesGone = slice('rate_batches', 'at < ?', 'at', now - DEDUPE_RETENTION_MS);
+      const blocksGone = slice('rate_blocked', 'until <= ?', 'until', now);
+      if (blocksGone > 0) changed = true;
+      this.#pruneBacklog = hitsGone === PRUNE_BATCH_ROWS || batchesGone === PRUNE_BATCH_ROWS || blocksGone === PRUNE_BATCH_ROWS;
     }
     const gen = changed ? this.#bumpGen() : this.gen();
     return { replay: false, keys: req.entries.length, hits, newBlocks, rowsWritten: written, gen, over };

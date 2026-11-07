@@ -46,7 +46,7 @@ export async function admitClient(req: Request, env: ViewerEnv, bucket: RateBuck
     }
     const t0 = performance.now()
     try {
-      if (id.mode === 'batched') return await admitBatched({ ctx, env, id, bucket, now, limitFor, set })
+      if (id.mode === 'batched' || id.mode === 'memo') return await admitBatched({ ctx, env, id, bucket, now, limitFor, set })
       const ns = env.VIEWER_RATE
       if (!ns) {
         set('rate.decision', 'unconfigured')
