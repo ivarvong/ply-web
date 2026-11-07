@@ -43,9 +43,13 @@ export const NO_STORE = 'no-store';
  * A server's refusal of a partial-clone filter (Artifacts: `400 … only blob:none is supported`) is a fact about that
  * server, the same for every caller. Uncached, every fresh isolate paid it upstream, and Workers Caching does not
  * collapse an uncacheable answer: 11 of 13 GitCache invocations in a burst of 20 concurrent cold requests were this 400
- * (e021776d, 2026-10-31T02:01:45Z). Cached for an hour, so a server that adds the filter is seen within the hour.
+ * (e021776d, 2026-10-31T02:01:45Z). Fresh for an hour, so a server that adds the filter is seen within the hour.
+ * Stale for a day after that, revalidated in the background: an expired refusal sent the first page of every new
+ * isolate on a quiet colo upstream for 1.0-1.6 s (read-token mint + the 400) before its blob:none retry (4 of 14
+ * first contacts in run sparse-ply, 2a4741c0; trace d149bcd8… 1647 ms MISS, c352756d… 1483 ms EXPIRED). A stale
+ * refusal costs at most one extra fallback if the server has since added the filter.
  */
-export const REFUSAL_CACHE = 'public, max-age=3600';
+export const REFUSAL_CACHE = 'public, max-age=3600, stale-while-revalidate=86400';
 // The text ply recognises as a filter refusal (fetch.js isFilterRejection).
 const FILTER_REFUSAL = /only blob:none is supported|unsupported (git )?fetch filter|filter .* not (supported|allowed)/i;
 
