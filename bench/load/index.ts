@@ -1,6 +1,7 @@
 // ply-load: open-loop, fixed-rate request generators inside Cloudflare (one Durable Object per region × shard).
 // Control (bearer = PLY_TOKEN):
-//   POST /run   {runId, target, version, workload, rate, seconds, arms, clients, fault, regions, shards, targets?}
+//   POST /run   {runId, target, version, workload, rate, seconds, arms, clients, fault, regions, shards, targets?, versions?}
+//               versions: request i is pinned to versions[i % n]; the row's arm index is then the version index.
 //               targets: request i goes to targets[(i + per-shard offset) % n]; its index is the row's last field.
 //   GET  /run/<runId>?regions=a,b&shards=n   → every shard's state and raw rows
 // Workloads: "latency" spreads requests over many synthetic clients, each well under the limit; "abuse" gives each
@@ -27,6 +28,8 @@ type ShardCfg = {
   maxInFlight: number;
   /** Optional: request i goes to targets[(i + shard offset) % n] instead of `target` (e.g. one old commit per request, cold upstream). */
   targets?: string[];
+  /** Optional: request i is pinned to versions[i % n] (the row's arm index is the version index): a per-request interleaved A/B. */
+  versions?: string[];
 };
 /** [t ms since start, arm index, client index, status, ttfb ms, total ms, version ok 1/0, target index] */
 type Row = [number, number, number, number, number, number, number, number];
@@ -110,8 +113,10 @@ export class Generator extends DurableObject<Env> {
   }
 
   async #one(cfg: ShardCfg, i: number, t0: number): Promise<void> {
-    const armIndex = i % cfg.arms.length;
-    const arm = cfg.arms[armIndex];
+    const versions = cfg.versions && cfg.versions.length ? cfg.versions : null;
+    const armIndex = versions ? i % versions.length : i % cfg.arms.length;
+    const arm = versions ? cfg.arms[0] : cfg.arms[armIndex];
+    const version = versions ? (versions[armIndex] as string) : cfg.version;
     // latency: rotate over many clients; abuse: every client sends at the shard rate / clients.
     const client = Math.floor(i / cfg.arms.length) % cfg.clients;
     const headers: Record<string, string> = {
@@ -120,7 +125,7 @@ export class Generator extends DurableObject<Env> {
       'user-agent': 'ply-load/1',
     };
     if (arm !== 'default') headers['x-ply-rate-mode'] = arm;
-    if (cfg.version) headers['cloudflare-workers-version-overrides'] = `ply="${cfg.version}"`;
+    if (version) headers['cloudflare-workers-version-overrides'] = `ply="${version}"`;
     const sent = Date.now();
     const t = sent - t0;
     if (cfg.fault !== null && (arm === 'batched' || arm === 'memo') && t >= cfg.fault.fromS * 1000 && t < cfg.fault.toS * 1000) headers['x-ply-rate-fault'] = cfg.fault.header;
@@ -135,7 +140,7 @@ export class Generator extends DurableObject<Env> {
       const res = await fetch(target, { headers, signal: AbortSignal.timeout(20_000) });
       ttfb = Date.now() - sent;
       status = res.status;
-      verOk = !cfg.version || res.headers.get('x-ply-version') === cfg.version ? 1 : 0;
+      verOk = !version || res.headers.get('x-ply-version') === version ? 1 : 0;
       await res.arrayBuffer();
     } catch {
       status = -1;
