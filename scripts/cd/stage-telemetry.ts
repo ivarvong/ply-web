@@ -5,7 +5,9 @@ import { pollEditSpans, type SpanCheck } from './span-check.ts'
 import { raysByRequestId } from './csv.ts'
 import { asRecord } from './json.ts'
 import { activeLog } from './log.ts'
-import { queryAll, queryCapturedSliced, telemetryQueryRetry, type QueryRetry } from './o11y.ts'
+import { queryAll, queryCapturedSliced, queryCounts, telemetryQueryRetry, type QueryRetry } from './o11y.ts'
+import { countsFromRows, pollRate, queryRateRows, sendRateProbes, type ProbeResult, type RateVerdict } from './rate-gate.ts'
+import { readTokenFile } from './token.ts'
 import { errorMessage } from './proc.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import { writeJson, writeText } from './run-dir.ts'
@@ -153,6 +155,38 @@ async function editSpans(config: CdConfig, requests: readonly SmokeRequest[], fr
   })
 }
 
+/**
+ * The rate limiter's silent-degradation gate (scripts/cd/rate-gate.ts): pinned probes as a load client, then the
+ * version's own rate spans since `from`, polled until enough warm default-mode checks are in.
+ */
+export async function rateGate(config: CdConfig, opts: { readonly version: string; readonly from: number; readonly runDir: string; readonly live: boolean }): Promise<{ verdict: RateVerdict; probes: ProbeResult | null }> {
+  const policy = config.policy.rate
+  let probes: ProbeResult | null = null
+  if (policy.probes > 0) {
+    let loadToken: string
+    try {
+      loadToken = await readTokenFile(config.loadTokenFile, 'PLY_LOAD_TOKEN_FILE')
+    } catch (error) {
+      return { verdict: { kind: 'harness_fault', line: `rate: cannot send probes: ${errorMessage(error)}`, counts: null }, probes: null }
+    }
+    const label = `cd-rate:${opts.runDir.split('/').pop() || 'run'}:${opts.live ? 'live' : 'canary'}`
+    probes = await sendRateProbes({ baseUrl: config.baseUrl, worker: config.worker, version: opts.version, loadToken, label, policy }, {
+      fetch: (url, init) => fetch(url, init),
+      sleep,
+    })
+  }
+  const retry = telemetryQueryRetry(config.policy)
+  const verdict = await pollRate(policy, {
+    query: async () => countsFromRows(await queryRateRows(config.worker, opts.version, (filters, groupBys) => queryCounts(opts.from, queryTo(Date.now()), filters, groupBys, retry))),
+    sleep,
+    now: () => Date.now(),
+    pollsMs: TELEMETRY_POLLS_MS,
+    waitMs: TELEMETRY_WAIT_MS,
+  })
+  const probeLine = probes === null ? '' : ` [probes ${probes.answered}/${probes.sent} answered, ${probes.onVersion} on ${opts.version.slice(0, 8)}, ${JSON.stringify(probes.statuses)}]`
+  return { verdict: { ...verdict, line: `${verdict.line}${probeLine}` }, probes }
+}
+
 export async function stageTelemetry(
   config: CdConfig,
   opts: { readonly version: string; readonly since: number; readonly reportPath: string; readonly runDir: string; readonly live: boolean },
@@ -161,6 +195,11 @@ export async function stageTelemetry(
     const requests = await withRays(opts.reportPath, readSmokeRequests(await readFile(opts.reportPath, 'utf8')))
     const retry = telemetryQueryRetry(config.policy)
     const from = opts.since
+    // Runs beside the smoke telemetry: its probes and its own ingest wait overlap the smoke's.
+    const rate = rateGate(config, { version: opts.version, from, runDir: opts.runDir, live: opts.live }).catch((error: unknown): { verdict: RateVerdict; probes: null } => ({
+      verdict: { kind: 'harness_fault', line: `rate: telemetry unavailable: ${errorMessage(error)}`, counts: null },
+      probes: null,
+    }))
     let events: unknown[] = []
     const started = Date.now()
     for (let attempt = 0; ; attempt++) {
@@ -204,9 +243,11 @@ export async function stageTelemetry(
     // #67: the pinned smoke's edit-traced request must show ply's spans in Workers tracing. Pinned only: it gates the 0%
     // canary, and a tracing regression found after 100% is not a reason to roll back.
     const spanCheck: SpanCheck | null = opts.live ? null : await editSpans(config, requests, from, spans, retry, traceIds)
+    const rateResult = await rate
+    const rateVerdict = rateResult.verdict
     const stem = opts.live ? 'live-telemetry' : 'telemetry'
     const spanLine = spanCheck === null ? '' : `\n\n${spanCheck.line}\n`
-    await writeText(opts.runDir, `${stem}.md`, `${telemetryMarkdown({ version: opts.version, from, to, judge, summary, loss })}${spanLine}`)
+    await writeText(opts.runDir, `${stem}.md`, `${telemetryMarkdown({ version: opts.version, from, to, judge, summary, loss })}${spanLine}\n\n${rateVerdict.line}\n`)
     const failures = judge.kind === 'worker'
       ? judge.failures.map(failure => {
         if (failure.kind === 'unexpected-status') return `unexpected-status ${failure.id} ${failure.status}`
@@ -217,8 +258,12 @@ export async function stageTelemetry(
     // The span check decides only when everything else passed: a worker fault or a harness fault above is reported first.
     const spanVerdict = judge.kind === 'pass' && spanCheck !== null && spanCheck.kind !== 'pass' ? spanCheck : null
     if (spanVerdict) failures.push(spanVerdict.line)
-    const kind = spanVerdict ? spanVerdict.kind : judge.kind
-    const line = spanCheck === null ? judge.line : `${judge.line}\n${spanCheck.line}`
+    // The rate gate decides after the smoke and span checks. A rate worker verdict is a silent degradation: canary stops,
+    // live rolls back. A rate harness fault (too few checks ingested, probes unsendable) is unevaluable, not a pass.
+    const rateDecides = judge.kind === 'pass' && spanVerdict === null && rateVerdict.kind !== 'pass' ? rateVerdict : null
+    if (rateDecides) failures.push(rateDecides.line)
+    const kind = spanVerdict ? spanVerdict.kind : rateDecides ? rateDecides.kind : judge.kind
+    const line = `${spanCheck === null ? judge.line : `${judge.line}\n${spanCheck.line}`}\n${rateVerdict.line}`
     const verdict = {
       kind,
       pass: kind === 'pass',
@@ -227,6 +272,7 @@ export async function stageTelemetry(
       line,
       loss,
       spans: spanCheck,
+      rate: { kind: rateVerdict.kind, line: rateVerdict.line, counts: rateVerdict.counts, probes: rateResult.probes },
       from,
       to,
     }
@@ -266,15 +312,17 @@ export async function stageTelemetry(
             ? (judge.checks.some(check => check.kind === 'join') ? 'span_join' : 'telemetry_evaluable')
             : 'smoke_telemetry',
           value: judge.kind === 'pass' ? 'pass' : judge.kind,
-        }, ...(spanCheck === null ? [] : [{ name: 'ply_spans', value: spanCheck.kind }])],
+        }, ...(spanCheck === null ? [] : [{ name: 'ply_spans', value: spanCheck.kind }]), { name: 'rate_degradation', value: rateVerdict.kind }],
         outcome: kind === 'pass' ? 'advance' : kind === 'harness_fault' ? 'harness_fault' : opts.live ? 'rollback' : 'stop',
-        reason: spanVerdict ? spanVerdict.line : judge.line,
+        reason: spanVerdict ? spanVerdict.line : rateDecides ? rateDecides.line : judge.line,
       })
     }
     if (judge.kind === 'harness_fault') return fail('telemetry', judge.reason, false, 'harness_fault')
     if (judge.kind === 'worker') return fail('telemetry', judge.line)
     if (spanVerdict && spanVerdict.kind === 'harness_fault') return fail('telemetry', spanVerdict.line, false, 'harness_fault')
     if (spanVerdict) return fail('telemetry', spanVerdict.line)
+    if (rateDecides && rateDecides.kind === 'harness_fault') return fail('telemetry', rateDecides.line, false, 'harness_fault')
+    if (rateDecides) return fail('telemetry', rateDecides.line)
     return pass('telemetry', { version: opts.version, line, from, to })
   } catch (error) {
     const fault = queryFault(`telemetry unavailable: ${errorMessage(error)}`)

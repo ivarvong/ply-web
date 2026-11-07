@@ -125,14 +125,20 @@ stored and cached. No address is stored. The blocked document is served only ove
 
 ## Load-test controls
 
-A request carrying `x-ply-load-token: <PLY_TOKEN>` (compared in constant time; never forwarded, logged or echoed) may
-also send `x-ply-rate-client` (a label hashed in place of the address, so one generator can be many clients),
-`x-ply-rate-mode: legacy|batched|memo` (choose the limiter for this request: an A/B inside one version), and
-`x-ply-rate-fault` (fault injection on the DO, below). Without a valid token those headers are ignored.
+A request carrying `x-ply-load-token: <PLY_LOAD_TOKEN>` (compared in constant time; never forwarded, logged or echoed;
+Workers Logs records the header as `REDACTED`) may also send `x-ply-rate-client` (a label hashed in place of the
+address, so one generator can be many clients), `x-ply-rate-mode: legacy|batched|memo` (choose the limiter for this
+request: an A/B inside one version), and `x-ply-rate-fault` (fault injection on the DO, below). Without a valid token
+those headers are ignored.
+
+`PLY_LOAD_TOKEN` is a credential of its own (2026-11-07): it unlocks these headers and nothing else. `PLY_TOKEN` (the
+/v1 bearer) does not unlock them, and the load generator (`ply-load`) holds only `PLY_LOAD_TOKEN` (for its control API and
+the header). With no `PLY_LOAD_TOKEN` bound, no request is a load request. Local copy: `~/.config/ply/load-token` (0600).
 
 `x-ply-rate-fault: slow-ack=<ms>;attempts=<n>` makes the DO apply, then hold its answer `<ms>` on attempts ≤ n
 (the client times out and retries; the retry must be a replay). `error;attempts=<n>` makes the DO throw before
-applying on attempts ≤ n. The fault rides on the batch that request joins.
+applying on attempts ≤ n. A faulted request flushes in a batch of its own, at once, never the isolate's shared batch:
+a fault slows, errors or drops only that request's own count, never a real client's.
 
 ## Instrumentation
 
@@ -140,13 +146,29 @@ Workers spans (`ctx.tracing`), each stamped with `ply.route` and `ply.script_ver
 
 | span | attributes |
 |---|---|
-| `ply.rate.check` | `rate.mode` legacy/batched, `rate.bucket`, `rate.decision` allow/deny/fail_open, `rate.check_ms`, `rate.cache` (HIT/STALE/MISS/EXPIRED/…), `rate.read` ok/memo/fail, `rate.doc_entries`, `rate.doc_age_ms`, `rate.blocked_for_ms` (deny: now − crossed) |
+| `ply.rate.check` | `rate.mode` legacy/batched, `rate.mode_source` default/header (header: a load request chose the arm), `rate.cold_isolate` (the isolate's first check), `rate.bucket`, `rate.decision` allow/deny/fail_open, `rate.check_ms`, `rate.cache` (HIT/STALE/MISS/EXPIRED/…), `rate.read` ok/memo/fail, `rate.doc_entries`, `rate.doc_age_ms`, `rate.blocked_for_ms` (deny: now − crossed) |
 | `ply.rate.check` (memo) | `rate.read` memo_fresh / memo_stale_refresh / cold, `rate.cache` MEMO, `rate.memo_age_ms` (now − the isolate's last read), `rate.doc_age_ms` (now − the DO's `at`), `rate.refresh.started` |
 | `ply.rate.refresh` | `rate.refresh.trigger` cold/stale, `.read` ok/memo/fail, `.cache` (the RateCache read's cf-cache-status), `.parsed`, `.ms`, `.joins` (requests that found it in flight), `rate.doc_age_ms` |
 | `ply.rate.flush` | `rate.batch.id`, `.keys`, `.hits`, `.linger_ms`, `.attempts`, `.attempt_log` (`ok:34,timeout:1000,…`), `.timeouts`, `.errors`, `.outcome` ok/dropped, `.deadline_hit`, `.replay` (DO said duplicate), `.flush_ms`, `.alive_ms` (batch open → flush end, the waitUntil lifetime), `rate.do.apply_ms`, `rate.do.rows_written`, `rate.do.new_blocks` |
 
 DO log lines: `ply.rate.apply` (id, attempt, replay, keys, hits, apply_ms, rows_written, new_blocks, fault) and
 `ply.rate.over` (a key at or over its limit: sum, limit, crossed, peak). Queried by `$workers.scriptVersion.id`.
+
+## CD gate (silent degradation)
+
+The limiter fails soft: a broken read admits (`fail_open`), a flush that cannot reach the counter is dropped after 5 s,
+and a missing counter sends every request to `legacy` (59926117 / e61a5742: nothing alerted). All of those answer 200,
+so the smoke and the error gates pass. `scripts/cd/rate-gate.ts` runs inside the telemetry stage of the 0% canary
+(fail → stop) and of the live watch (fail → rollback): 30 pinned probes of `/view?remote=<public ply>` (the redirect
+route: rate-checked, no git work) as a load client with no mode header, then the version's own spans since the stage
+began, by aggregate count. It fails the version when
+
+- any default-mode check (`rate.mode_source` default) ran a limiter other than `rate.expectMode` (batched);
+- warm default-mode checks (not `rate.cold_isolate`) failed open above 10% (with ≥ 20 of them; fewer is a harness fault);
+- any flush was dropped (deadline) or any batch overflowed without an injected fault.
+
+The thresholds and their evidence (7 days of spans, 128,753 flushes, every version since the limiter shipped) are in
+`scripts/cd/cd.policy.json` `rate`. A deliberate `RATE_MODE=legacy` rollback changes `rate.expectMode` too.
 
 ## Results
 

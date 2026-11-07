@@ -175,6 +175,51 @@ export type PromotePolicy = {
 
 export const DEFAULT_PROMOTE: PromotePolicy = { watchMs: 60_000, ingestWaitMs: 30_000, ingestPollMs: 3_000 }
 
+/**
+ * The rate limiter's silent-degradation gate (scripts/cd/rate-gate.ts, docs/rate-limit.md "CD gate"). Every number has
+ * its evidence in `calibration`. Omitted from a policy file: DEFAULT_RATE_GATE (the same numbers as cd.policy.json).
+ */
+export type RateGatePolicy = {
+  /** The limiter every real request must run (RATE_MODE). A deliberate RATE_MODE rollback edits this too. */
+  readonly expectMode: 'batched' | 'memo' | 'legacy'
+  /** Pinned viewer requests the gate sends (load token, no mode header) so the version has default-mode checks. */
+  readonly probes: number
+  readonly probeGapMs: number
+  readonly probePath: string
+  /** Warm default-mode checks needed before the fail_open share is judged. Fewer after the wait is a harness fault. */
+  readonly minChecks: number
+  /** Warm (not the isolate's first) default-mode fail_open share above this fails the version. */
+  readonly maxFailOpenRate: number
+  /** Flushes dropped (deadline, overflow) without an injected fault, above this fails the version. */
+  readonly maxDroppedFlushes: number
+  readonly calibration: RateCalibration
+}
+
+export type RateCalibration = {
+  readonly source: string
+  readonly date: string
+  readonly n: string
+  readonly observed: string
+  readonly headroom: string
+}
+
+export const DEFAULT_RATE_GATE: RateGatePolicy = {
+  expectMode: 'batched',
+  probes: 30,
+  probeGapMs: 300,
+  probePath: '/view?remote=https%3A%2F%2F5ad2236b39de4c8bd8f6270ea63f3ea9.artifacts.cloudflare.net%2Fgit%2Fpublic-v0%2Fply.git',
+  minChecks: 20,
+  maxFailOpenRate: 0.1,
+  maxDroppedFlushes: 0,
+  calibration: {
+    source: 'default for an omitted rate block; see cd.policy.json rate.calibration',
+    date: '2026-11-07',
+    n: 'see cd.policy.json',
+    observed: 'see cd.policy.json',
+    headroom: 'see cd.policy.json',
+  },
+}
+
 export type RolloutPolicy = {
   readonly steps: readonly RolloutStep[]
   readonly ingestWaitMs: number
@@ -211,6 +256,7 @@ export type RolloutPolicy = {
   readonly split: SplitPolicy
   readonly telemetry: TelemetryPolicy
   readonly cleanup: CleanupPolicy
+  readonly rate: RateGatePolicy
 }
 
 export type LoadedPolicy = {
@@ -503,6 +549,38 @@ function telemetryOf(value: unknown): TelemetryPolicy {
   }
 }
 
+function unitRate(value: unknown, path: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) reject(path, 'must be a number in [0, 1]')
+  return value
+}
+
+function rateGateOf(parent: Record<string, unknown>): RateGatePolicy {
+  if (!('rate' in parent)) return DEFAULT_RATE_GATE
+  const rec = record(parent.rate, 'rate')
+  exactKeys(rec, 'rate', ['expectMode', 'probes', 'probeGapMs', 'probePath', 'minChecks', 'maxFailOpenRate', 'maxDroppedFlushes', 'calibration'])
+  const cal = record(rec.calibration, 'rate.calibration')
+  exactKeys(cal, 'rate.calibration', ['source', 'date', 'n', 'observed', 'headroom'])
+  const probes = integer(rec.probes, 'rate.probes', 0)
+  const minChecks = integer(rec.minChecks, 'rate.minChecks', 1)
+  if (probes > 0 && minChecks > probes) reject('rate.minChecks', 'must be <= rate.probes (the probes are what fills it)')
+  return {
+    expectMode: oneOf(rec.expectMode, 'rate.expectMode', ['batched', 'memo', 'legacy']),
+    probes,
+    probeGapMs: integer(rec.probeGapMs, 'rate.probeGapMs', 0),
+    probePath: probePath(rec.probePath, 'rate.probePath'),
+    minChecks,
+    maxFailOpenRate: unitRate(rec.maxFailOpenRate, 'rate.maxFailOpenRate'),
+    maxDroppedFlushes: integer(rec.maxDroppedFlushes, 'rate.maxDroppedFlushes', 0),
+    calibration: {
+      source: textOf(cal.source, 'rate.calibration.source'),
+      date: textOf(cal.date, 'rate.calibration.date'),
+      n: textOf(cal.n, 'rate.calibration.n'),
+      observed: textOf(cal.observed, 'rate.calibration.observed'),
+      headroom: textOf(cal.headroom, 'rate.calibration.headroom'),
+    },
+  }
+}
+
 function promoteOf(value: unknown): PromotePolicy {
   const rec = record(value, 'promote')
   exactKeys(rec, 'promote', ['watchMs', 'ingestWaitMs', 'ingestPollMs'])
@@ -531,7 +609,7 @@ export function promotePolicy(policy: RolloutPolicy): RolloutPolicy {
 
 function validate(value: unknown): RolloutPolicy {
   const rec = record(value, 'policy')
-  exactKeys(rec, 'policy', ['steps', 'ingestWaitMs', 'probe', 'gates', 'burn', 'split', 'cleanup'], ['warmupMs', 'telemetry', 'promote', 'ingestPollMs'])
+  exactKeys(rec, 'policy', ['steps', 'ingestWaitMs', 'probe', 'gates', 'burn', 'split', 'cleanup'], ['warmupMs', 'telemetry', 'promote', 'ingestPollMs', 'rate'])
   const probe = record(rec.probe, 'probe')
   exactKeys(probe, 'probe', [
     'rps',
@@ -582,6 +660,7 @@ function validate(value: unknown): RolloutPolicy {
     split: splitOf(rec.split),
     telemetry: telemetryOf(rec.telemetry),
     cleanup: cleanupOf(rec.cleanup),
+    rate: rateGateOf(rec),
   }
 }
 
@@ -675,6 +754,16 @@ function policyBody(policy: RolloutPolicy): Json {
           headroom: policy.telemetry.query.calibration.headroom,
         },
       },
+    },
+    rate: {
+      expectMode: policy.rate.expectMode,
+      probes: policy.rate.probes,
+      probeGapMs: policy.rate.probeGapMs,
+      probePath: policy.rate.probePath,
+      minChecks: policy.rate.minChecks,
+      maxFailOpenRate: policy.rate.maxFailOpenRate,
+      maxDroppedFlushes: policy.rate.maxDroppedFlushes,
+      calibration: { ...policy.rate.calibration },
     },
     cleanup: {
       attempts: policy.cleanup.attempts,

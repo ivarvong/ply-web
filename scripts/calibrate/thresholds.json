@@ -516,6 +516,43 @@
       "value": 3000,
       "status": "PRIOR (uncalibrated)",
       "why": "Re-query period for the polled ingest wait: each poll is two telemetry queries of ~1 s (run 2026-11-06T21-06-26-841Z), so 3 s keeps the query load under one in flight."
+    },
+    "policy:rate.probes": {
+      "value": 30,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Round probe count for the rate gate (scripts/cd/rate-gate.ts): enough warm default-mode checks to judge a 10% fail_open share at a 0% canary, which has no other viewer traffic."
+    },
+    "policy:rate.probeGapMs": {
+      "value": 300,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Above a fresh isolate's first RateCache read (MISS 403-481 ms on lat2 is the worst; HIT/SWR p99 12 ms) so a probe rarely lands while its isolate's first read is still in flight; 30 probes take ~9 s."
+    },
+    "policy:rate.minChecks": {
+      "value": 20,
+      "status": "PRIOR (uncalibrated)",
+      "why": "Two thirds of the 30 probes: tolerates a third lost to ingest before the fail_open share is unevaluable (a harness fault, not a pass)."
+    },
+    "policy:rate.maxFailOpenRate": {
+      "value": 0.1,
+      "status": "calibrated",
+      "source": "Workers Observability spans, 7 days to 2026-11-07T17:30Z, every version since the batched limiter shipped (6ed2e746 through e8846911; runs lat1-lat8, abuse1-5, fault1-2)",
+      "query": "count of ply.rate.check by ply.script_version, rate.mode, rate.decision (calculations view), split by rate.load",
+      "window": "7 days, per version",
+      "date": "2026-11-07",
+      "n": 151822,
+      "percentile": "share, not a percentile: all batched checks 156/151822 = 0.10% fail_open; load runs per version 0-0.13% (2a4741c0 109/83,574); real (non-load) traffic per version 36-566 checks, worst 7.7% (ccad274e 4/52, cold isolates included)",
+      "headroom": "0.1 is above the worst real-traffic share (7.7%, which included the cold-isolate first reads the gate excludes) and 75x the load share (0.13%); a broken read path fails open ~100%"
+    },
+    "policy:rate.maxDroppedFlushes": {
+      "value": 0,
+      "status": "calibrated",
+      "source": "Workers Observability spans, 7 days to 2026-11-07T17:30Z, every version since the batched limiter shipped (6ed2e746 through e8846911; runs lat1-lat8, abuse1-5, fault1-2)",
+      "query": "count of ply.rate.flush by ply.script_version, rate.batch.outcome, rate.batch.deadline_hit; dropped ones by rate.fault; ply.rate.check with rate.batch.dropped",
+      "window": "7 days, 11 versions",
+      "date": "2026-11-07",
+      "n": 128753,
+      "percentile": "count, not a percentile: 1 dropped of 128,753 and it carried an injected fault (a020b1b1 error;attempts=2, run fault2); 0 overflow",
+      "headroom": "none: the no-fault baseline is 0 (rule of three: < 2.3e-5 per flush), so any drop without a fault fails"
     }
   }
 }

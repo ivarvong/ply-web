@@ -17,6 +17,8 @@ export type CdConfig = {
   readonly bumpBranch: string
   readonly runRoot: string
   readonly tokenFile: string
+  /** The load-test credential (PLY_LOAD_TOKEN), mode 0600: the rate gate's probes carry it. Never the /v1 bearer. */
+  readonly loadTokenFile: string
   readonly sha: string | null
   readonly policy: RolloutPolicy
   readonly policyPath: string
@@ -59,6 +61,11 @@ export function defaultTokenFile(): string {
   return join(homedir(), '.ply-token')
 }
 
+/** The load-test credential, mode 0600. Override with `PLY_LOAD_TOKEN_FILE`. Read by the rate gate, never printed. */
+export function defaultLoadTokenFile(): string {
+  return join(homedir(), '.config', 'ply', 'load-token')
+}
+
 /** What run_started records. Paths only; never a token. */
 export function publicConfig(config: CdConfig) {
   return {
@@ -68,6 +75,7 @@ export function publicConfig(config: CdConfig) {
     bumpBranch: config.bumpBranch,
     runRoot: config.runRoot,
     tokenFile: config.tokenFile,
+    loadTokenFile: config.loadTokenFile,
     sha: config.sha,
     ledgerPath: config.ledgerPath,
     policyPath: config.policyPath,
@@ -98,6 +106,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, policyPath?: string): CdConfi
     bumpBranch: env.PLY_BUMP_BRANCH || BUMP_BRANCH_DEFAULT,
     runRoot: env.PLY_CD_RUN_DIR || defaultRunRoot(),
     tokenFile: env.PLY_TOKEN_FILE || defaultTokenFile(),
+    loadTokenFile: env.PLY_LOAD_TOKEN_FILE || defaultLoadTokenFile(),
     sha: env.PLY_SHA || null,
     ledgerPath: env.PLY_CD_LEDGER || defaultLedgerPath(),
     policy: loaded.policy,

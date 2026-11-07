@@ -28,6 +28,8 @@ test('the checked-in calibrated entries are the ones with a measured run behind 
     'policy:probe.maxLossRate',
     'policy:probe.timeoutMs',
     'policy:probe.windowAttempts',
+    'policy:rate.maxDroppedFlushes',
+    'policy:rate.maxFailOpenRate',
     'policy:telemetry.query.attempts',
     'policy:warmupMs',
   ])

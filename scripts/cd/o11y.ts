@@ -1,3 +1,4 @@
+import { dig } from '../../src/absent.ts'
 import { assertNever } from '../../src/never.ts'
 import { TELEMETRY_MAX_PAGES, TELEMETRY_PAGE } from './baseline.ts'
 import { runCf } from './cf.ts'
@@ -29,7 +30,7 @@ export function telemetryQueryRetry(policy: RolloutPolicy): QueryRetry {
 }
 
 async function queryPage(
-  body: ReturnType<typeof telemetryQuery>,
+  body: object,
   secrets: readonly string[],
   retry: QueryRetry,
 ): Promise<string> {
@@ -149,4 +150,50 @@ function metaId(event: unknown): string {
   const meta = event.$metadata
   if (typeof meta !== 'object' || meta === null || !('id' in meta)) return ''
   return typeof meta.id === 'string' ? meta.id : ''
+}
+
+/** One count per group of a `calculations` aggregate. A group whose key is absent on an event drops that event. */
+export type CountRow = { readonly groups: Readonly<Record<string, string>>; readonly count: number }
+
+/**
+ * `count` over [from, to], grouped by `groupBys` (string keys). Workers Observability omits an event from a grouped count
+ * when it lacks one of the group keys, so callers group only by keys every matching event carries.
+ */
+export async function queryCounts(from: number, to: number, filters: readonly Filter[], groupBys: readonly string[], retry: QueryRetry): Promise<CountRow[]> {
+  const body = {
+    queryId: 'ply-cd-rate',
+    timeframe: { from, to },
+    view: 'calculations',
+    chartType: 'aggregate',
+    parameters: {
+      calculations: [{ operator: 'count' }],
+      groupBys: groupBys.map(value => ({ type: 'string', value })),
+      limit: 1000,
+      filters: [...filters],
+    },
+  }
+  return countRows(extractJson(await queryPage(body, [], retry)))
+}
+
+/** The aggregate rows of a calculations response. No calculation block is zero rows, not an error. */
+export function countRows(payload: unknown): CountRow[] {
+  const calcs = dig(payload, ['calculations'])
+  if (calcs.tag === 'none' || !Array.isArray(calcs.value)) throw new Error('calculations response has no calculations list')
+  const found = dig(calcs.value, ['0', 'aggregates'])
+  const aggregates: unknown[] = found.tag === 'some' && Array.isArray(found.value) ? found.value : []
+  const rows: CountRow[] = []
+  for (const item of aggregates) {
+    const groups: Record<string, string> = {}
+    const list = dig(item, ['groups'])
+    if (list.tag === 'some' && Array.isArray(list.value)) {
+      for (const g of list.value as unknown[]) {
+        const key = dig(g, ['key'])
+        const value = dig(g, ['value'])
+        if (key.tag === 'some' && value.tag === 'some') groups[String(key.value)] = String(value.value)
+      }
+    }
+    const count = dig(item, ['count'])
+    rows.push({ groups, count: count.tag === 'some' && typeof count.value === 'number' ? count.value : 0 })
+  }
+  return rows
 }

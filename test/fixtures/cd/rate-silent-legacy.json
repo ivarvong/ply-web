@@ -1,0 +1,227 @@
+{
+ "note": "ply.rate.check span events from Workers Observability, 2026-11-06: 59926117 (6) and e61a5742 (4). Load arms asked for batched; ctx.exports.RateCounter was a function, so every check silently ran legacy. Trimmed to $metadata.spanName/type/traceId/startTime and source.name/rate/ply.",
+ "events": [
+  {
+   "$metadata": {
+    "spanName": "ply.rate.check",
+    "type": "span",
+    "traceId": "9003e1ca94fac9692c394cc9ac0bc4ad",
+    "startTime": 1794001619419
+   },
+   "source": {
+    "name": "ply.rate.check",
+    "rate": {
+     "mode": "legacy",
+     "bucket": "page",
+     "decision": "allow",
+     "check_ms": 172
+    },
+    "ply": {
+     "script_version": "59926117-40f5-4d84-aa12-89eac76736b2",
+     "route": "rate.check"
+    }
+   }
+  },
+  {
+   "$metadata": {
+    "spanName": "ply.rate.check",
+    "type": "span",
+    "traceId": "90c5881bb5c86c76fc6e6eef243ad1d8",
+    "startTime": 1794001333738
+   },
+   "source": {
+    "name": "ply.rate.check",
+    "rate": {
+     "mode": "legacy",
+     "bucket": "page",
+     "decision": "allow",
+     "check_ms": 244
+    },
+    "ply": {
+     "script_version": "59926117-40f5-4d84-aa12-89eac76736b2",
+     "route": "rate.check"
+    }
+   }
+  },
+  {
+   "$metadata": {
+    "spanName": "ply.rate.check",
+    "type": "span",
+    "traceId": "6a98f60025313ed37c814db4e372378d",
+    "startTime": 1794001224074
+   },
+   "source": {
+    "name": "ply.rate.check",
+    "rate": {
+     "load": true,
+     "mode": "legacy",
+     "bucket": "page",
+     "decision": "allow",
+     "check_ms": 16
+    },
+    "ply": {
+     "script_version": "59926117-40f5-4d84-aa12-89eac76736b2",
+     "route": "rate.check"
+    }
+   }
+  },
+  {
+   "$metadata": {
+    "spanName": "ply.rate.check",
+    "type": "span",
+    "traceId": "6ca0a83f92b2cdd8311e7474e13733be",
+    "startTime": 1794001223875
+   },
+   "source": {
+    "name": "ply.rate.check",
+    "rate": {
+     "load": true,
+     "mode": "legacy",
+     "bucket": "page",
+     "decision": "allow",
+     "check_ms": 8
+    },
+    "ply": {
+     "script_version": "59926117-40f5-4d84-aa12-89eac76736b2",
+     "route": "rate.check"
+    }
+   }
+  },
+  {
+   "$metadata": {
+    "spanName": "ply.rate.check",
+    "type": "span",
+    "traceId": "b99167812a00f46178153b0a877bebcf",
+    "startTime": 1794001223674
+   },
+   "source": {
+    "name": "ply.rate.check",
+    "rate": {
+     "load": true,
+     "mode": "legacy",
+     "bucket": "page",
+     "decision": "allow",
+     "check_ms": 15
+    },
+    "ply": {
+     "script_version": "59926117-40f5-4d84-aa12-89eac76736b2",
+     "route": "rate.check"
+    }
+   }
+  },
+  {
+   "$metadata": {
+    "spanName": "ply.rate.check",
+    "type": "span",
+    "traceId": "024c4c012c7c97a6f11cc7e01225431e",
+    "startTime": 1794001223495
+   },
+   "source": {
+    "name": "ply.rate.check",
+    "rate": {
+     "load": true,
+     "mode": "legacy",
+     "bucket": "page",
+     "decision": "allow",
+     "check_ms": 4
+    },
+    "ply": {
+     "script_version": "59926117-40f5-4d84-aa12-89eac76736b2",
+     "route": "rate.check"
+    }
+   }
+  },
+  {
+   "$metadata": {
+    "spanName": "ply.rate.check",
+    "type": "span",
+    "traceId": "bda2e7841d32dfa91fd134132c99f6c7",
+    "startTime": 1794000808969
+   },
+   "source": {
+    "name": "ply.rate.check",
+    "rate": {
+     "load": true,
+     "mode": "legacy",
+     "bucket": "page",
+     "counter": "function:idFromName=function",
+     "decision": "allow",
+     "check_ms": 349
+    },
+    "ply": {
+     "script_version": "e61a5742-d17e-4adf-beda-0ed2e9e26272",
+     "route": "rate.check"
+    }
+   }
+  },
+  {
+   "$metadata": {
+    "spanName": "ply.rate.check",
+    "type": "span",
+    "traceId": "f84f647a7e92a7ecb90cf5f485b133f8",
+    "startTime": 1794000807744
+   },
+   "source": {
+    "name": "ply.rate.check",
+    "rate": {
+     "load": true,
+     "mode": "legacy",
+     "bucket": "page",
+     "counter": "function:idFromName=function",
+     "decision": "allow",
+     "check_ms": 150
+    },
+    "ply": {
+     "script_version": "e61a5742-d17e-4adf-beda-0ed2e9e26272",
+     "route": "rate.check"
+    }
+   }
+  },
+  {
+   "$metadata": {
+    "spanName": "ply.rate.check",
+    "type": "span",
+    "traceId": "bd35f5e9a107f64a8c8d9d788d482a6f",
+    "startTime": 1794000806797
+   },
+   "source": {
+    "name": "ply.rate.check",
+    "rate": {
+     "load": true,
+     "mode": "legacy",
+     "bucket": "page",
+     "counter": "function:idFromName=function",
+     "decision": "allow",
+     "check_ms": 395
+    },
+    "ply": {
+     "script_version": "e61a5742-d17e-4adf-beda-0ed2e9e26272",
+     "route": "rate.check"
+    }
+   }
+  },
+  {
+   "$metadata": {
+    "spanName": "ply.rate.check",
+    "type": "span",
+    "traceId": "b847d31bfe69e657324ffced3d1c36e7",
+    "startTime": 1794000805732
+   },
+   "source": {
+    "name": "ply.rate.check",
+    "rate": {
+     "load": true,
+     "mode": "legacy",
+     "bucket": "page",
+     "counter": "function:idFromName=function",
+     "decision": "allow",
+     "check_ms": 120
+    },
+    "ply": {
+     "script_version": "e61a5742-d17e-4adf-beda-0ed2e9e26272",
+     "route": "rate.check"
+    }
+   }
+  }
+ ]
+}

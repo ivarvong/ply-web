@@ -111,5 +111,21 @@
       "percentile": "one measured delete, not a percentile",
       "headroom": "attempts is 3, one past the timeout-then-404 that confirmed deletion. backoffMs 1000 is PRIOR: the confirming retry was immediate. staleMinutes 60 is PRIOR: the previous sweep age, not a measured leak age."
     }
+  },
+  "rate": {
+    "expectMode": "batched",
+    "probes": 30,
+    "probeGapMs": 300,
+    "probePath": "/view?remote=https%3A%2F%2F5ad2236b39de4c8bd8f6270ea63f3ea9.artifacts.cloudflare.net%2Fgit%2Fpublic-v0%2Fply.git",
+    "minChecks": 20,
+    "maxFailOpenRate": 0.1,
+    "maxDroppedFlushes": 0,
+    "calibration": {
+      "source": "Workers Observability ply.rate.check and ply.rate.flush spans, the 7 days to 2026-11-07T17:30Z: every version since the batched limiter shipped (6ed2e746, ae21dee2, a020b1b1, 78ddd5c3, b4bd90a3, 2a4741c0, ccad274e, fc120c0d, 5bd53910, 8df1e5a6, e8846911), runs lat1-lat8, abuse1-5, fault1-2",
+      "date": "2026-11-07",
+      "n": "128,753 ply.rate.flush; ply.rate.check: 36-566 real (non-load) per version, 5,714-115,585 load per version",
+      "observed": "dropped flushes: 1 of 128,753, and it carried an injected fault (a020b1b1, error;attempts=2, run fault2); overflow drops 0. fail_open, batched: load runs 0-0.13% (a020b1b1 13/15,128, 78ddd5c3 9/10,782, 2a4741c0 109/83,574, e8846911 4/11,263); real traffic per version, cold isolates included, worst 4/52 = 7.7% (ccad274e) and 3/41 = 7.3% (2a4741c0), the rest <= 2.8%. Mode: every version configured batched ran 0 real checks on another limiter; 59926117 and e61a5742 (the ctx.exports fallback bug) ran 100% legacy",
+      "headroom": "maxDroppedFlushes 0: the no-fault baseline is 0 in 128,753 (rule of three: < 2.3e-5 per flush), so one drop in a gate window (hundreds of flushes) is far beyond it. maxFailOpenRate 0.1 is above the worst real-traffic share (7.7%, which counted cold-isolate first reads; the gate excludes those) and 75x the load baseline (0.13%); a broken read path fails open on ~100%. minChecks 20 of 30 probes is PRIOR: 30 probes 300 ms apart take ~9 s, and 20 tolerates a third lost to ingest. expectMode batched is RATE_MODE in cloudflare.config.ts: a deliberate RATE_MODE=legacy rollback changes this too."
+    }
   }
 }
