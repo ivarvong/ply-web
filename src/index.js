@@ -14,7 +14,7 @@ import { readFile, listTree, refCandidates } from 'ply';
 import { lsRefs } from 'ply';
 import { discover } from 'ply';
 import { createTransport } from 'ply';
-import { plyTracer, requestStamp, routeStamp, spanList, stampRequestSpan } from './edge-trace.ts';
+import { cacheStatsOf, plyTracer, requestStamp, routeStamp, spanList, stampRequestSpan } from './edge-trace.ts';
 import { API_ROUTES, assertRouteTable } from './api-routes.ts';
 import { RETRY, isPlyCode, plyError } from 'ply';
 import { API_CAPS, API_LIMITS } from './limits.ts';
@@ -461,17 +461,7 @@ const worker = {
     let rays = null;
     let collected = null;
     const spans = () => (collected ? collected.spans : []);
-    const cacheStatusOf = a => a['git.response.cache'] || a['git.pack.cache'] || '';
-    const statsOf = s => ({
-      spans: s.length,
-      rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length,
-      wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length,
-      cache_hits: s.filter(x => cacheStatusOf(x.attrs) === 'HIT').length,
-      cache_misses: s.filter(x => {
-        const c = cacheStatusOf(x.attrs);
-        return c === 'MISS' || c === 'EXPIRED' || c === 'BYPASS';
-      }).length,
-    });
+    const statsOf = s => cacheStatsOf(s);
     const stamp = headers => {
       if (!rays || !collected) return;
       const report = rays.report();
@@ -547,12 +537,26 @@ const worker = {
         }
         if (parsed.kind === 'viewer') {
           try {
+            const viewerLog = (res, extra = {}) => {
+              const hits = Number(res.headers.get('x-ply-cache-hits'));
+              const misses = Number(res.headers.get('x-ply-cache-misses'));
+              const spans = Number(res.headers.get('x-ply-spans'));
+              const rtt = Number(res.headers.get('x-ply-rtt'));
+              const log = { viewer: 1, ...extra };
+              if (Number.isFinite(hits)) log.cache_hits = hits;
+              if (Number.isFinite(misses)) log.cache_misses = misses;
+              if (Number.isFinite(spans)) log.spans = spans;
+              if (Number.isFinite(rtt)) log.rtt = rtt;
+              return log;
+            };
             if (parsed.pinKey && parsed.pin) {
               const res = await viaPinned(parsed.pin, parsed.pinKey);
-              return ok(taken(await scrubResponse(res, publicScrub), { viewer: 1, pinned: unwrapOr(header(res.headers, 'x-ply-pinned-cache'), '') }));
+              const scrubbed = await scrubResponse(res, publicScrub);
+              return ok(taken(scrubbed, viewerLog(scrubbed, { pinned: unwrapOr(header(res.headers, 'x-ply-pinned-cache'), '') })));
             }
             const res = await handleViewer(req, env, ctx, { requestId: id, note: extra => Object.assign(record, extra), skipRate: isInternal(req) });
-            return ok(taken(await scrubResponse(res, publicScrub), { viewer: 1 }));
+            const scrubbed = await scrubResponse(res, publicScrub);
+            return ok(taken(scrubbed, viewerLog(scrubbed)));
           } catch (e) {
             if (!knownFailure(e)) throw e;
             const code = recordField(e, 'code');

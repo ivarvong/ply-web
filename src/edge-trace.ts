@@ -245,6 +245,47 @@ export function spanList(): SpanList {
   return { spans, onEnd: ended => { spans.push(ended) } }
 }
 
+/** Pack-cache outcome on a ply span: `git.response.cache` / `git.pack.cache` (x-ply-pack-cache), or the from_cache flag. */
+export type CacheStats = {
+  readonly spans: number
+  readonly rtt: number
+  readonly wide: number
+  readonly cache_hits: number
+  readonly cache_misses: number
+}
+
+function packCacheStatus(attrs: Readonly<Record<string, unknown>>): string {
+  // Prefer a non-empty stamp: '' / missing falls through (same as the prior || chain in index.js).
+  for (const key of ['git.response.cache', 'git.pack.cache'] as const) {
+    const raw = attrs[key]
+    if (typeof raw === 'string' && raw !== '') return raw
+  }
+  return ''
+}
+
+/**
+ * Aggregate ply span outcomes into the request-span counters. Hits/misses come from child pack-cache
+ * spans (`git.pack.cache` / `git.response.cache`), not from an empty CF cache status on the parent.
+ * `NONE` and `''` are unstamped and ignored; `http.response.headers.from_cache` counts as a hit.
+ */
+export function cacheStatsOf(spans: readonly EndedSpan[]): CacheStats {
+  let hits = 0
+  let misses = 0
+  for (const span of spans) {
+    const attrs = span.attrs
+    const status = packCacheStatus(attrs)
+    if (status === 'HIT' || attrs['http.response.headers.from_cache'] === true) hits += 1
+    else if (status === 'MISS' || status === 'EXPIRED' || status === 'BYPASS' || status === 'BUST') misses += 1
+  }
+  return {
+    spans: spans.length,
+    rtt: spans.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length,
+    wide: spans.filter(x => Boolean(x.attrs['git.fetch.filter.fallback'])).length,
+    cache_hits: hits,
+    cache_misses: misses,
+  }
+}
+
 /** The route and version stamp for one request. A missing version id (local dev, tests) is left out, not faked. */
 export function routeStamp(route: string, version: string | null): EdgeStamp {
   return version === null || version === '' ? { [EDGE_ATTR.route]: route } : { [EDGE_ATTR.route]: route, [EDGE_ATTR.version]: version }
