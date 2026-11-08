@@ -784,11 +784,15 @@ const worker = {
             refPurge = await invalidateRefsAfterWrite(ctx, env);
             if (refPurge && refPurge.ok === false) {
               console.warn('ref-purge-blocking-write', refPurge.error);
+              // Stamp fill rays so smoke reports the purge error, not "missing x-artifacts-ray".
+              const purgeHeaders = new Headers({ 'x-ply-ref-purge': `fail:${refPurge.error}`.slice(0, 120) });
+              stamp(purgeHeaders);
+              ensureRayServerTiming(purgeHeaders, Date.now() - t0);
               return err(jsonOut(503, {
                 code: 'unavailable',
                 message: `ref cache purge failed after write: ${refPurge.error}`,
                 retry: 'yes',
-              }, { 'x-ply-ref-purge': `fail:${refPurge.error}`.slice(0, 120) }));
+              }, purgeHeaders));
             }
           }
           if (!handled.ok) return plyFailure(handled.error);
