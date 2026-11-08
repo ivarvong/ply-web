@@ -216,11 +216,12 @@ function files(dir: string): string[] {
   return readdirSync(dir).flatMap(n => { const p = join(dir, n); return statSync(p).isDirectory() ? files(p) : [p]; });
 }
 
-test('guardrails: no Cache API in src/, and only src/gitcache.ts calls the GitCache binding', () => {
+test('guardrails: no Cache API in src/ (except blob-cache.ts), and only src/gitcache.ts calls the GitCache binding', () => {
   const src = fileURLToPath(new URL('../src/', import.meta.url));
   for (const f of files(src).filter(f => /\.(ts|tsx|js|mjs)$/.test(f))) {
     const text = readFileSync(f, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
-    assert.equal(/\bcaches\s*\.|cachingFetch|caches\.default/.test(text), false, `${f} uses the Cache API`);
+    // Inflated-blob cache (src/blob-cache.ts) is the sole Cache API allowlist; packs/refs stay on GitCache HTTP cache.
+    if (!f.endsWith('blob-cache.ts')) assert.equal(/\bcaches\s*\.|cachingFetch|caches\.default/.test(text), false, `${f} uses the Cache API`);
     if (!f.endsWith('gitcache.ts') && !f.endsWith('pinned.ts')) assert.equal(/GitCache\?\.fetch\s*\(|GitCache\.fetch\s*\(|binding\.fetch\s*\(/.test(text), false, `${f} calls the GitCache binding directly`);
     if (/\.exports\?\.GitCache|\.exports\.GitCache/.test(text)) assert.ok(/createLoopbackFetch/.test(text), `${f} reads ctx.exports.GitCache but not through createLoopbackFetch`);
   }

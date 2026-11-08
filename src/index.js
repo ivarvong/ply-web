@@ -39,6 +39,7 @@ import { ADVERTISED_REF_PREFIXES, isAbbreviatedOid, matchAbbreviatedOid } from '
 import { directoryReadMessage, isDirectoryRead } from './read-status.ts';
 import { BUILD_HEADER, plyBuildValue } from './version.ts';
 import { holdLastChunk } from './hold-last.ts';
+import { blobCacheBinding } from './blob-cache.ts';
 import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from './rays.ts';
 import { usageNote } from './flags/client.ts';
 import { handleFlagHttp } from './flags/http.ts';
@@ -361,7 +362,8 @@ const READS = {
     return read.ok ? ok({ body: read.value }) : read;
   },
   'GET /v1/read': async ({ remote, q, opts, spans, ctx, log }) => {
-    const read = await readFile(remote, { ref: q.get('ref') || null, path: q.get('path') }, opts);
+    const blobCache = blobCacheBinding(typeof ctx.waitUntil === 'function' ? (p) => ctx.waitUntil(p) : null);
+    const read = await readFile(remote, { ref: q.get('ref') || null, path: q.get('path') }, { ...opts, ...(blobCache ? { blobCache } : {}) });
     if (!read.ok) {
       const e = read.error;
       if (!isDirectoryRead(e)) return read;
