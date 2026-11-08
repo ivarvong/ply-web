@@ -48,7 +48,7 @@
       "window": "every ramp step of both 2026-11-08 runs",
       "date": "2026-11-08",
       "n": 10,
-      "percentile": "logged count plateaued at the 4th poll, 21.8-24.1 s after the dwell end, on all 5 steps of 2026-11-08T17-07-46-259Z (n=5); not a percentile",
+      "percentile": "logged count plateaued at the 4th poll, 21.8-24.1 s after the dwell end, on all 5 steps of 2026-11-08T17-07-46-259Z (n=5); the ~93% plateau was the $metadata.id dedupe bug (fixed ace0eb9), not ingest; not a percentile",
       "headroom": "the last poll under a 20000 ceiling returns at about +22-24 s, at the measured plateau; 30000 added two flat polls a step (ramp 374 s vs 325 s)"
     },
     "policy:warmupMs": {

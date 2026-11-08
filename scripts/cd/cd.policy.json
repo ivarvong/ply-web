@@ -23,7 +23,7 @@
       "date": "2026-11-08",
       "window": "the 100% watch of each run, polls after the dwell end",
       "n": 10,
-      "observed": "the first poll returned 5.5-8.6 s after the dwell end and each later one 5.4-11.1 s after the one before (3 s sleep + the query); 98% of answered probes were logged by 8.6-19.2 s after the dwell end (median 12.6 s); the first poll saw 0.877-0.947 (one run 1.132 with live-smoke traffic counted)",
+      "observed": "the first poll returned 5.5-8.6 s after the dwell end and each later one 5.4-11.1 s after the one before (3 s sleep + the query); 98% of answered probes were logged by 8.6-19.2 s after the dwell end (median 12.6 s); the first poll saw 0.877-0.947 (one run 1.132 with live-smoke traffic counted). CORRECTION 2026-11-08: these runs postdate cdb8e00, whose row dedupe deleted rows sharing a $metadata.id (fixed ace0eb9), so the landed fractions read low and 8.6-19.2 s are upper bounds. 3000 is a PRIOR period and does not change.",
       "headroom": "PRIOR period: 3000 keeps one query in flight. Replaces a fixed 20000 sleep per step that also ran before a 20-30 s query on the pre-slicing ramps (2026-11-06T20-24-45-549Z, 21-06-26-841Z: 44-66 s from dwell end to decision)."
     },
     "ingestWaitMs": {
@@ -31,8 +31,8 @@
       "date": "2026-11-08",
       "window": "the polls after each dwell end",
       "n": 22,
-      "observed": "2026-11-08T17-07-46-259Z (ceiling 30000): every step's logged count stopped rising at the 4th poll, 21.8-24.1 s after the dwell end (10% 1405, 25% 1160, 50% 1150, 75% 1142, 100% 1806), and the two later polls returned the same count. The plateau is ~93% of issued probes at partial splits: that is the final count, not ingest lag, so INGEST_LANDED 0.98 is never met there and the poll always runs to the ceiling. 2026-11-08T16-58-16-960Z (ceiling 20000) also took 4 polls per step, the last at about +22-24 s.",
-      "headroom": "20000 (unchanged since 2026-11-01): the poll's last query starts at the ceiling and returns at about +22-24 s, where the 2026-11-08 plateau was reached. 30000 (tried in 0016dae) added only flat polls: ramp stage 374 s against 325 s."
+      "observed": "2026-11-08T17-07-46-259Z (ceiling 30000): every step's logged count stopped rising at the 4th poll, 21.8-24.1 s after the dwell end (10% 1405, 25% 1160, 50% 1150, 75% 1142, 100% 1806), and the two later polls returned the same count. The plateau of ~93% of issued probes at partial splits was the row-dedupe bug fixed in ace0eb9 (rows sharing a $metadata.id were deleted), not ingest lag and not Workers Observability loss. 2026-11-08T16-58-16-960Z (ceiling 20000) also took 4 polls per step, the last at about +22-24 s.",
+      "headroom": "20000 (unchanged since 2026-11-01): the poll's last query starts at the ceiling and returns at about +22-24 s, where the 2026-11-08 plateau was reached. 30000 (tried in 0016dae) added only flat polls: ramp stage 374 s against 325 s. Re-checked 2026-11-08 after ace0eb9 and 633bfdb: value unchanged. Run 2026-11-08T18-30-12-168Z (d3a35bb1) has one external fetch row per responded probe at 10/25/50/75% (1499/1250/1250/1250, 0 absent); its polls stopped early because other traffic counts toward INGEST_LANDED, so it does not re-derive this ceiling."
     }
   },
   "probe": {
