@@ -27,7 +27,8 @@ test('a named entrypoint does not set cache.enabled false', () => {
   assert.equal(slot(entrypoints.TreeCache.cache, 'enabled'), true)
   assert.equal(slot(entrypoints.CommitCache.cache, 'enabled'), true)
   assert.equal(slot(entrypoints.ResolvePathCache.cache, 'enabled'), true)
-  assert.equal(slot(entrypoints.RefCache.cache, 'enabled'), true)
+  // Ref tip is live (no cache block) until purge-on-write is proven in prod.
+  assert.equal('cache' in entrypoints.RefCache, false)
   assert.equal(slot(entrypoints.Pinned.cache, 'enabled'), true)
   assert.equal(slot(entrypoints.FlagsCache.cache, 'enabled'), true)
 })
