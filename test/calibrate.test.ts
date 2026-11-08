@@ -172,7 +172,7 @@ test('bands: tight below the observed quantile; drift outside band x headroom; p
 
 test('a citation block cites the query, window, date, n, percentile and headroom', () => {
   const stats = calibrationStats(EVENTS)
-  const query = citedQuery({ worker: 'ply', from: Date.parse('2026-11-01T00:00:00Z'), to: Date.parse('2026-11-08T00:00:00Z'), sliceMs: 3_600_000 })
+  const query = citedQuery({ worker: 'ply', from: Date.parse('2026-11-01T00:00:00Z'), to: Date.parse('2026-11-08T00:00:00Z'), sliceMs: 3_600_000, routes: null, includeNoisy: false })
   const block = citationFor({ metric: METRIC, stats, query, from: query.timeframe.from, to: query.timeframe.to, source: 'scripts/calibrate test' })
   assert.ok(block)
   assert.equal(block.value, 236)
@@ -206,7 +206,7 @@ test('the query adapter slices the window and pages each slice through cf o11y t
       return { code: 0, stdout: `cf o11y\n${page}`, stderr: '' }
     })
     const retry = { bound: { attempts: 3, backoffMs: 1 }, sleep: async () => {}, note: async () => {} }
-    const events = await querySpanEvents({ worker: 'ply', from: 0, to: 7_200_000, sliceMs: 3_600_000 }, retry)
+    const events = await querySpanEvents({ worker: 'ply', from: 0, to: 7_200_000, sliceMs: 3_600_000, routes: null, includeNoisy: false }, retry)
     assert.equal(events.length, TELEMETRY_PAGE + 2 * EVENTS.length)
   } finally {
     useCfRunner(null)
@@ -283,14 +283,14 @@ test('spanFilters: default allowlists /v1 + GET /; --include-noisy and --route o
   for (const route of NOISY_ROUTES) {
     assert.equal(DEFAULT_CALIBRATE_ROUTES.includes(route), false, route)
   }
-  const noisy = keys(spanFilters('ply', { includeNoisy: true }))
+  const noisy = keys(spanFilters('ply', { routes: null, includeNoisy: true }))
   assert.equal(noisy.some(line => line.startsWith('in:ply.route=') || line.startsWith('neq:ply.route=')), false)
   assert.deepEqual(
-    keys(spanFilters('ply', { routes: ['GET /v1/tree'] })),
+    keys(spanFilters('ply', { routes: ['GET /v1/tree'], includeNoisy: false })),
     ['eq:$metadata.service=ply', 'eq:$metadata.type=span', 'eq:ply.route=GET /v1/tree'],
   )
   assert.deepEqual(
-    keys(spanFilters('ply', { routes: ['GET /v1/tree', 'POST /v1/edit'] })),
+    keys(spanFilters('ply', { routes: ['GET /v1/tree', 'POST /v1/edit'], includeNoisy: false })),
     ['eq:$metadata.service=ply', 'eq:$metadata.type=span', 'in:ply.route=GET /v1/tree,POST /v1/edit'],
   )
   // An explicit route list wins over includeNoisy.

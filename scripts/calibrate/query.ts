@@ -12,10 +12,13 @@ export type SpanQuery = {
   readonly to: number
   /** Slice length. Each slice is one paged query. */
   readonly sliceMs: number
-  /** Keep only these `ply.route` values. Null keeps every non-noisy route. */
-  readonly routes?: readonly string[] | null
-  /** When true, do not exclude NOISY_ROUTES. */
-  readonly includeNoisy?: boolean
+  /**
+   * Keep only these `ply.route` values. Null means the default allowlist
+   * (`DEFAULT_CALIBRATE_ROUTES`) unless `includeNoisy` is true.
+   */
+  readonly routes: readonly string[] | null
+  /** When true and `routes` is null, do not allowlist: return every span of the Worker. */
+  readonly includeNoisy: boolean
 }
 
 export type Slice = { readonly from: number; readonly to: number }
@@ -43,24 +46,24 @@ export const NOISY_ROUTES = ['viewer', 'rate.check', 'rate.flush', 'rate.refresh
 export const DEFAULT_CALIBRATE_ROUTES: readonly string[] = [...API_ROUTES, 'GET /']
 
 export type SpanFilterOpts = {
-  /** Keep only these `ply.route` values (`in`/`eq`). Null keeps DEFAULT_CALIBRATE_ROUTES. */
-  readonly routes?: readonly string[] | null
-  /** When true and `routes` is unset, do not allowlist: return every span of the Worker. */
-  readonly includeNoisy?: boolean
+  /** Keep only these `ply.route` values (`in`/`eq`). Null keeps DEFAULT_CALIBRATE_ROUTES unless includeNoisy. */
+  readonly routes: readonly string[] | null
+  /** When true and `routes` is null, do not allowlist: return every span of the Worker. */
+  readonly includeNoisy: boolean
 }
 
+const DEFAULT_SPAN_FILTER_OPTS: SpanFilterOpts = { routes: null, includeNoisy: false }
+
 /** The filters every calibration query uses: this Worker's span events (ply's spans and the runtime's request spans). */
-export function spanFilters(worker: string, opts: SpanFilterOpts = {}): Filter[] {
+export function spanFilters(worker: string, opts: SpanFilterOpts = DEFAULT_SPAN_FILTER_OPTS): Filter[] {
   const filters: Filter[] = [serviceFilter(worker), spanTypeFilter()]
   const routes = opts.routes
-  if (routes !== undefined && routes !== null && routes.length > 0) {
-    const first = routes[0]
-    if (first === undefined) return filters
+  if (routes !== null && routes.length > 0) {
     filters.push({
       key: 'ply.route',
       operation: routes.length === 1 ? 'eq' : 'in',
       type: 'string',
-      value: routes.length === 1 ? first : routes.join(','),
+      value: routes.join(','),
     })
     return filters
   }
