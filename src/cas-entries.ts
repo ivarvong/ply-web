@@ -80,10 +80,18 @@ export class ResolvePathCache extends WorkerEntrypoint<CasEnv> {
 
 export class RefCache extends WorkerEntrypoint<CasEnv> {
   override async fetch(req: Request): Promise<Response> {
+    // Backup invalidate path (POST): same purge as RPC, for when stub RPC is unavailable.
+    if (req.method === 'POST' && new URL(req.url).pathname === '/invalidate') {
+      const result = await purgeRefTags(this.ctx as object, ['ply-cas-ref']);
+      return new Response(JSON.stringify(result), {
+        status: result.ok ? 200 : 503,
+        headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
+      });
+    }
     return serveRef(req, propsOf(this.ctx as object), tokensOf(this.env), allowOf(this.env));
   }
 
-  /** Write path: purge ref tags so the next read sees the new tip. Purge is scoped to this entrypoint. */
+  /** Write path: purge every tip in this entrypoint so the next read sees the new tip. */
   async invalidateRefs(tags: string[]): Promise<{ ok: boolean; ms: number; error: string }> {
     return purgeRefTags(this.ctx as object, Array.isArray(tags) ? tags : []);
   }
