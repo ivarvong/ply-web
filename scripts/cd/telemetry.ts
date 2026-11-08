@@ -154,11 +154,56 @@ export function unwrapEvents(payload: unknown): unknown[] {
   return []
 }
 
-export function pageCursor(page: readonly unknown[]): string | null {
-  const last = asRecord(unwrapOr(atIndex(page, page.length - 1), null))
-  const meta = asRecord(field(last, '$metadata'))
-  const id = field(meta, 'id')
+function metaId(row: unknown): string | null {
+  const id = field(asRecord(field(asRecord(row), '$metadata')), 'id')
   return typeof id === 'string' && id !== '' ? id : null
+}
+
+/**
+ * Next page's `offset`: the last id on this page that differs from the page's final id, or null when the page has no such id.
+ *
+ * Rows come back newest first, ordered by `$metadata.id`, and `offset` returns only ids strictly below it. The id is a
+ * millisecond plus a per-invocation row position, so rows of different invocations can share it. Using the final id as the
+ * cursor would drop the rest of a same-id group the page boundary split: on 2026-11-08T17-17-40-415Z's 10% step at limit 37
+ * and 100 this lost 4 and 2 of 4,531 rows. Stepping back one id re-reads that group; callers remove the repeats with `dedupeRows`.
+ */
+export function pageCursor(page: readonly unknown[]): string | null {
+  const last = metaId(unwrapOr(atIndex(page, page.length - 1), null))
+  if (last === null) return null
+  for (let index = page.length - 2; index >= 0; index -= 1) {
+    const id = metaId(unwrapOr(atIndex(page, index), null))
+    if (id !== null && id !== last) return id
+  }
+  return null
+}
+
+/**
+ * Identity of one event row, or null when it has no `$metadata.id` (kept, never compared).
+ *
+ * `$metadata.id` alone is not unique: invocations in the same millisecond with the same row position share it. Adding
+ * `requestId` separates invocation and log rows, but a span row has a null `requestId`, and id + requestId still merged 355
+ * distinct spans of 9,908 rows (run 2026-11-08T17-17-40-415Z). Id + requestId + traceId + spanId had no collisions there.
+ */
+export function rowKey(row: unknown): string | null {
+  const id = metaId(row)
+  if (id === null) return null
+  const meta = asRecord(field(asRecord(row), '$metadata'))
+  return JSON.stringify([id, field(meta, 'requestId'), field(meta, 'traceId'), field(meta, 'spanId')])
+}
+
+/** Rows without repeats of the same row (overlapping pages or slices). Order is kept; rows with no id all stay. */
+export function dedupeRows(rows: readonly unknown[]): unknown[] {
+  const seen = new Set<string>()
+  const out: unknown[] = []
+  for (const row of rows) {
+    const key = rowKey(row)
+    if (key !== null) {
+      if (seen.has(key)) continue
+      seen.add(key)
+    }
+    out.push(row)
+  }
+  return out
 }
 
 /** Same percentile as scripts/canary-o11y.mjs: sorted[floor((n - 1) * p)], null when empty. */

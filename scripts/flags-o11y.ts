@@ -9,6 +9,7 @@
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { atIndex, chainGet } from '../src/absent.ts';
+import { dedupeRows, pageCursor } from './cd/telemetry.ts';
 import { unwrapOr } from '../src/option.ts';
 import { MEASUREMENT, flagLogQuery, renderReport, reportFromEvents } from '../src/flags/report.ts';
 
@@ -44,22 +45,14 @@ function page(body: unknown): unknown[] {
   return rows.value;
 }
 
-function cursor(rows: readonly unknown[]): string | null {
-  const last = unwrapOr(atIndex(rows, rows.length - 1), null);
-  if (last === null || typeof last !== 'object') return null;
-  const id = chainGet(unwrapOr(chainGet(last, '$metadata'), null), 'id');
-  if (id.tag !== 'some' || typeof id.value !== 'string' || id.value === '') return null;
-  return id.value;
-}
-
 function collect(msg: 'flags.eval' | 'flags.resolve'): unknown[] {
   const out: unknown[] = [];
   let offset: string | null = null;
   for (let i = 0; i < 50; i++) {
     const rows = page(flagLogQuery(worker, msg, from, to, offset));
     out.push(...rows);
-    if (rows.length < 1000) return out;
-    const next = cursor(rows);
+    if (rows.length < 1000) return dedupeRows(out);
+    const next = pageCursor(rows);
     if (!next) throw new Error(`a full ${msg} page had no cursor`);
     offset = next;
   }

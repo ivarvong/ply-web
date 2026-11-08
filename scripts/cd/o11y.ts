@@ -7,7 +7,7 @@ import { extractJson } from './json.ts'
 import { activeLog } from './log.ts'
 import type { RolloutPolicy } from './policy.ts'
 import { currentLog, recordQueryAttempt, retryQuery, type QueryAttempt, type QueryBound } from './query-retry.ts'
-import { pageCursor, telemetryQuery, unwrapEvents, type Filter } from './telemetry.ts'
+import { dedupeRows, pageCursor, telemetryQuery, unwrapEvents, type Filter } from './telemetry.ts'
 
 export type CapturedQuery = {
   readonly events: unknown[]
@@ -66,7 +66,7 @@ async function queryPage(
   }
 }
 
-/** Every page of one observability query, plus each page's capture digest and the first query body. */
+/** Every page of one observability query, repeats removed, plus each page's capture digest and the first query body. */
 export async function queryCaptured(
   view: 'events' | 'traces',
   from: number,
@@ -91,10 +91,10 @@ export async function queryCaptured(
     // TELEMETRY_PAGE because the index held that many rows: the series sum equalled
     // the page, sampleInterval was 1, and statistics.abr_level was 1.
     if (events.length < TELEMETRY_PAGE) {
-      return { events: out, pages, query: first }
+      return { events: dedupeRows(out), pages, query: first }
     }
     const cursor = pageCursor(events)
-    if (!cursor) throw new Error('a full telemetry page has no $metadata.id cursor')
+    if (!cursor) throw new Error('a full telemetry page has no usable $metadata.id cursor')
     offset = cursor
   }
   throw new Error(`more than ${TELEMETRY_MAX_PAGES} pages of telemetry`)
@@ -122,7 +122,7 @@ export function notSpanFilter(): Filter {
 
 /**
  * One query over [from, to], run as parallel `SLICE_MS` windows so a busy window pages in
- * parallel instead of serially into TELEMETRY_MAX_PAGES. Rows are deduplicated by `$metadata.id`.
+ * parallel instead of serially into TELEMETRY_MAX_PAGES. Repeated rows are removed by `rowKey`.
  */
 export async function queryCapturedSliced(
   view: 'events' | 'traces',
@@ -135,28 +135,10 @@ export async function queryCapturedSliced(
   for (let start = from; start < to; start += SLICE_MS) bounds.push([start, Math.min(to, start + SLICE_MS)])
   if (bounds.length === 0) bounds.push([from, to])
   const parts = await Promise.all(bounds.map(([start, end]) => queryCaptured(view, start, end, filters, retry)))
-  const seen = new Set<string>()
-  const events: unknown[] = []
-  for (const part of parts) {
-    for (const event of part.events) {
-      const id = metaId(event)
-      if (id !== '') {
-        if (seen.has(id)) continue
-        seen.add(id)
-      }
-      events.push(event)
-    }
-  }
+  const events = dedupeRows(parts.flatMap(part => part.events))
   const first = parts[0]
   if (!first) throw new Error('sliced query with no slice')
   return { events, pages: parts.flatMap(part => part.pages), query: telemetryQuery(view, from, to, filters, null) }
-}
-
-function metaId(event: unknown): string {
-  if (typeof event !== 'object' || event === null || !('$metadata' in event)) return ''
-  const meta = event.$metadata
-  if (typeof meta !== 'object' || meta === null || !('id' in meta)) return ''
-  return typeof meta.id === 'string' ? meta.id : ''
 }
 
 /** One count per group of a `calculations` aggregate. A group whose key is absent on an event drops that event. */

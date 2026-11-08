@@ -3,9 +3,9 @@
   "counts": {
     "word": 42,
     "optional": 60,
-    "chain": 106,
+    "chain": 102,
     "nullish": 156,
-    "total": 364
+    "total": 360
   },
   "files": {
     "cloudflare.config.ts": {
@@ -214,9 +214,9 @@
     "scripts/cd/stage-telemetry.ts": {
       "word": 0,
       "optional": 0,
-      "chain": 8,
+      "chain": 6,
       "nullish": 2,
-      "total": 10
+      "total": 8
     },
     "scripts/flags-cli.ts": {
       "word": 3,
@@ -305,9 +305,9 @@
     "test/cd-telemetry.test.ts": {
       "word": 1,
       "optional": 0,
-      "chain": 15,
+      "chain": 13,
       "nullish": 2,
-      "total": 18
+      "total": 16
     },
     "test/cf-bundle.js": {
       "word": 0,

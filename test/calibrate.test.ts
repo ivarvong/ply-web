@@ -221,7 +221,7 @@ test('the query adapter slices the window and pages each slice through cf o11y t
     { key: 'ply.route', operation: 'in', type: 'string', value: DEFAULT_CALIBRATE_ROUTES.join(',') },
   ])
   assert.deepEqual(bodies.map(body => body.timeframe), [{ from: 0, to: 3_600_000 }, { from: 0, to: 3_600_000 }, { from: 0, to: 3_600_000 }, { from: 3_600_000, to: 7_200_000 }])
-  assert.equal(bodies[1].offset, `page-${TELEMETRY_PAGE - 1}`)
+  assert.equal(bodies[1].offset, `page-${TELEMETRY_PAGE - 2}`, 'stepped back one id: the cursor is the last id that differs from the page tail')
 })
 
 test('cli arguments: window, filters, and errors', () => {

@@ -40,6 +40,7 @@ import { fileURLToPath } from 'node:url';
 import { atIndex, chainGet, dig, recordGet } from '../src/absent.ts';
 import { unwrapOr } from '../src/option.ts';
 import { parseRequests, verdict } from './canary-verdict.mjs';
+import { dedupeRows, pageCursor } from './cd/telemetry.ts';
 
 function asRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null;
@@ -114,10 +115,8 @@ function queryView(view, filters) {
     };
     const rows = pageOf(cfQuery(body), view);
     out.push(...rows);
-    if (rows.length < PAGE) return out;
-    const last = unwrapOr(atIndex(rows, rows.length - 1), null);
-    const id = own(present(chainGet(last, '$metadata')), 'id');
-    offset = id.tag === 'some' && typeof id.value === 'string' && id.value !== '' ? id.value : null;
+    if (rows.length < PAGE) return dedupeRows(out);
+    offset = pageCursor(rows);
     if (!offset) throw new Error(`a full page with no $metadata.id cursor (${view})`);
   }
   throw new Error(`more than ${MAX_PAGES} pages of ${PAGE} ${view} for ${JSON.stringify(filters)}`);

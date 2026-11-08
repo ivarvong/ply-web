@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { dig } from '../src/absent.ts'
+import { unwrapOr } from '../src/option.ts'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { JOIN_MIN_LOGGED, SMOKE_LATENCY } from '../scripts/cd/baseline.ts'
@@ -244,8 +246,9 @@ test('recorded query responses exercise every telemetry evaluator', () => {
   assert.equal(refs.length, 1)
   assert.equal(refs[0]?.durationMs, 49)
   const cursor = pageCursor(recordedSpans)
-  const last = asRecord(asRecord(recordedSpans[recordedSpans.length - 1])?.$metadata)
-  assert.equal(cursor, last?.id)
+  const metaIds = recordedSpans.map(span => unwrapOr(dig(span, ['$metadata', 'id']), null))
+  const steppedBack = metaIds.filter(id => id !== metaIds[metaIds.length - 1]).at(-1)
+  assert.equal(cursor, steppedBack)
 
   const requests: SmokeRequest[] = []
   const events: unknown[] = []

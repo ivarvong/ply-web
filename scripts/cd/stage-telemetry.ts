@@ -27,6 +27,7 @@ import {
   versionFilter,
   type Filter,
   type SmokeRequest,
+  dedupeRows,
 } from './telemetry.ts'
 import type { CdConfig } from './config.ts'
 
@@ -225,16 +226,7 @@ export async function stageTelemetry(
       byTrace(config, 'traces', from, to, traceIds, retry),
       byTrace(config, 'events', from, to, traceIds, retry),
     ])
-    const seen = new Set<string>()
-    const combined = []
-    for (const event of [...events, ...health]) {
-      const id = asRecord(asRecord(event)?.$metadata)?.id
-      if (typeof id === 'string') {
-        if (seen.has(id)) continue
-        seen.add(id)
-      }
-      combined.push(event)
-    }
+    const combined = dedupeRows([...events, ...health])
     const summary = summarizeTelemetry(opts.version, requests, combined, traces, spans)
     const { maxLossRate } = config.policy.telemetry
     const loss = telemetryLoss(requests, summary, maxLossRate)
