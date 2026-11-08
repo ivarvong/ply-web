@@ -4,6 +4,7 @@
 //   node --experimental-strip-types scripts/calibrate/main.ts --from 2026-11-01T00:00:00Z --to 2026-11-02T00:00:00Z --route 'GET /v1/tree'
 //   node --experimental-strip-types scripts/calibrate/main.ts --since 7d --check --report drift.md
 //   node --experimental-strip-types scripts/calibrate/main.ts --fixture test/fixtures/calibrate/spans.json --check
+//   node --experimental-strip-types scripts/calibrate/main.ts --since 72h --include-noisy   # unfiltered; pair with a smaller --slice
 //
 // Prints, per route (and `*` for all routes), every numeric input attribute's n, p50/p90/p99/p99.9, max and log2
 // histogram, and categorical counts (error kind, cache status, outcome). --check judges every threshold in
@@ -53,10 +54,17 @@ export type Args = {
   readonly cite: readonly string[]
   readonly registry: string
   readonly policy: string
+  /** When true, the observability query does not allowlist routes (default is /v1 + GET /). */
+  readonly includeNoisy: boolean
 }
 
-/** One hour per slice by default: well under 50 pages of 1000 events at the current request rate. */
-const DEFAULT_SLICE = '1h'
+/**
+ * Ten minutes per slice by default (loop 2026-11-08): with DEFAULT_CALIBRATE_ROUTES, a peak hour still
+ * had ~61k allowlisted spans (discover 26k + GET / 17k + read 9k + tree 6k during a load burst), which
+ * overflows TELEMETRY_MAX_PAGES (50×1000). Ten-minute slices of that hour stayed ≤16,885. Pass
+ * `--include-noisy` only with an even smaller `--slice` when you need viewer/rate.* distributions.
+ */
+const DEFAULT_SLICE = '10m'
 
 /** `first` when given, else `fallback`. */
 function or(first: string | null, fallback: string): string {
@@ -66,7 +74,7 @@ function or(first: string | null, fallback: string): string {
 export function parseArgs(argv: readonly string[], now: number, env: Readonly<Record<string, unknown>>): Args {
   const many = new Map<string, string[]>()
   const flags = new Set<string>()
-  const BOOL = new Set(['--check', '--no-histogram'])
+  const BOOL = new Set(['--check', '--no-histogram', '--include-noisy'])
   for (let i = 0; i < argv.length; i++) {
     const arg = unwrapOr(atIndex(argv, i), '')
     if (BOOL.has(arg)) {
@@ -117,6 +125,7 @@ export function parseArgs(argv: readonly string[], now: number, env: Readonly<Re
     cite: unwrapOr(mapGet(many, '--cite'), []),
     registry: or(one('--registry'), REGISTRY_PATH),
     policy: or(one('--policy'), DEFAULT_POLICY_PATH),
+    includeNoisy: flags.has('--include-noisy'),
   }
 }
 
@@ -156,7 +165,14 @@ export function evaluate(args: Args, events: readonly unknown[], source: string)
   const stats = calibrationStats(events, { routes: args.routes, attributes: args.attributes, versions: args.versions })
   const parts = [statsText(stats, args, args.histograms)]
   const loaded = loadRegistry(args.registry)
-  const query: SpanQuery = { worker: args.worker, from: args.from, to: args.to, sliceMs: args.sliceMs }
+  const query: SpanQuery = {
+    worker: args.worker,
+    from: args.from,
+    to: args.to,
+    sliceMs: args.sliceMs,
+    routes: args.routes,
+    includeNoisy: args.includeNoisy,
+  }
   for (const key of args.cite) {
     const entry = loaded.registry.thresholds.get(key)
     const block = entry && entry.metric ? citationFor({ metric: entry.metric, stats, query: citedQuery(query), from: args.from, to: args.to, source }) : null
@@ -187,7 +203,14 @@ export async function cli(argv: readonly string[], env: Readonly<Record<string, 
       source = `fixture ${args.fixtures.join(',')}`
     } else {
       const retry = telemetryQueryRetry(loadPolicy(args.policy).policy)
-      events = await querySpanEvents({ worker: args.worker, from: args.from, to: args.to, sliceMs: args.sliceMs }, retry)
+      events = await querySpanEvents({
+        worker: args.worker,
+        from: args.from,
+        to: args.to,
+        sliceMs: args.sliceMs,
+        routes: args.routes,
+        includeNoisy: args.includeNoisy,
+      }, retry)
       source = `scripts/calibrate ${new Date(args.to).toISOString()}`
     }
   } catch (error) {

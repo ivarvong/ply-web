@@ -17,7 +17,7 @@ import { TELEMETRY_PAGE } from '../scripts/cd/baseline.ts'
 import { unwrapEvents } from '../scripts/cd/telemetry.ts'
 import { driftMarkdown, evaluate, fixtureEvents, parseArgs, parseDuration } from '../scripts/calibrate/main.ts'
 import { checkBands, citationFor, readRegistry, type Metric } from '../scripts/calibrate/provenance.ts'
-import { citedQuery, querySpanEvents, slices } from '../scripts/calibrate/query.ts'
+import { citedQuery, DEFAULT_CALIBRATE_ROUTES, NOISY_ROUTES, querySpanEvents, slices, spanFilters } from '../scripts/calibrate/query.ts'
 import {
   ALL_ROUTES,
   API_GROUP,
@@ -172,7 +172,7 @@ test('bands: tight below the observed quantile; drift outside band x headroom; p
 
 test('a citation block cites the query, window, date, n, percentile and headroom', () => {
   const stats = calibrationStats(EVENTS)
-  const query = citedQuery({ worker: 'ply', from: Date.parse('2026-11-01T00:00:00Z'), to: Date.parse('2026-11-08T00:00:00Z'), sliceMs: 3_600_000 })
+  const query = citedQuery({ worker: 'ply', from: Date.parse('2026-11-01T00:00:00Z'), to: Date.parse('2026-11-08T00:00:00Z'), sliceMs: 3_600_000, routes: null, includeNoisy: false })
   const block = citationFor({ metric: METRIC, stats, query, from: query.timeframe.from, to: query.timeframe.to, source: 'scripts/calibrate test' })
   assert.ok(block)
   assert.equal(block.value, 236)
@@ -206,7 +206,7 @@ test('the query adapter slices the window and pages each slice through cf o11y t
       return { code: 0, stdout: `cf o11y\n${page}`, stderr: '' }
     })
     const retry = { bound: { attempts: 3, backoffMs: 1 }, sleep: async () => {}, note: async () => {} }
-    const events = await querySpanEvents({ worker: 'ply', from: 0, to: 7_200_000, sliceMs: 3_600_000 }, retry)
+    const events = await querySpanEvents({ worker: 'ply', from: 0, to: 7_200_000, sliceMs: 3_600_000, routes: null, includeNoisy: false }, retry)
     assert.equal(events.length, TELEMETRY_PAGE + 2 * EVENTS.length)
   } finally {
     useCfRunner(null)
@@ -218,6 +218,7 @@ test('the query adapter slices the window and pages each slice through cf o11y t
   assert.deepEqual(filters, [
     { key: '$metadata.service', operation: 'eq', type: 'string', value: 'ply' },
     { key: '$metadata.type', operation: 'eq', type: 'string', value: 'span' },
+    { key: 'ply.route', operation: 'in', type: 'string', value: DEFAULT_CALIBRATE_ROUTES.join(',') },
   ])
   assert.deepEqual(bodies.map(body => body.timeframe), [{ from: 0, to: 3_600_000 }, { from: 0, to: 3_600_000 }, { from: 0, to: 3_600_000 }, { from: 3_600_000, to: 7_200_000 }])
   assert.equal(bodies[1].offset, `page-${TELEMETRY_PAGE - 1}`)
@@ -270,4 +271,38 @@ test('--check fails on a threshold out of band, and the issue body names it', ()
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+
+test('spanFilters: default allowlists /v1 + GET /; --include-noisy and --route override', () => {
+  const keys = (filters: ReturnType<typeof spanFilters>) => filters.map(f => `${f.operation}:${f.key}=${f.value}`)
+  const base = keys(spanFilters('ply'))
+  assert.ok(base.includes('eq:$metadata.service=ply'))
+  assert.ok(base.includes('eq:$metadata.type=span'))
+  assert.ok(base.includes(`in:ply.route=${DEFAULT_CALIBRATE_ROUTES.join(',')}`))
+  for (const route of NOISY_ROUTES) {
+    assert.equal(DEFAULT_CALIBRATE_ROUTES.includes(route), false, route)
+  }
+  const noisy = keys(spanFilters('ply', { routes: null, includeNoisy: true }))
+  assert.equal(noisy.some(line => line.startsWith('in:ply.route=') || line.startsWith('neq:ply.route=')), false)
+  assert.deepEqual(
+    keys(spanFilters('ply', { routes: ['GET /v1/tree'], includeNoisy: false })),
+    ['eq:$metadata.service=ply', 'eq:$metadata.type=span', 'eq:ply.route=GET /v1/tree'],
+  )
+  assert.deepEqual(
+    keys(spanFilters('ply', { routes: ['GET /v1/tree', 'POST /v1/edit'], includeNoisy: false })),
+    ['eq:$metadata.service=ply', 'eq:$metadata.type=span', 'in:ply.route=GET /v1/tree,POST /v1/edit'],
+  )
+  // An explicit route list wins over includeNoisy.
+  assert.deepEqual(
+    keys(spanFilters('ply', { routes: ['viewer'], includeNoisy: true })),
+    ['eq:$metadata.service=ply', 'eq:$metadata.type=span', 'eq:ply.route=viewer'],
+  )
+})
+
+test('parseArgs: --include-noisy is a boolean flag', () => {
+  const args = parseArgs(['--since', '1h', '--include-noisy'], Date.parse('2026-11-08T12:00:00Z'), {})
+  assert.equal(args.includeNoisy, true)
+  const off = parseArgs(['--since', '1h'], Date.parse('2026-11-08T12:00:00Z'), {})
+  assert.equal(off.includeNoisy, false)
 })
