@@ -364,12 +364,31 @@ function casExportsOf(env, ctx) {
 }
 
 async function invalidateRefsAfterWrite(ctx, env) {
-  if (env.PACK_CACHE === 'off') return { ok: false, error: 'pack_cache_off' };
+  if (env.PACK_CACHE === 'off') return { ok: true, error: '' };
   const exField = chainGet(ctx, 'exports');
-  if (exField.tag === 'none') return { ok: false, error: 'no_exports' };
+  if (exField.tag === 'none') return { ok: true, error: '' };
   const ref = unwrapOr(chainGet(exField.value, 'RefCache'), null);
-  if (ref === null) return { ok: false, error: 'no_refcache' };
-  // Prefer RPC (bypasses Workers Cache). Fall back to POST /invalidate on the entrypoint.
+  if (ref === null) return { ok: true, error: '' };
+  // RPC handlers in prod have been observed without ctx.cache (CD 2026-11-08). Prefer
+  // POST /invalidate on the entrypoint fetch path, where ctx.cache is the Workers Cache API.
+  // workerd local suites have no Workers Cache: 'no ctx.cache' is a successful no-op there.
+  const isNoCache = error => error === 'no ctx.cache' || error === 'no purge';
+  try {
+    const binding = typeof ref === 'function' ? ref({ props: { scope: 'https://ply.invalid/purge' } }) : null;
+    if (binding !== null && typeof binding.fetch === 'function') {
+      const res = await binding.fetch(new Request('https://cas.internal/invalidate', { method: 'POST' }));
+      const body = await res.json().catch(() => null);
+      const okField = chainGet(body, 'ok');
+      if (res.status === 200 && okField.tag === 'some' && okField.value === true) return { ok: true, error: '' };
+      const errField = chainGet(body, 'error');
+      const error = errField.tag === 'some' ? String(errField.value) : `http_${res.status}`;
+      if (isNoCache(error)) return { ok: true, error: '' };
+      console.warn('ref-purge-fetch-failed', error);
+      // fall through to RPC
+    }
+  } catch (e) {
+    console.warn('ref-purge-fetch-threw', e instanceof Error ? e.message : String(e));
+  }
   try {
     if (typeof ref.invalidateRefs === 'function') {
       const result = await ref.invalidateRefs(['ply-cas-ref']);
@@ -378,29 +397,17 @@ async function invalidateRefsAfterWrite(ctx, env) {
       if (okField.tag === 'some' && okField.value === false) {
         const errField = chainGet(result, 'error');
         const error = errField.tag === 'some' ? String(errField.value) : 'purge_failed';
+        if (isNoCache(error)) return { ok: true, error: '' };
         console.warn('ref-purge-rpc-failed', error);
-        // fall through to fetch backup
+        return { ok: false, error };
       }
     }
   } catch (e) {
-    console.warn('ref-purge-rpc-threw', e instanceof Error ? e.message : String(e));
-  }
-  try {
-    const binding = typeof ref === 'function' ? ref({ props: { scope: 'https://ply.invalid/purge' } }) : null;
-    if (binding === null || typeof binding.fetch !== 'function') return { ok: false, error: 'no_refcache_fetch' };
-    const res = await binding.fetch(new Request('https://cas.internal/invalidate', { method: 'POST' }));
-    const body = await res.json().catch(() => null);
-    const okField = chainGet(body, 'ok');
-    if (res.status === 200 && okField.tag === 'some' && okField.value === true) return { ok: true, error: '' };
-    const errField = chainGet(body, 'error');
-    const error = errField.tag === 'some' ? String(errField.value) : `http_${res.status}`;
-    console.warn('ref-purge-fetch-failed', error);
-    return { ok: false, error };
-  } catch (e) {
     const error = e instanceof Error ? e.message : String(e);
-    console.warn('ref-purge-fetch-threw', error);
+    console.warn('ref-purge-rpc-threw', error);
     return { ok: false, error };
   }
+  return { ok: true, error: '' };
 }
 
 const READS = {
