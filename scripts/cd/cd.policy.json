@@ -6,7 +6,7 @@
     { "percent": 75, "dwellMs": 25000 },
     { "percent": 100, "dwellMs": 40000 }
   ],
-  "ingestWaitMs": 30000,
+  "ingestWaitMs": 20000,
   "ingestPollMs": 3000,
   "warmupMs": 10000,
   "calibration": {
@@ -27,12 +27,12 @@
       "headroom": "PRIOR period: 3000 keeps one query in flight. Replaces a fixed 20000 sleep per step that also ran before a 20-30 s query on the pre-slicing ramps (2026-11-06T20-24-45-549Z, 21-06-26-841Z: 44-66 s from dwell end to decision)."
     },
     "ingestWaitMs": {
-      "source": "run 2026-11-08T16-58-16-960Z (the first ramp-only run: polled ingest, ceiling 20000); run 2026-11-01T00-10-02-620Z (12640 ms and 17313 ms gaps); the 10 polled promote watches 2026-11-06T21-45-51-484Z through 2026-11-07T19-39-00-604Z",
+      "source": "runs 2026-11-08T16-58-16-960Z (ceiling 20000) and 2026-11-08T17-07-46-259Z (ceiling 30000), every ramp step; run 2026-11-01T00-10-02-620Z (12640 ms and 17313 ms gaps); the 10 polled promote watches 2026-11-06T21-45-51-484Z through 2026-11-07T19-39-00-604Z",
       "date": "2026-11-08",
-      "window": "every step of 2026-11-08T16-58-16-960Z; 1% and 5% steps; the 100% promote watches",
-      "n": 17,
-      "observed": "2026-11-08T16-58-16-960Z: at the 20000 ceiling the 10/25/50/75% steps had logged 1394/1500, 1171/1250, 1150/1240, 1165/1250 (0.927-0.937 of issued), still rising at the last poll, so they were judged on ~93% of their windows; its 100% step reached 1997/2000 at 19 s. Promote watches: 98% by 8.6-19.2 s.",
-      "headroom": "30000 (the promote's ceiling) gives the 10-75% steps 10 s more to reach 98% landed (scripts/cd/ramp.ts INGEST_LANDED); a step that lands sooner stops sooner. Was 20000, which the 2026-11-08 run showed binds at partial splits."
+      "window": "the polls after each dwell end",
+      "n": 22,
+      "observed": "2026-11-08T17-07-46-259Z (ceiling 30000): every step's logged count stopped rising at the 4th poll, 21.8-24.1 s after the dwell end (10% 1405, 25% 1160, 50% 1150, 75% 1142, 100% 1806), and the two later polls returned the same count. The plateau is ~93% of issued probes at partial splits: that is the final count, not ingest lag, so INGEST_LANDED 0.98 is never met there and the poll always runs to the ceiling. 2026-11-08T16-58-16-960Z (ceiling 20000) also took 4 polls per step, the last at about +22-24 s.",
+      "headroom": "20000 (unchanged since 2026-11-01): the poll's last query starts at the ceiling and returns at about +22-24 s, where the 2026-11-08 plateau was reached. 30000 (tried in 0016dae) added only flat polls: ramp stage 374 s against 325 s."
     }
   },
   "probe": {
