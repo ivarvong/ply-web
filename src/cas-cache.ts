@@ -594,17 +594,19 @@ export async function serveRef(req: Request, props: CasProps, tokens: TokenSourc
  * is scoped to this entrypoint (docs), so it clears all scopes' ref tips without touching
  * Object/Tree/Commit. Tags + pathPrefixes alone still left stale HIT+SWR tips in CD (74c7519).
  */
-type PurgeFn = (opts: { purgeEverything: true } | { tags: string[]; pathPrefixes: string[] }) => Promise<unknown>;
 export const REF_PATH_PREFIX = `/v${CACHE_VERSION}/ref/`;
 export async function purgeRefTags(ctx: object, _tags: string[]): Promise<{ ok: boolean; ms: number; error: string }> {
   const t0 = Date.now();
   const cacheField = dig(ctx, ['cache']);
   if (cacheField.tag === 'none' || cacheField.value === null) return { ok: false, ms: 0, error: 'no ctx.cache' };
-  const purgeField = chainGet(cacheField.value, 'purge');
+  // Must call as a method: extracting purge and invoking unbound throws
+  // "Illegal invocation" on Workers Cache (CD 2026-11-08 root-create 503).
+  const cache = cacheField.value as { purge(opts: { purgeEverything: true }): Promise<unknown> };
+  const purgeField = chainGet(cache, 'purge');
   if (purgeField.tag === 'none' || typeof purgeField.value !== 'function') return { ok: false, ms: 0, error: 'no purge' };
-  const run = purgeField.value as PurgeFn;
   try {
-    const result = await run({ purgeEverything: true });
+    // Method call keeps `this` = cache (unbound extract → Illegal invocation on Workers Cache).
+    const result = await cache.purge({ purgeEverything: true });
     const success = chainGet(result, 'success');
     if (success.tag === 'some' && success.value === false) {
       const errors = chainGet(result, 'errors');

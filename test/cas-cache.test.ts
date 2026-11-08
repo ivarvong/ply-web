@@ -157,18 +157,30 @@ test('mergeRayHeaderValues concatenates fill rays in order', () => {
 
 test('purgeRefTags uses purgeEverything on RefCache (entrypoint-scoped)', async () => {
   const calls: unknown[] = []
-  const ctx = {
-    cache: {
-      purge: async (opts: unknown) => {
-        calls.push(opts)
-        return { success: true }
-      },
+  const cache = {
+    purge: async function (this: unknown, opts: unknown) {
+      // Workers Cache throws Illegal invocation when purge is unbound (CD 2026-11-08).
+      if (this !== cache) throw new TypeError('Illegal invocation')
+      calls.push(opts)
+      return { success: true }
     },
   }
-  const out = await purgeRefTags(ctx, ['ply-cas-ref'])
+  const out = await purgeRefTags({ cache }, ['ply-cas-ref'])
   assert.equal(out.ok, true)
   assert.deepEqual(calls, [{ purgeEverything: true }])
   assert.equal(REF_PATH_PREFIX, `/v${CACHE_VERSION}/ref/`)
+})
+
+test('purgeRefTags fails when purge is extracted unbound (Illegal invocation)', async () => {
+  const cache = {
+    purge: async function (this: unknown) {
+      if (this !== cache) throw new TypeError('Illegal invocation')
+      return { success: true }
+    },
+  }
+  // Simulate the old bug: extract then call unbound.
+  const run = cache.purge
+  await assert.rejects(async () => run({ purgeEverything: true }), /Illegal invocation/)
 })
 
 test('purgeRefTags reports missing ctx.cache (RefCache live / uncached)', async () => {
