@@ -110,3 +110,18 @@ test('a full page of one id cannot page further and fails loudly rather than loo
     useCfRunner(null)
   }
 })
+
+test('adjacent slices share their edge millisecond: the timeframe excludes both endpoints', async () => {
+  const frames: { from: number; to: number }[] = []
+  useCfRunner(async (args): Promise<CfResult> => {
+    const body = JSON.parse(String(args[4])) as { timeframe: { from: number; to: number } }
+    frames.push(body.timeframe)
+    return { code: 0, stdout: JSON.stringify({ events: { events: [] } }), stderr: '' }
+  })
+  try {
+    await queryCapturedSliced('events', 0, 25_000, [], RETRY)
+  } finally {
+    useCfRunner(null)
+  }
+  assert.deepEqual(frames, [{ from: 0, to: 10_001 }, { from: 10_000, to: 20_001 }, { from: 20_000, to: 25_001 }])
+})

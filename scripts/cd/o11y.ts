@@ -132,7 +132,9 @@ export async function queryCapturedSliced(
   retry: QueryRetry,
 ): Promise<CapturedQuery> {
   const bounds: [number, number][] = []
-  for (let start = from; start < to; start += SLICE_MS) bounds.push([start, Math.min(to, start + SLICE_MS)])
+  // The timeframe excludes both endpoints: on 2026-11-08 rows stamped exactly at a slice edge were in neither neighbouring
+  // slice (17:19:44.000Z: 4 rows in [b-1000, b+1], 0 in [b-1000, b] and in [b, b+1000]). End each slice 1 ms past its edge.
+  for (let start = from; start < to; start += SLICE_MS) bounds.push([start, Math.min(to, start + SLICE_MS) + 1])
   if (bounds.length === 0) bounds.push([from, to])
   const parts = await Promise.all(bounds.map(([start, end]) => queryCaptured(view, start, end, filters, retry)))
   const events = dedupeRows(parts.flatMap(part => part.events))
