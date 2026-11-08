@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { test } from 'node:test'
 import { arrayExporter, Tracer } from 'ply'
-import { EDGE_ATTR, REQUEST_ATTR, edgeTracingOf, plyTracer, requestStamp, routeStamp, spanList, stampRequestSpan } from '../src/edge-trace.ts'
+import { EDGE_ATTR, REQUEST_ATTR, cacheStatsOf, edgeTracingOf, plyTracer, requestStamp, routeStamp, spanList, stampRequestSpan } from '../src/edge-trace.ts'
 import { openSpan, type TracingLike } from '../src/flags/telemetry.ts'
 
 type Recorded = { name: string; parent: string | null; attrs: Record<string, unknown>; status: string | null; ended: boolean }
@@ -185,4 +185,25 @@ test('requestStamp copies the route, version, status, error and ply\'s counts fr
   })
   const unexpected = requestStamp({ route: 'unmatched', version: null, surface: 'api', status: 500, log: { code: 'internal', error_kind: 'unexpected', spans: Number.NaN, viewer: 1 } })
   assert.deepEqual(unexpected, { 'ply.route': 'unmatched', 'ply.surface': 'api', 'http.response.status_code': 500, 'ply.error.code': 'internal', 'ply.error.kind': 'unexpected' })
+})
+
+test('cacheStatsOf counts pack-cache child outcomes (HIT/MISS), ignores empty/NONE', () => {
+  const spans = [
+    { name: 'git.upload-pack fetch', attrs: { 'git.pack.cache': 'HIT', 'git.response.cache': 'HIT' } },
+    { name: 'git.upload-pack fetch', attrs: { 'git.pack.cache': 'MISS' } },
+    { name: 'git.upload-pack fetch', attrs: { 'git.response.cache': '', 'git.pack.cache': '' } },
+    { name: 'git.upload-pack fetch', attrs: { 'git.pack.cache': 'NONE' } },
+    { name: 'git.upload-pack fetch', attrs: { 'http.response.headers.from_cache': true } },
+    { name: 'git.upload-pack ls-refs', attrs: { 'git.pack.cache': 'BUST' } },
+    { name: 'git.read', attrs: { 'git.fetch.filter.fallback': true } },
+  ]
+  assert.deepEqual(cacheStatsOf(spans as never), {
+    spans: 7,
+    rtt: 6,
+    wide: 1,
+    cache_hits: 2,
+    cache_misses: 2,
+  })
+  // empty response.cache falls through to pack.cache
+  assert.equal(cacheStatsOf([{ name: 'git.upload-pack fetch', attrs: { 'git.response.cache': '', 'git.pack.cache': 'HIT' } }] as never).cache_hits, 1)
 })

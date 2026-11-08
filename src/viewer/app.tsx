@@ -10,7 +10,7 @@ import { htmlResponse, SECURITY, statusOf, textResponse } from './http.ts'
 import { VIEWER_CAPS, rateLimitFor, type RateBucket } from './limits.ts'
 import type { RateDecision, TraceModel, ViewerEnv } from './model.ts'
 import { isPlyCode } from 'ply'
-import { EDGE_ATTR, plyTracer, routeStamp, spanList } from '../edge-trace.ts'
+import { EDGE_ATTR, cacheStatsOf, plyTracer, routeStamp, spanList } from '../edge-trace.ts'
 import { admitBatched, firstCheckInIsolate, inSpan, rateIdentity, versionOf } from '../rate/admit.ts'
 import { describeCounter } from '../rate/stub.ts'
 import { createLoopbackFetch, isLoopback, type LoopbackBinding } from '../gitcache.ts'
@@ -199,6 +199,12 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
   }
   const attach = (res: Response): Response => {
     applyUpstreamHeaders(res.headers, rays.report(), Date.now() - call.now)
+    // Stamp pack-cache child outcomes onto the response so index.js can put them on the request span.
+    const stats = cacheStatsOf(collected.spans)
+    res.headers.set('x-ply-cache-hits', String(stats.cache_hits))
+    res.headers.set('x-ply-cache-misses', String(stats.cache_misses))
+    res.headers.set('x-ply-spans', String(stats.spans))
+    res.headers.set('x-ply-rtt', String(stats.rtt))
     return res
   }
   try {
