@@ -39,12 +39,7 @@ import { ADVERTISED_REF_PREFIXES, isAbbreviatedOid, matchAbbreviatedOid } from '
 import { directoryReadMessage, isDirectoryRead } from './read-status.ts';
 import { BUILD_HEADER, plyBuildValue } from './version.ts';
 import { holdLastChunk } from './hold-last.ts';
-import {
-  BLOB_CACHE_HEADER,
-  composeCasGraph,
-  gitAuthorizationValue,
-  layerHeader,
-} from './cas-cache.ts';
+import { BLOB_CACHE_HEADER, composeCasGraph, gitAuthorizationValue } from './cas-cache.ts';
 import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from './rays.ts';
 import { usageNote } from './flags/client.ts';
 import { handleFlagHttp } from './flags/http.ts';
