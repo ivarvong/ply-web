@@ -364,23 +364,25 @@ function casExportsOf(env, ctx) {
 }
 
 async function invalidateRefsAfterWrite(ctx, env) {
-  if (env.PACK_CACHE === 'off') return;
+  if (env.PACK_CACHE === 'off') return { ok: false, error: 'pack_cache_off' };
   const exField = chainGet(ctx, 'exports');
-  if (exField.tag === 'none') return;
+  if (exField.tag === 'none') return { ok: false, error: 'no_exports' };
   const ref = unwrapOr(chainGet(exField.value, 'RefCache'), null);
-  if (ref === null || typeof ref.invalidateRefs !== 'function') {
-    console.warn('ref-purge-skipped', 'no RefCache.invalidateRefs');
-    return;
-  }
+  if (ref === null) return { ok: false, error: 'no_refcache' };
   try {
     const result = await ref.invalidateRefs(['ply-cas-ref']);
     const okField = chainGet(result, 'ok');
     if (okField.tag === 'some' && okField.value === false) {
       const errField = chainGet(result, 'error');
-      console.warn('ref-purge-failed', errField.tag === 'some' ? errField.value : result);
+      const error = errField.tag === 'some' ? String(errField.value) : 'purge_failed';
+      console.warn('ref-purge-failed', error);
+      return { ok: false, error };
     }
+    return { ok: true, error: '' };
   } catch (e) {
-    console.warn('ref-purge-threw', e instanceof Error ? e.message : String(e));
+    const error = e instanceof Error ? e.message : String(e);
+    console.warn('ref-purge-threw', error);
+    return { ok: false, error };
   }
 }
 
@@ -753,19 +755,26 @@ const worker = {
             }
           }
           const handled = await handler({ remote, q: url.searchParams, body, opts, spans, ctx, log, env, req });
-          if (handled.ok && WRITES[key]) await invalidateRefsAfterWrite(ctx, env);
+          let refPurge = null;
+          if (handled.ok && WRITES[key]) refPurge = await invalidateRefsAfterWrite(ctx, env);
           if (!handled.ok) return plyFailure(handled.error);
           const out = handled.value;
+          const stampPurge = headers => {
+            if (refPurge === null) return;
+            headers.set('x-ply-ref-purge', refPurge.ok ? 'ok' : `fail:${refPurge.error}`.slice(0, 120));
+          };
           if (out && typeof out === 'object' && 'stream' in out) {
             out.headers.set('cache-control', NO_STORE);
             stamp(out.headers);
             ensureRayServerTiming(out.headers, Date.now() - t0);
+            stampPurge(out.headers);
             return ok(rawOut(200, out.stream, out.headers, statsOf(spans())));
           }
           if (out instanceof Response) {
             out.headers.set('cache-control', NO_STORE);
             stamp(out.headers);
             ensureRayServerTiming(out.headers, Date.now() - t0);
+            stampPurge(out.headers);
             return ok(taken(out, statsOf(spans())));
           }
           const status = unwrapOr(chainGet(out, 'status'), 200);
@@ -780,6 +789,7 @@ const worker = {
             }
           }
           ensureRayServerTiming(rayHeaders, Date.now() - t0);
+          stampPurge(rayHeaders);
           const s = spans();
           const extra = Object.fromEntries(rayHeaders);
           const stats = statsOf(s);
