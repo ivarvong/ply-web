@@ -4,8 +4,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  FAIL_PURGE_MS, HEALTHY_MS, LEASE_MS, LEASE_TIMEOUT_MS, SECOND_PURGE_MS, WATCHED_REFS_CACHE, WATCH_GAP_MS, WATCH_TICK_MS,
-  applyTick, emptyState, leaseRepo, needsAlarm, parseLsRefsAnswer, pollList, purgeFailed, refMapOf, refsTag, sawRefs,
+  FAIL_PURGE_MS, HEALTHY_TICK_MS, LEASE_MS, LEASE_TIMEOUT_MS, POLL_TIMEOUT_MS, SECOND_PURGE_MS, WATCHED_REFS_CACHE, WATCH_GAP_MS, WATCH_TICK_MS,
+  applyTick, emptyState, healthyPollMs, leaseRepo, needsAlarm, parseLsRefsAnswer, pollList, purgeFailed, refMapOf, refsTag, sawRefs,
   type PollResult, type RefMap,
 } from '../src/refs-watch.ts';
 import {
@@ -18,6 +18,7 @@ import { PUBLIC_GIT_ORIGIN, PUBLIC_NAMESPACE, type TokenSource } from '../src/pu
 const A = 'a'.repeat(40);
 const B = 'b'.repeat(40);
 const C = 'c'.repeat(40);
+const HEALTHY_MS = healthyPollMs('ply');
 const PUB = `${PUBLIC_GIT_ORIGIN}/git/${PUBLIC_NAMESPACE}/ply.git`;
 const GH = 'https://github.com/octocat/Hello-World.git';
 const pkt = (s: string) => `${(s.length + 4).toString(16).padStart(4, '0')}${s}`;
@@ -105,6 +106,67 @@ test('tick: a gap purges every leased repo; a failing repo is purged once after 
   assert.equal(needsAlarm(s), Object.keys(s.again).length > 0);
   applyTick(s, {}, end + SECOND_PURGE_MS);
   assert.equal(needsAlarm(s), false);
+});
+
+// A repo on the 12 s grid (Phase 1: the experiment arm `ply-slow`; Phase 2: every repo).
+const SLOW = 'ply-slow';
+
+test('grid: a slow repo polls every 4th tick and a poked, new, or failing repo polls at once; the failing repo stops polling each tick after its purge', () => {
+  const s = emptyState();
+  let t = 5_000_000;
+  leaseRepo(s, SLOW, t);
+  assert.deepEqual(pollList(s), [SLOW], 'no baseline yet: polled now');
+  applyTick(s, { [SLOW]: ok(main(A)) }, t);
+  const polled: number[] = [];
+  for (let i = 0; i < 8; i++) {
+    t += WATCH_TICK_MS;
+    if (pollList(s).length > 0) polled.push(i);
+    applyTick(s, pollList(s).length > 0 ? { [SLOW]: ok(main(A)) } : {}, t);
+  }
+  assert.deepEqual(polled, [3, 7], 'every 4th tick');
+  // a repeat purge waits for the grid: first purge on a grid tick, repeat is due SECOND_PURGE_MS later, runs on the next grid tick
+  while (pollList(s).length === 0) { t += WATCH_TICK_MS; applyTick(s, {}, t); }
+  t += WATCH_TICK_MS;
+  let r = applyTick(s, { [SLOW]: ok(main(B)) }, t);
+  assert.deepEqual(r.changed.map(c => c.repo), [SLOW]);
+  const repeats: string[][] = [];
+  for (let i = 0; i < 5; i++) {
+    t += WATCH_TICK_MS;
+    const poll = pollList(s);
+    r = applyTick(s, poll.length > 0 ? { [SLOW]: ok(main(B)) } : {}, t);
+    repeats.push(r.purge);
+  }
+  assert.ok(repeats.flat().length === 1 && repeats.flat()[0] === SLOW, 'the repeat is one purge');
+  const poke = emptyState();
+  leaseRepo(poke, SLOW, t);
+  applyTick(poke, { [SLOW]: ok(main(A)) }, t);
+  assert.deepEqual(pollList(poke), [], 'off grid');
+  (poke.repos[SLOW] as { pollNow: boolean }).pollNow = true;
+  assert.deepEqual(pollList(poke), [SLOW], 'pollNow');
+  applyTick(poke, { [SLOW]: ok(main(A)) }, t + 1);
+  assert.equal((poke.repos[SLOW] as { pollNow: boolean }).pollNow, false, 'cleared by the poll');
+  assert.equal(sawRefs(poke, SLOW, [['HEAD', B]]), true);
+  assert.deepEqual(pollList(poke), [SLOW], 'a seen mismatch polls at the next tick');
+  applyTick(poke, { [SLOW]: { ok: false, error: 'down' } }, t + 2);
+  assert.deepEqual(pollList(poke), [SLOW], 'failing and not purged yet: polled each tick');
+  r = applyTick(poke, { [SLOW]: { ok: false, error: 'down' } }, t + 2 + FAIL_PURGE_MS);
+  assert.deepEqual(r.purge, [SLOW], 'purged after two failures one tick apart');
+  applyTick(poke, {}, t + 3 + FAIL_PURGE_MS);
+  assert.deepEqual(pollList(poke), [], 'purged: back on the grid');
+});
+
+test('lease: a slow repo is healthy across its 12 s grid, a default repo at 3 s, and any repo is stale when the heartbeat stops', () => {
+  const s = emptyState();
+  const t = 6_000_000;
+  leaseRepo(s, SLOW, t);
+  applyTick(s, { [SLOW]: ok(main(A)) }, t + 100);
+  assert.equal(healthyPollMs(SLOW), 12_000 + POLL_TIMEOUT_MS + 1_000);
+  assert.deepEqual(leaseRepo(s, SLOW, t + 100 + 3_000), { grant: true, reason: 'ok' });
+  applyTick(s, {}, t + 100 + 3_000);
+  assert.deepEqual(leaseRepo(s, SLOW, t + 100 + 3_000 + HEALTHY_TICK_MS), { grant: true, reason: 'ok' }, 'at the edge of the heartbeat window');
+  assert.deepEqual(leaseRepo(s, SLOW, t + 100 + 3_000 + HEALTHY_TICK_MS + 1), { grant: false, reason: 'stale' }, 'heartbeat stopped');
+  applyTick(s, {}, t + 100 + 3_000 + HEALTHY_TICK_MS);
+  assert.deepEqual(leaseRepo(s, SLOW, t + 100 + healthyPollMs(SLOW) + 1), { grant: false, reason: 'stale' }, 'polled too long ago');
 });
 
 test('seen: a fill that stored refs the watcher has not seen purges at the next tick; a failed purge is retried', () => {
