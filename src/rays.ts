@@ -326,6 +326,35 @@ export function exposeRayHeaders(headers: Headers): void {
   headers.set('access-control-expose-headers', [...have].join(', '));
 }
 
+/** Derive `phase;dur=N` metrics from an `x-artifacts-ray` value (CAS fill rays on a HIT). */
+export function phaseTimingFromRayHeader(ray: string | null): string {
+  if (ray === null || ray === '') return '';
+  const parts: string[] = [];
+  for (const part of ray.split(ENTRY_GAP)) {
+    const m = /^(ls-refs|fetch|receive-pack)=[^;]*;dur=(\d+)$/.exec(part);
+    if (m !== null) parts.push(`${m[1]};dur=${m[2]}`);
+  }
+  return parts.join(ENTRY_GAP);
+}
+
+/**
+ * When CAS compose (or a cached fill) already set `x-artifacts-ray` but the parent's ray log is empty,
+ * Server-Timing would otherwise be only `total`. Fold the fill-ray phases in.
+ */
+export function ensureRayServerTiming(headers: Headers, totalMs: number): void {
+  const phases = phaseTimingFromRayHeader(headers.get(RAY_HEADER));
+  if (!phases) return;
+  const total = `total;dur=${durationMs(0, totalMs)}`;
+  const prior = headers.get('server-timing');
+  // Replace a total-only timing; keep any prior phase metrics that are already present.
+  if (prior === null || prior === '' || /^total;dur=\d+$/.test(prior.trim())) {
+    headers.set('server-timing', `${phases}${ENTRY_GAP}${total}`);
+  } else if (!prior.includes('ls-refs;') && !prior.includes('fetch;') && !prior.includes('receive-pack;')) {
+    headers.set('server-timing', `${phases}${ENTRY_GAP}${prior}`);
+  }
+  exposeRayHeaders(headers);
+}
+
 /** Set `x-artifacts-ray` when the log is non-empty, and Server-Timing (phases plus total) always. */
 export function applyUpstreamHeaders(headers: Headers, report: RayReport, totalMs: number): void {
   const ray = encodeRayHeader(report);
@@ -335,4 +364,5 @@ export function applyUpstreamHeaders(headers: Headers, report: RayReport, totalM
   const prior = headers.get('server-timing');
   headers.set('server-timing', prior ? [phases, prior].filter(Boolean).join(ENTRY_GAP) : [phases, total].filter(Boolean).join(ENTRY_GAP));
   exposeRayHeaders(headers);
+  ensureRayServerTiming(headers, totalMs);
 }

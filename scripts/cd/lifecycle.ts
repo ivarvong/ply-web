@@ -94,8 +94,8 @@ const read = (name: string, path: string, expect: Expect, rayIncludes?: string):
   path: '/v1/read',
   query: { path },
   expect,
-  // CAS entrypoints dial upstream outside the parent's ray log; body/auth gates still apply.
-  ray: 'optional',
+  // Fill rays ride on cached CAS responses (HIT = stored fill rays); required on every Artifacts hop.
+  ray: 'required',
   rayIncludes,
 })
 
@@ -182,14 +182,14 @@ export function lifecycle(): readonly HttpStep[] {
       expect: { kind: 'code', status: 401, code: 'unauthorized' },
       ray: 'absent',
     },
-    { name: 'commit-empty', method: 'GET', path: '/v1/commit', expect: { kind: 'empty-commit' }, ray: 'optional' },
+    { name: 'commit-empty', method: 'GET', path: '/v1/commit', expect: { kind: 'empty-commit' }, ray: 'required' },
     {
       name: 'commit-empty-main',
       method: 'GET',
       path: '/v1/commit',
       query: { ref: 'main' },
       expect: { kind: 'empty-commit' },
-      ray: 'optional',
+      ray: 'required',
     },
     {
       name: 'commit-missing',
@@ -197,7 +197,7 @@ export function lifecycle(): readonly HttpStep[] {
       path: '/v1/commit',
       query: { ref: 'nope' },
       expect: { kind: 'code', status: 404, code: 'not_found' },
-      ray: 'optional',
+      ray: 'required',
     },
     { name: 'refs-empty', method: 'GET', path: '/v1/refs', expect: { kind: 'refs-empty' }, ray: 'required' },
     {
@@ -232,7 +232,7 @@ export function lifecycle(): readonly HttpStep[] {
       method: 'GET',
       path: '/v1/tree',
       expect: { kind: 'tree', names: ['README.md', 'src', 'old.txt', 'bin', 'link', 'blob'] },
-      ray: 'optional',
+      ray: 'required',
     },
     read('read-readme', 'README.md', { kind: 'text', status: 200, text: 'hello\n' }, 'fetch='),
     // Warm re-read of the same blob: body bytes must match. Empty cache hits fail this (2026-11-08).
@@ -264,7 +264,7 @@ export function lifecycle(): readonly HttpStep[] {
       method: 'GET',
       path: '/v1/commit',
       expect: { kind: 'parents', count: 1, oidEquals: 'c1' },
-      ray: 'optional',
+      ray: 'required',
     },
     {
       name: 'merge-zero',
@@ -510,7 +510,7 @@ export function lifecycle(): readonly HttpStep[] {
         noFastForward: true,
       }),
       expect: { kind: 'outcome', status: 200, outcome: 'merge' },
-      ray: 'optional',
+      ray: 'required',
       rayIncludes: 'receive-pack=',
       save: [{ key: 'noffMerge', field: 'oid' }],
     },
@@ -520,7 +520,7 @@ export function lifecycle(): readonly HttpStep[] {
       path: '/v1/commit',
       query: { ref: 'main' },
       expect: { kind: 'parents', count: 2, oidEquals: 'noffMerge' },
-      ray: 'optional',
+      ray: 'required',
     },
     {
       name: 'merge-stamps',
@@ -643,7 +643,7 @@ export function lifecycle(): readonly HttpStep[] {
       method: 'GET',
       path: '/v1/commit',
       expect: { kind: 'born' },
-      ray: 'optional',
+      ray: 'required',
       save: [{ key: 'mainTip', field: 'oid' }],
     },
     {

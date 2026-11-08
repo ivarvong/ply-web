@@ -460,6 +460,13 @@ test('empty repo lifecycle: first commit through history, with no git seeding', 
   assert.match(raw1, new RegExp(`parent ${c0}\\n`));
   assert.match(raw1, /author w <w@x> 1700000100 \+0000\n/);
   assert.match(raw1, /committer c <c@x> 1700000100 -0800\n/);
+  // commit-fresh-after-write: tip must be c1 (parents length 1), never a stale c0 RefCache HIT.
+  const freshRes = await W(`/v1/commit?${qs({ remote })}`);
+  const fresh = await freshRes.json();
+  assert.equal(freshRes.status, 200, JSON.stringify(fresh));
+  assert.equal(fresh.oid, c1, JSON.stringify(fresh));
+  assert.deepEqual(fresh.parents, [c0], JSON.stringify(fresh));
+  assert.ok(freshRes.headers.get('x-artifacts-ray'), 'fill rays required on /v1/commit');
   assert.equal(gitBuf(bare, ['show', 'main:src/a.txt']).toString(), 'v2\n');
   assert.equal(gitBuf(bare, ['show', 'main:ADDED.txt']).toString(), 'added\n');
   assert.equal(gitBuf(bare, ['show', 'main:new.txt']).toString(), 'x\n');
@@ -877,27 +884,22 @@ test('x-artifacts-ray: a read, an empty-repo first commit, a delta push, and a C
   assert.equal(read.status, 200);
   assert.equal(Buffer.from(await read.arrayBuffer()).toString(), 'one\n');
   const readRayHdr = read.headers.get('x-artifacts-ray');
-  const casObject = read.headers.get('x-ply-cache-object') || read.headers.get('x-ply-blob-cache');
-  if (readRayHdr !== null) {
-    const readRays = assertRaysMatch(readRayHdr, raySrv.seen.slice(fromRead), read.headers.get('server-timing'));
-    assert.ok(readRays.entries.some(e => e.phase === 'ls-refs'));
-    assert.ok(readRays.entries.some(e => e.phase === 'fetch'));
-  } else {
-    // CAS graph: git hops run inside named entrypoints; front door exposes layer cache status instead.
-    assert.ok(casObject === 'HIT' || casObject === 'MISS' || casObject === 'BYPASS' || casObject === 'NONE', `cas headers ${[...read.headers].join('|')}`);
-    assert.ok(raySrv.seen.length >= fromRead, 'entrypoint still dialed the ray proxy');
-  }
+  // Fill rays required: parent observeUpstream (fallback) or CAS-stamped fill rays on the cached response.
+  const readRays = assertRaysMatch(readRayHdr, raySrv.seen.slice(fromRead), read.headers.get('server-timing'));
+  assert.ok(readRays.entries.some(e => e.phase === 'ls-refs'));
+  assert.ok(readRays.entries.some(e => e.phase === 'fetch'));
 
   const fromTree = raySrv.seen.length;
   const treeRes = await W(`/v1/tree?${qs({ remote: r.remote, trace: '1' })}`);
   const tree = await treeRes.json();
   assert.equal(treeRes.status, 200, JSON.stringify(tree));
   const treeRayHdr = treeRes.headers.get('x-artifacts-ray');
-  if (treeRayHdr !== null) {
-    const treeRays = assertRaysMatch(treeRayHdr, raySrv.seen.slice(fromTree), treeRes.headers.get('server-timing'));
-    assertSpanRays(tree.trace, treeRays.entries);
+  const treeRays = assertRaysMatch(treeRayHdr, raySrv.seen.slice(fromTree), treeRes.headers.get('server-timing'));
+  if (Array.isArray(tree.trace) && tree.trace.some(s => String(s.name).startsWith('ply.cas.'))) {
+    // CAS compose: span pairing differs (ply.cas.* instead of git.*); header still required.
+    assert.ok(treeRays.entries.length >= 1, treeRayHdr);
   } else {
-    assert.ok(Array.isArray(tree.trace) && tree.trace.some(s => String(s.name).startsWith('ply.cas.')), JSON.stringify(tree.trace));
+    assertSpanRays(tree.trace, treeRays.entries);
   }
 
   const fromMiss = raySrv.seen.length;
@@ -906,12 +908,8 @@ test('x-artifacts-ray: a read, an empty-repo first commit, a delta push, and a C
   assert.equal(miss.status, 404);
   assert.equal(missBody.code, 'not_found');
   const missRayHdr = miss.headers.get('x-artifacts-ray');
-  if (missRayHdr !== null) {
-    const missRays = assertRaysMatch(missRayHdr, raySrv.seen.slice(fromMiss), miss.headers.get('server-timing'));
-    assert.ok(missRays.entries.some(e => e.phase === 'ls-refs' || e.phase === 'fetch'));
-  } else {
-    assert.ok(raySrv.seen.length >= fromMiss);
-  }
+  const missRays = assertRaysMatch(missRayHdr, raySrv.seen.slice(fromMiss), miss.headers.get('server-timing'));
+  assert.ok(missRays.entries.some(e => e.phase === 'ls-refs' || e.phase === 'fetch'));
 
   const name = `ray${n++}`;
   const bare = makeBareRepo(root, name);

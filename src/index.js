@@ -40,7 +40,7 @@ import { directoryReadMessage, isDirectoryRead } from './read-status.ts';
 import { BUILD_HEADER, plyBuildValue } from './version.ts';
 import { holdLastChunk } from './hold-last.ts';
 import { BLOB_CACHE_HEADER, composeCasGraph, gitAuthorizationValue } from './cas-cache.ts';
-import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from './rays.ts';
+import { applyUpstreamHeaders, createRayLog, ensureRayServerTiming, observeUpstream, stampUpstreamSpans } from './rays.ts';
 import { usageNote } from './flags/client.ts';
 import { handleFlagHttp } from './flags/http.ts';
 import { headerNumber, parseBearer, readHeader } from './http/inbound.ts';
@@ -368,11 +368,19 @@ async function invalidateRefsAfterWrite(ctx, env) {
   const exField = chainGet(ctx, 'exports');
   if (exField.tag === 'none') return;
   const ref = unwrapOr(chainGet(exField.value, 'RefCache'), null);
-  if (ref === null || typeof ref.invalidateRefs !== 'function') return;
+  if (ref === null || typeof ref.invalidateRefs !== 'function') {
+    console.warn('ref-purge-skipped', 'no RefCache.invalidateRefs');
+    return;
+  }
   try {
-    await ref.invalidateRefs(['ply-cas-ref']);
-  } catch {
-    /* best effort; short TTL still bounds staleness */
+    const result = await ref.invalidateRefs(['ply-cas-ref']);
+    const okField = chainGet(result, 'ok');
+    if (okField.tag === 'some' && okField.value === false) {
+      const errField = chainGet(result, 'error');
+      console.warn('ref-purge-failed', errField.tag === 'some' ? errField.value : result);
+    }
+  } catch (e) {
+    console.warn('ref-purge-threw', e instanceof Error ? e.message : String(e));
   }
 }
 
@@ -408,7 +416,13 @@ const READS = {
     const composed = await composeCasGraph({
       remote, ref: q.get('ref') || null, path: unwrapOr(queryParam(q, 'path'), ''), authHeader, exports: cas, want: 'tree', bypass: false, tracer: unwrapOr(chainGet(opts, 'tracer'), null),
     });
-    if (!composed.ok) return err(plyError(composed.code, composed.message));
+    if (!composed.ok) {
+      const e = plyError(composed.code, composed.message);
+      if (composed.cache && composed.cache['x-artifacts-ray']) {
+        return ok({ body: errorBody(e), status: composed.status, headers: new Headers(composed.cache) });
+      }
+      return err(e);
+    }
     if (composed.kind !== 'tree') return err(plyError('bad_request', 'unexpected cas kind'));
     const headers = new Headers(composed.cache);
     return ok({ body: composed.body, headers });
@@ -423,7 +437,13 @@ const READS = {
     const composed = await composeCasGraph({
       remote, ref: q.get('ref') || null, path: null, authHeader, exports: cas, want: 'commit', bypass: false, tracer: unwrapOr(chainGet(opts, 'tracer'), null),
     });
-    if (!composed.ok) return err(plyError(composed.code, composed.message));
+    if (!composed.ok) {
+      const e = plyError(composed.code, composed.message);
+      if (composed.cache && composed.cache['x-artifacts-ray']) {
+        return ok({ body: errorBody(e), status: composed.status, headers: new Headers(composed.cache) });
+      }
+      return err(e);
+    }
     if (composed.kind !== 'commit') return err(plyError('bad_request', 'unexpected cas kind'));
     const headers = new Headers(composed.cache);
     return ok({ body: composed.body, headers });
@@ -455,7 +475,11 @@ const READS = {
         if (composed.code === 'bad_request' && /directory/.test(composed.message)) {
           return err(plyError('bad_request', directoryReadMessage(composed.message)));
         }
-        return err(plyError(composed.code, composed.message));
+        const e = plyError(composed.code, composed.message);
+        if (composed.cache && composed.cache['x-artifacts-ray']) {
+          return ok({ body: errorBody(e), status: composed.status, headers: new Headers(composed.cache) });
+        }
+        return err(e);
       }
       if (composed.kind !== 'blob') return err(plyError('bad_request', 'unexpected cas kind'));
       stream = composed.stream;
@@ -735,21 +759,27 @@ const worker = {
           if (out && typeof out === 'object' && 'stream' in out) {
             out.headers.set('cache-control', NO_STORE);
             stamp(out.headers);
+            ensureRayServerTiming(out.headers, Date.now() - t0);
             return ok(rawOut(200, out.stream, out.headers, statsOf(spans())));
           }
           if (out instanceof Response) {
             out.headers.set('cache-control', NO_STORE);
             stamp(out.headers);
+            ensureRayServerTiming(out.headers, Date.now() - t0);
             return ok(taken(out, statsOf(spans())));
           }
           const status = unwrapOr(chainGet(out, 'status'), 200);
           const rayHeaders = new Headers();
           stamp(rayHeaders);
-          // CAS layer cache statuses (x-ply-cache-*) from composeCasGraph.
+          // CAS layer cache statuses (x-ply-cache-*) + fill x-artifacts-ray from composeCasGraph.
           const casHeaders = chainGet(out, 'headers');
           if (casHeaders.tag === 'some' && casHeaders.value instanceof Headers) {
-            for (const [k, v] of casHeaders.value) rayHeaders.set(k, v);
+            for (const [k, v] of casHeaders.value) {
+              if (k.toLowerCase() === 'server-timing') continue;
+              rayHeaders.set(k, v);
+            }
           }
+          ensureRayServerTiming(rayHeaders, Date.now() - t0);
           const s = spans();
           const extra = Object.fromEntries(rayHeaders);
           const stats = statsOf(s);
