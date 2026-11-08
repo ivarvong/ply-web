@@ -21,6 +21,7 @@ import {
   type CasLayer,
 } from '../src/cas-cache.ts'
 import { CACHE_VERSION } from '../src/cache-version.ts'
+import { chainGet } from '../src/absent.ts'
 
 test('cas paths round-trip per layer', () => {
   const oid = 'a'.repeat(40)
@@ -61,7 +62,7 @@ function memoryTier(): { binding: (layer: CasLayer) => CasBinding; fills: Map<st
       async fetch(input, init) {
         const req = input instanceof Request ? input : new Request(String(input))
         assert.equal(req.headers.get('authorization'), null)
-        const props = init?.props ?? { scope: '' }
+        const props = init.props
         const key = `${layer}\0${new URL(req.url).pathname}\0${props.scope}`
         const hit = store.get(key)
         if (hit) {
@@ -69,7 +70,8 @@ function memoryTier(): { binding: (layer: CasLayer) => CasBinding; fills: Map<st
           h.set('cf-cache-status', 'HIT')
           return new Response(hit.body.slice(), { status: hit.status, headers: h })
         }
-        fills.set(layer, (fills.get(layer) ?? 0) + 1)
+        const prev = fills.get(layer)
+        fills.set(layer, (prev === void 0 ? 0 : prev) + 1)
         const body = new TextEncoder().encode(JSON.stringify({ layer, scope: props.scope, path: new URL(req.url).pathname }))
         const headers = new Headers({
           'content-type': 'application/json',
@@ -104,14 +106,13 @@ test('cross-scope isolation at every layer', async () => {
     assert.equal(warm.headers.get(layerHeader(layer)), 'HIT')
     const other = await viaCas(binding(layer), layer, rest, scopeB, 'Bearer b')
     assert.equal(other.headers.get(layerHeader(layer)), 'MISS', `${layer} must not share across scopes`)
-    const aBody = await cold.text()
-    // re-fetch cold body already consumed — use warm
     const warmBody = await warm.text()
     const bBody = await other.text()
     assert.notEqual(warmBody, bBody)
     assert.match(warmBody, /\/a\.git/)
     assert.match(bBody, /\/b\.git/)
-    void aBody
+    const coldBody = cold.body
+    if (coldBody !== null) await coldBody.cancel().catch(() => {})
   }
   assert.equal(fills.get('object'), 2)
   assert.equal(fills.get('ref'), 2)
@@ -122,9 +123,10 @@ test('viaCas strips Authorization and surfaces cf-cache-status', async () => {
   const binding: CasBinding = {
     async fetch(input, init) {
       const req = input instanceof Request ? input : new Request(String(input))
-      seen.push(req.headers.get(CAS_AUTH_HEADER) ?? '')
+      const auth = req.headers.get(CAS_AUTH_HEADER)
+      seen.push(auth === null ? '' : auth)
       assert.equal(req.headers.get('authorization'), null)
-      assert.deepEqual(init?.props, { scope: 'https://ex.example/r.git' })
+      assert.deepEqual(init.props, { scope: 'https://ex.example/r.git' })
       return new Response('x', { status: 200, headers: { 'cf-cache-status': 'HIT', 'x-ply-size': '1' } })
     },
   }
@@ -132,5 +134,6 @@ test('viaCas strips Authorization and surfaces cf-cache-status', async () => {
   assert.equal(res.headers.get(layerHeader('object')), 'HIT')
   assert.equal(res.headers.get('cf-cache-status'), null)
   assert.equal(seen[0], 'Bearer secret')
-  await res.body?.cancel()
+  const body = chainGet(res, 'body')
+  if (body.tag === 'some' && body.value !== null) await (body.value as ReadableStream).cancel()
 })

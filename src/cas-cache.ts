@@ -44,8 +44,9 @@ export const CAS_ORIGIN = 'https://cas.internal';
 
 export type CasProps = { readonly scope: string };
 
+export type CasFetchInit = { readonly props: CasProps };
 export type CasBinding = {
-  fetch(input: RequestInfo | URL, init?: { props?: CasProps }): Promise<Response>;
+  fetch(input: RequestInfo | URL, init: CasFetchInit): Promise<Response>;
 };
 
 export type CasLayer = 'ref' | 'commit' | 'tree' | 'resolve' | 'object';
@@ -66,6 +67,20 @@ function plain(status: number, text: string): Response {
     headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': NO_STORE },
   });
 }
+
+function ifNoneMatchHits(inm: string | null, etag: string): boolean {
+  if (inm === null || etag === '') return false;
+  if (inm.trim() === '*') return false;
+  const want = etag.startsWith('"') ? etag : `"${etag}"`;
+  for (const part of inm.split(',')) {
+    const raw = part.trim();
+    if (raw === '') continue;
+    const tag = raw.startsWith('W/') ? raw.slice(2).trim() : raw;
+    if (tag === want) return true;
+  }
+  return false;
+}
+
 
 function jsonOk(body: unknown, cacheControl: string, etag: string | null, layer: CasLayer, extra: HeadersInit = {}): Response {
   const headers = new Headers({
@@ -193,11 +208,11 @@ export function parseCommitPath(pathname: string): string | null {
 }
 
 export function parseResolvePath(pathname: string): { readonly commit: string; readonly path: string } | null {
-  const m = /^\/v(\d+)\/resolve\/([0-9a-f]{40})(?:\/(.*))?$/.exec(pathname);
+  const m = /^\/v(\d+)\/resolve\/([0-9a-f]{40})(\/(.*))?$/.exec(pathname);
   const version = captureGroup(m, 1);
   const commit = captureGroup(m, 2);
   if (version.tag === 'none' || commit.tag === 'none' || Number(version.value) !== CACHE_VERSION) return null;
-  const rest = captureGroup(m, 3);
+  const rest = captureGroup(m, 4);
   let path = '';
   if (rest.tag === 'some') {
     try {
@@ -274,6 +289,10 @@ export async function serveObject(req: Request, props: CasProps, tokens: TokenSo
     etag: `"${oid}"`,
     'cache-tag': `ply-cas-v${CACHE_VERSION},ply-cas-object,ply-cas-object-${oid}`,
   });
+  if (ifNoneMatchHits(req.headers.get('if-none-match'), `"${oid}"`)) {
+    headers.delete('content-length');
+    return new Response(null, { status: 304, headers });
+  }
   return new Response(data, { status: 200, headers });
 }
 
@@ -363,11 +382,13 @@ export async function serveResolve(
     const text = await commitRes.text().catch(() => '');
     return plain(commitRes.status, text || 'commit resolve failed');
   }
-  const commitBody = (await commitRes.json()) as { tree?: string };
-  if (typeof commitBody.tree !== 'string' || !OID_RE.test(commitBody.tree)) return plain(502, 'commit missing tree');
+  const commitRaw = await commitRes.json();
+  const treeField = chainGet(commitRaw, 'tree');
+  if (treeField.tag === 'none' || typeof treeField.value !== 'string' || !OID_RE.test(treeField.value)) return plain(502, 'commit missing tree');
+  const commitTree = treeField.value;
 
   const segments = parsed.path === '' ? [] : parsed.path.split('/').filter(s => s.length > 0);
-  let treeOid = commitBody.tree;
+  let treeOid = commitTree;
   let mode = '040000';
   let oid = treeOid;
   let type: 'tree' | 'blob' | 'commit' = 'tree';
@@ -378,9 +399,11 @@ export async function serveResolve(
       const text = await treeRes.text().catch(() => '');
       return plain(treeRes.status, text || 'tree resolve failed');
     }
-    const listing = (await treeRes.json()) as { entries?: { name: string; mode: string; oid: string; type: string }[] };
-    const entry = (listing.entries ?? []).find(e => e.name === segments[i]);
-    if (!entry) return plain(404, `${segments.slice(0, i + 1).join('/')} not found`);
+    const listingRaw = await treeRes.json();
+    const entriesField = chainGet(listingRaw, 'entries');
+    const entries = entriesField.tag === 'some' && Array.isArray(entriesField.value) ? entriesField.value : [];
+    const entry = entries.find((e: { name: string }) => e.name === segments[i]) as { name: string; mode: string; oid: string; type: string } | null;
+    if (entry === null || entry === void 0) return plain(404, `${segments.slice(0, i + 1).join('/')} not found`);
     oid = entry.oid;
     mode = entry.mode;
     type = entry.type === 'tree' ? 'tree' : entry.type === 'commit' ? 'commit' : 'blob';
@@ -391,7 +414,7 @@ export async function serveResolve(
   }
 
   return jsonOk(
-    { commit: parsed.commit, path: parsed.path, oid, mode, type, tree: commitBody.tree },
+    { commit: parsed.commit, path: parsed.path, oid, mode, type, tree: commitTree },
     CAS_IMMUTABLE,
     `${parsed.commit}:${parsed.path}`,
     'resolve',
@@ -411,8 +434,9 @@ export async function serveRef(req: Request, props: CasProps, tokens: TokenSourc
   if (!listed.ok) return plain(502, listed.error.message);
   const refs = listed.value.refs;
   const full = ref.startsWith('refs/') || ref === 'HEAD' ? ref : `refs/heads/${ref}`;
-  const entry = refs.get(full) ?? (ref === 'HEAD' || full === 'HEAD' ? refs.get('HEAD') : undefined);
-  if (entry === undefined) {
+  let entry = refs.get(full);
+  if (entry === void 0 && (ref === 'HEAD' || full === 'HEAD')) entry = refs.get('HEAD');
+  if (entry === void 0) {
     // Unborn HEAD: still cacheable briefly so we don't hammer ls-refs; short TTL.
     return jsonOk({ ref: full, commit: null, unborn: true }, REF_CACHE_CONTROL, null, 'ref', {
       'cache-tag': `ply-cas-v${CACHE_VERSION},ply-cas-ref,ply-cas-ref-scope`,
@@ -426,12 +450,16 @@ export async function serveRef(req: Request, props: CasProps, tokens: TokenSourc
 }
 
 /** Purge tags for refs after a write. Must run inside RefCache (purge is entrypoint-scoped). */
-export async function purgeRefTags(ctx: { cache?: { purge?: (opts: { tags: string[] }) => Promise<unknown> } }, tags: string[]): Promise<{ ok: boolean; ms: number; error: string }> {
+type PurgeFn = (opts: { tags: string[] }) => Promise<unknown>;
+export async function purgeRefTags(ctx: object, tags: string[]): Promise<{ ok: boolean; ms: number; error: string }> {
   const t0 = Date.now();
-  const purge = ctx.cache?.purge;
+  const cacheField = chainGet(ctx, 'cache');
+  const purgeField = cacheField.tag === 'some' ? chainGet(cacheField.value, 'purge') : { tag: 'none' as const };
+  const purge = purgeField.tag === 'some' ? purgeField.value : null;
   if (typeof purge !== 'function') return { ok: false, ms: 0, error: 'no purge' };
+  const run = purge as PurgeFn;
   try {
-    await purge({ tags: tags.length > 0 ? tags : [`ply-cas-v${CACHE_VERSION}`, 'ply-cas-ref'] });
+    await run({ tags: tags.length > 0 ? tags : [`ply-cas-v${CACHE_VERSION}`, 'ply-cas-ref'] });
     return { ok: true, ms: Date.now() - t0, error: '' };
   } catch (e) {
     return { ok: false, ms: Date.now() - t0, error: e instanceof Error ? e.message : String(e) };
@@ -439,11 +467,17 @@ export async function purgeRefTags(ctx: { cache?: { purge?: (opts: { tags: strin
 }
 
 export type CasExports = {
-  readonly RefCache?: CasBinding;
-  readonly CommitCache?: CasBinding;
-  readonly TreeCache?: CasBinding;
-  readonly ResolvePathCache?: CasBinding;
-  readonly ObjectCache?: CasBinding;
+  readonly RefCache: CasBinding | null;
+  readonly CommitCache: CasBinding | null;
+  readonly TreeCache: CasBinding | null;
+  readonly ResolvePathCache: CasBinding | null;
+  readonly ObjectCache: CasBinding | null;
+};
+
+/** Minimal ply Tracer surface used for per-layer cache-status spans. */
+export type CasSpan = { set(attrs: Record<string, string | number | boolean>): unknown; ok(): unknown };
+export type CasTracer = {
+  span<T>(name: string, opts: { attrs: Record<string, string | number | boolean> }, fn: (s: CasSpan) => T | PromiseLike<T>): Promise<T>;
 };
 
 export type ComposeWant = 'blob' | 'tree' | 'commit';
@@ -457,7 +491,28 @@ export type ComposeInput = {
   readonly want: ComposeWant;
   /** When true, skip Workers Cache and return null so the caller uses direct ply. */
   readonly bypass: boolean;
+  readonly tracer: CasTracer | null;
 };
+
+async function viaCasSpan(
+  tracer: CasTracer | null,
+  binding: CasBinding,
+  layer: CasLayer,
+  pathRest: string,
+  scope: string,
+  auth: string | null,
+): Promise<Response> {
+  const run = () => viaCas(binding, layer, pathRest, scope, auth);
+  if (tracer === null) return run();
+  return tracer.span(`ply.cas.${layer}`, { attrs: { 'ply.cas.layer': layer } }, async span => {
+    const res = await run();
+    const status = unwrapOr(header(res.headers, layerHeader(layer)), 'NONE');
+    span.set({ 'ply.cas.cache': status, 'http.status_code': res.status });
+    if (res.status >= 400) span.set({ 'ply.cas.error': true });
+    else span.ok();
+    return res;
+  });
+}
 
 /**
  * Auth already ran. Compose Ref → (Commit | Resolve → Object/Tree).
@@ -487,34 +542,40 @@ export async function composeCasGraph(input: ComposeInput): Promise<
   | { readonly ok: false; readonly status: number; readonly code: string; readonly message: string }
 > {
   const cache: Record<string, string> = {};
-  if (input.bypass || !input.exports.RefCache) {
+  if (input.bypass || input.exports.RefCache === null) {
     return { ok: false, status: 501, code: 'bad_request', message: 'cas bypass' };
   }
   const refName = input.ref === null || input.ref === '' ? 'HEAD' : input.ref;
-  const refRes = await viaCas(input.exports.RefCache, 'ref', encodeRefPath(refName), input.remote, input.authHeader);
+  const refRes = await viaCasSpan(input.tracer, input.exports.RefCache, 'ref', encodeRefPath(refName), input.remote, input.authHeader);
   cache[layerHeader('ref')] = unwrapOr(header(refRes.headers, layerHeader('ref')), 'NONE');
   if (refRes.status !== 200) {
     const text = await refRes.text().catch(() => '');
     return { ok: false, status: refRes.status === 404 ? 404 : 502, code: refRes.status === 404 ? 'not_found' : 'upstream_5xx', message: text || 'ref resolve failed' };
   }
-  const refBody = (await refRes.json()) as { ref?: string; commit?: string | null; unborn?: boolean };
-  if (refBody.unborn || !refBody.commit) {
+  const refRaw = await refRes.json();
+  const unbornField = chainGet(refRaw, 'unborn');
+  const commitField = chainGet(refRaw, 'commit');
+  const refField = chainGet(refRaw, 'ref');
+  const unborn = unbornField.tag === 'some' && unbornField.value === true;
+  const commitOidVal = commitField.tag === 'some' && typeof commitField.value === 'string' ? commitField.value : null;
+  const refVal = refField.tag === 'some' && typeof refField.value === 'string' ? refField.value : refName;
+  if (unborn || commitOidVal === null) {
     if (input.want === 'commit') {
       return {
         ok: true,
         kind: 'commit',
-        body: { empty: true, ref: refBody.ref ?? 'refs/heads/main', oid: null, tree: null, parents: [], author: null, committer: null, message: null, signed: false },
+        body: { empty: true, ref: refVal === '' ? 'refs/heads/main' : refVal, oid: null, tree: null, parents: [], author: null, committer: null, message: null, signed: false },
         cache,
       };
     }
     return { ok: false, status: 404, code: 'not_found', message: 'empty repository' };
   }
-  const commitOid = refBody.commit;
-  const presentedRef = refBody.ref ?? refName;
+  const commitOid = commitOidVal;
+  const presentedRef = refVal;
 
   if (input.want === 'commit') {
-    if (!input.exports.CommitCache) return { ok: false, status: 501, code: 'bad_request', message: 'no CommitCache' };
-    const cRes = await viaCas(input.exports.CommitCache, 'commit', commitOid, input.remote, input.authHeader);
+    if (input.exports.CommitCache === null) return { ok: false, status: 501, code: 'bad_request', message: 'no CommitCache' };
+    const cRes = await viaCasSpan(input.tracer, input.exports.CommitCache, 'commit', commitOid, input.remote, input.authHeader);
     cache[layerHeader('commit')] = unwrapOr(header(cRes.headers, layerHeader('commit')), 'NONE');
     if (cRes.status !== 200) {
       const text = await cRes.text().catch(() => '');
@@ -524,9 +585,10 @@ export async function composeCasGraph(input: ComposeInput): Promise<
     return { ok: true, kind: 'commit', body: { ...body, ref: presentedRef }, cache };
   }
 
-  if (!input.exports.ResolvePathCache) return { ok: false, status: 501, code: 'bad_request', message: 'no ResolvePathCache' };
+  if (input.exports.ResolvePathCache === null) return { ok: false, status: 501, code: 'bad_request', message: 'no ResolvePathCache' };
   const path = input.path === null ? '' : input.path;
-  const resolveRes = await viaCas(
+  const resolveRes = await viaCasSpan(
+    input.tracer,
     input.exports.ResolvePathCache,
     'resolve',
     encodeResolveRest(commitOid, path),
@@ -547,8 +609,8 @@ export async function composeCasGraph(input: ComposeInput): Promise<
       return { ok: false, status: 400, code: 'bad_request', message: `${path} is not a directory` };
     }
     const treeOid = path === '' ? resolved.tree : resolved.oid;
-    if (!input.exports.TreeCache) return { ok: false, status: 501, code: 'bad_request', message: 'no TreeCache' };
-    const tRes = await viaCas(input.exports.TreeCache, 'tree', treeOid, input.remote, input.authHeader);
+    if (input.exports.TreeCache === null) return { ok: false, status: 501, code: 'bad_request', message: 'no TreeCache' };
+    const tRes = await viaCasSpan(input.tracer, input.exports.TreeCache, 'tree', treeOid, input.remote, input.authHeader);
     cache[layerHeader('tree')] = unwrapOr(header(tRes.headers, layerHeader('tree')), 'NONE');
     if (tRes.status !== 200) {
       const text = await tRes.text().catch(() => '');
@@ -570,10 +632,11 @@ export async function composeCasGraph(input: ComposeInput): Promise<
   if (resolved.type === 'commit') {
     return { ok: false, status: 404, code: 'not_found', message: `${path} is a submodule (commit ${resolved.oid})` };
   }
-  if (!input.exports.ObjectCache) return { ok: false, status: 501, code: 'bad_request', message: 'no ObjectCache' };
-  const oRes = await viaCas(input.exports.ObjectCache, 'object', resolved.oid, input.remote, input.authHeader);
-  cache[layerHeader('object')] = unwrapOr(header(oRes.headers, layerHeader('object')), 'NONE');
-  cache[BLOB_CACHE_HEADER] = cache[layerHeader('object')] ?? 'NONE';
+  if (input.exports.ObjectCache === null) return { ok: false, status: 501, code: 'bad_request', message: 'no ObjectCache' };
+  const oRes = await viaCasSpan(input.tracer, input.exports.ObjectCache, 'object', resolved.oid, input.remote, input.authHeader);
+  const objectStatus = unwrapOr(header(oRes.headers, layerHeader('object')), 'NONE');
+  cache[layerHeader('object')] = objectStatus;
+  cache[BLOB_CACHE_HEADER] = objectStatus;
   if (oRes.status !== 200 || oRes.body === null) {
     const text = await oRes.text().catch(() => '');
     return { ok: false, status: oRes.status === 404 ? 404 : 502, code: oRes.status === 404 ? 'not_found' : 'upstream_5xx', message: text || 'object cache failed' };
