@@ -25,7 +25,7 @@ import {
   refCandidates,
   validatePath,
 } from 'ply';
-import { captureGroup, chainGet, header } from './absent.ts';
+import { captureGroup, chainGet, dig, header } from './absent.ts';
 import { CACHE_VERSION } from './cache-version.ts';
 import { REFS_MAX_AGE_S } from './gitcache.ts';
 import { API_LIMITS } from './limits.ts';
@@ -531,13 +531,19 @@ export async function serveRef(req: Request, props: CasProps, tokens: TokenSourc
 type PurgeFn = (opts: { tags: string[] }) => Promise<unknown>;
 export async function purgeRefTags(ctx: object, tags: string[]): Promise<{ ok: boolean; ms: number; error: string }> {
   const t0 = Date.now();
-  const cacheField = chainGet(ctx, 'cache');
-  const purgeField = cacheField.tag === 'some' ? chainGet(cacheField.value, 'purge') : { tag: 'none' as const };
-  const purge = purgeField.tag === 'some' ? purgeField.value : null;
-  if (typeof purge !== 'function') return { ok: false, ms: 0, error: 'no purge' };
-  const run = purge as PurgeFn;
+  const cacheField = dig(ctx, ['cache']);
+  if (cacheField.tag === 'none' || cacheField.value === null) return { ok: false, ms: 0, error: 'no ctx.cache' };
+  const purgeField = chainGet(cacheField.value, 'purge');
+  if (purgeField.tag === 'none' || typeof purgeField.value !== 'function') return { ok: false, ms: 0, error: 'no purge' };
+  const run = purgeField.value as PurgeFn;
+  const list = tags.length > 0 ? tags : [`ply-cas-v${CACHE_VERSION}`, 'ply-cas-ref'];
   try {
-    await run({ tags: tags.length > 0 ? tags : [`ply-cas-v${CACHE_VERSION}`, 'ply-cas-ref'] });
+    const result = await run({ tags: list });
+    const success = chainGet(result, 'success');
+    if (success.tag === 'some' && success.value === false) {
+      const errors = chainGet(result, 'errors');
+      return { ok: false, ms: Date.now() - t0, error: JSON.stringify(errors.tag === 'some' ? errors.value : null).slice(0, 200) };
+    }
     return { ok: true, ms: Date.now() - t0, error: '' };
   } catch (e) {
     return { ok: false, ms: Date.now() - t0, error: e instanceof Error ? e.message : String(e) };

@@ -56,7 +56,8 @@ export const entrypoints = {
 	TreeCache: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
 	CommitCache: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
 	ResolvePathCache: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
-	RefCache: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
+	// Mutable tip: omit cache block (live) until purge-on-write is proven (CD commit-fresh).
+	RefCache: exports.worker({} satisfies NamedWorkerOptions),
 	// Whole responses pinned to a commit oid (src/pinned.ts): /v1 tree/read/commit and viewer raw files.
 	Pinned: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
 	// The one flag ruleset (src/flags/cache.ts). Caching stays off on the default entrypoint, which always runs.
