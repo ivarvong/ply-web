@@ -173,7 +173,7 @@ test('purgeRefTags uses purgeEverything on RefCache (entrypoint-scoped)', async 
 
 test('purgeRefTags fails when purge is extracted unbound (Illegal invocation)', async () => {
   const cache = {
-    purge: async function (this: unknown) {
+    purge: async function (this: unknown, _opts: unknown) {
       if (this !== cache) throw new TypeError('Illegal invocation')
       return { success: true }
     },
