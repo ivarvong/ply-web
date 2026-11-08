@@ -6,7 +6,7 @@ import { cfOk, ROOT } from './cf.ts'
 import { fullSplit, isTrafficSplit, versionsFromList, type VersionShare } from './deploy-plan.ts'
 import { asRecord, extractJson } from './json.ts'
 import { isoOffset, type RunLog } from './log.ts'
-import { nextPhase, pipelineStart, type PhaseOutcome, type PipelineState } from './pipeline-plan.ts'
+import { liveVerdict, nextPhase, pipelineStart, type PhaseOutcome, type PipelineState } from './pipeline-plan.ts'
 import { errorMessage } from './proc.ts'
 import { liveSmokeAlreadyPassed, reconcile, reconcileReason, type Reconcile } from './reconcile.ts'
 import { checkoutReason, readCheckout, releasePair, releaseTag, type ReleaseId } from './release.ts'
@@ -19,7 +19,6 @@ import { stageRollback } from './stage-rollback.ts'
 import { stageSmoke } from './stage-smoke.ts'
 import { reportPath, stageTelemetry } from './stage-telemetry.ts'
 import { stageVisual } from './stage-visual.ts'
-import { promotePolicy } from './policy.ts'
 import { readDeployment } from './traffic.ts'
 
 export type PipelineExit = {
@@ -208,7 +207,7 @@ async function liveChecks(
       if (streak < CONVERGED_ROUNDS) await new Promise(resolve => setTimeout(resolve, 500))
     }
     const ms = Date.now() - started
-    opts.log(`promote: unpinned traffic ${streak >= CONVERGED_ROUNDS ? 'converged' : 'NOT converged'} on ${opts.version} after ${ms} ms (${rounds} rounds of ${CONVERGE_BATCH})`)
+    opts.log(`live: unpinned traffic ${streak >= CONVERGED_ROUNDS ? 'converged' : 'NOT converged'} on ${opts.version} after ${ms} ms (${rounds} rounds of ${CONVERGE_BATCH})`)
     await runLog.observation({
       measurement: { source: 'split-convergence', converged: streak >= CONVERGED_ROUNDS, ms, rounds, batch: CONVERGE_BATCH },
       query: { source: 'unpinned GET /', base: config.baseUrl },
@@ -252,8 +251,8 @@ export async function runPipeline(
     readonly token: string
     readonly sha: string | null
     readonly noBump: boolean
-    /** The stepped schedule (`--ramp`). Otherwise the direct promote with a live watch. */
-    readonly ramp: boolean
+    /** A 0% version this run may replace in the canary slot (`--replace-canary <id>`). Null refuses any foreign one. */
+    readonly replaceCanary: string | null
     readonly release: ReleaseId
     readonly log: (line: string) => void
     readonly runDir: string
@@ -360,7 +359,7 @@ export async function runPipeline(
           continue
         }
       }
-      const result = await span(runLog, 'deploy-canary', () => stageDeploy(config, opts.release))
+      const result = await span(runLog, 'deploy-canary', () => stageDeploy(config, opts.release, { replaceCanary: opts.replaceCanary }))
       await writeJson(runDir, 'deploy.json', result, [opts.token])
       await note(result)
       if (result.kind === 'pass') {
@@ -396,15 +395,17 @@ export async function runPipeline(
       }
       continue
     }
-    if (state.phase === 'ramp' && !opts.ramp) {
-      // The direct promote: 100% at once, watched with unpinned probes and the new version's telemetry. The live smoke,
-      // its telemetry and the visual smoke start the moment the split is written and run during the watch.
+    if (state.phase === 'ramp') {
+      // The stepped ramp is the only promotion path (Ivar, 2026-11-08: "Ramp should be the only option."). The live
+      // smoke, its telemetry (with the rate gate) and the visual smoke start the moment the 100% step's split is written
+      // and run during that step's dwell, which is the live watch: a new-version regression in it rolls back.
       let live: Promise<readonly StageResult<unknown>[]> | null = null
-      const result = await span(runLog, 'promote', () => stageRamp(config, rampOpts(), {
-        policy: promotePolicy(config.policy),
+      const result = await span(runLog, 'ramp', () => stageRamp(config, rampOpts(), {
+        policy: config.policy,
         onApplied: percent => {
           if (percent < 100 || live) return
-          opts.log(`promote: ${version} at 100% (previous ${previous}); live watch ${config.policy.promote.watchMs} ms beside live smoke + visual smoke`)
+          const last = config.policy.steps[config.policy.steps.length - 1]
+          opts.log(`ramp: ${version} at 100% (previous ${previous}); live watch ${last ? last.dwellMs : 0} ms beside live smoke + visual smoke`)
           live = liveChecks(config, runLog, { version, token: opts.token, runDir, log: opts.log })
         },
       }))
@@ -413,31 +414,18 @@ export async function runPipeline(
         // Settle the live checks before the verdict so nothing writes into a sealed log; the watch decided.
         if (promoted) await promoted
         await note(result)
-        opts.log(`promote: ${result.reason}`)
+        opts.log(`ramp: ${result.reason}`)
         state = nextPhase(state, outcomeOf(result))
         continue
       }
       runLog.patch({ liveAt: isoOffset(new Date()) })
-      // A resumed run whose split was already at 100% promoted nothing here: run the live checks now.
+      // A resumed run whose 100% split was already in place still calls onApplied; this is the belt to that brace.
       const checks = await (promoted === null ? liveChecks(config, runLog, { version, token: opts.token, runDir, log: opts.log }) : promoted)
       // A Worker failure in any live check rolls back; a harness fault stops with the new version live and says so.
-      const worker = checks.find(check => check.kind === 'fail' && check.fault === 'worker')
-      const harness = checks.find(check => check.kind === 'fail' && check.fault !== 'worker')
-      if (worker) {
-        await note(worker)
-        state = { phase: 'rollback', smoke: state.smoke }
-      } else if (harness) {
-        await note(harness)
-        state = { phase: 'halt', smoke: state.smoke }
-      } else state = { phase: 'done', smoke: state.smoke }
-      continue
-    }
-    if (state.phase === 'ramp') {
-      const result = await span(runLog, 'ramp', () => stageRamp(config, rampOpts()))
-      await note(result)
-      if (result.kind === 'pass') runLog.patch({ liveAt: isoOffset(new Date()) })
-      else opts.log(`ramp: ${result.reason}`)
-      state = nextPhase(state, outcomeOf(result))
+      const verdict = liveVerdict(checks)
+      const decisive = checks.find(check => check.kind === 'fail' && (verdict !== 'rollback' || check.fault === 'worker'))
+      if (decisive) await note(decisive)
+      state = { phase: verdict, smoke: state.smoke }
       continue
     }
     if (state.phase === 'rollback') {

@@ -1,22 +1,44 @@
 {
   "steps": [
-    { "percent": 10, "dwellMs": 40000 },
-    { "percent": 25, "dwellMs": 40000 },
-    { "percent": 50, "dwellMs": 40000 },
-    { "percent": 75, "dwellMs": 40000 },
+    { "percent": 10, "dwellMs": 30000 },
+    { "percent": 25, "dwellMs": 25000 },
+    { "percent": 50, "dwellMs": 25000 },
+    { "percent": 75, "dwellMs": 25000 },
     { "percent": 100, "dwellMs": 40000 }
   ],
   "ingestWaitMs": 20000,
+  "ingestPollMs": 3000,
   "warmupMs": 10000,
-  "promote": {
-    "watchMs": 60000,
-    "ingestWaitMs": 30000,
-    "ingestPollMs": 3000
+  "calibration": {
+    "steps[*].dwellMs": {
+      "source": "ledger ramp-step observations, runs 2026-11-06T17-35-09-419Z through 2026-11-06T21-06-26-841Z (10 steps at 10%, 8 at 25%, 8 at 50%, 7 at 75%); live-check stage durations of the 10 direct-promote runs 2026-11-06T21-45-51-484Z through 2026-11-07T19-39-00-604Z",
+      "date": "2026-11-08",
+      "window": "every 10/25/50/75% ramp step in the ledger; smoke-live + telemetry-live of every promote run",
+      "n": 33,
+      "observed": "probes issue 50 req/s (25 rps x 2 calls). At 40 s the 10% steps logged agg 1978-2000 (0.989-1.000 of issued) and new 174-214, share 0.0874-0.1076 (0.0712 on 18-54-31-261Z, which rolled back on that share before warm-up existed; since warm-up 0.1003-0.107). Min share at 25/50/75: 0.232/0.4765/0.734. Live smoke + live telemetry in the promote runs took 42-86 s (median 49 s) after the 100% write.",
+      "headroom": "10%: 30000 issues 1500; at the worst post-stall share 0.0874 that is 131 new against split.minNewRequests 100 (2.8 sd above it; at the post-warm-up 0.10 it is 150, 4.6 sd). 25/50/75%: 25000 issues 1250, 25% above probe.minSamples 1000 (a clean window sheds 0), and the smallest new arm is 290 (0.232 x 1250), 2.9x the floor; detectable new-version error rate at 25% goes from 0.60% (n=500) to about 1.0% (n=290). 100%: 40000 unchanged: the step runs beside the live checks (median 49 s), so a shorter dwell would not end the run sooner, and it keeps n=2000 (0.15%) for the live watch."
+    },
+    "ingestPollMs": {
+      "source": "the polled ingest wait of the 10 direct-promote runs 2026-11-06T21-45-51-484Z through 2026-11-07T19-39-00-604Z (promote.ingestPollMs 3000, ceiling 30000)",
+      "date": "2026-11-08",
+      "window": "the 100% watch of each run, polls after the dwell end",
+      "n": 10,
+      "observed": "the first poll returned 5.5-8.6 s after the dwell end and each later one 5.4-11.1 s after the one before (3 s sleep + the query); 98% of answered probes were logged by 8.6-19.2 s after the dwell end (median 12.6 s); the first poll saw 0.877-0.947 (one run 1.132 with live-smoke traffic counted)",
+      "headroom": "PRIOR period: 3000 keeps one query in flight. Replaces a fixed 20000 sleep per step that also ran before a 20-30 s query on the pre-slicing ramps (2026-11-06T20-24-45-549Z, 21-06-26-841Z: 44-66 s from dwell end to decision)."
+    },
+    "ingestWaitMs": {
+      "source": "run 2026-11-01T00-10-02-620Z (the 12640 ms and 17313 ms gaps, thresholds.json policy:ingestWaitMs); re-checked against the 10 polled promote watches 2026-11-06T21-45-51-484Z through 2026-11-07T19-39-00-604Z",
+      "date": "2026-11-08",
+      "window": "1% and 5% ramp steps; the 100% promote watches",
+      "n": 12,
+      "observed": "largest gap 17313 ms (2026-11-01); polled time to 98% landed at most 19.2 s (2026-11-07T17-51-47-638Z)",
+      "headroom": "20000 is unchanged and is now the ceiling of the poll, above both measured maxima; a window that has not landed 98% by then is judged on what landed, as before"
+    }
   },
   "probe": {
     "rps": 25,
     "maxLossRate": 0.0012658227848101266,
-    "onHarnessFault": "rollback",
+    "onHarnessFault": "telemetry",
     "calibration": {
       "source": "run 2026-11-01T17-06-08-780Z",
       "date": "2026-11-01",

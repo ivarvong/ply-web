@@ -208,7 +208,7 @@ export type RampIo = {
   dwell?(ms: number, percent: number): Promise<{ readonly outcomes: readonly ProbeOutcome[] }>
   applySplit(percent: number): Promise<null | string | HeldWrite>
   observe(from: number, to: number, percent: number): Promise<Observation>
-  /** Called once a step's split is written (or already in place). The direct promote starts the live checks here. */
+  /** Called once a step's split is written (or already in place). The pipeline starts the live checks at 100% here. */
   onApplied?(percent: number): void
   /** Called with the observation ref. A missing ref is a bug: a decision without an observation. */
   onDecision?(ref: ObservationRef, decision: RampDecision, percent: number): Promise<void>

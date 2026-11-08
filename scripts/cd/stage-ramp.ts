@@ -180,7 +180,7 @@ export async function stageRamp(
     /** When set, the version is already at this ramp percent. Do not write it again. */
     readonly fromPercent?: number
   },
-  /** The schedule (the direct promote passes `promotePolicy`), and a hook called once each step's split is in place. */
+  /** The schedule (the policy's steps), and a hook called once each step's split is in place: the pipeline starts the live checks at 100%. */
   schedule: { readonly policy: RolloutPolicy; readonly onApplied: (percent: number) => void } = { policy: config.policy, onApplied: () => {} },
 ): Promise<StageResult<RampValue>> {
   const rollout = schedule.policy

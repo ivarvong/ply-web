@@ -38,7 +38,7 @@ test('the checked-in policy is the correctness ramp', () => {
   assert.equal(loaded.policy.split.onMismatch, 'rollback')
   assert.equal(loaded.policy.split.onInsufficient, 'hold')
   assert.equal(loaded.policy.probe.maxLossRate, 1 / 790)
-  assert.equal(loaded.policy.probe.onHarnessFault, 'rollback')
+  assert.equal(loaded.policy.probe.onHarnessFault, 'telemetry')
   assert.equal(loaded.policy.probe.calibration.source, 'run 2026-11-01T17-06-08-780Z')
   assert.equal(loaded.policy.probe.calibration.date, '2026-11-01')
   assert.equal(loaded.policy.probe.calibration.window, '100% ramp step')
@@ -94,7 +94,7 @@ test('the checked-in policy is the correctness ramp', () => {
   assert.equal(loaded.policy.cleanup.calibration.namespace, 'ply-loadgen')
   assert.match(loaded.policy.cleanup.calibration.observed, /404 \[10200\] Repository not found/)
   assert.match(loaded.policy.cleanup.calibration.headroom, /PRIOR/)
-  assert.equal(loaded.policy.steps.every(step => step.dwellMs === 40_000), true)
+  assert.deepEqual(loaded.policy.steps.map(step => step.dwellMs), [30_000, 25_000, 25_000, 25_000, 40_000])
 })
 
 test('a policy that cannot be run is rejected', () => {
@@ -142,14 +142,32 @@ test('the checked-in probe can see a correctness regression on the smallest step
   const open = loaded.steps.map(step => step.percent).filter(percent => percent < 100)
   const smallest = Math.min(...open)
   const expectedNew = requests * (smallest / 100)
-  assert.equal(requests, 2000)
+  assert.equal(requests, 1500)
   assert.equal(smallest, 10)
-  assert.equal(expectedNew, 200)
+  assert.equal(expectedNew, 150)
   assert.ok(expectedNew >= loaded.split.minNewRequests)
   const atFloor = 1 - 0.05 ** (1 / loaded.split.minNewRequests)
   const atExpected = 1 - 0.05 ** (1 / expectedNew)
   assert.ok(Math.abs(atFloor - 0.0295) < 0.001)
-  assert.ok(Math.abs(atExpected - 0.0149) < 0.001)
+  assert.ok(Math.abs(atExpected - 0.0198) < 0.001)
+})
+
+test('every checked-in step reaches its sample floors at the worst measured routed share, and cites its evidence', () => {
+  const loaded = loadPolicy(DEFAULT_POLICY_PATH).policy
+  // Worst new-version share per percent in the ledger (cd.policy.json calibration[steps[*].dwellMs]).
+  const worst: Record<number, number> = { 10: 0.0874, 25: 0.232, 50: 0.4765, 75: 0.734, 100: 0.98 }
+  for (const step of loaded.steps) {
+    const issued = loaded.probe.rps * loaded.probe.calls.length * (step.dwellMs / 1000)
+    assert.ok(issued >= loaded.probe.minSamples, `${step.percent}%: ${issued} issued`)
+    assert.ok(issued >= loaded.burn.minSamples)
+    const share = worst[step.percent]
+    if (share === Number(share)) assert.ok(issued * share >= loaded.split.minNewRequests, `${step.percent}%: ${issued * share} new`)
+  }
+  for (const field of ['steps[*].dwellMs', 'ingestPollMs', 'ingestWaitMs']) {
+    assert.ok(field in loaded.calibration, `calibration for ${field}`)
+  }
+  const bad = { ...raw(), calibration: { 'promote.watchMs': { source: 's', date: 'd', window: 'w', n: 1, observed: 'o', headroom: 'h' } } }
+  assert.throws(() => parsePolicy(JSON.stringify(bad)), /calibration\.promote\.watchMs: names no schedule field/)
 })
 
 test('latency=gate with thresholds is a policy, and warm-up may be omitted', () => {

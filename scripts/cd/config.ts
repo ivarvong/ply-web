@@ -7,6 +7,7 @@ import {
   WORKER_DEFAULT,
 } from './baseline.ts'
 import type { Json } from './log.ts'
+import { defaultLockPath } from './lock.ts'
 import { DEFAULT_POLICY_PATH, loadPolicy, type RolloutPolicy } from './policy.ts'
 import { SLOS } from './slo.ts'
 
@@ -25,6 +26,8 @@ export type CdConfig = {
   readonly policySha256: string
   readonly policyBody: Json
   readonly ledgerPath: string
+  /** The deployment lock every writing command holds (scripts/cd/lock.ts). Shared by every worktree. */
+  readonly lockPath: string
 }
 
 const RETIRED = [
@@ -56,9 +59,12 @@ export function defaultRunRoot(): string {
   return join(homedir(), '.local', 'state', 'ply-cd', 'runs')
 }
 
-/** Worker bearer, mode 0600. Override with `PLY_TOKEN_FILE`. The file is read and never printed. */
+/**
+ * Worker bearer, mode 0600. Override with `PLY_TOKEN_FILE`. The file is read and never printed. The default is where the
+ * rotated bearer lives (2026-10-30); `~/.ply-token` was the default until 2026-11-08 and every run passed the override.
+ */
 export function defaultTokenFile(): string {
-  return join(homedir(), '.ply-token')
+  return join(homedir(), '.config', 'ply', 'worker-token')
 }
 
 /** The load-test credential, mode 0600. Override with `PLY_LOAD_TOKEN_FILE`. Read by the rate gate, never printed. */
@@ -78,6 +84,7 @@ export function publicConfig(config: CdConfig) {
     loadTokenFile: config.loadTokenFile,
     sha: config.sha,
     ledgerPath: config.ledgerPath,
+    lockPath: config.lockPath,
     policyPath: config.policyPath,
     policySha256: config.policySha256,
     slos: SLOS.map(slo => ({
@@ -109,6 +116,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, policyPath?: string): CdConfi
     loadTokenFile: env.PLY_LOAD_TOKEN_FILE || defaultLoadTokenFile(),
     sha: env.PLY_SHA || null,
     ledgerPath: env.PLY_CD_LEDGER || defaultLedgerPath(),
+    lockPath: env.PLY_CD_LOCK || defaultLockPath(),
     policy: loaded.policy,
     policyPath: path,
     policySha256: loaded.sha256,

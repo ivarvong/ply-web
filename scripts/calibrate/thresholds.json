@@ -25,14 +25,20 @@
     },
     "policy:steps[*].dwellMs": {
       "value": [
-        40000,
-        40000,
-        40000,
-        40000,
+        30000,
+        25000,
+        25000,
+        25000,
         40000
       ],
-      "status": "PRIOR (uncalibrated)",
-      "why": "Round dwell; the forecast line of each step prints the detectable effect this dwell buys at the measured request rate."
+      "status": "calibrated",
+      "source": "ledger ramp-step observations of runs 2026-11-06T17-35-09-419Z through 2026-11-06T21-06-26-841Z; live-check durations of the promote runs 2026-11-06T21-45-51-484Z through 2026-11-07T19-39-00-604Z",
+      "query": "ramp-step measurement nextRequests / aggregateRequests per step; run_finished stage durations smoke-live + telemetry-live",
+      "window": "10/25/50/75% ramp steps (n=33); 100% promote watches (n=10)",
+      "date": "2026-11-08",
+      "n": 43,
+      "percentile": "minimum observed new-version share per percent (0.0874 at 10% excluding the pre-warm-up 0.0712 rollback, 0.232 at 25%); median live-check time 49 s; not a percentile",
+      "headroom": "10%: 1500 issued x 0.0874 = 131 new vs split.minNewRequests 100. 25-75%: 1250 issued, 25% above probe.minSamples 1000. 100%: unchanged, bounded by the live checks. Full derivation: cd.policy.json calibration[steps[*].dwellMs]."
     },
     "policy:ingestWaitMs": {
       "value": 20000,
@@ -509,20 +515,10 @@
       "status": "PRIOR (uncalibrated)",
       "why": "Clamp on an operator-set rate, not a load threshold."
     },
-    "policy:promote.watchMs": {
-      "value": 60000,
-      "status": "PRIOR (uncalibrated)",
-      "why": "Live watch after the direct promote (2026-11-06, Ivar: green change to 100% in <= 3 min). One minute of unpinned probes at 25 rps x 2 calls is ~3000 probes, above probe.minSamples 1000 and burn.minSamples 100; the live smoke (~45 s on run 2026-11-06T21-06-26-841Z) runs inside it."
-    },
-    "policy:promote.ingestWaitMs": {
-      "value": 30000,
-      "status": "PRIOR (uncalibrated)",
-      "why": "Ceiling on the polled ingest wait after the watch. Above the 17313 ms gap measured on run 2026-11-01T00-10-02-620Z (policy:ingestWaitMs) with headroom; the poll usually stops earlier once the probes have landed."
-    },
-    "policy:promote.ingestPollMs": {
+    "policy:ingestPollMs": {
       "value": 3000,
       "status": "PRIOR (uncalibrated)",
-      "why": "Re-query period for the polled ingest wait: each poll is two telemetry queries of ~1 s (run 2026-11-06T21-06-26-841Z), so 3 s keeps the query load under one in flight."
+      "why": "Re-query period for the polled ingest wait after each ramp step (moved from promote.ingestPollMs 2026-11-08, when the direct promote was removed): each poll is two telemetry queries of ~1 s (run 2026-11-06T21-06-26-841Z), so 3 s keeps the query load under one in flight. policy:ingestWaitMs stays the ceiling; the poll stops early only once >= 98% of answered probes are logged (scripts/cd/ramp.ts INGEST_LANDED)."
     },
     "policy:rate.probes": {
       "value": 30,

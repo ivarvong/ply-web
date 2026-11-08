@@ -34,8 +34,11 @@ function scripted(commands: readonly QueryCommand[]): () => Promise<QueryCommand
 
 function policy(): RolloutPolicy {
   const raw = JSON.parse(readFileSync(new URL('../scripts/cd/cd.policy.json', import.meta.url), 'utf8')) as Record<string, unknown>
-  raw.steps = [{ percent: 100, dwellMs: 1 }]
-  return parsePolicy(JSON.stringify(raw)).policy
+  raw.ingestPollMs = 0
+  const parsed = parsePolicy(JSON.stringify(raw)).policy
+  // A lone 100 step is not a loadable policy (ramp-only, 2026-11-08); the engine runs one here to isolate a single window.
+  // Frozen test clocks need the fixed ingest sleep, and these windows were written against onHarnessFault rollback.
+  return { ...parsed, steps: [{ percent: 100, dwellMs: 1 }], probe: { ...parsed.probe, onHarnessFault: 'rollback' } }
 }
 
 function probes(count: number, status: number): ProbeOutcome[] {

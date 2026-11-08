@@ -11,6 +11,8 @@ import type { CdConfig } from './config.ts'
 import { applySplit, readShares, rollbackTo } from './traffic.ts'
 
 const CANARY_PREFIX = 'cd canary '
+/** Stands in for a version not uploaded yet, so the pre-upload plan can name a foreign 0% version. Never written. */
+const PLACEHOLDER = '00000000-0000-4000-8000-000000000000'
 
 export type DeployValue = {
   readonly version: string
@@ -52,7 +54,11 @@ function canaryMessage(tag: string): string {
   return message
 }
 
-export async function stageDeploy(config: CdConfig, release: ReleaseId): Promise<StageResult<DeployValue>> {
+export async function stageDeploy(
+  config: CdConfig,
+  release: ReleaseId,
+  opts: { readonly replaceCanary: string | null },
+): Promise<StageResult<DeployValue>> {
   const mainRef = await requireOriginMain(ROOT)
   if (!mainRef.ok) {
     const reason = originMainReason(mainRef)
@@ -70,6 +76,9 @@ export async function stageDeploy(config: CdConfig, release: ReleaseId): Promise
   const resolved = releaseTag(release)
   try {
     let version = await versionTagged(config.worker, resolved)
+    // Refuse before building: a foreign 0% version is checked again (planCanary) against the split read after upload.
+    const before = planCanary(await readShares(config.worker), version || PLACEHOLDER, opts.replaceCanary)
+    if (before.kind === 'conflict') return fail('deploy-canary', before.reason, false, 'state_conflict')
     if (!version) {
       await cfOk(['build', '--mode', 'production'])
       await cfOk([
@@ -80,8 +89,9 @@ export async function stageDeploy(config: CdConfig, release: ReleaseId): Promise
     }
     if (!version) return fail('deploy-canary', `version-not-found: no version tagged ${resolved}`, false, 'harness_fault')
     const shares = await readShares(config.worker)
-    const plan = planCanary(shares, version)
+    const plan = planCanary(shares, version, opts.replaceCanary)
     if (plan.kind === 'refuse') return fail('deploy-canary', plan.reason, false, 'harness_fault')
+    if (plan.kind === 'conflict') return fail('deploy-canary', plan.reason, false, 'state_conflict')
     const want = trafficSplit(0, version, plan.live)
     if (!isTrafficSplit(want)) return fail('deploy-canary', `${want.reason}; traffic was not changed`, false, 'harness_fault')
     const applied = await applySplit(config.worker, canaryMessage(resolved), want, shares, { kind: 'canary' })

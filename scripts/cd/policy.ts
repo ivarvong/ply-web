@@ -20,7 +20,9 @@ export type ProbeCall = {
  * Where a harness fault above 0% leaves traffic. Rollback restores `previous` at 100%.
  * `telemetry` does not decide on the probe window at all: the loss is recorded, and the
  * step is judged on the new version's own telemetry (a probe-tail loss is the harness,
- * not the Worker). The direct promote uses it.
+ * not the Worker). The checked-in ramp uses it since 2026-11-08: under `rollback`, runs
+ * 2026-11-06T17-32-11-293Z (6/2000) and 18-44-58-475Z (5/2000) rolled back clean versions on
+ * probe-tail loss alone.
  */
 export type ProbeFaultAction = 'rollback' | 'hold' | 'telemetry'
 
@@ -162,20 +164,6 @@ export type TelemetryPolicy = {
 export const DEFAULT_MAX_LOSS_RATE = 0.5
 
 /**
- * The default rollout (no `--ramp`): after the pinned smoke and its telemetry pass, the
- * new version goes straight to 100% and is watched for `watchMs` with unpinned probes.
- * The watch is then judged on the new version's telemetry, polled every `ingestPollMs`
- * until the probes have landed or `ingestWaitMs` has passed.
- */
-export type PromotePolicy = {
-  readonly watchMs: number
-  readonly ingestWaitMs: number
-  readonly ingestPollMs: number
-}
-
-export const DEFAULT_PROMOTE: PromotePolicy = { watchMs: 60_000, ingestWaitMs: 30_000, ingestPollMs: 3_000 }
-
-/**
  * The rate limiter's silent-degradation gate (scripts/cd/rate-gate.ts, docs/rate-limit.md "CD gate"). Every number has
  * its evidence in `calibration`. Omitted from a policy file: DEFAULT_RATE_GATE (the same numbers as cd.policy.json).
  */
@@ -226,7 +214,6 @@ export type RolloutPolicy = {
   /** When > 0, the post-dwell ingest wait is polled at this period instead of one fixed sleep; `ingestWaitMs` is the ceiling. */
   readonly ingestPollMs: number
   readonly warmupMs: number
-  readonly promote: PromotePolicy
   readonly probe: {
     readonly rps: number
     readonly calls: readonly ProbeCall[]
@@ -257,6 +244,40 @@ export type RolloutPolicy = {
   readonly telemetry: TelemetryPolicy
   readonly cleanup: CleanupPolicy
   readonly rate: RateGatePolicy
+  /** Evidence for the schedule's numbers (steps, ingest), keyed by field, like `probe.calibration`. Empty when omitted. */
+  readonly calibration: Readonly<Record<string, ScheduleCalibration>>
+}
+
+/** Citation for a schedule number: the runs it was read from, what they showed, and the headroom chosen. */
+export type ScheduleCalibration = {
+  readonly source: string
+  readonly date: string
+  readonly window: string
+  readonly n: number
+  readonly observed: string
+  readonly headroom: string
+}
+
+const SCHEDULE_FIELDS: readonly string[] = ['steps[*].percent', 'steps[*].dwellMs', 'ingestWaitMs', 'ingestPollMs', 'warmupMs']
+
+function scheduleCalibrationOf(value: unknown): Readonly<Record<string, ScheduleCalibration>> {
+  const rec = record(value, 'calibration')
+  const out: Record<string, ScheduleCalibration> = {}
+  for (const [key, entry] of Object.entries(rec)) {
+    const path = `calibration.${key}`
+    if (!SCHEDULE_FIELDS.includes(key)) reject(path, `names no schedule field (${SCHEDULE_FIELDS.join(', ')})`)
+    const row = record(entry, path)
+    exactKeys(row, path, ['source', 'date', 'window', 'n', 'observed', 'headroom'])
+    out[key] = {
+      source: textOf(row.source, `${path}.source`),
+      date: textOf(row.date, `${path}.date`),
+      window: textOf(row.window, `${path}.window`),
+      n: integer(row.n, `${path}.n`, 1),
+      observed: textOf(row.observed, `${path}.observed`),
+      headroom: textOf(row.headroom, `${path}.headroom`),
+    }
+  }
+  return out
 }
 
 export type LoadedPolicy = {
@@ -325,6 +346,8 @@ function stepsOf(value: unknown): readonly RolloutStep[] {
   }
   const last = steps[steps.length - 1]
   if (!last || last.percent !== 100) reject('steps', 'the last step must be 100')
+  // Ramp-only (Ivar, 2026-11-08): a lone 100 step is the removed direct promote, 0% straight to 100%.
+  if (steps.length < 2) reject('steps', 'must ramp: at least one step below 100 before the last (a single 0 to 100 step is a direct promote)')
   return steps
 }
 
@@ -581,35 +604,13 @@ function rateGateOf(parent: Record<string, unknown>): RateGatePolicy {
   }
 }
 
-function promoteOf(value: unknown): PromotePolicy {
-  const rec = record(value, 'promote')
-  exactKeys(rec, 'promote', ['watchMs', 'ingestWaitMs', 'ingestPollMs'])
-  return {
-    watchMs: integer(rec.watchMs, 'promote.watchMs', 1),
-    ingestWaitMs: integer(rec.ingestWaitMs, 'promote.ingestWaitMs', 0),
-    ingestPollMs: integer(rec.ingestPollMs, 'promote.ingestPollMs', 0),
-  }
-}
-
-/**
- * The policy the direct promote runs: one step at 100% for `promote.watchMs`, no warm-up,
- * ingest polled. A probe-loss harness fault defers to the new version's telemetry instead of
- * rolling back. Every gate, the burn and the share band are the checked-in ones.
- */
-export function promotePolicy(policy: RolloutPolicy): RolloutPolicy {
-  return {
-    ...policy,
-    steps: [{ percent: 100, dwellMs: policy.promote.watchMs }],
-    warmupMs: 0,
-    ingestWaitMs: policy.promote.ingestWaitMs,
-    ingestPollMs: policy.promote.ingestPollMs,
-    probe: { ...policy.probe, onHarnessFault: 'telemetry' },
-  }
-}
 
 function validate(value: unknown): RolloutPolicy {
   const rec = record(value, 'policy')
-  exactKeys(rec, 'policy', ['steps', 'ingestWaitMs', 'probe', 'gates', 'burn', 'split', 'cleanup'], ['warmupMs', 'telemetry', 'promote', 'ingestPollMs', 'rate'])
+  // The direct promote (one write to 100%, `promote.watchMs` watch) was removed 2026-11-08 (Ivar: "Ramp should be the
+  // only option."). Name it, so an old policy file is not just an unknown key.
+  if ('promote' in rec) reject('promote', 'was removed 2026-11-08: the stepped ramp in steps is the only promotion path')
+  exactKeys(rec, 'policy', ['steps', 'ingestWaitMs', 'probe', 'gates', 'burn', 'split', 'cleanup'], ['warmupMs', 'telemetry', 'ingestPollMs', 'rate', 'calibration'])
   const probe = record(rec.probe, 'probe')
   exactKeys(probe, 'probe', [
     'rps',
@@ -637,7 +638,6 @@ function validate(value: unknown): RolloutPolicy {
     ingestWaitMs: integer(rec.ingestWaitMs, 'ingestWaitMs', 0),
     ingestPollMs: 'ingestPollMs' in rec ? integer(rec.ingestPollMs, 'ingestPollMs', 0) : 0,
     warmupMs: rec.warmupMs === undefined ? 0 : integer(rec.warmupMs, 'warmupMs', 0),
-    promote: 'promote' in rec ? promoteOf(rec.promote) : DEFAULT_PROMOTE,
     probe: {
       rps,
       calls,
@@ -661,6 +661,7 @@ function validate(value: unknown): RolloutPolicy {
     telemetry: telemetryOf(rec.telemetry),
     cleanup: cleanupOf(rec.cleanup),
     rate: rateGateOf(rec),
+    calibration: 'calibration' in rec ? scheduleCalibrationOf(rec.calibration) : {},
   }
 }
 
@@ -678,7 +679,6 @@ function policyBody(policy: RolloutPolicy): Json {
     ingestWaitMs: policy.ingestWaitMs,
     ingestPollMs: policy.ingestPollMs,
     warmupMs: policy.warmupMs,
-    promote: { watchMs: policy.promote.watchMs, ingestWaitMs: policy.promote.ingestWaitMs, ingestPollMs: policy.promote.ingestPollMs },
     probe: {
       rps: policy.probe.rps,
       maxLossRate: policy.probe.maxLossRate,
@@ -755,6 +755,14 @@ function policyBody(policy: RolloutPolicy): Json {
         },
       },
     },
+    calibration: Object.fromEntries(Object.entries(policy.calibration).map(([key, row]) => [key, {
+      source: row.source,
+      date: row.date,
+      window: row.window,
+      n: row.n,
+      observed: row.observed,
+      headroom: row.headroom,
+    }])),
     rate: {
       expectMode: policy.rate.expectMode,
       probes: policy.rate.probes,

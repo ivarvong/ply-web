@@ -17,6 +17,7 @@ import { pruneRuns, retentionLine } from './retention.ts'
 import { checkoutReason, isReleaseId, readCheckout, releaseId, releasePair, type ReleaseId } from './release.ts'
 import { reportLedger } from './report.ts'
 import { createRunDir, RUN_ID, writeJson } from './run-dir.ts'
+import { acquireLock, realLockIo } from './lock.ts'
 import { readPlyPin, resolvePlySha, stageBump } from './stage-bump.ts'
 import { stageDeploy } from './stage-deploy.ts'
 import { stageRamp } from './stage-ramp.ts'
@@ -28,9 +29,16 @@ import { readTokenFile } from './token.ts'
 import { parseSince } from './config.ts'
 
 export type Parsed =
-  | { readonly kind: 'cd'; readonly sha: string | null; readonly noBump: boolean; readonly ramp: boolean }
+  | {
+    readonly kind: 'cd'
+    readonly sha: string | null
+    readonly noBump: boolean
+    /** `--ramp` was passed. It is a no-op since 2026-11-08 (the ramp is the only path); the run says so. */
+    readonly rampFlag: boolean
+    readonly replaceCanary: string | null
+  }
   | { readonly kind: 'bump'; readonly sha: string | null }
-  | { readonly kind: 'deploy-canary' }
+  | { readonly kind: 'deploy-canary'; readonly replaceCanary: string | null }
   | { readonly kind: 'smoke'; readonly version: string | null; readonly expectVersion: string | null }
   | { readonly kind: 'telemetry'; readonly version: string; readonly since: string; readonly report: string | null }
   | { readonly kind: 'ramp'; readonly version: string; readonly previous: string | null; readonly verdict: string | null }
@@ -65,7 +73,8 @@ export function noBumpSha(sha: string, pin: string | null): string | null {
 function parseCd(argv: readonly string[], pin: string | null): Parsed {
   let sha: string | null = null
   let noBump = false
-  let ramp = false
+  let rampFlag = false
+  let replaceCanary: string | null = null
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i] ?? ''
     if (arg === '--no-bump') {
@@ -73,7 +82,14 @@ function parseCd(argv: readonly string[], pin: string | null): Parsed {
       continue
     }
     if (arg === '--ramp') {
-      ramp = true
+      rampFlag = true
+      continue
+    }
+    if (arg === '--replace-canary') {
+      const value = uuid(argv[i + 1] || null)
+      if (!value) return { kind: 'error', reason: '--replace-canary needs the version id now at 0%' }
+      replaceCanary = value
+      i += 1
       continue
     }
     if (arg === '--sha') {
@@ -91,7 +107,7 @@ function parseCd(argv: readonly string[], pin: string | null): Parsed {
     const mismatch = noBumpSha(sha, pin)
     if (mismatch) return { kind: 'error', reason: mismatch }
   }
-  return { kind: 'cd', sha, noBump, ramp }
+  return { kind: 'cd', sha, noBump, rampFlag, replaceCanary }
 }
 
 export function parseArgs(argv: readonly string[], pin: string | null = null): Parsed {
@@ -105,7 +121,12 @@ export function parseArgs(argv: readonly string[], pin: string | null = null): P
     if (sha !== null && !/^[0-9a-f]{40}$/.test(sha)) return { kind: 'error', reason: '--sha must be 40 hex characters' }
     return { kind: 'bump', sha }
   }
-  if (command === 'deploy-canary') return { kind: 'deploy-canary' }
+  if (command === 'deploy-canary') {
+    if (rest.length === 0) return { kind: 'deploy-canary', replaceCanary: null }
+    const replaceCanary = uuid(flag(rest, 'replace-canary'))
+    if (!replaceCanary || rest.length !== 2) return { kind: 'error', reason: 'deploy-canary takes only --replace-canary <version id now at 0%>' }
+    return { kind: 'deploy-canary', replaceCanary }
+  }
   if (command === 'smoke') {
     const version = flag(rest, 'version')
     const expectVersion = flag(rest, 'expect-version')
@@ -157,12 +178,14 @@ export function parseArgs(argv: readonly string[], pin: string | null = null): P
 export function usageText(): string {
   return [
     'usage: npm run cd -- [--policy <path>] [command]',
-    '  cd [--sha <40 hex>] [--no-bump] [--ramp]',
-    '  [--sha <40 hex>] [--no-bump] [--ramp]',
-    '     default: 0% canary, pinned smoke + telemetry, promote to 100%, live watch (auto-rollback)',
-    '     --ramp: the stepped schedule in the policy (steps) instead of the direct promote',
+    '  cd [--sha <40 hex>] [--no-bump] [--replace-canary <id>]',
+    '  [--sha <40 hex>] [--no-bump] [--replace-canary <id>]',
+    '     0% canary, pinned smoke + telemetry, then the stepped ramp in the policy (steps) to 100%;',
+    '     live smoke + telemetry + visual smoke during the 100% step (auto-rollback). The ramp is the only path:',
+    '     --ramp is accepted and ignored. --replace-canary lets this run replace that version at 0%.',
+    '     One run at a time: the deployment lock (PLY_CD_LOCK, ~/.local/state/ply-cd/deploy.lock) refuses a second.',
     '  bump [--sha <40 hex>]',
-    '  deploy-canary',
+    '  deploy-canary [--replace-canary <id>]',
     '  smoke --version <id> | --expect-version <id>',
     '  telemetry --version <id> --since <iso|epoch> --report smoke.json',
     '  ramp --version <id> [--previous <id>] [--verdict telemetry.json]',
@@ -285,6 +308,31 @@ export async function cli(argv: readonly string[], env: NodeJS.ProcessEnv, log: 
       return finish(log, 1, `cd: harness_fault preflight: ${errorMessage(error)}`)
     }
   }
+  // Every command that writes the deployment holds the lock for its whole run (scripts/cd/lock.ts).
+  const writes = parsed.kind === 'cd' || parsed.kind === 'deploy-canary' || parsed.kind === 'ramp' || parsed.kind === 'rollback'
+  const lock = writes
+    ? await acquireLock(config.lockPath, { command: ['cd', ...argv].join(' '), cwd: ROOT, pid: process.pid }, realLockIo)
+    : null
+  if (lock && !lock.ok) return finish(log, 1, `cd: state_conflict lock: ${lock.reason}`)
+  if (lock && lock.ok) {
+    log(`lock: ${lock.path} (pid ${lock.holder.pid})`)
+    if (lock.tookOver) log(`lock: took over a stale lock from pid ${lock.tookOver.pid} (${lock.tookOver.startedAt}), which is no longer running`)
+  }
+  try {
+    return await runLocked(parsed, config, token, release, log)
+  } finally {
+    if (lock && lock.ok) await lock.release()
+  }
+}
+
+async function runLocked(
+  parsed: Exclude<Parsed, { kind: 'usage' | 'error' | 'report' | 'debrief' | 'annotate' }>,
+  config: CdConfig,
+  token: string,
+  release: ReleaseId | null,
+  log: (line: string) => void,
+): Promise<number> {
+  if (parsed.kind === 'cd' && parsed.rampFlag) log('cd: --ramp is ignored: the stepped ramp is the only promotion path since 2026-11-08')
   const existing = parsed.kind === 'cd' && release ? await unfinishedRunDir(config.runRoot, release) : null
   try {
     log(retentionLine(await pruneRuns(config.runRoot, existing ? [basename(existing)] : [])))
@@ -351,7 +399,7 @@ async function dispatch(
 ): Promise<Outcome> {
   if (parsed.kind === 'cd') {
     if (!release) return { code: 1, reason: 'cd: harness_fault bad-ply-sha: release was not read' }
-    const exit = await runPipeline(config, { token, sha: parsed.sha, noBump: parsed.noBump, ramp: parsed.ramp, release, log, runDir, runLog })
+    const exit = await runPipeline(config, { token, sha: parsed.sha, noBump: parsed.noBump, replaceCanary: parsed.replaceCanary, release, log, runDir, runLog })
     return { code: exit.code, reason: exit.reason }
   }
   if (parsed.kind === 'bump') {
@@ -369,7 +417,7 @@ async function dispatch(
   }
   if (parsed.kind === 'deploy-canary') {
     if (!release) return { code: 1, reason: 'cd: harness_fault bad-ply-sha: release was not read' }
-    const result = await stageDeploy(config, release)
+    const result = await stageDeploy(config, release, { replaceCanary: parsed.replaceCanary })
     await writeJson(runDir, 'deploy.json', result)
     if (result.kind === 'fail') {
       runLog.patch({ fault: result.fault })

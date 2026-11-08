@@ -55,3 +55,17 @@ export function nextPhase(state: PipelineState, outcome: PhaseOutcome): Pipeline
       return state
   }
 }
+
+/** A live check's result, reduced to what decides the run. */
+export type LiveCheck = { readonly kind: 'pass' } | { readonly kind: 'fail'; readonly fault: 'worker' | 'harness_fault' | 'state_conflict' | 'insufficient_samples' }
+
+/**
+ * After the ramp reaches 100%: the live smoke, its telemetry (with the rate gate) and the visual smoke. Any Worker
+ * failure rolls back to `previous`, even beside a harness fault. A harness fault alone (no Chrome, a lost query, too few
+ * rate checks ingested) stops with the new version live: it is not evidence against the version.
+ */
+export function liveVerdict(checks: readonly LiveCheck[]): 'rollback' | 'halt' | 'done' {
+  if (checks.some(check => check.kind === 'fail' && check.fault === 'worker')) return 'rollback'
+  if (checks.some(check => check.kind === 'fail')) return 'halt'
+  return 'done'
+}

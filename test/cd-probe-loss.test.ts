@@ -12,8 +12,14 @@ function policy(over: { readonly onHarnessFault: 'rollback' | 'hold'; readonly m
     steps: { percent: number; dwellMs: number }[]
     probe: { maxLossRate: number; onHarnessFault: string }
     burn: { minSamples: number }
+    ingestPollMs: number
   }
   raw.steps = [{ percent: 75, dwellMs: 1 }, { percent: 100, dwellMs: 1 }]
+  // These tests drive the probe-loss gate's traffic modes with a frozen clock: the fixed ingest sleep (a polled wait
+  // needs a clock that moves), and onHarnessFault rollback unless a test picks another (the file is telemetry since
+  // 2026-11-08; test/cd-ramp-only.test.ts covers that mode).
+  raw.ingestPollMs = 0
+  raw.probe.onHarnessFault = 'rollback'
   if (over) {
     raw.probe.maxLossRate = over.maxLossRate
     raw.probe.onHarnessFault = over.onHarnessFault

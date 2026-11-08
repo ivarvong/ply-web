@@ -11,8 +11,15 @@ export type VersionShare = {
 export type CanaryPlan =
   | { readonly kind: 'ok'; readonly live: string; readonly dropped: string | null }
   | { readonly kind: 'refuse'; readonly reason: string }
+  /** Another version holds the 0% slot and the operator did not name it for replacement. Traffic is not changed. */
+  | { readonly kind: 'conflict'; readonly reason: string; readonly sitting: string }
 
-export function planCanary(versions: readonly VersionShare[], next: string): CanaryPlan {
+/**
+ * Where to put `next` at 0%. A different version already at 0% is someone else's canary (another run, or an agent's
+ * measurement version: run 2026-11-07T18-30-47-501Z replaced b494b751 that way), so it is a conflict unless
+ * `replace` names exactly that version (`--replace-canary <id>`).
+ */
+export function planCanary(versions: readonly VersionShare[], next: string, replace: string | null = null): CanaryPlan {
   if (!VERSION_ID.test(next)) return { kind: 'refuse', reason: 'new version id is not a uuid' }
   if (versions.length === 0) return { kind: 'refuse', reason: 'no deployment' }
   const live = versions.filter(v => v.percentage === 100)
@@ -29,6 +36,14 @@ export function planCanary(versions: readonly VersionShare[], next: string): Can
   if (zero.length > 1) return { kind: 'refuse', reason: 'more than one version at 0%' }
   const sitting = zero[0]
   const dropped = sitting && sitting.versionId !== next ? sitting.versionId : null
+  if (dropped !== null && dropped !== replace) {
+    const named = replace === null ? '' : ` (--replace-canary names ${replace})`
+    return {
+      kind: 'conflict',
+      sitting: dropped,
+      reason: `${dropped} is already at 0% and this run did not create it${named}; to replace it pass --replace-canary ${dropped}`,
+    }
+  }
   return { kind: 'ok', live: current.versionId, dropped }
 }
 

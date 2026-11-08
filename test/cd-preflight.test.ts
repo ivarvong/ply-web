@@ -35,8 +35,11 @@ test('engines accept 22.23, 24.22, and 26.12, and a newer image is selected for 
   assert.equal(selectNode('v22.14.0', [{ bin: image, version: null }], engines), null)
 })
 
-test('token file and run dir have documented defaults', () => {
-  assert.equal(defaultTokenFile(), join(homedir(), '.ply-token'))
+test('token file, run dir and lock have documented defaults', () => {
+  // The rotated bearer's path (2026-10-30); every run passed PLY_TOKEN_FILE=~/.config/ply/worker-token before 2026-11-08.
+  assert.equal(defaultTokenFile(), join(homedir(), '.config', 'ply', 'worker-token'))
+  assert.equal(loadConfig({}).lockPath, join(homedir(), '.local', 'state', 'ply-cd', 'deploy.lock'))
+  assert.equal(loadConfig({ PLY_CD_LOCK: '/tmp/x.lock' }).lockPath, '/tmp/x.lock')
   assert.equal(defaultRunRoot(), join(homedir(), '.local', 'state', 'ply-cd', 'runs'))
   const config = loadConfig({})
   assert.equal(config.tokenFile, defaultTokenFile())

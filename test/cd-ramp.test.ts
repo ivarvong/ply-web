@@ -13,9 +13,11 @@ function policy(steps?: { percent: number; dwellMs: number }[], warmupMs = 0): R
     steps: { percent: number; dwellMs: number }[]
     warmupMs: number
   }
-  if (steps) raw.steps = steps
   raw.warmupMs = warmupMs
-  return parsePolicy(JSON.stringify(raw)).policy
+  const parsed = parsePolicy(JSON.stringify(raw)).policy
+  // A one-step schedule is not a loadable policy (ramp-only, 2026-11-08); these engine tests drive runRamp with one directly.
+  // The engine tests below exercise onHarnessFault rollback, the mode the file shipped before 2026-11-08.
+  return { ...parsed, steps: steps ? steps : parsed.steps, probe: { ...parsed.probe, onHarnessFault: 'rollback' } }
 }
 
 function stats(over: Partial<VersionStats> = {}): VersionStats {
