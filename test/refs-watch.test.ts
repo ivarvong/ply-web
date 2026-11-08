@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  FAIL_PURGE_MS, HEALTHY_POLL_MS, HEALTHY_TICK_MS, LEASE_MS, LEASE_TIMEOUT_MS, POLL_INTERVAL_MS, SECOND_PURGE_MS, WATCHED_REFS_CACHE, WATCH_GAP_MS, WATCH_TICK_MS,
+  FAIL_PURGE_MS, HEALTHY_MS, LEASE_MS, LEASE_TIMEOUT_MS, SECOND_PURGE_MS, WATCHED_REFS_CACHE, WATCH_GAP_MS, WATCH_TICK_MS,
   applyTick, emptyState, leaseRepo, needsAlarm, parseLsRefsAnswer, pollList, purgeFailed, refMapOf, refsTag, sawRefs,
   type PollResult, type RefMap,
 } from '../src/refs-watch.ts';
@@ -18,7 +18,6 @@ import { PUBLIC_GIT_ORIGIN, PUBLIC_NAMESPACE, type TokenSource } from '../src/pu
 const A = 'a'.repeat(40);
 const B = 'b'.repeat(40);
 const C = 'c'.repeat(40);
-const HEALTHY_MS = HEALTHY_POLL_MS;
 const PUB = `${PUBLIC_GIT_ORIGIN}/git/${PUBLIC_NAMESPACE}/ply.git`;
 const GH = 'https://github.com/octocat/Hello-World.git';
 const pkt = (s: string) => `${(s.length + 4).toString(16).padStart(4, '0')}${s}`;
@@ -58,12 +57,7 @@ test('tick: a first baseline and every change purge, and each purge repeats SECO
   assert.equal(due, t + SECOND_PURGE_MS);
   r = applyTick(s, { ply: ok(main(B)) }, t + WATCH_TICK_MS);
   assert.deepEqual(r.purge, [], 'not due yet');
-  // the repeat waits for the next grid tick at or after due, so it can share that tick's purge call
-  let at = due;
-  r = applyTick(s, {}, at);
-  while (r.purge.length === 0) { at += WATCH_TICK_MS; r = applyTick(s, {}, at); }
-  assert.ok(at >= due, 'never early');
-  assert.ok(at < due + POLL_INTERVAL_MS, 'at most one grid period late');
+  r = applyTick(s, { ply: ok(main(B)) }, due);
   assert.deepEqual(r.purge, ['ply']);
   assert.deepEqual(r.again, ['ply']);
   assert.equal('ply' in s.again, false, 'a repeat is not repeated');
@@ -109,72 +103,19 @@ test('tick: a gap purges every leased repo; a failing repo is purged once after 
   assert.deepEqual(Object.keys(s.repos), []);
   // repeats still outstanding keep the alarm; once they ran, it stops
   assert.equal(needsAlarm(s), Object.keys(s.again).length > 0);
-  // a repeat waits for the next grid tick, at most one poll period after it is due
-  let after = end + SECOND_PURGE_MS;
-  applyTick(s, {}, after);
-  while (needsAlarm(s) && after < end + SECOND_PURGE_MS + POLL_INTERVAL_MS) { after += WATCH_TICK_MS; applyTick(s, {}, after); }
+  applyTick(s, {}, end + SECOND_PURGE_MS);
   assert.equal(needsAlarm(s), false);
 });
 
-const SLOW = 'ply';
-
-test('grid: a repo polls every 4th tick and a poked, new, or failing repo polls at once; the failing repo stops polling each tick after its purge', () => {
+test('every tick polls every leased repo', () => {
   const s = emptyState();
-  let t = 5_000_000;
-  leaseRepo(s, SLOW, t);
-  assert.deepEqual(pollList(s), [SLOW], 'no baseline yet: polled now');
-  applyTick(s, { [SLOW]: ok(main(A)) }, t);
-  const polled: number[] = [];
-  for (let i = 0; i < 8; i++) {
-    t += WATCH_TICK_MS;
-    if (pollList(s).length > 0) polled.push(i);
-    applyTick(s, pollList(s).length > 0 ? { [SLOW]: ok(main(A)) } : {}, t);
+  const t = 7_000_000;
+  leaseRepo(s, 'b', t);
+  leaseRepo(s, 'a', t);
+  for (let i = 1; i <= 8; i++) {
+    assert.deepEqual(pollList(s), ['a', 'b']);
+    applyTick(s, { a: ok(main(A)), b: ok(main(A)) }, t + i * WATCH_TICK_MS);
   }
-  assert.deepEqual(polled, [3, 7], 'every 4th tick');
-  // a repeat purge waits for the grid: first purge on a grid tick, repeat is due SECOND_PURGE_MS later, runs on the next grid tick
-  while (pollList(s).length === 0) { t += WATCH_TICK_MS; applyTick(s, {}, t); }
-  t += WATCH_TICK_MS;
-  let r = applyTick(s, { [SLOW]: ok(main(B)) }, t);
-  assert.deepEqual(r.changed.map(c => c.repo), [SLOW]);
-  const repeats: string[][] = [];
-  for (let i = 0; i < 5; i++) {
-    t += WATCH_TICK_MS;
-    const poll = pollList(s);
-    r = applyTick(s, poll.length > 0 ? { [SLOW]: ok(main(B)) } : {}, t);
-    repeats.push(r.purge);
-  }
-  assert.ok(repeats.flat().length === 1 && repeats.flat()[0] === SLOW, 'the repeat is one purge');
-  const poke = emptyState();
-  leaseRepo(poke, SLOW, t);
-  applyTick(poke, { [SLOW]: ok(main(A)) }, t);
-  assert.deepEqual(pollList(poke), [], 'off grid');
-  (poke.repos[SLOW] as { pollNow: boolean }).pollNow = true;
-  assert.deepEqual(pollList(poke), [SLOW], 'pollNow');
-  applyTick(poke, { [SLOW]: ok(main(A)) }, t + 1);
-  assert.equal((poke.repos[SLOW] as { pollNow: boolean }).pollNow, false, 'cleared by the poll');
-  assert.equal(sawRefs(poke, SLOW, [['HEAD', B]]), true);
-  assert.deepEqual(pollList(poke), [SLOW], 'a seen mismatch polls at the next tick');
-  applyTick(poke, { [SLOW]: { ok: false, error: 'down' } }, t + 2);
-  assert.deepEqual(pollList(poke), [SLOW], 'failing and not purged yet: polled each tick');
-  r = applyTick(poke, { [SLOW]: { ok: false, error: 'down' } }, t + 2 + FAIL_PURGE_MS);
-  assert.deepEqual(r.purge, [SLOW], 'purged after two failures one tick apart');
-  applyTick(poke, {}, t + 3 + FAIL_PURGE_MS);
-  assert.deepEqual(pollList(poke), [], 'purged: back on the grid');
-});
-
-test('lease: a repo is healthy across its 12 s grid, and any repo is stale when the heartbeat stops', () => {
-  const s = emptyState();
-  const t = 6_000_000;
-  leaseRepo(s, SLOW, t);
-  applyTick(s, { [SLOW]: ok(main(A)) }, t + 100);
-  assert.equal(POLL_INTERVAL_MS, 12_000);
-  assert.equal(HEALTHY_POLL_MS, 18_000);
-  assert.deepEqual(leaseRepo(s, SLOW, t + 100 + 3_000), { grant: true, reason: 'ok' });
-  applyTick(s, {}, t + 100 + 3_000);
-  assert.deepEqual(leaseRepo(s, SLOW, t + 100 + 3_000 + HEALTHY_TICK_MS), { grant: true, reason: 'ok' }, 'at the edge of the heartbeat window');
-  assert.deepEqual(leaseRepo(s, SLOW, t + 100 + 3_000 + HEALTHY_TICK_MS + 1), { grant: false, reason: 'stale' }, 'heartbeat stopped');
-  applyTick(s, {}, t + 100 + 3_000 + HEALTHY_TICK_MS);
-  assert.deepEqual(leaseRepo(s, SLOW, t + 100 + HEALTHY_POLL_MS + 1), { grant: false, reason: 'stale' }, 'polled too long ago');
 });
 
 test('seen: a fill that stored refs the watcher has not seen purges at the next tick; a failed purge is retried', () => {
