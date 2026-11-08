@@ -99,15 +99,7 @@ export class RefsWatch extends DurableObject<Env> {
   /** The mirror pushed: poll now. */
   async poke(repos: string[]): Promise<void> {
     const state = await this.#load();
-    let polled = false;
-    for (const r of repos) {
-      const found = recordGet(state.repos, r);
-      if (found.tag === 'some') { found.value.pollNow = true; polled = true; }
-    }
-    if (polled) {
-      await this.#save();
-      await this.#arm(Date.now());
-    }
+    if (repos.some(r => recordGet(state.repos, r).tag === 'some')) await this.#arm(Date.now());
   }
 
   /** The minute cron: an alarm that should be set but is not is set for now (that tick then sees the gap and purges). */

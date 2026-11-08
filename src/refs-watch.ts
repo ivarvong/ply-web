@@ -10,7 +10,7 @@
 //
 // RefsWatch (one Durable Object) is the only thing that grants the long policy:
 //   lease(repo)    GitCache asks before it stores a watched answer, in parallel with its upstream ls-refs. The answer is
-//                  long-lived only when the watcher has polled that repo successfully within HEALTHY_POLL_MS (and the heartbeat ran within HEALTHY_TICK_MS); otherwise
+//                  long-lived only when the watcher has polled that repo successfully within HEALTHY_MS; otherwise
 //                  GitCache stores today's short policy. The lease keeps the repo polled for LEASE_MS, longer than any
 //                  answer granted under it can be served (two cache tiers, each max-age + swr).
 //   alarm          every WATCH_TICK_MS: ls-refs each leased repo (straight upstream, never through the cache) and purge
@@ -19,18 +19,17 @@
 //                  (GitCache aborts a watched upstream after REFS_FILL_TIMEOUT_MS < SECOND_PURGE_MS).
 //   seen(repo, …)  GitCache reports the refs it stored. A ref the watcher has not seen (a push and its revert inside one
 //                  tick, or a fill racing a push) purges the repo.
-//   poke(repos)    the mirror cron after it pushes: poll now instead of waiting for the grid.
+//   poke(repos)    the mirror cron after it pushes: poll now instead of at the next tick.
 //   ensure()       the minute cron: an alarm that should be set but is not is set for now.
 //
-// The alarm (WATCH_TICK_MS, a heartbeat) is separate from the poll grid (POLL_EVERY_TICKS): one ls-refs per poll can be a billed
-// Artifacts operation, so polls are every 4th tick; liveness, gap detection, purge retries and failing repos stay on the
-// 3 s heartbeat. Repeat purges wait for their repo's next grid tick, so purges for a push share the tick's one purge call:
-// at most one call per grid period (12 s, i.e. 5/min, the Workers Cache tag-purge refill).
+// Every tick polls every leased repo (Ivar, 2026-11-08: "Assume billing is not a factor"; a 12 s poll in 88cc23b2 took the
+// median push-to-visible from 3.6 s to 6.7 s, run fab3). A push costs two purge calls, the first and its repeat, against the Workers Cache
+// tag-purge limit of 5/min with a burst of 25; a refused purge is retried every tick.
 // Bound on how long a page can show an old head after any push (the mirror's, or one made straight to Artifacts):
-// the poll grid + one upstream ls-refs + purge propagation (≈ 12 s + 0.1-0.7 s + 0.1-0.4 s), against ~15 s before.
+// WATCH_TICK_MS + one upstream ls-refs + purge propagation (≈ 3 s + 0.1-0.7 s + 0.1-0.4 s), against ~15 s before.
 // Failure modes, each closed: a tick later than WATCH_GAP_MS (alarm stalled, DO restarted, a deploy without the watcher)
-// purges every leased repo; a repo that fails two polls FAIL_PURGE_MS apart is purged and no longer granted; a failed purge
-// is retried every tick; GitCache stores the short policy whenever the lease does not answer in LEASE_TIMEOUT_MS.
+// purges every leased repo; a repo the watcher cannot read for FAIL_PURGE_MS is purged and no longer granted; a failed
+// purge is retried every tick; GitCache stores the short policy whenever the lease does not answer in LEASE_TIMEOUT_MS.
 // What is left: the watcher and its cron both stopped for longer than a tick while an answer granted before is still
 // cached. That answer can then be served for at most WATCHED_MAX_AGE_S + WATCHED_SWR_S (×2 across tiers).
 import { captureGroup, recordGet } from './absent.ts';
@@ -40,24 +39,19 @@ export const WATCHED_MAX_AGE_S = 300;
 export const WATCHED_SWR_S = 300;
 export const WATCHED_REFS_CACHE = `public, max-age=${WATCHED_MAX_AGE_S}, stale-while-revalidate=${WATCHED_SWR_S}`;
 
-/** The alarm's period. A heartbeat: it costs no Artifacts operation unless the tick is a poll tick. */
+/** The alarm's period: one ls-refs per leased repo per tick. */
 export const WATCH_TICK_MS = 3_000;
 /** One poll's own deadline. */
 export const POLL_TIMEOUT_MS = 5_000;
-/** Poll every 4th tick (12 s). Each ls-refs may be a billed Artifacts operation ($0.15 / 1000 from 2026-11-12). */
-export const POLL_EVERY_TICKS = 4;
-export const POLL_INTERVAL_MS = POLL_EVERY_TICKS * WATCH_TICK_MS;
-/** No tick for this long: the watcher is presumed stopped and grants nothing. */
-export const HEALTHY_TICK_MS = 3 * WATCH_TICK_MS;
-/** A repo polled less recently than this is not granted: one poll period, one slow poll, one second of alarm jitter. */
-export const HEALTHY_POLL_MS = POLL_INTERVAL_MS + POLL_TIMEOUT_MS + 1_000;
+/** A repo polled less recently than this is not granted the long policy. */
+export const HEALTHY_MS = 3 * WATCH_TICK_MS;
 /** A tick this late may have missed a push: every leased repo is purged. */
 export const WATCH_GAP_MS = 4 * WATCH_TICK_MS;
 /** The upstream ls-refs of a watched fill is aborted after this, so no fill outlives the second purge. */
 export const REFS_FILL_TIMEOUT_MS = 8_000;
 export const SECOND_PURGE_MS = REFS_FILL_TIMEOUT_MS + 2_000;
-/** A repo failing two polls this far apart is purged once (fail closed) and is not granted until it reads. */
-export const FAIL_PURGE_MS = WATCH_TICK_MS;
+/** A repo the watcher has failed to read for this long is purged once (fail closed) and is not granted until it reads. */
+export const FAIL_PURGE_MS = 2 * WATCH_TICK_MS;
 /** GitCache waits this long for lease(); no answer stores the short policy. */
 export const LEASE_TIMEOUT_MS = 2_000;
 /** Longer than a granted answer can be served: two tiers, each max-age + swr, plus a minute. */
@@ -83,17 +77,13 @@ export type RepoWatch = {
   polledAt: number;
   failingSince: number | null;
   failPurged: boolean;
-  /** Poll at the next tick whatever the grid says: the mirror pushed, or a fill reported refs the watcher has not seen. */
-  pollNow: boolean;
 };
 
 export type WatchState = {
   repos: Record<string, RepoWatch>;
   /** The last tick that ran; 0 before the first. */
   tickAt: number;
-  /** Ticks run so far (absent in state written before polls left the 3 s grid): the poll grid. */
-  ticks: number;
-  /** ls-refs sent since the minute cron last read this: the number the Artifacts bill can be estimated from. */
+  /** ls-refs sent since the minute cron last read this. */
   polls: number;
   /** repo → when its repeat purge is due. */
   again: Record<string, number>;
@@ -102,7 +92,7 @@ export type WatchState = {
 };
 
 export function emptyState(): WatchState {
-  return { repos: {}, tickAt: 0, ticks: 0, polls: 0, again: {}, soon: [] };
+  return { repos: {}, tickAt: 0, polls: 0, again: {}, soon: [] };
 }
 
 export type LeaseAnswer = { grant: boolean; reason: 'ok' | 'new' | 'unpolled' | 'stale' | 'failing' | 'bad_name' };
@@ -112,14 +102,14 @@ export function leaseRepo(state: WatchState, repo: string, now: number): LeaseAn
   if (!isPublicRepoName(repo)) return { grant: false, reason: 'bad_name' };
   const found = recordGet(state.repos, repo);
   if (found.tag === 'none') {
-    state.repos[repo] = { lease: now + LEASE_MS, refs: null, polledAt: 0, failingSince: null, failPurged: false, pollNow: false };
+    state.repos[repo] = { lease: now + LEASE_MS, refs: null, polledAt: 0, failingSince: null, failPurged: false };
     return { grant: false, reason: 'new' };
   }
   const known = found.value;
   known.lease = Math.max(known.lease, now + LEASE_MS);
   if (known.refs === null) return { grant: false, reason: 'unpolled' };
   if (known.failingSince !== null) return { grant: false, reason: 'failing' };
-  if (now - state.tickAt > HEALTHY_TICK_MS || now - known.polledAt > HEALTHY_POLL_MS) return { grant: false, reason: 'stale' };
+  if (now - known.polledAt > HEALTHY_MS) return { grant: false, reason: 'stale' };
   return { grant: true, reason: 'ok' };
 }
 
@@ -130,10 +120,7 @@ export function sawRefs(state: WatchState, repo: string, seen: readonly (readonl
   const refs = known.value.refs;
   // A HEAD target the watcher did not list (its ls-refs carried no symref) is not a difference.
   const differs = seen.some(([name, oid]) => !(name === 'HEAD->' && !(name in refs)) && refs[name] !== oid);
-  if (differs) {
-    if (!state.soon.includes(repo)) state.soon.push(repo);
-    known.value.pollNow = true;
-  }
+  if (differs && !state.soon.includes(repo)) state.soon.push(repo);
   return differs;
 }
 
@@ -164,22 +151,9 @@ export function headLabel(refs: RefMap | null): string {
   return head.tag === 'none' ? `${Object.keys(refs).length} refs` : head.value.slice(0, 12);
 }
 
-/** Ticks since the first (0 for state written before the grid existed). */
-function tickCount(state: WatchState): number {
-  return state.ticks || 0;
-}
-
-/**
- * The repos to poll this tick. A repo is polled on the grid (every POLL_EVERY_TICKS ticks, so all repos poll on the same
- * tick and share one purge call), and also when it has no baseline, when something asked for it, or while it fails
- * and has not been purged yet: a failing repo is retried each tick so its failure bound does not depend on the grid.
- */
+/** The repos to poll this tick: every leased one. */
 export function pollList(state: WatchState): string[] {
-  const n = tickCount(state);
-  return Object.keys(state.repos).filter(repo => {
-    const w = state.repos[repo] as RepoWatch;
-    return w.pollNow || w.refs === null || (w.failingSince !== null && !w.failPurged) || n % POLL_EVERY_TICKS === 0;
-  }).sort();
+  return Object.keys(state.repos).sort();
 }
 
 /**
@@ -193,14 +167,13 @@ export function applyTick(state: WatchState, polls: Record<string, PollResult>, 
   const expired: string[] = [];
   const sinceMs = state.tickAt === 0 ? null : now - state.tickAt;
   const gap = sinceMs !== null && sinceMs > WATCH_GAP_MS;
-  for (const repo of Object.keys(state.repos).sort()) {
+  for (const repo of pollList(state)) {
     const watch = state.repos[repo] as RepoWatch;
     if (gap) purge.add(repo);
     const result = recordGet(polls, repo);
     const polled = result.tag === 'some' ? result.value : null;
-    if (polled !== null) watch.pollNow = false;
     if (polled === null) {
-      // Off its grid this tick, or leased while this tick's polls were in flight.
+      // Leased while this tick's polls were in flight: polled next tick.
     } else if (polled.ok) {
       // A first baseline purges too: an answer from an earlier lease of this repo may still be cached.
       if (watch.refs === null || !sameRefs(watch.refs, polled.refs)) {
@@ -228,8 +201,7 @@ export function applyTick(state: WatchState, polls: Record<string, PollResult>, 
   state.soon = [];
   const again: string[] = [];
   for (const [repo, due] of Object.entries(state.again)) {
-    // A repeat waits for its repo's next grid tick: it shares that tick's purge call, and a later repeat is never short.
-    if (due <= now && tickCount(state) % POLL_EVERY_TICKS === 0) {
+    if (due <= now) {
       again.push(repo);
       purge.add(repo);
       delete state.again[repo];
@@ -240,7 +212,6 @@ export function applyTick(state: WatchState, polls: Record<string, PollResult>, 
     if (!again.includes(repo) || changed.some(c => c.repo === repo)) state.again[repo] = now + SECOND_PURGE_MS;
   }
   state.tickAt = now;
-  state.ticks = tickCount(state) + 1;
   return { purge: [...purge].sort(), changed, gap, sinceMs, failed, expired, again };
 }
 
