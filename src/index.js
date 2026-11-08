@@ -369,19 +369,36 @@ async function invalidateRefsAfterWrite(ctx, env) {
   if (exField.tag === 'none') return { ok: false, error: 'no_exports' };
   const ref = unwrapOr(chainGet(exField.value, 'RefCache'), null);
   if (ref === null) return { ok: false, error: 'no_refcache' };
+  // Prefer RPC (bypasses Workers Cache). Fall back to POST /invalidate on the entrypoint.
   try {
-    const result = await ref.invalidateRefs(['ply-cas-ref']);
-    const okField = chainGet(result, 'ok');
-    if (okField.tag === 'some' && okField.value === false) {
-      const errField = chainGet(result, 'error');
-      const error = errField.tag === 'some' ? String(errField.value) : 'purge_failed';
-      console.warn('ref-purge-failed', error);
-      return { ok: false, error };
+    if (typeof ref.invalidateRefs === 'function') {
+      const result = await ref.invalidateRefs(['ply-cas-ref']);
+      const okField = chainGet(result, 'ok');
+      if (okField.tag === 'some' && okField.value === true) return { ok: true, error: '' };
+      if (okField.tag === 'some' && okField.value === false) {
+        const errField = chainGet(result, 'error');
+        const error = errField.tag === 'some' ? String(errField.value) : 'purge_failed';
+        console.warn('ref-purge-rpc-failed', error);
+        // fall through to fetch backup
+      }
     }
-    return { ok: true, error: '' };
+  } catch (e) {
+    console.warn('ref-purge-rpc-threw', e instanceof Error ? e.message : String(e));
+  }
+  try {
+    const binding = typeof ref === 'function' ? ref({ props: { scope: 'https://ply.invalid/purge' } }) : null;
+    if (binding === null || typeof binding.fetch !== 'function') return { ok: false, error: 'no_refcache_fetch' };
+    const res = await binding.fetch(new Request('https://cas.internal/invalidate', { method: 'POST' }));
+    const body = await res.json().catch(() => null);
+    const okField = chainGet(body, 'ok');
+    if (res.status === 200 && okField.tag === 'some' && okField.value === true) return { ok: true, error: '' };
+    const errField = chainGet(body, 'error');
+    const error = errField.tag === 'some' ? String(errField.value) : `http_${res.status}`;
+    console.warn('ref-purge-fetch-failed', error);
+    return { ok: false, error };
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e);
-    console.warn('ref-purge-threw', error);
+    console.warn('ref-purge-fetch-threw', error);
     return { ok: false, error };
   }
 }
@@ -756,7 +773,17 @@ const worker = {
           }
           const handled = await handler({ remote, q: url.searchParams, body, opts, spans, ctx, log, env, req });
           let refPurge = null;
-          if (handled.ok && WRITES[key]) refPurge = await invalidateRefsAfterWrite(ctx, env);
+          if (handled.ok && WRITES[key]) {
+            refPurge = await invalidateRefsAfterWrite(ctx, env);
+            if (refPurge && refPurge.ok === false) {
+              console.warn('ref-purge-blocking-write', refPurge.error);
+              return err(jsonOut(503, {
+                code: 'unavailable',
+                message: `ref cache purge failed after write: ${refPurge.error}`,
+                retry: 'yes',
+              }, { 'x-ply-ref-purge': `fail:${refPurge.error}`.slice(0, 120) }));
+            }
+          }
           if (!handled.ok) return plyFailure(handled.error);
           const out = handled.value;
           const stampPurge = headers => {

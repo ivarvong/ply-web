@@ -45,9 +45,14 @@ export { BLOB_CACHE_HEADER, BLOB_CACHE_MAX_AGE_SECONDS, BLOB_CACHE_MAX_BYTES, BL
 
 /** Dated 2026-11-08: object/tree/commit/resolve TTL (REPORT-blob-cache / REPORT-workers-cache). */
 export const CAS_IMMUTABLE = `public, max-age=${BLOB_CACHE_MAX_AGE_SECONDS}, immutable`;
-/** Dated 2026-11-08: ref layer — short max-age; SWR 30s (design t186u; GitCache refs uses SWR 10). */
-export const REF_SWR_S = 30;
-export const REF_CACHE_CONTROL = `public, max-age=${REFS_MAX_AGE_S}, stale-while-revalidate=${REF_SWR_S}`;
+/**
+ * Ref layer: max-age=0 must-revalidate (2026-11-08).
+ * SWR previously served pre-write tips after a missed purge (CD commit-fresh).
+ * Concurrent misses still collapse; every response revalidates through RefCache.
+ * purgeEverything on write remains the primary invalidation.
+ */
+export const REF_SWR_S = 0;
+export const REF_CACHE_CONTROL = 'public, max-age=0, must-revalidate';
 export const NO_STORE = 'no-store';
 
 /** Upstream Authorization value; must NOT be named Authorization (triggers BYPASS). */
