@@ -242,14 +242,21 @@
       }
     },
     "api:requestTimeoutMs": {
-      "value": 30000,
-      "status": "PRIOR (uncalibrated)",
-      "why": "Round per-request upstream deadline.",
+      "value": 10000,
+      "status": "calibrated",
+      "source": "loop 2026-11-08 phase6 remeasure + Workers Observability calibrate (service ply); cited in ivarvong/ply-web#73",
+      "query": "ply-loadgen phase6 worker/* latencies (identical suite) and git.response.duration_ms / request wall times on ply @ fcb0148c",
+      "window": "phase6 remeasure 2026-11-08T09:20 America/New_York; calibrate 30m post-promote",
+      "date": "2026-11-08",
+      "n": 20,
+      "percentile": "phase6 max on slowest route worker/read/big20m = 2624ms; other routes max \u2264652ms; not near 10s",
+      "headroom": "10000 is ~3.8x the observed max (2624ms); prior 30000 was PRIOR (uncalibrated)",
+      "comment": "https://github.com/ivarvong/ply-web/issues/73",
       "metric": {
-        "attribute": "git.response.duration_ms",
-        "route": "api",
-        "quantile": 0.999,
-        "headroom": 10,
+        "attribute": "http.request.duration_ms",
+        "route": "GET /v1/blob (read/big20m)",
+        "quantile": 1.0,
+        "headroom": 3.8,
         "band": 2
       }
     },

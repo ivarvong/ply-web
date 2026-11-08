@@ -461,7 +461,17 @@ const worker = {
     let rays = null;
     let collected = null;
     const spans = () => (collected ? collected.spans : []);
-    const statsOf = s => ({ spans: s.length, rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length, wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length, cache_hits: s.filter(x => x.attrs['git.response.cache'] === 'HIT').length });
+    const cacheStatusOf = a => a['git.response.cache'] || a['git.pack.cache'] || '';
+    const statsOf = s => ({
+      spans: s.length,
+      rtt: s.filter(x => /^git\.(upload-pack|receive-pack)/.test(x.name)).length,
+      wide: s.filter(x => x.attrs['git.fetch.filter.fallback']).length,
+      cache_hits: s.filter(x => cacheStatusOf(x.attrs) === 'HIT').length,
+      cache_misses: s.filter(x => {
+        const c = cacheStatusOf(x.attrs);
+        return c === 'MISS' || c === 'EXPIRED' || c === 'BYPASS';
+      }).length,
+    });
     const stamp = headers => {
       if (!rays || !collected) return;
       const report = rays.report();

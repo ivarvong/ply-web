@@ -74,6 +74,7 @@ export const REQUEST_ATTR = {
   roundTrips: 'ply.round_trips',
   wide: 'ply.wide_fetches',
   cacheHits: 'ply.cache_hits',
+  cacheMisses: 'ply.cache_misses',
 } as const
 
 /** Attributes every platform span of one request carries beside ply's own. */
@@ -257,6 +258,7 @@ const LOGGED_COUNTS = [
   ['rtt', REQUEST_ATTR.roundTrips],
   ['wide', REQUEST_ATTR.wide],
   ['cache_hits', REQUEST_ATTR.cacheHits],
+  ['cache_misses', REQUEST_ATTR.cacheMisses],
 ] as const
 
 /**

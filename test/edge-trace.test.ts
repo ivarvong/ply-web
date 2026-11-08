@@ -171,7 +171,7 @@ test('stampRequestSpan sets attributes on the runtime\'s active span, and never 
 })
 
 test('requestStamp copies the route, version, status, error and ply\'s counts from the request log', () => {
-  assert.deepEqual(requestStamp({ route: 'POST /v1/edit', version: 'v1', surface: 'api', status: 409, log: { code: 'cas_conflict', spans: 7, rtt: 3, wide: 0, cache_hits: 1 } }), {
+  assert.deepEqual(requestStamp({ route: 'POST /v1/edit', version: 'v1', surface: 'api', status: 409, log: { code: 'cas_conflict', spans: 7, rtt: 3, wide: 0, cache_hits: 1, cache_misses: 2 } }), {
     [REQUEST_ATTR.route]: 'POST /v1/edit',
     [REQUEST_ATTR.version]: 'v1',
     [REQUEST_ATTR.surface]: 'api',
@@ -181,6 +181,7 @@ test('requestStamp copies the route, version, status, error and ply\'s counts fr
     [REQUEST_ATTR.roundTrips]: 3,
     [REQUEST_ATTR.wide]: 0,
     [REQUEST_ATTR.cacheHits]: 1,
+    [REQUEST_ATTR.cacheMisses]: 2,
   })
   const unexpected = requestStamp({ route: 'unmatched', version: null, surface: 'api', status: 500, log: { code: 'internal', error_kind: 'unexpected', spans: Number.NaN, viewer: 1 } })
   assert.deepEqual(unexpected, { 'ply.route': 'unmatched', 'ply.surface': 'api', 'http.response.status_code': 500, 'ply.error.code': 'internal', 'ply.error.kind': 'unexpected' })
