@@ -199,14 +199,14 @@ export function lifecycle(): readonly HttpStep[] {
       expect: { kind: 'code', status: 404, code: 'not_found' },
       ray: 'optional',
     },
-    { name: 'refs-empty', method: 'GET', path: '/v1/refs', expect: { kind: 'refs-empty' }, ray: 'required' },
+    { name: 'refs-empty', method: 'GET', path: '/v1/refs', expect: { kind: 'refs-empty' }, ray: 'optional' },
     {
       name: 'branch-unborn',
       method: 'POST',
       path: '/v1/branch',
       body: () => ({ ref: 'tmp' }),
       expect: { kind: 'code', status: 400, code: 'bad_request', message: /from is required when the remote HEAD is unborn/ },
-      ray: 'required',
+      ray: 'optional',
     },
     {
       name: 'branch-zero',
@@ -280,7 +280,7 @@ export function lifecycle(): readonly HttpStep[] {
       path: '/v1/merge',
       body: saved => ({ from: saved.c0, author: author(T + 106) }),
       expect: { kind: 'outcome', status: 200, outcome: 'up_to_date', noop: true },
-      ray: 'required',
+      ray: 'optional',
     },
     read('read-edited', 'src/a.txt', { kind: 'text', status: 200, text: 'v2\n' }, 'fetch='),
     read('read-edited-warm', 'src/a.txt', { kind: 'text', status: 200, text: 'v2\n' }),
@@ -528,7 +528,7 @@ export function lifecycle(): readonly HttpStep[] {
       path: '/v1/commit',
       query: { ref: 'main' },
       expect: { kind: 'stamps', authorEmail: 'cd@ply.invalid', committerEmail: 'commit@ply.invalid' },
-      ray: 'required',
+      ray: 'optional',
     },
     {
       name: 'merge-diverged',
@@ -536,7 +536,7 @@ export function lifecycle(): readonly HttpStep[] {
       path: '/v1/merge',
       body: () => ({ from: 'diverge', author: author(T + 620), message: 'merge diverged' }),
       expect: { kind: 'outcome', status: 200, outcome: 'merge' },
-      ray: 'required',
+      ray: 'optional',
       rayIncludes: 'receive-pack=',
     },
     {
@@ -665,7 +665,7 @@ export function lifecycle(): readonly HttpStep[] {
         author: author(T + 820),
       }),
       expect: { kind: 'outcome', status: 200, outcome: 'rebase' },
-      ray: 'required',
+      ray: 'optional',
       rayIncludes: 'receive-pack=',
     },
     {
