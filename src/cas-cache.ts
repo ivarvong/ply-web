@@ -27,7 +27,6 @@ import {
 } from 'ply';
 import { captureGroup, chainGet, dig, header } from './absent.ts';
 import { CACHE_VERSION } from './cache-version.ts';
-import { REFS_MAX_AGE_S } from './gitcache.ts';
 import { API_LIMITS } from './limits.ts';
 import { unwrapOr } from './option.ts';
 import { withPublicReadCredential, type TokenSource } from './public.ts';
