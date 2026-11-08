@@ -1,3 +1,6 @@
+// CD correctness gate (2026-11-08 incident): after each successful blob read, a warm re-read of the
+// same path must return identical body bytes. An empty/short Workers Cache hit fails the smoke and
+// blocks promote / triggers live rollback. Do not remove these *-warm steps.
 import {
   HTTP_BAD_REQUEST,
   HTTP_METHOD_NOT_ALLOWED,
@@ -42,6 +45,9 @@ function committer(time: number) {
   return { name: 'ply cd committer', email: 'commit@ply.invalid', tz: '-0800', time }
 }
 
+/** 64 KiB of 'm' — large enough to exercise blob-cache tee/put; small enough for smoke. */
+const MEDIUM_BLOB = 'm'.repeat(65_536)
+
 /** The second commit, shared so a replay onto another branch produces the same tree. */
 export function secondChanges(): readonly Record<string, string>[] {
   return [
@@ -66,8 +72,10 @@ function rootChanges(): readonly Record<string, string>[] {
     { op: 'create', path: 'old.txt', content: 'x\n' },
     { op: 'create', path: 'bin/run', content: '#!/bin/sh\n', mode: '100755' },
     { op: 'create', path: 'link', content: 'README.md', mode: '120000' },
+    { op: 'create', path: 'blob/medium.bin', content: MEDIUM_BLOB },
   ]
 }
+
 
 const write = (name: string, body: (saved: Saved) => Record<string, unknown>, expect: Expect, save?: HttpStep['save']): HttpStep => ({
   name,
@@ -222,10 +230,14 @@ export function lifecycle(): readonly HttpStep[] {
       name: 'tree-root',
       method: 'GET',
       path: '/v1/tree',
-      expect: { kind: 'tree', names: ['README.md', 'src', 'old.txt', 'bin', 'link'] },
+      expect: { kind: 'tree', names: ['README.md', 'src', 'old.txt', 'bin', 'link', 'blob'] },
       ray: 'required',
     },
     read('read-readme', 'README.md', { kind: 'text', status: 200, text: 'hello\n' }, 'fetch='),
+    // Warm re-read of the same blob: body bytes must match. Empty cache hits fail this (2026-11-08).
+    read('read-readme-warm', 'README.md', { kind: 'text', status: 200, text: 'hello\n' }),
+    read('read-medium', 'blob/medium.bin', { kind: 'text', status: 200, text: MEDIUM_BLOB }, 'fetch='),
+    read('read-medium-warm', 'blob/medium.bin', { kind: 'text', status: 200, text: MEDIUM_BLOB }),
     write('edit-update', () => ({
       message: 'second',
       author: author(T + 100),
@@ -251,9 +263,13 @@ export function lifecycle(): readonly HttpStep[] {
       ray: 'required',
     },
     read('read-edited', 'src/a.txt', { kind: 'text', status: 200, text: 'v2\n' }, 'fetch='),
+    read('read-edited-warm', 'src/a.txt', { kind: 'text', status: 200, text: 'v2\n' }),
     read('read-added', 'ADDED.txt', { kind: 'text', status: 200, text: 'added\n' }, 'fetch='),
+    read('read-added-warm', 'ADDED.txt', { kind: 'text', status: 200, text: 'added\n' }),
     read('read-renamed', 'new.txt', { kind: 'text', status: 200, text: 'x\n' }, 'fetch='),
+    read('read-renamed-warm', 'new.txt', { kind: 'text', status: 200, text: 'x\n' }),
     read('read-written', 'notes/w.txt', { kind: 'text', status: 200, text: 'w\n' }, 'fetch='),
+    read('read-written-warm', 'notes/w.txt', { kind: 'text', status: 200, text: 'w\n' }),
     read('read-deleted', 'src/keep.txt', { kind: 'code', status: 404, code: 'not_found' }),
     {
       name: 'cas-stale',
