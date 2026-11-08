@@ -585,20 +585,22 @@ export async function serveRef(req: Request, props: CasProps, tokens: TokenSourc
   );
 }
 
-/** Purge tags + ref path prefix after a write. Must run inside RefCache (purge is entrypoint-scoped). */
-type PurgeFn = (opts: { tags: string[]; pathPrefixes: string[] }) => Promise<unknown>;
+/**
+ * Purge every RefCache entry after a write. RefCache stores only mutable tips; purgeEverything
+ * is scoped to this entrypoint (docs), so it clears all scopes' ref tips without touching
+ * Object/Tree/Commit. Tags + pathPrefixes alone still left stale HIT+SWR tips in CD (74c7519).
+ */
+type PurgeFn = (opts: { purgeEverything: true } | { tags: string[]; pathPrefixes: string[] }) => Promise<unknown>;
 export const REF_PATH_PREFIX = `/v${CACHE_VERSION}/ref/`;
-export async function purgeRefTags(ctx: object, tags: string[]): Promise<{ ok: boolean; ms: number; error: string }> {
+export async function purgeRefTags(ctx: object, _tags: string[]): Promise<{ ok: boolean; ms: number; error: string }> {
   const t0 = Date.now();
   const cacheField = dig(ctx, ['cache']);
   if (cacheField.tag === 'none' || cacheField.value === null) return { ok: false, ms: 0, error: 'no ctx.cache' };
   const purgeField = chainGet(cacheField.value, 'purge');
   if (purgeField.tag === 'none' || typeof purgeField.value !== 'function') return { ok: false, ms: 0, error: 'no purge' };
   const run = purgeField.value as PurgeFn;
-  const list = tags.length > 0 ? tags : [`ply-cas-v${CACHE_VERSION}`, 'ply-cas-ref'];
   try {
-    // Tags catch tagged fills; pathPrefixes clears every /vN/ref/* key even if Cache-Tag was dropped.
-    const result = await run({ tags: list, pathPrefixes: [REF_PATH_PREFIX] });
+    const result = await run({ purgeEverything: true });
     const success = chainGet(result, 'success');
     if (success.tag === 'some' && success.value === false) {
       const errors = chainGet(result, 'errors');

@@ -155,7 +155,7 @@ test('mergeRayHeaderValues concatenates fill rays in order', () => {
   )
 })
 
-test('purgeRefTags sends tags and /vN/ref/ pathPrefixes', async () => {
+test('purgeRefTags uses purgeEverything on RefCache (entrypoint-scoped)', async () => {
   const calls: unknown[] = []
   const ctx = {
     cache: {
@@ -167,7 +167,7 @@ test('purgeRefTags sends tags and /vN/ref/ pathPrefixes', async () => {
   }
   const out = await purgeRefTags(ctx, ['ply-cas-ref'])
   assert.equal(out.ok, true)
-  assert.deepEqual(calls, [{ tags: ['ply-cas-ref'], pathPrefixes: [REF_PATH_PREFIX] }])
+  assert.deepEqual(calls, [{ purgeEverything: true }])
   assert.equal(REF_PATH_PREFIX, `/v${CACHE_VERSION}/ref/`)
 })
 
