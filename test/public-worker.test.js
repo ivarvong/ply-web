@@ -191,21 +191,22 @@ test('a server that refuses tree:0: the viewer learns it once per isolate, a 2,1
   assert.match(dir.text, /learned earlier in this isolate|was rejected/);
 });
 
-test('Workers Cache routing: anonymous public reads reach upstream through GitCache; a credentialed read never does', { skip }, async () => {
+test('Workers Cache routing: anonymous public reads use GitCache or CAS; a credentialed read never does', { skip }, async () => {
   let i = mark();
   assert.equal((await W(`/v1/read?${q({ remote: remote('ply'), path: 'README.md' })}`)).status, 200);
   assert.equal((await W(publicView('ply', '?path=README.md'))).status, 200);
   const anon = since(i).filter(h => h.path.startsWith(`/git/${NS}/ply.git/`));
   assert.ok(anon.length > 0);
-  for (const h of anon) assert.equal(h.via, 'gitcache', `${h.method} ${h.path}`);
-  // the caller's credential (for public-v0 itself, and for another namespace): straight upstream, never through the cache
+  // Viewer pages still loop through GitCache. /v1/read|/tree|/commit use the CAS entrypoint graph (no x-ply-via).
+  for (const h of anon) assert.ok(h.via === 'gitcache' || h.via === null, `${h.method} ${h.path} via=${h.via}`);
+  // the caller's credential (for public-v0 itself, and for another namespace): straight upstream, never through GitCache
   i = mark();
   await W(`/v1/read?${q({ remote: remote('ply'), path: 'README.md' })}`, { headers: { ...bearer, 'git-token': OTHER } });
   await W(`/v1/read?${q({ remote: `${ORIGIN}/git/other/secret.git`, path: 'SECRET.md' })}`, { headers: { ...bearer, 'git-token': OTHER } });
   const cred = since(i);
   assert.ok(cred.length > 0);
   for (const h of cred) { assert.equal(h.via, null, `${h.method} ${h.path}`); assert.equal(h.auth, `Bearer ${OTHER}`); }
-  // with a bearer but no git credential, a public-v0 read is anonymous upstream-wise: cached path, Worker token
+  // /v1/refs is not on the CAS graph: still GitCache + Worker public token when no caller git credential
   i = mark();
   assert.equal((await W(`/v1/refs?${q({ remote: remote('ply') })}`, { headers: bearer })).status, 200);
   for (const h of since(i)) { assert.equal(h.via, 'gitcache'); assert.equal(h.auth, `Bearer ${TOKEN}`); }

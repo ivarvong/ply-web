@@ -39,7 +39,7 @@ import { ADVERTISED_REF_PREFIXES, isAbbreviatedOid, matchAbbreviatedOid } from '
 import { directoryReadMessage, isDirectoryRead } from './read-status.ts';
 import { BUILD_HEADER, plyBuildValue } from './version.ts';
 import { holdLastChunk } from './hold-last.ts';
-import { blobCacheBinding } from './blob-cache.ts';
+import { BLOB_CACHE_HEADER, composeCasGraph, gitAuthorizationValue } from './cas-cache.ts';
 import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from './rays.ts';
 import { usageNote } from './flags/client.ts';
 import { handleFlagHttp } from './flags/http.ts';
@@ -54,6 +54,7 @@ export { checkRemote };
 
 export { ViewerRateLimit } from './viewer/rate.ts';
 export { GitCache } from './gitcache-entry.ts';
+export { ObjectCache, TreeCache, CommitCache, ResolvePathCache, RefCache } from './cas-entries.ts';
 export { RefsWatch } from './refs-watch-entry.ts';
 export { RateCounter } from './rate/counter.ts';
 export { RateCache } from './rate/cache-entry.ts';
@@ -331,6 +332,50 @@ const traceSummary = spans => spans.map(s => `${s.name.replace(/^git\.(upload-pa
 // ---- handlers: (ctx) → Result<{ status?, body } | { stream, headers }, PlyError> ----
 // A ply call's failure is its Err, returned as the handler's. index.js answers it with errorBody and statusOf.
 
+
+
+/** True when If-None-Match lists the response ETag (weak tags and * ignored for body skip). */
+function ifNoneMatchHits(inm, etag) {
+  if (typeof inm !== 'string' || typeof etag !== 'string' || etag === '') return false;
+  if (inm.trim() === '*') return false;
+  const want = etag.trim();
+  for (const part of inm.split(',')) {
+    const raw = part.trim();
+    if (raw === '') continue;
+    const tag = raw.startsWith('W/') ? raw.slice(2).trim() : raw;
+    if (tag === want) return true;
+  }
+  return false;
+}
+
+/** CAS Workers Cache exports; null when PACK_CACHE=off. */
+function casExportsOf(env, ctx) {
+  if (env.PACK_CACHE === 'off') return null;
+  const exField = chainGet(ctx, 'exports');
+  if (exField.tag === 'none') return null;
+  const ex = exField.value;
+  return {
+    RefCache: unwrapOr(chainGet(ex, 'RefCache'), null),
+    CommitCache: unwrapOr(chainGet(ex, 'CommitCache'), null),
+    TreeCache: unwrapOr(chainGet(ex, 'TreeCache'), null),
+    ResolvePathCache: unwrapOr(chainGet(ex, 'ResolvePathCache'), null),
+    ObjectCache: unwrapOr(chainGet(ex, 'ObjectCache'), null),
+  };
+}
+
+async function invalidateRefsAfterWrite(ctx, env) {
+  if (env.PACK_CACHE === 'off') return;
+  const exField = chainGet(ctx, 'exports');
+  if (exField.tag === 'none') return;
+  const ref = unwrapOr(chainGet(exField.value, 'RefCache'), null);
+  if (ref === null || typeof ref.invalidateRefs !== 'function') return;
+  try {
+    await ref.invalidateRefs(['ply-cas-ref']);
+  } catch {
+    /* best effort; short TTL still bounds staleness */
+  }
+}
+
 const READS = {
   'GET /v1/refs': async ({ remote, q, opts }) => {
     const prefix = q.get('prefix');
@@ -351,36 +396,98 @@ const READS = {
     if (!info.ok) return info;
     return ok({ body: { ...info.value, caps: Object.fromEntries(info.value.caps) } });
   },
-  'GET /v1/tree': async ({ remote, q, opts }) => {
-    const listed = await listTree(remote, { ref: q.get('ref') || null, path: unwrapOr(queryParam(q, 'path'), '') }, opts);
-    if (!listed.ok) return listed;
-    const r = listed.value;
-    return ok({ body: { ref: r.ref, commit: r.commit, tree: r.tree, entries: r.entries } });
-  },
-  'GET /v1/commit': async ({ remote, q, opts }) => {
-    const read = await readCommitOrEmpty(remote, q.get('ref') || null, opts);
-    return read.ok ? ok({ body: read.value }) : read;
-  },
-  'GET /v1/read': async ({ remote, q, opts, spans, ctx, log }) => {
-    const blobCache = blobCacheBinding(typeof ctx.waitUntil === 'function' ? (p) => ctx.waitUntil(p) : null);
-    const read = await readFile(remote, { ref: q.get('ref') || null, path: q.get('path') }, { ...opts, ...(blobCache ? { blobCache } : {}) });
-    if (!read.ok) {
-      const e = read.error;
-      if (!isDirectoryRead(e)) return read;
-      const message = chainGet(e, 'message');
-      return err(plyError('bad_request', directoryReadMessage(String(message.tag === 'some' ? message.value : e))));
+  'GET /v1/tree': async ({ remote, q, opts, ctx, env }) => {
+    const cas = casExportsOf(env, ctx);
+    const authHeader = gitAuthorizationValue(unwrapOr(chainGet(opts, 'auth'), null));
+    if (cas === null || cas.RefCache === null) {
+      const listed = await listTree(remote, { ref: q.get('ref') || null, path: unwrapOr(queryParam(q, 'path'), '') }, opts);
+      if (!listed.ok) return listed;
+      const r = listed.value;
+      return ok({ body: { ref: r.ref, commit: r.commit, tree: r.tree, entries: r.entries } });
     }
-    const r = read.value;
-    const fixed = new FixedLengthStream(r.size);
-    // a verification failure aborts the body short of its Content-Length: the client sees a truncated response, never a
-    // clean one with the wrong bytes. holdLastChunk keeps the final bytes back until the blob verified (src/hold-last.ts).
-    ctx.waitUntil(holdLastChunk(r.stream).pipeTo(fixed.writable).then(() => log({ stream: 'ok' }), e => {
-      const code = chainGet(e, 'code');
-      log({ stream: 'error', stream_code: code.tag === 'some' ? code.value : 'error' });
-    }));
-    const headers = new Headers({ 'content-type': 'application/octet-stream', 'x-ply-ref': r.ref, 'x-ply-commit': r.commit, 'x-ply-blob': r.blob, 'x-ply-mode': r.mode, 'x-ply-size': String(r.size) });
+    const composed = await composeCasGraph({
+      remote, ref: q.get('ref') || null, path: unwrapOr(queryParam(q, 'path'), ''), authHeader, exports: cas, want: 'tree', bypass: false, tracer: unwrapOr(chainGet(opts, 'tracer'), null),
+    });
+    if (!composed.ok) return err(plyError(composed.code, composed.message));
+    if (composed.kind !== 'tree') return err(plyError('bad_request', 'unexpected cas kind'));
+    const headers = new Headers(composed.cache);
+    return ok({ body: composed.body, headers });
+  },
+  'GET /v1/commit': async ({ remote, q, opts, ctx, env }) => {
+    const cas = casExportsOf(env, ctx);
+    const authHeader = gitAuthorizationValue(unwrapOr(chainGet(opts, 'auth'), null));
+    if (cas === null || cas.RefCache === null) {
+      const read = await readCommitOrEmpty(remote, q.get('ref') || null, opts);
+      return read.ok ? ok({ body: read.value }) : read;
+    }
+    const composed = await composeCasGraph({
+      remote, ref: q.get('ref') || null, path: null, authHeader, exports: cas, want: 'commit', bypass: false, tracer: unwrapOr(chainGet(opts, 'tracer'), null),
+    });
+    if (!composed.ok) return err(plyError(composed.code, composed.message));
+    if (composed.kind !== 'commit') return err(plyError('bad_request', 'unexpected cas kind'));
+    const headers = new Headers(composed.cache);
+    return ok({ body: composed.body, headers });
+  },
+  'GET /v1/read': async ({ remote, q, opts, spans, ctx, log, env, req }) => {
+    const path = q.get('path');
+    if (path === null || path === '') return err(plyError('bad_request', 'path is required'));
+    const cas = casExportsOf(env, ctx);
+    const authHeader = gitAuthorizationValue(unwrapOr(chainGet(opts, 'auth'), null));
+    let stream, size, meta, cacheHeaders = {};
+    if (cas === null || cas.RefCache === null || cas.ObjectCache === null) {
+      const read = await readFile(remote, { ref: q.get('ref') || null, path }, opts);
+      if (!read.ok) {
+        const e = read.error;
+        if (!isDirectoryRead(e)) return read;
+        const message = chainGet(e, 'message');
+        return err(plyError('bad_request', directoryReadMessage(String(message.tag === 'some' ? message.value : e))));
+      }
+      stream = read.value.stream;
+      size = read.value.size;
+      meta = { ref: read.value.ref, commit: read.value.commit, blob: read.value.blob, mode: read.value.mode, etag: `"${read.value.blob}"` };
+      cacheHeaders = { [BLOB_CACHE_HEADER]: 'BYPASS' };
+    } else {
+      const composed = await composeCasGraph({
+        remote, ref: q.get('ref') || null, path, authHeader, exports: cas, want: 'blob', bypass: false,
+        tracer: unwrapOr(chainGet(opts, 'tracer'), null),
+      });
+      if (!composed.ok) {
+        if (composed.code === 'bad_request' && /directory/.test(composed.message)) {
+          return err(plyError('bad_request', directoryReadMessage(composed.message)));
+        }
+        return err(plyError(composed.code, composed.message));
+      }
+      if (composed.kind !== 'blob') return err(plyError('bad_request', 'unexpected cas kind'));
+      stream = composed.stream;
+      size = composed.size;
+      meta = composed.meta;
+      cacheHeaders = composed.cache;
+    }
+    const headers = new Headers({
+      'content-type': 'application/octet-stream',
+      'x-ply-ref': meta.ref,
+      'x-ply-commit': meta.commit,
+      'x-ply-blob': meta.blob,
+      'x-ply-mode': meta.mode,
+      'x-ply-size': String(size),
+      etag: meta.etag,
+      ...cacheHeaders,
+    });
     const summary = traceSummary(spans());
     if (q.get('trace') === '1' && summary) headers.set('x-ply-trace', summary);
+    // ETag is the blob oid; If-None-Match → 304. Public /v1/read stays Cache-Control: no-store.
+    const inm = req.headers.get('if-none-match');
+    if (inm !== null && ifNoneMatchHits(inm, meta.etag)) {
+      if (stream !== null && typeof stream.cancel === 'function') {
+        stream.cancel().catch(() => {});
+      }
+      return ok(new Response(null, { status: 304, headers }));
+    }
+    const fixed = new FixedLengthStream(size);
+    ctx.waitUntil(holdLastChunk(stream).pipeTo(fixed.writable).then(() => log({ stream: 'ok', ...cacheHeaders }), e => {
+      const code = chainGet(e, 'code');
+      log({ stream: 'error', stream_code: code.tag === 'some' ? code.value : 'error', ...cacheHeaders });
+    }));
     return ok({ stream: fixed.readable, headers });
   },
 };
@@ -621,7 +728,8 @@ const worker = {
               url.searchParams.set('ref', match.oid);
             }
           }
-          const handled = await handler({ remote, q: url.searchParams, body, opts, spans, ctx, log });
+          const handled = await handler({ remote, q: url.searchParams, body, opts, spans, ctx, log, env, req });
+          if (handled.ok && WRITES[key]) await invalidateRefsAfterWrite(ctx, env);
           if (!handled.ok) return plyFailure(handled.error);
           const out = handled.value;
           if (out && typeof out === 'object' && 'stream' in out) {
@@ -637,6 +745,11 @@ const worker = {
           const status = unwrapOr(chainGet(out, 'status'), 200);
           const rayHeaders = new Headers();
           stamp(rayHeaders);
+          // CAS layer cache statuses (x-ply-cache-*) from composeCasGraph.
+          const casHeaders = chainGet(out, 'headers');
+          if (casHeaders.tag === 'some' && casHeaders.value instanceof Headers) {
+            for (const [k, v] of casHeaders.value) rayHeaders.set(k, v);
+          }
           const s = spans();
           const extra = Object.fromEntries(rayHeaders);
           const stats = statsOf(s);
