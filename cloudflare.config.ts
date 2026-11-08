@@ -36,9 +36,9 @@ const durableObjects = {
 	RefsWatch: exports.durableObject({ storage: "sqlite" }),
 } as const;
 
-// Workers Caching (never the Cache API). The default entrypoint is uncached so it always runs (rate limit, logs, scrub,
-// traces). It sends public upload-pack exchanges to the cache-enabled GitCache over ctx.exports (src/gitcache.ts).
-// crossVersionCache keeps immutable packs across deploys; CACHE_VERSION (src/cache-version.ts) is in every key.
+// Workers Caching (never the Cache API / caches.default). The default entrypoint is uncached so it always runs (rate limit,
+// logs, scrub, traces). It sends public upload-pack to GitCache and authenticated inflated blobs to BlobCache over
+// ctx.exports. crossVersionCache keeps immutable content across deploys; CACHE_VERSION (src/cache-version.ts) is in every key.
 // Named entrypoints omit `cache` or set `enabled: true`. `enabled: false` does not compile:
 // the versions API rejects that block on a named entrypoint with error 10375. The default
 // entrypoint is the one place the block is accepted. Caching is off when the block is omitted.
@@ -51,6 +51,12 @@ export function namedEntrypoint<const T extends NamedWorkerOptions>(options: T):
 export const entrypoints = {
 	default: exports.worker({ cache: { enabled: false } }),
 	GitCache: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
+	// CAS graph (src/cas-cache.ts / cas-entries.ts): content-addressed layers via ctx.exports; props.scope partitions.
+	ObjectCache: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
+	TreeCache: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
+	CommitCache: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
+	ResolvePathCache: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
+	RefCache: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
 	// Whole responses pinned to a commit oid (src/pinned.ts): /v1 tree/read/commit and viewer raw files.
 	Pinned: exports.worker(namedEntrypoint({ cache: { enabled: true } })),
 	// The one flag ruleset (src/flags/cache.ts). Caching stays off on the default entrypoint, which always runs.

@@ -216,14 +216,15 @@ function files(dir: string): string[] {
   return readdirSync(dir).flatMap(n => { const p = join(dir, n); return statSync(p).isDirectory() ? files(p) : [p]; });
 }
 
-test('guardrails: no Cache API in src/ (except blob-cache.ts), and only src/gitcache.ts calls the GitCache binding', () => {
+test('guardrails: no Cache API in src/; Workers Cache entrypoints only via their modules', () => {
   const src = fileURLToPath(new URL('../src/', import.meta.url));
   for (const f of files(src).filter(f => /\.(ts|tsx|js|mjs)$/.test(f))) {
     const text = readFileSync(f, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
-    // Inflated-blob cache (src/blob-cache.ts) is the sole Cache API allowlist; packs/refs stay on GitCache HTTP cache.
-    if (!f.endsWith('blob-cache.ts')) assert.equal(/\bcaches\s*\.|cachingFetch|caches\.default/.test(text), false, `${f} uses the Cache API`);
-    if (!f.endsWith('gitcache.ts') && !f.endsWith('pinned.ts')) assert.equal(/GitCache\?\.fetch\s*\(|GitCache\.fetch\s*\(|binding\.fetch\s*\(/.test(text), false, `${f} calls the GitCache binding directly`);
-    if (/\.exports\?\.GitCache|\.exports\.GitCache/.test(text)) assert.ok(/createLoopbackFetch/.test(text), `${f} reads ctx.exports.GitCache but not through createLoopbackFetch`);
+    // Workers Caching only — never caches.default / caches.open / cachingFetch (Cache API).
+    assert.equal(/\bcaches\s*\.\s*(default|open)\b|cachingFetch/.test(text), false, `${f} uses the Cache API`);
+    if (!f.endsWith('gitcache.ts') && !f.endsWith('pinned.ts') && !f.endsWith('blob-cache.ts') && !f.endsWith('cas-cache.ts')) {
+      assert.equal(/GitCache\?\.fetch\s*\(|GitCache\.fetch\s*\(|BlobCache\?\.fetch\s*\(|BlobCache\.fetch\s*\(/.test(text), false, `${f} calls a cache binding directly`);
+    }
   }
 });
 

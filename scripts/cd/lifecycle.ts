@@ -236,6 +236,17 @@ export function lifecycle(): readonly HttpStep[] {
     read('read-readme', 'README.md', { kind: 'text', status: 200, text: 'hello\n' }, 'fetch='),
     // Warm re-read of the same blob: body bytes must match. Empty cache hits fail this (2026-11-08).
     read('read-readme-warm', 'README.md', { kind: 'text', status: 200, text: 'hello\n' }),
+    // After a warm Workers Cache fill, an unauthenticated /v1/read must still 401 (auth never skipped).
+    {
+      name: 'read-readme-warm-unauth',
+      method: 'GET',
+      path: '/v1/read',
+      query: { path: 'README.md' },
+      ply: false,
+      git: false,
+      expect: { kind: 'code', status: HTTP_UNAUTHORIZED, code: 'unauthorized' },
+      ray: 'absent',
+    },
     read('read-medium', 'blob/medium.bin', { kind: 'text', status: 200, text: MEDIUM_BLOB }, 'fetch='),
     read('read-medium-warm', 'blob/medium.bin', { kind: 'text', status: 200, text: MEDIUM_BLOB }),
     write('edit-update', () => ({
@@ -246,6 +257,14 @@ export function lifecycle(): readonly HttpStep[] {
     }), {
       kind: 'outcome', status: 200, outcome: 'commit', equals: [{ field: 'oldOid', key: 'c0' }],
     }, [{ key: 'c1', field: 'oid' }]),
+    // Ref freshness: after write + RefCache purge, /v1/commit must see c1 (not a stale ref hit).
+    {
+      name: 'commit-fresh-after-write',
+      method: 'GET',
+      path: '/v1/commit',
+      expect: { kind: 'parents', count: 1, oidEquals: 'c1' },
+      ray: 'required',
+    },
     {
       name: 'merge-zero',
       method: 'POST',
