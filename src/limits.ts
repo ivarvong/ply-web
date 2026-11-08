@@ -23,7 +23,7 @@ export const API_CAPS = Object.freeze({
   maxPackObjects: 100_000,
   // One ref listing is buffered, so it shares the pack byte cap.
   maxLsRefsBytes: 32 * MIB,
-  requestTimeoutMs: 30_000,
+  requestTimeoutMs: 10_000,
   /** A JSON request body (src/index.js readJson). */
   maxBodyBytes: MIB,
 })

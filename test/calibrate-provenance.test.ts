@@ -23,6 +23,7 @@ test('the checked-in calibrated entries are the ones with a measured run behind 
   const { registry } = loadRegistry()
   const calibrated = [...registry.thresholds.entries()].filter(([, entry]) => entry.status === CALIBRATED).map(([key]) => key).sort()
   assert.deepEqual(calibrated, [
+    'api:requestTimeoutMs',
     'policy:cleanup.attempts',
     'policy:ingestWaitMs',
     'policy:probe.maxLossRate',
