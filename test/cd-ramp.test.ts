@@ -274,7 +274,7 @@ test('the ramp waits out the policy ingest lag, and a warm-up, before it reads t
     rollback: async () => null,
   })
   assert.equal(result.state.kind, 'complete')
-  assert.deepEqual(slept, [40, 20_000])
+  assert.deepEqual(slept, [40, 30_000])
   const warmed: number[] = []
   await runRamp(policy([{ percent: 100, dwellMs: 40 }], 5_000), {
     now: () => 0,
@@ -283,7 +283,7 @@ test('the ramp waits out the policy ingest lag, and a warm-up, before it reads t
     observe: async () => atPercent(100),
     rollback: async () => null,
   })
-  assert.deepEqual(warmed, [5_000, 40, 20_000])
+  assert.deepEqual(warmed, [5_000, 40, 30_000])
 })
 
 test('a decision callback without an observation ref throws', async () => {

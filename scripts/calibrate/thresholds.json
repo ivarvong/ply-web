@@ -41,15 +41,15 @@
       "headroom": "10%: 1500 issued x 0.0874 = 131 new vs split.minNewRequests 100. 25-75%: 1250 issued, 25% above probe.minSamples 1000. 100%: unchanged, bounded by the live checks. Full derivation: cd.policy.json calibration[steps[*].dwellMs]."
     },
     "policy:ingestWaitMs": {
-      "value": 20000,
+      "value": 30000,
       "status": "calibrated",
-      "source": "run 2026-11-01T00-10-02-620Z",
-      "query": "per-step ingest gap: last event timestamp minus dwell end, Workers Observability events view, service ply",
-      "window": "1% and 5% ramp steps",
-      "date": "2026-11-01",
-      "n": 2,
-      "percentile": "max of two measured gaps (12640ms, 17313ms); not a percentile",
-      "headroom": "20000 is 1.16x the larger gap"
+      "source": "run 2026-11-08T16-58-16-960Z (first ramp-only run, polled ingest); earlier run 2026-11-01T00-10-02-620Z",
+      "query": "ramp-step aggregateRequests per poll against the step's issued probes, after the dwell end",
+      "window": "10/25/50/75/100% ramp steps",
+      "date": "2026-11-08",
+      "n": 5,
+      "percentile": "at the 20000 ceiling the 10-75% steps had logged 0.929/0.937/0.927/0.932 of issued probes, still rising (1146 -> 1165 at 75%); the 100% step reached 0.9985 at 19 s; not a percentile",
+      "headroom": "30000 (the direct promote's ceiling, promote.ingestWaitMs) gives the poll 10 s more to reach INGEST_LANDED 0.98; the poll still stops as soon as it does"
     },
     "policy:warmupMs": {
       "value": 10000,

@@ -23,7 +23,7 @@ test('the checked-in policy is the correctness ramp', () => {
   assert.equal(loaded.policy.gates.errorLogs, 'hard')
   assert.equal(loaded.policy.gates.nonOk, 'hard')
   assert.equal(loaded.policy.gates.burn, 'hard')
-  assert.equal(loaded.policy.ingestWaitMs, 20_000)
+  assert.equal(loaded.policy.ingestWaitMs, 30_000)
   assert.equal(loaded.policy.warmupMs, 10_000)
   assert.equal(loaded.policy.probe.rps, 25)
   assert.deepEqual(loaded.policy.probe.calls.map(call => call.path), [
