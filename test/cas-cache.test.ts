@@ -8,11 +8,14 @@ import {
   gitAuthorizationValue,
   isBlobEntry,
   layerHeader,
+  mergeRayHeaderValues,
   parseCommitPath,
   parseObjectPath,
   parseRefPath,
   parseResolvePath,
   parseTreePath,
+  purgeRefTags,
+  REF_PATH_PREFIX,
   serveObject,
   serveRef,
   splitFilePath,
@@ -136,4 +139,84 @@ test('viaCas strips Authorization and surfaces cf-cache-status', async () => {
   assert.equal(seen[0], 'Bearer secret')
   const body = chainGet(res, 'body')
   if (body.tag === 'some' && body.value !== null) await (body.value as ReadableStream).cancel()
+})
+
+import { RAY_HEADER } from '../src/rays.ts'
+
+test('mergeRayHeaderValues concatenates fill rays in order', () => {
+  assert.equal(mergeRayHeaderValues(null, ''), '')
+  assert.equal(
+    mergeRayHeaderValues('ls-refs=aaaaaaaaaaaaaaaa-IAD;dur=1', 'fetch=bbbbbbbbbbbbbbbb-IAD;dur=2'),
+    'ls-refs=aaaaaaaaaaaaaaaa-IAD;dur=1, fetch=bbbbbbbbbbbbbbbb-IAD;dur=2',
+  )
+  assert.equal(
+    mergeRayHeaderValues('ls-refs=-;dur=1, fetch=-;dur=2', 'ls-refs=-;dur=3'),
+    'ls-refs=-;dur=1, fetch=-;dur=2, ls-refs=-;dur=3',
+  )
+})
+
+test('purgeRefTags sends tags and /vN/ref/ pathPrefixes', async () => {
+  const calls: unknown[] = []
+  const ctx = {
+    cache: {
+      purge: async (opts: unknown) => {
+        calls.push(opts)
+        return { success: true }
+      },
+    },
+  }
+  const out = await purgeRefTags(ctx, ['ply-cas-ref'])
+  assert.equal(out.ok, true)
+  assert.deepEqual(calls, [{ tags: ['ply-cas-ref'], pathPrefixes: [REF_PATH_PREFIX] }])
+  assert.equal(REF_PATH_PREFIX, `/v${CACHE_VERSION}/ref/`)
+})
+
+test('purgeRefTags reports missing ctx.cache (RefCache live / uncached)', async () => {
+  const out = await purgeRefTags({}, ['ply-cas-ref'])
+  assert.equal(out.ok, false)
+  assert.equal(out.error, 'no ctx.cache')
+})
+
+test('purgeRefTags surfaces success:false from Workers Cache', async () => {
+  const ctx = {
+    cache: {
+      purge: async () => ({ success: false, errors: [{ code: 1, message: 'rate limited' }] }),
+    },
+  }
+  const out = await purgeRefTags(ctx, ['ply-cas-ref'])
+  assert.equal(out.ok, false)
+  assert.match(out.error, /rate limited/)
+})
+
+test('HIT preserves stored fill x-artifacts-ray (memory tier)', async () => {
+  const store = new Map<string, { status: number; headers: Headers; body: Uint8Array }>()
+  const binding: CasBinding = () => ({
+    async fetch(input) {
+      const req = input instanceof Request ? input : new Request(String(input))
+      const key = new URL(req.url).pathname
+      const hit = store.get(key)
+      if (hit) {
+        const h = new Headers(hit.headers)
+        h.set('cf-cache-status', 'HIT')
+        return new Response(hit.body.slice(), { status: hit.status, headers: h })
+      }
+      const body = new TextEncoder().encode(JSON.stringify({ commit: 'c'.repeat(40) }))
+      const headers = new Headers({
+        'content-type': 'application/json',
+        'cache-control': 'public, max-age=60',
+        [RAY_HEADER]: 'ls-refs=cccccccccccccccc-IAD;dur=9, fetch=dddddddddddddddd-IAD;dur=11',
+      })
+      store.set(key, { status: 200, headers: new Headers(headers), body })
+      headers.set('cf-cache-status', 'MISS')
+      return new Response(body.slice(), { status: 200, headers })
+    },
+  })
+  const miss = await viaCas(binding, 'commit', 'c'.repeat(40), 'https://ex.example/a.git', null)
+  assert.equal(miss.headers.get('x-ply-cache-commit'), 'MISS')
+  assert.equal(miss.headers.get(RAY_HEADER), 'ls-refs=cccccccccccccccc-IAD;dur=9, fetch=dddddddddddddddd-IAD;dur=11')
+  await miss.arrayBuffer()
+  const hit = await viaCas(binding, 'commit', 'c'.repeat(40), 'https://ex.example/a.git', null)
+  assert.equal(hit.headers.get('x-ply-cache-commit'), 'HIT')
+  assert.equal(hit.headers.get(RAY_HEADER), 'ls-refs=cccccccccccccccc-IAD;dur=9, fetch=dddddddddddddddd-IAD;dur=11')
+  await hit.arrayBuffer()
 })
