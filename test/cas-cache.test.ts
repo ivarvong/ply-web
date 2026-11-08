@@ -58,11 +58,11 @@ function memoryTier(): { binding: (layer: CasLayer) => CasBinding; fills: Map<st
   const store = new Map<string, { status: number; headers: Headers; body: Uint8Array }>()
   const fills = new Map<string, number>()
   function binding(layer: CasLayer): CasBinding {
-    return {
-      async fetch(input, init) {
+    return (opts) => ({
+      async fetch(input) {
         const req = input instanceof Request ? input : new Request(String(input))
         assert.equal(req.headers.get('authorization'), null)
-        const props = init.props
+        const props = opts.props
         const key = `${layer}\0${new URL(req.url).pathname}\0${props.scope}`
         const hit = store.get(key)
         if (hit) {
@@ -82,7 +82,7 @@ function memoryTier(): { binding: (layer: CasLayer) => CasBinding; fills: Map<st
         headers.set('cf-cache-status', 'MISS')
         return new Response(body.slice(), { status: 200, headers })
       },
-    }
+    })
   }
   return { binding, fills }
 }
@@ -120,16 +120,16 @@ test('cross-scope isolation at every layer', async () => {
 
 test('viaCas strips Authorization and surfaces cf-cache-status', async () => {
   const seen: string[] = []
-  const binding: CasBinding = {
-    async fetch(input, init) {
+  const binding: CasBinding = (opts) => ({
+    async fetch(input) {
       const req = input instanceof Request ? input : new Request(String(input))
       const auth = req.headers.get(CAS_AUTH_HEADER)
       seen.push(auth === null ? '' : auth)
       assert.equal(req.headers.get('authorization'), null)
-      assert.deepEqual(init.props, { scope: 'https://ex.example/r.git' })
+      assert.deepEqual(opts.props, { scope: 'https://ex.example/r.git' })
       return new Response('x', { status: 200, headers: { 'cf-cache-status': 'HIT', 'x-ply-size': '1' } })
     },
-  }
+  })
   const res = await viaCas(binding, 'object', 'd'.repeat(40), 'https://ex.example/r.git', 'Bearer secret')
   assert.equal(res.headers.get(layerHeader('object')), 'HIT')
   assert.equal(res.headers.get('cf-cache-status'), null)

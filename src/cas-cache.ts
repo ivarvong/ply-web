@@ -22,12 +22,17 @@ import {
   openBlob,
   parseTree,
   readBlob,
+  refCandidates,
+  validatePath,
 } from 'ply';
 import { captureGroup, chainGet, header } from './absent.ts';
 import { CACHE_VERSION } from './cache-version.ts';
 import { REFS_MAX_AGE_S } from './gitcache.ts';
+import { API_LIMITS } from './limits.ts';
 import { unwrapOr } from './option.ts';
 import { withPublicReadCredential, type TokenSource } from './public.ts';
+import { quirksFor } from './quirks.ts';
+import { checkRemote, createGuardedFetch, redirectOptions } from './remote.ts';
 
 export { BLOB_CACHE_HEADER, BLOB_CACHE_MAX_AGE_SECONDS, BLOB_CACHE_MAX_BYTES, BLOB_OID_HEADER };
 
@@ -44,9 +49,9 @@ export const CAS_ORIGIN = 'https://cas.internal';
 
 export type CasProps = { readonly scope: string };
 
-export type CasFetchInit = { readonly props: CasProps };
+/** ctx.exports.<Entrypoint> is callable with { props } then .fetch (LoopbackServiceStub). */
 export type CasBinding = {
-  fetch(input: RequestInfo | URL, init: CasFetchInit): Promise<Response>;
+  (opts: { readonly props: CasProps }): { fetch(input: RequestInfo | URL): Promise<Response> };
 };
 
 export type CasLayer = 'ref' | 'commit' | 'tree' | 'resolve' | 'object';
@@ -66,6 +71,21 @@ function plain(status: number, text: string): Response {
     status,
     headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': NO_STORE },
   });
+}
+
+/** Map ply fetch errors: not_found and upload-pack not_our_ref → 404; else 502. */
+function upstreamStatus(error: unknown): number {
+  const code = chainGet(error, 'code');
+  if (code.tag === 'some' && code.value === 'not_found') return 404;
+  if (code.tag === 'some' && code.value === 'remote_error') {
+    const reason = chainGet(error, 'reason');
+    if (reason.tag === 'some' && reason.value === 'not_our_ref') return 404;
+  }
+  if (code.tag === 'some' && code.value === 'http') {
+    const status = chainGet(error, 'status');
+    if (status.tag === 'some' && status.value === 404) return 404;
+  }
+  return 502;
 }
 
 function ifNoneMatchHits(inm: string | null, etag: string): boolean {
@@ -135,12 +155,29 @@ export type TransportResult =
   | { readonly ok: true; readonly value: PlyTransport }
   | { readonly ok: false; readonly response: Response };
 
-export function transportFor(req: Request, scope: string, tokens: TokenSource | null): TransportResult {
+export function allowOriginsFromEnv(env: object): readonly string[] {
+  const field = chainGet(env, 'ALLOW_REMOTE_ORIGINS');
+  const raw = field.tag === 'some' && typeof field.value === 'string' ? field.value : '';
+  return raw.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+export function transportFor(req: Request, scope: string, tokens: TokenSource | null, allow: readonly string[] = []): TransportResult {
   const auth = authorizationFrom(req);
-  const fetchImpl = withPublicReadCredential(globalThis.fetch.bind(globalThis), tokens);
-  const transport = createTransport(scope, {
+  let remote;
+  try {
+    remote = checkRemote(scope, allow);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { ok: false, response: plain(400, msg) };
+  }
+  const direct = withPublicReadCredential(globalThis.fetch.bind(globalThis), tokens);
+  const fetchImpl = createGuardedFetch(direct, remote, allow);
+  const transport = createTransport(remote.href, {
     ...(auth === null ? {} : { auth }),
     fetchImpl,
+    limits: API_LIMITS,
+    quirks: quirksFor(remote.origin),
+    ...redirectOptions(remote, allow),
   });
   if (!transport.ok) return { ok: false, response: plain(400, transport.error.message) };
   return { ok: true, value: transport.value };
@@ -159,9 +196,10 @@ export async function viaCas(
   headers.delete('authorization');
   headers.delete('Authorization');
   if (gitAuthorization !== null && gitAuthorization !== '') headers.set(CAS_AUTH_HEADER, gitAuthorization);
-  const res = await binding.fetch(new Request(`${CAS_ORIGIN}${casPath(layer, pathRest)}`, { ...init, headers, redirect: 'manual' }), {
-    props: { scope },
-  });
+  // LoopbackServiceStub: binding({ props }).fetch(req) — props land on the callee's ctx.props (cache key).
+  const res = await binding({ props: { scope } }).fetch(
+    new Request(`${CAS_ORIGIN}${casPath(layer, pathRest)}`, { ...init, headers, redirect: 'manual' }),
+  );
   const out = new Headers(res.headers);
   out.set(layerHeader(layer), unwrapOr(header(res.headers, 'cf-cache-status'), unwrapOr(header(res.headers, layerHeader(layer)), 'NONE')));
   out.delete('cf-cache-status');
@@ -248,20 +286,18 @@ export function encodeResolveRest(commit: string, path: string): string {
 
 // ── serve layers ────────────────────────────────────────────────────────────
 
-export async function serveObject(req: Request, props: CasProps, tokens: TokenSource | null): Promise<Response> {
+export async function serveObject(req: Request, props: CasProps, tokens: TokenSource | null, allow: readonly string[] = []): Promise<Response> {
   if (req.method !== 'GET' && req.method !== 'HEAD') return plain(405, 'method not allowed');
   const oid = parseObjectPath(new URL(req.url).pathname);
   if (oid === null) return plain(404, 'not an object key');
   const scoped = parseScope(props);
   if (scoped instanceof Response) return scoped;
-  const t = transportFor(req, scoped.scope, tokens);
+  const t = transportFor(req, scoped.scope, tokens, allow);
   if (!t.ok) return t.response;
 
   const buffered = await readBlob(t.value, oid, { maxBytes: BLOB_CACHE_MAX_BYTES });
   if (!buffered.ok) {
-    const code = chainGet(buffered.error, 'code');
-    const status = code.tag === 'some' && code.value === 'not_found' ? 404 : 502;
-    return plain(status, buffered.error.message);
+    return plain(upstreamStatus(buffered.error), buffered.error.message);
   }
   if (buffered.value.kind === 'too_big') {
     const opened = await openBlob(t.value, oid);
@@ -296,20 +332,18 @@ export async function serveObject(req: Request, props: CasProps, tokens: TokenSo
   return new Response(data, { status: 200, headers });
 }
 
-export async function serveTree(req: Request, props: CasProps, tokens: TokenSource | null): Promise<Response> {
+export async function serveTree(req: Request, props: CasProps, tokens: TokenSource | null, allow: readonly string[] = []): Promise<Response> {
   if (req.method !== 'GET' && req.method !== 'HEAD') return plain(405, 'method not allowed');
   const oid = parseTreePath(new URL(req.url).pathname);
   if (oid === null) return plain(404, 'not a tree key');
   const scoped = parseScope(props);
   if (scoped instanceof Response) return scoped;
-  const t = transportFor(req, scoped.scope, tokens);
+  const t = transportFor(req, scoped.scope, tokens, allow);
   if (!t.ok) return t.response;
 
   const fetched = await fetchObject(t.value, { oid, expectType: TYPE.TREE });
   if (!fetched.ok) {
-    const code = chainGet(fetched.error, 'code');
-    const status = code.tag === 'some' && code.value === 'not_found' ? 404 : 502;
-    return plain(status, fetched.error.message);
+    return plain(upstreamStatus(fetched.error), fetched.error.message);
   }
   if (fetched.value.type !== TYPE.TREE) return plain(502, 'not a tree');
   const parsed = parseTree(fetched.value.data);
@@ -323,22 +357,20 @@ export async function serveTree(req: Request, props: CasProps, tokens: TokenSour
   return jsonOk({ tree: oid, entries }, CAS_IMMUTABLE, oid, 'tree');
 }
 
-export async function serveCommit(req: Request, props: CasProps, tokens: TokenSource | null): Promise<Response> {
+export async function serveCommit(req: Request, props: CasProps, tokens: TokenSource | null, allow: readonly string[] = []): Promise<Response> {
   if (req.method !== 'GET' && req.method !== 'HEAD') return plain(405, 'method not allowed');
   const oid = parseCommitPath(new URL(req.url).pathname);
   if (oid === null) return plain(404, 'not a commit key');
   const scoped = parseScope(props);
   if (scoped instanceof Response) return scoped;
-  const t = transportFor(req, scoped.scope, tokens);
+  const t = transportFor(req, scoped.scope, tokens, allow);
   if (!t.ok) return t.response;
 
   const fetched = await fetchObject(t.value, { oid, expectType: TYPE.COMMIT });
   if (!fetched.ok) {
-    const code = chainGet(fetched.error, 'code');
-    const status = code.tag === 'some' && code.value === 'not_found' ? 404 : 502;
-    return plain(status, fetched.error.message);
+    return plain(upstreamStatus(fetched.error), fetched.error.message);
   }
-  if (fetched.value.type !== TYPE.COMMIT) return plain(502, 'not a commit');
+  if (fetched.value.type !== TYPE.COMMIT) return plain(404, `${oid} is not a commit`);
   const viewed = commitView(fetched.value.data);
   if (!viewed.ok) return plain(502, viewed.error.message);
   const view = viewed.value;
@@ -369,6 +401,7 @@ export async function serveResolve(
   props: CasProps,
   _tokens: TokenSource | null,
   loop: { readonly tree: TreeLoopback; readonly commit: CommitLoopback },
+  _allow: readonly string[] = [],
 ): Promise<Response> {
   if (req.method !== 'GET' && req.method !== 'HEAD') return plain(405, 'method not allowed');
   const parsed = parseResolvePath(new URL(req.url).pathname);
@@ -421,31 +454,77 @@ export async function serveResolve(
   );
 }
 
-export async function serveRef(req: Request, props: CasProps, tokens: TokenSource | null): Promise<Response> {
+export async function serveRef(req: Request, props: CasProps, tokens: TokenSource | null, allow: readonly string[] = []): Promise<Response> {
   if (req.method !== 'GET' && req.method !== 'HEAD') return plain(405, 'method not allowed');
   const ref = parseRefPath(new URL(req.url).pathname);
   if (ref === null) return plain(404, 'not a ref key');
   const scoped = parseScope(props);
   if (scoped instanceof Response) return scoped;
-  const t = transportFor(req, scoped.scope, tokens);
+  const t = transportFor(req, scoped.scope, tokens, allow);
   if (!t.ok) return t.response;
 
-  const listed = await lsRefs(t.value, [ref === 'HEAD' || ref.startsWith('refs/') ? ref : `refs/heads/${ref}`, 'HEAD']);
-  if (!listed.ok) return plain(502, listed.error.message);
-  const refs = listed.value.refs;
-  const full = ref.startsWith('refs/') || ref === 'HEAD' ? ref : `refs/heads/${ref}`;
-  let entry = refs.get(full);
-  if (entry === void 0 && (ref === 'HEAD' || full === 'HEAD')) entry = refs.get('HEAD');
-  if (entry === void 0) {
-    // Unborn HEAD: still cacheable briefly so we don't hammer ls-refs; short TTL.
-    return jsonOk({ ref: full, commit: null, unborn: true }, REF_CACHE_CONTROL, null, 'ref', {
-      'cache-tag': `ply-cas-v${CACHE_VERSION},ply-cas-ref,ply-cas-ref-scope`,
+  // Full oid: immutable tip; still cache briefly under the ref key (caller may also skip RefCache).
+  if (OID_RE.test(ref)) {
+    return jsonOk({ ref, commit: ref, unborn: false }, REF_CACHE_CONTROL, ref, 'ref', {
+      'cache-tag': `ply-cas-v${CACHE_VERSION},ply-cas-ref,ply-cas-ref-${ref.slice(0, 12)}`,
     });
   }
-  const oid = entry.oid;
-  if (!OID_RE.test(oid)) return plain(502, 'bad commit oid from ls-refs');
-  return jsonOk({ ref: full, commit: oid, unborn: false }, REF_CACHE_CONTROL, oid, 'ref', {
-    'cache-tag': `ply-cas-v${CACHE_VERSION},ply-cas-ref,ply-cas-ref-${oid.slice(0, 12)}`,
+  const cands = refCandidates(ref === '' ? null : ref);
+  if (!cands.ok) return plain(400, cands.error.message);
+  const prefixes = cands.value.length > 0 ? [...cands.value, 'HEAD'] : ['HEAD'];
+  const listed = await lsRefs(t.value, prefixes, { unborn: true });
+  if (!listed.ok) return plain(upstreamStatus(listed.error), listed.error.message);
+  const refs = listed.value.refs;
+  const unborn = listed.value.unborn;
+
+  // Unborn HEAD / default branch: empty-repo body.
+  if (unborn !== null) {
+    const target = unborn.target;
+    const askingUnborn =
+      cands.value.includes('HEAD') ||
+      cands.value.includes(target) ||
+      ref === 'HEAD' ||
+      ref === '' ||
+      ref === target ||
+      (target.startsWith('refs/heads/') && (ref === target.slice('refs/heads/'.length) || ref === 'main'));
+    if (askingUnborn) {
+      return jsonOk({ ref: target, commit: null, unborn: true }, REF_CACHE_CONTROL, null, 'ref', {
+        'cache-tag': `ply-cas-v${CACHE_VERSION},ply-cas-ref,ply-cas-ref-scope`,
+      });
+    }
+  }
+
+  // First candidate that ls-refs returned wins (tags before branches, matching git / refCandidates order).
+  let hitName: string | null = null;
+  let hitOid: string | null = null;
+  for (const name of cands.value) {
+    const entry = refs.get(name);
+    if (entry === void 0) continue;
+    hitName = name;
+    hitOid = entry.peeled !== null ? entry.peeled : entry.oid;
+    break;
+  }
+  if (hitName === null && cands.value.includes('HEAD')) {
+    const headName = listed.value.head;
+    if (headName !== null && refs.has(headName)) {
+      const entry = refs.get(headName);
+      if (entry !== void 0) {
+        hitName = headName;
+        hitOid = entry.peeled !== null ? entry.peeled : entry.oid;
+      }
+    }
+    const headEntry = refs.get('HEAD');
+    if (hitName === null && headEntry !== void 0) {
+      hitName = headName !== null ? headName : 'HEAD';
+      hitOid = headEntry.peeled !== null ? headEntry.peeled : headEntry.oid;
+    }
+  }
+  if (hitName === null || hitOid === null) return plain(404, `ref ${ref} not found`);
+  if (!OID_RE.test(hitOid)) return plain(502, 'bad commit oid from ls-refs');
+  // Present the symref target when the caller asked for HEAD (matches readCommit).
+  const presented = hitName === 'HEAD' && listed.value.head !== null ? listed.value.head : hitName;
+  return jsonOk({ ref: presented, commit: hitOid, unborn: false }, REF_CACHE_CONTROL, hitOid, 'ref', {
+    'cache-tag': `ply-cas-v${CACHE_VERSION},ply-cas-ref,ply-cas-ref-${hitOid.slice(0, 12)}`,
   });
 }
 
@@ -546,32 +625,43 @@ export async function composeCasGraph(input: ComposeInput): Promise<
     return { ok: false, status: 501, code: 'bad_request', message: 'cas bypass' };
   }
   const refName = input.ref === null || input.ref === '' ? 'HEAD' : input.ref;
-  const refRes = await viaCasSpan(input.tracer, input.exports.RefCache, 'ref', encodeRefPath(refName), input.remote, input.authHeader);
-  cache[layerHeader('ref')] = unwrapOr(header(refRes.headers, layerHeader('ref')), 'NONE');
-  if (refRes.status !== 200) {
-    const text = await refRes.text().catch(() => '');
-    return { ok: false, status: refRes.status === 404 ? 404 : 502, code: refRes.status === 404 ? 'not_found' : 'upstream_5xx', message: text || 'ref resolve failed' };
-  }
-  const refRaw = await refRes.json();
-  const unbornField = chainGet(refRaw, 'unborn');
-  const commitField = chainGet(refRaw, 'commit');
-  const refField = chainGet(refRaw, 'ref');
-  const unborn = unbornField.tag === 'some' && unbornField.value === true;
-  const commitOidVal = commitField.tag === 'some' && typeof commitField.value === 'string' ? commitField.value : null;
-  const refVal = refField.tag === 'some' && typeof refField.value === 'string' ? refField.value : refName;
-  if (unborn || commitOidVal === null) {
-    if (input.want === 'commit') {
-      return {
-        ok: true,
-        kind: 'commit',
-        body: { empty: true, ref: refVal === '' ? 'refs/heads/main' : refVal, oid: null, tree: null, parents: [], author: null, committer: null, message: null, signed: false },
-        cache,
-      };
+  let commitOid: string;
+  let presentedRef: string;
+  if (OID_RE.test(refName)) {
+    // Content-addressed tip: skip mutable RefCache.
+    cache[layerHeader('ref')] = 'BYPASS';
+    commitOid = refName;
+    presentedRef = refName;
+  } else {
+    const refRes = await viaCasSpan(input.tracer, input.exports.RefCache, 'ref', encodeRefPath(refName), input.remote, input.authHeader);
+    cache[layerHeader('ref')] = unwrapOr(header(refRes.headers, layerHeader('ref')), 'NONE');
+    if (refRes.status !== 200) {
+      const text = await refRes.text().catch(() => '');
+      if (refRes.status === 404) return { ok: false, status: 404, code: 'not_found', message: text || 'ref resolve failed' };
+      if (refRes.status === 400) return { ok: false, status: 400, code: 'bad_request', message: text || 'bad ref' };
+      return { ok: false, status: 502, code: 'upstream_5xx', message: text || 'ref resolve failed' };
     }
-    return { ok: false, status: 404, code: 'not_found', message: 'empty repository' };
+    const refRaw = await refRes.json();
+    const unbornField = chainGet(refRaw, 'unborn');
+    const commitField = chainGet(refRaw, 'commit');
+    const refField = chainGet(refRaw, 'ref');
+    const unborn = unbornField.tag === 'some' && unbornField.value === true;
+    const commitOidVal = commitField.tag === 'some' && typeof commitField.value === 'string' ? commitField.value : null;
+    const refVal = refField.tag === 'some' && typeof refField.value === 'string' ? refField.value : refName;
+    if (unborn || commitOidVal === null) {
+      if (input.want === 'commit') {
+        return {
+          ok: true,
+          kind: 'commit',
+          body: { empty: true, ref: refVal === '' ? 'refs/heads/main' : refVal, oid: null, tree: null, parents: [], author: null, committer: null, message: null, signed: false },
+          cache,
+        };
+      }
+      return { ok: false, status: 404, code: 'not_found', message: 'empty repository' };
+    }
+    commitOid = commitOidVal;
+    presentedRef = refVal;
   }
-  const commitOid = commitOidVal;
-  const presentedRef = refVal;
 
   if (input.want === 'commit') {
     if (input.exports.CommitCache === null) return { ok: false, status: 501, code: 'bad_request', message: 'no CommitCache' };
@@ -579,7 +669,8 @@ export async function composeCasGraph(input: ComposeInput): Promise<
     cache[layerHeader('commit')] = unwrapOr(header(cRes.headers, layerHeader('commit')), 'NONE');
     if (cRes.status !== 200) {
       const text = await cRes.text().catch(() => '');
-      return { ok: false, status: cRes.status, code: 'upstream_5xx', message: text || 'commit cache failed' };
+      const code = cRes.status === 404 ? 'not_found' : cRes.status === 400 ? 'bad_request' : 'upstream_5xx';
+      return { ok: false, status: cRes.status === 404 || cRes.status === 400 ? cRes.status : 502, code, message: text || 'commit cache failed' };
     }
     const body = (await cRes.json()) as Record<string, unknown>;
     return { ok: true, kind: 'commit', body: { ...body, ref: presentedRef }, cache };
@@ -587,6 +678,10 @@ export async function composeCasGraph(input: ComposeInput): Promise<
 
   if (input.exports.ResolvePathCache === null) return { ok: false, status: 501, code: 'bad_request', message: 'no ResolvePathCache' };
   const path = input.path === null ? '' : input.path;
+  if (path !== '') {
+    const checked = validatePath(path);
+    if (!checked.ok) return { ok: false, status: 400, code: 'bad_request', message: checked.error.message };
+  }
   const resolveRes = await viaCasSpan(
     input.tracer,
     input.exports.ResolvePathCache,
