@@ -488,9 +488,8 @@ export async function serveRef(req: Request, props: CasProps, tokens: TokenSourc
       ref === target ||
       (target.startsWith('refs/heads/') && (ref === target.slice('refs/heads/'.length) || ref === 'main'));
     if (askingUnborn) {
-      return jsonOk({ ref: target, commit: null, unborn: true }, REF_CACHE_CONTROL, null, 'ref', {
-        'cache-tag': `ply-cas-v${CACHE_VERSION},ply-cas-ref,ply-cas-ref-scope`,
-      });
+      // Never cache unborn: the next write births the ref; a HIT would 404 tree/read until TTL.
+      return jsonOk({ ref: target, commit: null, unborn: true }, NO_STORE, null, 'ref');
     }
   }
 
