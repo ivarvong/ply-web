@@ -111,10 +111,13 @@ export class RefsWatch extends DurableObject<Env> {
   }
 
   /** The minute cron: an alarm that should be set but is not is set for now (that tick then sees the gap and purges). */
-  async ensure(): Promise<{ repos: number; alarm: number | null }> {
+  async ensure(): Promise<{ repos: number; alarm: number | null; polls: number }> {
     const state = await this.#load();
     if (needsAlarm(state) && (await this.ctx.storage.getAlarm()) === null) await this.ctx.storage.setAlarm(Date.now());
-    return { repos: Object.keys(state.repos).length, alarm: await this.ctx.storage.getAlarm() };
+    const polls = state.polls || 0;
+    state.polls = 0;
+    await this.#save();
+    return { repos: Object.keys(state.repos).length, alarm: await this.ctx.storage.getAlarm(), polls };
   }
 
   async status(): Promise<WatchState> {
@@ -140,6 +143,7 @@ export class RefsWatch extends DurableObject<Env> {
     await Promise.all(repos.map(async repo => {
       polls[repo] = tokens === null ? { ok: false, error: 'no PUBLIC_REPOS binding' } : await pollRefs(repo, tokens);
     }));
+    state.polls = (state.polls || 0) + repos.length;
     const pollMs = Date.now() - t0;
     const now = Date.now();
     const report = applyTick(state, polls, now);
