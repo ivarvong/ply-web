@@ -6,7 +6,7 @@ export type Pass<T> = {
   readonly value: T
 }
 
-export type Fault = 'worker' | 'harness_fault' | 'state_conflict' | 'insufficient_samples'
+export type Fault = 'worker' | 'harness_fault' | 'state_conflict' | 'insufficient_samples' | 'harness_unhealthy'
 
 export type Fail = {
   readonly kind: 'fail'
@@ -17,7 +17,8 @@ export type Fail = {
   /**
    * `harness_fault` above 0% has already moved traffic: rolled back to `previous`, or held at the
    * last fully passed split. `state_conflict` does not move traffic. `insufficient_samples` is not a pass
-   * and is not a correctness failure.
+   * and is not a correctness failure. `harness_unhealthy` is the client itself (a stalled box): no product verdict,
+   * and traffic is left exactly where it was (prod untouched).
    */
   readonly fault: Fault
 }

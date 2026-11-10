@@ -27,6 +27,15 @@ export type ProbeOutcome =
     readonly kind: 'shed'
     readonly id: string
   }
+  /**
+   * The client was stalled (client-health.ts) while this probe was in flight, or the schedule recorded a stall in its
+   * window (one marker per stall, id `client-stall ...`). Not a loss and not in the denominator: it says nothing about
+   * the Worker. A window with stalls must still reach probe.minSamples real samples or it is `harness_unhealthy`.
+   */
+  | {
+    readonly kind: 'stalled'
+    readonly id: string
+  }
 
 /** What `fetch` did, before it is a probe outcome. A thrown attempt has no status and no ray. */
 export type FetchAttempt =
@@ -57,6 +66,8 @@ export type ProbeLoss = {
   readonly aborted: number
   readonly network: number
   readonly shed: number
+  /** Probes in flight across a client stall, plus one marker per stall in the window. Not in `total`. */
+  readonly stalled: number
 }
 
 export type ProbeWindow =
@@ -65,6 +76,8 @@ export type ProbeWindow =
   | { readonly kind: 'insufficient_samples'; readonly loss: ProbeLoss; readonly reason: string }
   | { readonly kind: 'rollback'; readonly loss: ProbeLoss; readonly reason: string }
   | { readonly kind: 'retry'; readonly loss: ProbeLoss; readonly reason: string }
+  /** The client stalled and the window, even extended, has fewer than minSamples real samples. Prod is not judged. */
+  | { readonly kind: 'harness_unhealthy'; readonly loss: ProbeLoss; readonly reason: string }
 
 /** Bounds for one probe window. `minSamples` is the loss-rate denominator; `respondedMin` is `burn.minSamples`. */
 export type ProbeJudge = {
@@ -149,6 +162,7 @@ export function emptyProbeLoss(maxLossRate: number): ProbeLoss {
     aborted: 0,
     network: 0,
     shed: 0,
+    stalled: 0,
   }
 }
 
@@ -161,6 +175,7 @@ export function accountProbeLoss(outcomes: readonly ProbeOutcome[], maxLossRate:
   let aborted = 0
   let network = 0
   let shed = 0
+  let stalled = 0
   for (const outcome of outcomes) {
     switch (outcome.kind) {
       case 'lost':
@@ -186,6 +201,9 @@ export function accountProbeLoss(outcomes: readonly ProbeOutcome[], maxLossRate:
       case 'shed':
         shed += 1
         break
+      case 'stalled':
+        stalled += 1
+        break
       default:
         return assertNever(outcome)
     }
@@ -206,6 +224,7 @@ export function accountProbeLoss(outcomes: readonly ProbeOutcome[], maxLossRate:
     aborted,
     network,
     shed,
+    stalled,
   }
 }
 
@@ -257,6 +276,17 @@ function percent(value: number): string {
  */
 export function judgeProbeWindow(outcomes: readonly ProbeOutcome[], judge: ProbeJudge): ProbeWindow {
   const loss = accountProbeLoss(outcomes, judge.maxLossRate)
+  // A stalled client: the schedule already extended the window to replace the stalled time. Short of minSamples real
+  // samples after that, nothing here is evidence about the Worker; with enough, the stalled probes are simply not counted.
+  if (loss.stalled > 0 && loss.total < judge.minSamples) {
+    // A 5xx the Worker served is product evidence whatever the client did.
+    if (loss.serverErrors > 0 && judge.fivexxHard) return { kind: 'rollback', loss, reason: `${loss.serverErrors} 5xx on responded probes` }
+    return {
+      kind: 'harness_unhealthy',
+      loss,
+      reason: `harness unhealthy, prod untouched: the client stalled (${loss.stalled} stalled probes/markers); ${loss.total} real samples < probe.minSamples ${judge.minSamples} after extension`,
+    }
+  }
   if (loss.total === 0 && loss.shed === 0) return { kind: 'ok', loss }
   const pace = versionPace(outcomes, judge.stallLatencyMs)
   const stall = harnessStall(loss, pace, judge)

@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { startClientHealth, stopClientHealth } from './client-health.ts'
 import { readFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { basename, join, resolve } from 'node:path'
@@ -369,6 +370,8 @@ async function runLocked(
         body: config.policyBody,
         release: release ? releasePair(release) : null,
       })
+      // Watch this process's own clocks for the whole run (client-health.ts): a stalled box is never a product verdict.
+      startClientHealth()
       const outcome = await dispatch(parsed, config, token, runDir, runLog, log, release)
       code = outcome.code
       reason = outcome.reason
@@ -380,6 +383,8 @@ async function runLocked(
       log(`cd: harness_fault run: ${reason}`)
       return 1
     } finally {
+      const stalls = stopClientHealth()
+      if (stalls.length > 0) log(`client: ${stalls.length} stall(s) this run: ${stalls.map(stall => `${new Date(stall.from).toISOString()} ${stall.ms} ms`).join(', ')}`)
       if (!runLog.finished) await runLog.finish(code, code === 0 ? null : reason)
       if (!runLog.sealed) await runLog.seal()
     }

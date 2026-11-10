@@ -230,7 +230,7 @@ test('live checks at 100%: a Worker failure (smoke, telemetry, the rate gate, vi
 
 test('the polled ingest wait stops as soon as the probes have landed, and gives up at the ceiling', async () => {
   const policy = checked()
-  const loss = { total: 1000, count: 0, rate: 0, maxLossRate: 0.01, exceeded: false, responded: 1000, serverErrors: 0, ids: [], timedOut: 0, aborted: 0, network: 0, shed: 0 }
+  const loss = { total: 1000, count: 0, rate: 0, maxLossRate: 0.01, exceeded: false, responded: 1000, serverErrors: 0, ids: [], timedOut: 0, aborted: 0, network: 0, shed: 0, stalled: 0 }
   let landed = 0
   const fast = io(() => { landed += 400; return window({ requests: Math.min(landed, 1000) }) }, probes(1000))
   const observed = await observeAfterIngest(policy, fast.io, 0, 0, 100, loss, ALL_INVOCATIONS)

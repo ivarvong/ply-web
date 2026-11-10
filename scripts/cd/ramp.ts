@@ -70,7 +70,15 @@ export type ProbeSampleDecision = {
   readonly burns: StepVerdict['burns']
 }
 
-export type RampDecision = StepVerdict | HarnessRamp | ProbeSampleDecision
+/** The client itself stalled and the window could not be refilled: no verdict on the Worker, traffic left where it is. */
+export type HarnessUnhealthyDecision = {
+  readonly outcome: 'harness_unhealthy'
+  readonly reason: string
+  readonly rules: StepVerdict['rules']
+  readonly burns: StepVerdict['burns']
+}
+
+export type RampDecision = StepVerdict | HarnessRamp | ProbeSampleDecision | HarnessUnhealthyDecision
 
 export type HeldWrite = { readonly kind: 'state_conflict'; readonly reason: string }
 
@@ -81,7 +89,7 @@ export type RampState =
   | { readonly kind: 'rolled-back'; readonly reason: string }
   | { readonly kind: 'stopped'; readonly reason: string; readonly fault: 'state_conflict' }
   | { readonly kind: 'stopped'; readonly reason: string; readonly fault: 'harness_fault'; readonly traffic: HarnessTraffic }
-  | { readonly kind: 'held'; readonly reason: string; readonly outcome: 'hold' | 'insufficient_data' | 'insufficient_samples' }
+  | { readonly kind: 'held'; readonly reason: string; readonly outcome: 'hold' | 'insufficient_data' | 'insufficient_samples' | 'harness_unhealthy' }
   | { readonly kind: 'complete' }
 
 export function rampStart(): RampState {
@@ -144,7 +152,7 @@ export function applyRamp(state: RampState, decision: RampDecision, stepCount: n
   if (state.kind !== 'ramping') return state
   if (decision.outcome === 'harness_fault') return { kind: 'stopped', reason: decision.reason, fault: 'harness_fault', traffic: 'held' }
   if (decision.outcome === 'rollback') return { kind: 'rolled-back', reason: decision.reason }
-  if (decision.outcome === 'hold' || decision.outcome === 'insufficient_data' || decision.outcome === 'insufficient_samples') {
+  if (decision.outcome === 'hold' || decision.outcome === 'insufficient_data' || decision.outcome === 'insufficient_samples' || decision.outcome === 'harness_unhealthy') {
     return { kind: 'held', reason: decision.reason, outcome: decision.outcome }
   }
   const next = state.step + 1
@@ -377,6 +385,13 @@ function probeWindowDecision(policy: RolloutPolicy, window: ProbeWindow): RampDe
         rules: [{ name: 'probe_window_attempts', value: policy.probe.windowAttempts }],
         burns: burnMap([]),
       }
+    case 'harness_unhealthy':
+      return {
+        outcome: 'harness_unhealthy',
+        reason: window.reason,
+        rules: [{ name: 'probe_min_samples', value: policy.probe.minSamples }],
+        burns: burnMap([]),
+      }
     case 'ok':
       throw new Error('an ok probe window is not a fault')
     default:
@@ -528,6 +543,9 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
             rollbackError = typeof rolled === 'string' ? rolled : null
             state = { kind: 'rolled-back', reason: window.reason }
           }
+        } else if (window.kind === 'harness_unhealthy') {
+          // Prod untouched: no rollback, no hold write; the split stays as the last write left it.
+          state = { kind: 'held', reason: window.reason, outcome: 'harness_unhealthy' }
         } else {
           state = { kind: 'held', reason: window.reason, outcome: 'insufficient_samples' }
         }

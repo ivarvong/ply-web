@@ -5,6 +5,7 @@ import { none, some } from '../src/option.ts'
 import { parsePolicy, type RolloutPolicy } from '../scripts/cd/policy.ts'
 import { classifyProbe, judgeProbeWindow, type ProbeJudge, type ProbeOutcome } from '../scripts/cd/probe.ts'
 import { runProbeSchedule, type ProbeClock } from '../scripts/cd/probe-schedule.ts'
+import { NO_STALLS } from '../scripts/cd/client-health.ts'
 import { runRamp, type Observation } from '../scripts/cd/ramp.ts'
 import type { VersionStats } from '../scripts/cd/telemetry.ts'
 
@@ -108,6 +109,8 @@ test('at the in-flight bound the next tick is shed and the dwell stays on the wa
     maxInFlight: 2,
     batch: 2,
     graceMs: 0,
+    health: NO_STALLS,
+    extension: { maxMs: 0, minReal: 0 },
     issue: seq => ({ id: `probe-${seq}`, promise: new Promise<ProbeOutcome>(() => {}) }),
     shed: seq => ({ kind: 'shed', id: `shed-${seq}` }),
     stop: () => {
@@ -135,6 +138,8 @@ test('a client stall does not stretch a 40s dwell and the unfinished probes are 
     maxInFlight: 4,
     batch: 2,
     graceMs: 0,
+    health: NO_STALLS,
+    extension: { maxMs: 0, minReal: 0 },
     issue: seq => ({ id: `probe-${seq}`, promise: new Promise<ProbeOutcome>(() => {}) }),
     shed: seq => ({ kind: 'shed', id: `shed-${seq}` }),
     stop: () => {},
@@ -162,6 +167,8 @@ test('a fast probe is issued on the period and is not shed', async () => {
     maxInFlight: 10,
     batch: 2,
     graceMs: 0,
+    health: NO_STALLS,
+    extension: { maxMs: 0, minReal: 0 },
     issue: seq => ({
       id: `probe-${seq}`,
       promise: Promise.resolve({ kind: 'responded', id: `probe-${seq}`, status: 200, ray: none(), latencyMs: 40, version: none() }),
@@ -193,6 +200,8 @@ test('a probe in flight at the deadline answers within the grace and is not lost
     maxInFlight: 10,
     batch: 2,
     graceMs: 2000,
+    health: NO_STALLS,
+    extension: { maxMs: 0, minReal: 0 },
     issue: seq => {
       const answer: ProbeOutcome = { kind: 'responded', id: `probe-${seq}`, status: 200, ray: none(), latencyMs: 40, version: none() }
       if (seq <= 4) return { id: `probe-${seq}`, promise: Promise.resolve(answer) }
@@ -217,6 +226,8 @@ test('a probe still hung after the grace is timed_out and the dwell ends at dead
     maxInFlight: 10,
     batch: 2,
     graceMs: 2000,
+    health: NO_STALLS,
+    extension: { maxMs: 0, minReal: 0 },
     issue: seq => ({ id: `probe-${seq}`, promise: new Promise<ProbeOutcome>(() => {}) }),
     shed: seq => ({ kind: 'shed', id: `shed-${seq}` }),
     stop: () => {},

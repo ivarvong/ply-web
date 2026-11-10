@@ -173,7 +173,7 @@ test('runRamp with no dwell (no probes) reads latency from every invocation and 
 })
 
 test('the polled ingest wait counts the sample\'s probes, not the live checks\' requests beside them', async () => {
-  const loss = { total: 2000, count: 0, rate: 0, maxLossRate: 0.01, exceeded: false, responded: 2000, serverErrors: 0, ids: [], timedOut: 0, aborted: 0, network: 0, shed: 0 }
+  const loss = { total: 2000, count: 0, rate: 0, maxLossRate: 0.01, exceeded: false, responded: 2000, serverErrors: 0, ids: [], timedOut: 0, aborted: 0, network: 0, shed: 0, stalled: 0 }
   // each poll: 2,100 events in the window (smoke and visual included) but only 1,500 probes have landed, then 1,990
   let polls = 0
   let clock = 0

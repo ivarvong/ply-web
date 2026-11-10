@@ -1,4 +1,5 @@
-import { MESSAGE_MAX, PIN_ATTEMPTS, PIN_CONFIRMATIONS, PIN_INTERVAL_MS } from './baseline.ts'
+import { MESSAGE_MAX } from './baseline.ts'
+import { confirmRoute, logRoute } from './route-confirm.ts'
 import { cfOk, ROOT } from './cf.ts'
 import { isTrafficSplit, planCanary, trafficSplit, versionByTag } from './deploy-plan.ts'
 import { extractJson } from './json.ts'
@@ -20,20 +21,22 @@ export type DeployValue = {
   readonly dropped: string | null
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
-
-async function pinReady(config: CdConfig, version: string): Promise<boolean> {
-  let streak = 0
-  for (let attempt = 0; attempt < PIN_ATTEMPTS && streak < PIN_CONFIRMATIONS; attempt++) {
-    const response = await fetch(`${config.baseUrl}/`, {
-      headers: { 'Cloudflare-Workers-Version-Overrides': `${config.worker}="${version}"` },
-    })
-    streak = response.headers.get('x-ply-version') === version ? streak + 1 : 0
-    if (streak < PIN_CONFIRMATIONS) await sleep(PIN_INTERVAL_MS)
-  }
-  return streak >= PIN_CONFIRMATIONS
+/**
+ * The canary is served to pinned requests on every fresh connection for PIN_SUSTAIN_MS (route-confirm.ts). `since` is
+ * the split write, so the log's sample offsets are time since it.
+ */
+export async function pinReady(config: CdConfig, version: string, since: number): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string; readonly fault: 'harness_fault' | 'worker' }> {
+  const started = Date.now()
+  const verdict = await confirmRoute({
+    url: `${config.baseUrl}/`,
+    version,
+    headers: { 'Cloudflare-Workers-Version-Overrides': `${config.worker}="${version}"` },
+    since,
+  })
+  const line = await logRoute({ purpose: 'pin', version, since, started }, verdict)
+  process.stdout.write(`${line}\n`)
+  if (verdict.kind === 'confirmed') return { ok: true }
+  return { ok: false, reason: verdict.reason, fault: verdict.kind === 'worker' ? 'worker' : 'harness_fault' }
 }
 
 async function versionTagged(worker: string, tag: string): Promise<string | null> {
@@ -102,8 +105,8 @@ export async function stageDeploy(
       const rollbackError = rolled.ok ? null : rolled.reason
       return fail('deploy-canary', rollbackError ? `${applied.reason}; ${rollbackError}` : applied.reason, rollbackError === null)
     }
-    const pinned = await pinReady(config, version)
-    if (!pinned) return fail('deploy-canary', `pinned requests were not answered by ${version}; left the 0% canary in place`)
+    const pinned = await pinReady(config, version, Date.now())
+    if (!pinned.ok) return fail('deploy-canary', `${pinned.reason}; left the 0% canary in place`, false, pinned.fault)
     return pass('deploy-canary', { version, previous: plan.live, dropped: plan.dropped })
   } catch (error) {
     return fail('deploy-canary', errorMessage(error), false, 'harness_fault')

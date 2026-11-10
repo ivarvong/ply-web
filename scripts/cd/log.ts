@@ -22,7 +22,7 @@ export type ObservationRef = {
 
 export type Json = null | boolean | number | string | readonly Json[] | { readonly [key: string]: Json }
 
-export type DecisionOutcome = 'advance' | 'hold' | 'insufficient_data' | 'insufficient_samples' | 'rollback' | 'stop' | 'harness_fault' | 'state_conflict' | 'cleanup_leak'
+export type DecisionOutcome = 'advance' | 'hold' | 'insufficient_data' | 'insufficient_samples' | 'rollback' | 'stop' | 'harness_fault' | 'harness_unhealthy' | 'state_conflict' | 'cleanup_leak'
 
 export type RuleRef = {
   readonly name: string
@@ -164,8 +164,8 @@ export type RunFacts = {
 }
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$/
-const OUTCOMES = new Set<DecisionOutcome>(['advance', 'hold', 'insufficient_data', 'insufficient_samples', 'rollback', 'stop', 'harness_fault', 'state_conflict', 'cleanup_leak'])
-const FAULTS = new Set<Fault>(['worker', 'harness_fault', 'state_conflict', 'insufficient_samples'])
+const OUTCOMES = new Set<DecisionOutcome>(['advance', 'hold', 'insufficient_data', 'insufficient_samples', 'rollback', 'stop', 'harness_fault', 'harness_unhealthy', 'state_conflict', 'cleanup_leak'])
+const FAULTS = new Set<Fault>(['worker', 'harness_fault', 'state_conflict', 'insufficient_samples', 'harness_unhealthy'])
 
 export function isoOffset(date: Date): string {
   const pad = (value: number, width = 2) => String(Math.trunc(Math.abs(value))).padStart(width, '0')

@@ -1,4 +1,6 @@
 import { readFile, appendFile } from 'node:fs/promises'
+import { CLIENT_MAX_EXTENSION_MS } from './baseline.ts'
+import { clientHealth } from './client-health.ts'
 import { join } from 'node:path'
 import { none, orNull, some, type Option } from '../../src/option.ts'
 import type { CdConfig } from './config.ts'
@@ -181,6 +183,8 @@ async function dwell(
     maxInFlight: probe.maxInFlight,
     batch: live.length,
     graceMs: probe.timeoutMs,
+    health: clientHealth(),
+    extension: { maxMs: CLIENT_MAX_EXTENSION_MS, minReal: probe.minSamples },
     issue: seq => {
       const call = live[(seq - 1) % live.length]
       if (!call) throw new Error('probe call missing')
@@ -366,6 +370,7 @@ export async function stageRamp(
     if (result.state.kind === 'complete') return pass('ramp', { version: opts.version, previous: target, lines: result.lines })
     if (result.state.kind === 'held') {
       if (result.state.outcome === 'insufficient_samples') return fail('ramp', result.state.reason, false, 'insufficient_samples')
+      if (result.state.outcome === 'harness_unhealthy') return fail('ramp', result.state.reason, false, 'harness_unhealthy')
       return fail('ramp', result.state.reason, false)
     }
     if (result.state.kind === 'stopped') {

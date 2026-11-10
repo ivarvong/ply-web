@@ -11,6 +11,7 @@ import { errorMessage } from './proc.ts'
 import { liveSmokeAlreadyPassed, reconcile, reconcileReason, type Reconcile } from './reconcile.ts'
 import { checkoutReason, readCheckout, releasePair, releaseTag, type ReleaseId } from './release.ts'
 import { fail, type Fail, type StageResult } from './result.ts'
+import { confirmRoute, logRoute } from './route-confirm.ts'
 import { writeJson } from './run-dir.ts'
 import { stageBump } from './stage-bump.ts'
 import { stageDeploy } from './stage-deploy.ts'
@@ -68,7 +69,7 @@ async function recordedCleanupLeaks(runDir: string): Promise<readonly string[]> 
 
 function outcomeOf(result: StageResult<unknown>): PhaseOutcome {
   if (result.kind === 'pass') return 'pass'
-  if (result.fault === 'harness_fault') return 'harness-stop'
+  if (result.fault === 'harness_fault' || result.fault === 'harness_unhealthy') return 'harness-stop'
   if (result.fault === 'state_conflict') return 'state-conflict'
   return result.rolledBack ? 'rolled-back' : 'fail'
 }
@@ -179,11 +180,6 @@ async function span<T>(log: RunLog, name: string, fn: () => Promise<T>): Promise
   }
 }
 
-/** Unpinned requests per convergence round, rounds in a row that must all answer as the new version, and the cap. */
-const CONVERGE_BATCH = 10
-const CONVERGED_ROUNDS = 2
-const CONVERGE_MAX_MS = 30_000
-
 /**
  * After promotion: the live lifecycle smoke and its telemetry, beside the CDP visual smoke.
  * Each failure is returned in the order the checks finished; a pass is an empty list.
@@ -194,30 +190,21 @@ async function liveChecks(
   opts: { readonly version: string; readonly token: string; readonly runDir: string; readonly log: (line: string) => void },
 ): Promise<readonly StageResult<unknown>[]> {
   // The split write returns before every colo serves it (98.74% at 100% on run 2026-11-06T20-11-49-685Z). The unpinned
-  // smoke asserts x-ply-version, so wait until unpinned requests agree; the visual smoke is pinned and need not wait.
-  const converged = async (): Promise<void> => {
+  // smoke asserts x-ply-version, so first confirm unpinned traffic the same way the pin is confirmed (route-confirm.ts:
+  // fresh connections, a sustained all-new window). A routing failure is a harness fault, never a product verdict.
+  const converged = async (): Promise<StageResult<unknown> | null> => {
     const started = Date.now()
-    let streak = 0
-    let rounds = 0
-    while (streak < CONVERGED_ROUNDS && Date.now() - started < CONVERGE_MAX_MS) {
-      rounds += 1
-      const seen = await Promise.all(Array.from({ length: CONVERGE_BATCH }, () => fetch(`${config.baseUrl}/`, { signal: AbortSignal.timeout(5_000) })
-        .then(response => response.headers.get('x-ply-version'), () => 'lost')))
-      streak = seen.every(seen1 => seen1 === opts.version) ? streak + 1 : 0
-      if (streak < CONVERGED_ROUNDS) await new Promise(resolve => setTimeout(resolve, 500))
-    }
-    const ms = Date.now() - started
-    opts.log(`live: unpinned traffic ${streak >= CONVERGED_ROUNDS ? 'converged' : 'NOT converged'} on ${opts.version} after ${ms} ms (${rounds} rounds of ${CONVERGE_BATCH})`)
-    await runLog.observation({
-      measurement: { source: 'split-convergence', converged: streak >= CONVERGED_ROUNDS, ms, rounds, batch: CONVERGE_BATCH },
-      query: { source: 'unpinned GET /', base: config.baseUrl },
-      from: started,
-      to: Date.now(),
-      raw: JSON.stringify({ ms, rounds }),
-    })
+    const verdict = await confirmRoute({ url: `${config.baseUrl}/`, version: opts.version, headers: {}, since: started })
+    opts.log(await logRoute({ purpose: 'live', version: opts.version, since: started, started }, verdict))
+    if (verdict.kind === 'confirmed') return null
+    return fail('smoke', `live: ${verdict.reason}; prod is already at 100% on ${opts.version}`, false, verdict.kind === 'worker' ? 'worker' : 'harness_fault')
   }
   const smokeAndTelemetry = async (): Promise<StageResult<unknown>[]> => {
-    await converged()
+    const route = await converged()
+    if (route !== null) {
+      opts.log(`smoke: ${route.kind === 'fail' ? route.reason : 'route'}`)
+      return [route]
+    }
     const started = Date.now()
     const smoke = await span(runLog, 'smoke-live', () => stageSmoke(config, { version: opts.version, pin: false, token: opts.token, runDir: opts.runDir }))
     if (smoke.kind === 'fail') {
@@ -460,7 +447,9 @@ export async function runPipeline(
       ? 'state_conflict' as const
       : fault === 'insufficient_samples'
         ? 'insufficient_samples' as const
-        : 'fail' as const
+        : fault === 'harness_unhealthy'
+          ? 'harness_unhealthy' as const
+          : 'fail' as const
   const probeLoss = await recordedProbeLoss(runDir)
   const cleanupLeak = await recordedCleanupLeaks(runDir)
   const verdict = failure

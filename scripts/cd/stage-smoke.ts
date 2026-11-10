@@ -1,7 +1,9 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { REPO_PREFIX, REVOKE_ATTEMPTS, REVOKE_PROBE_MS, REVOKE_WAIT_MS, SMOKE_HTTP_MS, TOKEN_TTL_SECONDS } from './baseline.ts'
+import { REPO_PREFIX, REVOKE_ATTEMPTS, REVOKE_PROBE_MS, REVOKE_WAIT_MS, SMOKE_HTTP_MS, SMOKE_REISSUE_ATTEMPTS, SMOKE_REISSUE_WAIT_MS, SMOKE_RESTARTS, TOKEN_TTL_SECONDS } from './baseline.ts'
+import { clientHealth, type StallSource } from './client-health.ts'
+import { confirmRoute, logRoute } from './route-confirm.ts'
 import { cfOk, runCf } from './cf.ts'
 import {
   appendCleanupFile,
@@ -42,6 +44,12 @@ export type SmokeReport = {
   readonly detail: string
   readonly passed: number
   readonly failed: number
+  /** Rows answered by another version or lost while the client stalled: re-issued or restarted, never counted. */
+  readonly harnessEvents: number
+  /** Lifecycle restarts on a new scratch repo after a write met a harness event. */
+  readonly restarts: number
+  /** Scratch repos of discarded attempts (deleted). */
+  readonly discarded: readonly string[]
 }
 
 export type SweepRun =
@@ -245,6 +253,52 @@ function stepPath(step: HttpStep): string {
   return query ? `${step.path}?${query}` : step.path
 }
 
+export type CallResult = {
+  readonly started: number
+  readonly ended: number
+  /** `x-ply-version` of the response, null when there was none (or no response). */
+  readonly served: string | null
+  readonly row: CsvRow
+  readonly judgementDetail: string
+  readonly ok: boolean
+  readonly save: Saved
+  readonly request: SmokeRequest | null
+  readonly refs: ApiRefs | null
+  readonly fault: FailureClass | null
+}
+
+/**
+ * A row that is not evidence about the version under test. `wrong_version`: another version answered (the override or
+ * the new split was not yet on that edge machine). `client_stall`: no response while this process was stalled
+ * (client-health.ts). Either is re-issued or restarts the attempt; neither is a pass or a product failure.
+ */
+export type HarnessEvent =
+  | { readonly kind: 'wrong_version'; readonly served: string; readonly detail: string }
+  | { readonly kind: 'client_stall'; readonly stalledMs: number; readonly detail: string }
+
+export function harnessEvent(
+  call: { readonly started: number; readonly ended: number; readonly served: string | null; readonly status: number },
+  version: string | null,
+  health: StallSource,
+): HarnessEvent | null {
+  if (call.status !== 0 && version !== null && call.served !== null && call.served !== version) {
+    return { kind: 'wrong_version', served: call.served, detail: `routing: answered by ${call.served}, wanted ${version}` }
+  }
+  if (call.status === 0) {
+    const stalls = health.during(call.started, call.ended)
+    if (stalls.length > 0) {
+      const stalledMs = health.stalledMs(call.started, call.ended)
+      return { kind: 'client_stall', stalledMs, detail: `client stall: no response while the harness was stalled ${stalledMs} ms` }
+    }
+  }
+  return null
+}
+
+/** Re-issue a GET; restart the attempt (fresh scratch repo) for anything else, since a write may have landed. */
+export function reissuable(step: { readonly method: string }): boolean {
+  return step.method === 'GET'
+}
+
 async function oneCall(
   config: CdConfig,
   step: HttpStep,
@@ -254,7 +308,7 @@ async function oneCall(
   gitToken: string,
   version: string | null,
   pin: boolean,
-): Promise<{ row: CsvRow; judgementDetail: string; ok: boolean; save: Saved; request: SmokeRequest | null; refs: ApiRefs | null; fault: FailureClass | null }> {
+): Promise<CallResult> {
   const started = Date.now()
   const params = new URLSearchParams({ remote, ...(step.query ?? {}) })
   const url = `${config.baseUrl}${step.path}?${params.toString()}`
@@ -279,6 +333,9 @@ async function oneCall(
       cfRay: null, requestId: null, artifactsRay: null,
     })
     return {
+      started,
+      ended: Date.now(),
+      served: null,
       row: {
         step: step.name, method: step.method, path: stepPath(step), status: 0, ms: Date.now() - started,
         pass: false, cfRay: '', requestId: '', artifactsRay: '', version: '', build: '', serverTiming: '', detail,
@@ -344,6 +401,9 @@ async function oneCall(
     artifactsRay: ray,
   })
   return {
+    started,
+    ended: Date.now(),
+    served: seen,
     row: {
       step: step.name,
       method: step.method,
@@ -407,31 +467,75 @@ async function judgeMirror(remote: string, gitToken: string, api: ApiRefs): Prom
   }
 }
 
-export async function stageSmoke(
-  config: CdConfig,
-  opts: { readonly version: string | null; readonly pin: boolean; readonly token: string; readonly runDir: string },
-): Promise<StageResult<SmokeReport>> {
-  const secrets = [opts.token]
-  const smokeStarted = Date.now()
-  activeLog()?.conceal(opts.token)
-  const leaks: string[] = []
-  const swept = await sweep(config, secrets)
-  if (swept) {
-    for (const repoName of swept.leaks) leaks.push(repoName)
+type HarnessFaultKind = 'harness_fault' | 'harness_unhealthy'
+
+type AttemptResult = {
+  readonly name: string
+  readonly deleted: boolean
+  readonly refs: ApiRefs | null
+  readonly detail: string
+  readonly passed: boolean
+  readonly harness: boolean
+  readonly fault: HarnessFaultKind | null
+  /** Set when a write met a harness event: discard this scratch repo and run the lifecycle again on a new one. */
+  readonly restart: string | null
+}
+
+/** A harness event's row: kept in the CSV for the record, never counted as a pass or a failure. */
+function eventRow(row: CsvRow, event: HarnessEvent, next: string): CsvRow {
+  return { ...row, pass: false, detail: `${event.detail}; ${next}` }
+}
+
+async function noteEvent(step: HttpStep, event: HarnessEvent, call: CallResult, next: string): Promise<void> {
+  const log = activeLog()
+  if (!log) return
+  await log.observation({
+    measurement: {
+      source: 'smoke-harness-event',
+      step: step.name,
+      method: step.method,
+      kind: event.kind,
+      served: event.kind === 'wrong_version' ? event.served : null,
+      stalledMs: event.kind === 'client_stall' ? event.stalledMs : null,
+      status: call.row.status,
+      cfRay: call.row.cfRay,
+      next,
+    },
+    query: { source: 'smoke' },
+    from: call.started,
+    to: call.ended,
+    raw: JSON.stringify({ step: step.name, detail: event.detail, next }),
+  })
+}
+
+function exhausted(event: HarnessEvent, step: HttpStep, tries: number): { readonly detail: string; readonly fault: HarnessFaultKind } {
+  if (event.kind === 'client_stall') {
+    return { detail: `harness unhealthy, prod untouched: ${step.name}: ${event.detail} on ${tries} tries`, fault: 'harness_unhealthy' }
   }
+  return { detail: `${step.name}: ${event.detail} on ${tries} tries`, fault: 'harness_fault' }
+}
+
+async function smokeAttempt(
+  config: CdConfig,
+  opts: { readonly version: string | null; readonly pin: boolean; readonly token: string },
+  secrets: string[],
+  rows: CsvRow[],
+  harnessRows: Set<CsvRow>,
+  requests: SmokeRequest[],
+): Promise<AttemptResult> {
   const name = `${REPO_PREFIX}${new Date().toISOString().replace(/\D/g, '').slice(0, 14)}-${Math.random().toString(36).slice(2, 8)}`
   let gitToken = ''
   let remote = ''
   const minted: string[] = []
   let mintedToken: { readonly id: string; readonly secret: Secret } | null = null
   let deleted = false
-  const rows: CsvRow[] = []
-  const requests: SmokeRequest[] = []
   let saved: Saved = {}
   let detail = 'ok'
   let refs: ApiRefs | null = null
   let passed = false
   let harness = false
+  let fault: HarnessFaultKind | null = null
+  let restart: string | null = null
   try {
     const created = await cfJson([
       'artifacts', 'namespaces', 'repos', 'create', config.namespace,
@@ -439,7 +543,7 @@ export async function stageSmoke(
     ], secrets)
     const found = remember(created, secrets)
     const auto = createdTokenSecret(created, found)
-    remote = findRemote(created) ?? ''
+    remote = findRemote(created) || ''
     if (!REMOTE.test(remote)) throw new Error('cf did not return an Artifacts remote')
     const opening = await listTokenIds(config, name, secrets)
     let revoked = opening.length > 0
@@ -464,16 +568,51 @@ export async function stageSmoke(
       ], secrets)
       const mintedSecrets = remember(mintedJson, secrets)
       const rec = asRecord(mintedJson)
-      const plain = typeof rec?.plaintext === 'string' ? rec.plaintext : ''
+      const plain = rec !== null && typeof rec.plaintext === 'string' ? rec.plaintext : ''
       const writeToken = mintedSecrets.find(secret => secret.reveal() === plain)
       if (!writeToken) throw new Error('cf returned no write token')
       gitToken = writeToken.reveal()
-      if (typeof rec?.id === 'string') {
+      if (rec !== null && typeof rec.id === 'string') {
         minted.push(rec.id)
         mintedToken = { id: rec.id, secret: writeToken }
       }
-      for (const step of lifecycle()) {
-        const result = await oneCall(config, step, saved, remote, opts.token, gitToken, opts.version, opts.pin)
+      steps: for (const step of lifecycle()) {
+        let result = await oneCall(config, step, saved, remote, opts.token, gitToken, opts.version, opts.pin)
+        let tries = 1
+        for (;;) {
+          const event = harnessEvent({ started: result.started, ended: result.ended, served: result.served, status: result.row.status }, opts.version, clientHealth())
+          if (event === null) break
+          if (!reissuable(step)) {
+            const next = 'restart the lifecycle on a new scratch repo'
+            const row = eventRow(result.row, event, next)
+            rows.push(row)
+            harnessRows.add(row)
+            await noteEvent(step, event, result, next)
+            restart = `${step.name}: ${event.detail}`
+            if (event.kind === 'client_stall') fault = 'harness_unhealthy'
+            break steps
+          }
+          if (tries > SMOKE_REISSUE_ATTEMPTS) {
+            const next = 'no re-issue left'
+            const row = eventRow(result.row, event, next)
+            rows.push(row)
+            harnessRows.add(row)
+            await noteEvent(step, event, result, next)
+            const out = exhausted(event, step, tries)
+            detail = out.detail
+            fault = out.fault
+            harness = true
+            break steps
+          }
+          const next = `re-issued (${tries}/${SMOKE_REISSUE_ATTEMPTS})`
+          const row = eventRow(result.row, event, next)
+          rows.push(row)
+          harnessRows.add(row)
+          await noteEvent(step, event, result, next)
+          await wait(SMOKE_REISSUE_WAIT_MS)
+          tries += 1
+          result = await oneCall(config, step, saved, remote, opts.token, gitToken, opts.version, opts.pin)
+        }
         rows.push(result.row)
         if (result.request) requests.push(result.request)
         if (!result.ok) {
@@ -484,20 +623,19 @@ export async function stageSmoke(
         saved = { ...saved, ...result.save }
         if (result.refs) refs = result.refs
       }
-      if (detail === 'ok') {
+      if (detail === 'ok' && restart === null) {
         if (!refs) detail = 'refs-final did not return a ref map'
         else {
           const gitDetail = await judgeMirror(remote, gitToken, refs)
           if (gitDetail) detail = gitDetail
         }
       }
-      passed = detail === 'ok'
+      passed = detail === 'ok' && restart === null
     }
   } catch (error) {
     detail = redact(errorMessage(error), secrets)
     harness = true
   } finally {
-    await writeText(opts.runDir, opts.pin ? 'smoke.csv' : 'live-smoke.csv', csvDocument(rows), secrets)
     const pending = [...new Set([...minted, ...await listTokenIds(config, name, secrets)])]
     const stuck = []
     for (const id of pending) {
@@ -509,11 +647,91 @@ export async function stageSmoke(
         stuck.push(id)
       }
     }
-    if (passed && stuck.length > 0) {
-      detail = `smoke passed but a token for ${name} was not revoked`
+    if ((passed || restart !== null) && stuck.length > 0) {
+      detail = `smoke ${passed ? 'passed' : 'restart'} but a token for ${name} was not revoked`
       passed = false
+      restart = null
       harness = true
+      fault = 'harness_fault'
     }
+  }
+  return { name, deleted, refs, detail, passed, harness, fault, restart }
+}
+
+/** The route the smoke needs, confirmed again before a restart: the override for a pinned smoke, the split otherwise. */
+async function reconfirmRoute(config: CdConfig, version: string | null, pin: boolean): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string; readonly fault: 'harness_fault' | 'worker' }> {
+  if (version === null) return { ok: true }
+  const since = Date.now()
+  const verdict = await confirmRoute({
+    url: `${config.baseUrl}/`,
+    version,
+    headers: pin ? { 'Cloudflare-Workers-Version-Overrides': `${config.worker}="${version}"` } : {},
+    since,
+  })
+  await logRoute({ purpose: pin ? 'pin' : 'live', version, since, started: since }, verdict)
+  if (verdict.kind === 'confirmed') return { ok: true }
+  return { ok: false, reason: verdict.reason, fault: verdict.kind === 'worker' ? 'worker' : 'harness_fault' }
+}
+
+export async function stageSmoke(
+  config: CdConfig,
+  opts: { readonly version: string | null; readonly pin: boolean; readonly token: string; readonly runDir: string },
+): Promise<StageResult<SmokeReport>> {
+  const secrets = [opts.token]
+  const smokeStarted = Date.now()
+  activeLog()?.conceal(opts.token)
+  const leaks: string[] = []
+  const swept = await sweep(config, secrets)
+  if (swept) {
+    for (const repoName of swept.leaks) leaks.push(repoName)
+  }
+  const rows: CsvRow[] = []
+  const harnessRows = new Set<CsvRow>()
+  const requests: SmokeRequest[] = []
+  const discarded: string[] = []
+  let attempt: AttemptResult
+  let restarts = 0
+  let routeFault: { readonly reason: string; readonly fault: 'harness_fault' | 'worker' } | null = null
+  for (;;) {
+    attempt = await smokeAttempt(config, opts, secrets, rows, harnessRows, requests)
+    if (attempt.restart === null) break
+    // The discarded attempt's repo saw a write that is not evidence; delete it like a passed one.
+    const bound = cleanupBound(config)
+    const removed = await confirmDelete(attempt.name, bound, { once: () => deleteOnce(attempt.name, config, secrets), sleep: wait })
+    await noteCleanup(removed, bound)
+    if (removed.kind === 'leak') leaks.push(removed.repo)
+    discarded.push(attempt.name)
+    if (restarts >= SMOKE_RESTARTS) break
+    restarts += 1
+    const route = await reconfirmRoute(config, opts.version, opts.pin)
+    if (!route.ok) {
+      routeFault = { reason: route.reason, fault: route.fault }
+      break
+    }
+  }
+  let detail = attempt.detail
+  let passed = attempt.passed
+  let harness = attempt.harness
+  let fault: HarnessFaultKind | null = attempt.fault
+  const name = attempt.name
+  let deleted = attempt.deleted
+  if (attempt.restart !== null) {
+    passed = false
+    harness = true
+    if (routeFault !== null) {
+      detail = `${attempt.restart}; ${routeFault.reason}`
+      fault = routeFault.fault === 'worker' ? null : 'harness_fault'
+      harness = routeFault.fault !== 'worker'
+    } else {
+      detail = fault === 'harness_unhealthy'
+        ? `harness unhealthy, prod untouched: ${attempt.restart}; ${restarts} restarts exhausted`
+        : `${attempt.restart}; ${restarts} restarts exhausted`
+      if (fault === null) fault = 'harness_fault'
+    }
+    deleted = true
+  }
+  try {
+    await writeText(opts.runDir, opts.pin ? 'smoke.csv' : 'live-smoke.csv', csvDocument(rows), secrets)
     if (passed) {
       const bound = cleanupBound(config)
       const removed = await confirmDelete(name, bound, {
@@ -535,32 +753,39 @@ export async function stageSmoke(
     }
     if (passed && leaks.length > 0) detail = `ok; cleanup_leak ${leaks.join(' ')}`
     await appendCleanupFile(opts.runDir, leaks)
+  } catch (error) {
+    detail = redact(errorMessage(error), secrets)
+    passed = false
+    harness = true
   }
-  const httpPass = rows.filter(row => row.pass).length
-  const httpFail = rows.length - httpPass
+  const counted = rows.filter(row => !harnessRows.has(row))
+  const httpPass = counted.filter(row => row.pass).length
+  const httpFail = counted.length - httpPass
   const passedCount = httpPass + (passed ? 1 : 0)
   const failedCount = httpFail + (!passed && httpFail === 0 ? 1 : 0)
-  const report: SmokeReport = { version: opts.version, repo: name, deleted, cleanup_leak: leaks, requests, refs, detail, passed: passedCount, failed: failedCount }
+  const harnessEvents = harnessRows.size
+  const report: SmokeReport = { version: opts.version, repo: name, deleted, cleanup_leak: leaks, requests, refs: attempt.refs, detail, passed: passedCount, failed: failedCount, harnessEvents, restarts, discarded }
   await writeJson(opts.runDir, opts.pin ? 'smoke.json' : 'live-smoke.json', report, secrets)
   const runLog = activeLog()
+  const outcomeFault = harness ? (fault === null ? 'harness_fault' : fault) : null
   if (runLog) {
     runLog.addSmoke(passedCount, failedCount)
     const ref = await runLog.observation({
-      measurement: { source: 'lifecycle-smoke', passed: passedCount, failed: failedCount, detail },
+      measurement: { source: 'lifecycle-smoke', passed: passedCount, failed: failedCount, harnessEvents, restarts, detail },
       query: { source: 'lifecycle' },
       from: smokeStarted,
       to: Date.now(),
-      raw: JSON.stringify({ detail, requests: requests.length, repo: name, deleted, cleanup_leak: leaks }),
+      raw: JSON.stringify({ detail, requests: requests.length, repo: name, deleted, cleanup_leak: leaks, harnessEvents, restarts, discarded }),
     })
     const informationalSmoke = !passed && !harness && config.policy.gates.smoke === 'informational'
     await runLog.decision({
       inputs: [ref],
       rules: [{ name: 'correctness.target', value: CORRECTNESS.target }],
-      outcome: passed || informationalSmoke ? 'advance' : harness ? 'harness_fault' : 'stop',
+      outcome: passed || informationalSmoke ? 'advance' : outcomeFault !== null ? outcomeFault : 'stop',
       reason: informationalSmoke ? `informational: ${detail}` : detail,
     })
   }
   const smokeHard = config.policy.gates.smoke === 'hard'
-  if (!passed && (harness || smokeHard)) return fail('smoke', `${detail}; repo ${deleted ? 'deleted' : name}`, false, harness ? 'harness_fault' : 'worker')
+  if (!passed && (harness || smokeHard)) return fail('smoke', `${detail}; repo ${deleted ? 'deleted' : name}`, false, outcomeFault !== null ? outcomeFault : 'worker')
   return pass('smoke', report)
 }
