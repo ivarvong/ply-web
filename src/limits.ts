@@ -8,6 +8,11 @@
 // including delta results resolvePack allocates on top of the instructions (ply #9). Four
 // maximum-sized objects cover a merge-base triple plus the commit that names them, and
 // wire + inflated stays under the isolate. The blob itself is streamed and is not in this total.
+//
+// Time (ply #255/#258): requestTimeoutMs is ply's opt-in cap on one whole HTTP exchange, body included; ply's default is
+// 0 (no total cap), with firstByteTimeoutMs and idleTimeoutMs (60 s each) bounding stalls. Every limit set here and in
+// src/viewer/limits.ts names its requestTimeoutMs, so no ply-web exchange runs on ply's default: the API keeps #124's
+// 10 s, the mirror and pack verification 30 s, the viewer 12 s. Under those totals the 60 s stall timers never fire first.
 import { withLimits } from 'ply'
 
 const KIB = 1024
