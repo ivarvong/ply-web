@@ -8,7 +8,7 @@ import { artifactsProbeUrl, revokeConfirmed } from '../scripts/cd/classify.ts'
 import { raysByRequestId } from '../scripts/cd/csv.ts'
 import { asRecord } from '../scripts/cd/json.ts'
 import { DEFAULT_MAX_LOSS_RATE, DEFAULT_POLICY_PATH, loadPolicy } from '../scripts/cd/policy.ts'
-import { progressLine } from '../scripts/cd/ramp.ts'
+import { ALL_INVOCATIONS, progressLine } from '../scripts/cd/ramp.ts'
 import { readSmokeRequests } from '../scripts/cd/stage-telemetry.ts'
 import { judgeStep, routedShare } from '../scripts/cd/slo.ts'
 import {
@@ -460,6 +460,7 @@ test('named entrypoints are not routed traffic', () => {
     decision,
     latency: policy.gates.latency.mode,
     probe: { kind: 'none' },
+    sample: ALL_INVOCATIONS,
   })
   assert.match(line, new RegExp(`samples=${NEW_EXTERNAL}/${OLD_EXTERNAL}`))
   assert.match(line, /routed_share=10.27/)

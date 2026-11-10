@@ -57,6 +57,7 @@ function sample(next: Partial<VersionStats> = {}, previous: Partial<VersionStats
       fetchMs: [...newer.fetchMs, ...older.fetchMs],
       v1: [...newer.v1, ...older.v1],
     }),
+    landed: newer.invocations + older.invocations,
   }
 }
 
@@ -158,10 +159,11 @@ test('progress line labels latency informational and names a carried baseline', 
     decision: advance,
     latency: 'informational',
     probe: { kind: 'none' },
+    sample: { kind: 'probes', rays: ['a585f4159ae599a2-IAD'] },
   })
   assert.match(line, /^ramp step=1\/5 percent=50 previous=50 /)
   assert.match(line, /routed_share=50.00 target=50 tolerance=42.50..57.50 agg=400/)
-  assert.match(line, /latency=informational/)
+  assert.match(line, /latency=informational latency_sample=probes/)
   assert.match(line, /decision=advance/)
   const carried = progressLine({
     step: 5,
@@ -174,10 +176,11 @@ test('progress line labels latency informational and names a carried baseline', 
     decision: advance,
     latency: 'informational',
     probe: { kind: 'none' },
+    sample: { kind: 'probes', rays: ['a585f4159ae599a2-IAD'] },
   })
   assert.equal(
     carried,
-    'ramp step=5/5 percent=100 previous=0 samples=120/0 error_rate=0.0000/- routed_share=100.00 target=100 tolerance=100.00..100.00 agg=120 p99_wall_ms=114/84 p99_cpu_ms=12/12 latency=informational decision=advance previous_sample=carried',
+    'ramp step=5/5 percent=100 previous=0 samples=120/0 error_rate=0.0000/- routed_share=100.00 target=100 tolerance=100.00..100.00 agg=120 p99_wall_ms=114/84 p99_cpu_ms=12/12 latency=informational latency_sample=probes decision=advance previous_sample=carried',
   )
 })
 

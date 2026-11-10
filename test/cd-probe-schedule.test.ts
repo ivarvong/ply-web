@@ -83,7 +83,7 @@ function stats(requests: number): VersionStats {
 
 function at100(): Observation {
   const next = stats(200)
-  return { kind: 'sample', next, previous: stats(0), aggregate: next }
+  return { kind: 'sample', next, previous: stats(0), aggregate: next, landed: next.invocations }
 }
 
 test('a policy timeout is timed_out and a transport error stays network', () => {

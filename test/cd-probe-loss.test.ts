@@ -66,11 +66,12 @@ function windowFor(percent: number): Observation {
   if (percent >= 100) {
     const next = stats(200)
     const previous = stats(0)
-    return { kind: 'sample', next, previous: { ...previous, wallMs: [], cpuMs: [], fetchMs: [] }, aggregate: next }
+    return { kind: 'sample', next, previous: { ...previous, wallMs: [], cpuMs: [], fetchMs: [] }, aggregate: next, landed: next.invocations }
   }
   const next = stats(150)
   const previous = stats(50)
-  return { kind: 'sample', next, previous, aggregate: stats(200) }
+  const aggregate = stats(200)
+  return { kind: 'sample', next, previous, aggregate, landed: aggregate.invocations }
 }
 
 test('a client abort with no status and no ray is a loss, and a 500 is a responded server error', () => {

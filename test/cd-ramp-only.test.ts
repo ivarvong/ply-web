@@ -9,7 +9,7 @@ import { parsePolicy, type RolloutPolicy } from '../scripts/cd/policy.ts'
 import { liveVerdict } from '../scripts/cd/pipeline-plan.ts'
 import { planCanary } from '../scripts/cd/deploy-plan.ts'
 import type { ProbeOutcome } from '../scripts/cd/probe.ts'
-import { INGEST_LANDED, observeAfterIngest, runRamp, type Observation, type RampIo } from '../scripts/cd/ramp.ts'
+import { ALL_INVOCATIONS, INGEST_LANDED, observeAfterIngest, runRamp, type Observation, type RampIo } from '../scripts/cd/ramp.ts'
 import type { VersionStats } from '../scripts/cd/telemetry.ts'
 
 function checked(): RolloutPolicy {
@@ -50,6 +50,7 @@ function window(next: Partial<VersionStats>, previous: Partial<VersionStats> = {
       errorLogs: newer.errorLogs + older.errorLogs,
       wallMs: [...newer.wallMs, ...older.wallMs],
     }),
+    landed: newer.invocations + older.invocations,
   }
 }
 
@@ -232,12 +233,12 @@ test('the polled ingest wait stops as soon as the probes have landed, and gives 
   const loss = { total: 1000, count: 0, rate: 0, maxLossRate: 0.01, exceeded: false, responded: 1000, serverErrors: 0, ids: [], timedOut: 0, aborted: 0, network: 0, shed: 0 }
   let landed = 0
   const fast = io(() => { landed += 400; return window({ requests: Math.min(landed, 1000) }) }, probes(1000))
-  const observed = await observeAfterIngest(policy, fast.io, 0, 0, 100, loss)
+  const observed = await observeAfterIngest(policy, fast.io, 0, 0, 100, loss, ALL_INVOCATIONS)
   assert.equal(observed.kind, 'sample')
   if (observed.kind === 'sample') assert.ok(observed.aggregate.invocations >= 1000 * INGEST_LANDED)
   assert.equal(fast.trace.observed, 3)
   const slow = io(() => window({ requests: 10 }), probes(1000))
-  await observeAfterIngest(policy, slow.io, 0, 0, 100, loss)
+  await observeAfterIngest(policy, slow.io, 0, 0, 100, loss, ALL_INVOCATIONS)
   assert.equal(slow.trace.slept.reduce((a, b) => a + b, 0), policy.ingestWaitMs)
 })
 

@@ -31,7 +31,8 @@ function stats(over: Partial<VersionStats> = {}): VersionStats {
 function sample(next: Partial<VersionStats>, previous: Partial<VersionStats>): Extract<Observation, { kind: 'sample' }> {
   const newer = stats(next)
   const older = stats(previous)
-  return { kind: 'sample', next: newer, previous: older, aggregate: stats({ requests: newer.requests + older.requests, wallMs: [...newer.wallMs, ...older.wallMs] }) }
+  const aggregate = stats({ requests: newer.requests + older.requests, wallMs: [...newer.wallMs, ...older.wallMs] })
+  return { kind: 'sample', next: newer, previous: older, aggregate, landed: aggregate.invocations }
 }
 
 test('mean and sample variance', () => {

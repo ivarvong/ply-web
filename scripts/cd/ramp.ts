@@ -10,6 +10,34 @@ import { burnMap, CARRY_WALL_SAMPLES, judgeStep, routedShare, type RoutedShare, 
 
 export type { VersionStats } from './telemetry.ts'
 
+/**
+ * Which invocations a step's latency figures (wall and CPU p99, the forecast's wall delta) are read from. Counts, errors,
+ * 5xx, burn and routed share always come from every invocation of the window; only latency is scoped.
+ *
+ * `probes`: the step's own responded probes, joined on cf-ray. The ramp's probes are the one traffic the harness controls
+ * at every step, so the figure means the same thing at 10% and at 100%. At 100% the live smoke, the visual smoke and the
+ * rate gate run inside the dwell (pipeline.ts `liveChecks`); their writes wait on Artifacts. Measured on run
+ * 2026-11-10T14-56-52-021Z (480225db, the 100% step's query window 15:04:07.9Z to 15:05:47.9Z, re-queried read-only on
+ * 2026-11-10): 2,091 external invocations of the new version, of which 1,962 probes (wall p99 14 ms, cpu p99 7), 74
+ * live-smoke requests (p99 6,580 ms, the slowest POST /v1/branch) and 55 GET /view from the visual smoke (p99 836 ms).
+ * The step reported p99 696 ms from all of them; its probes alone were 14 ms, beside 76/40/49/15 ms at 10..75%.
+ * `all`: no probe answered with a ray (no dwell, or every probe lost): every invocation, and the line says so.
+ */
+export type LatencySample =
+  | { readonly kind: 'probes'; readonly rays: readonly string[] }
+  | { readonly kind: 'all'; readonly reason: 'no_probe_rays' }
+
+export const ALL_INVOCATIONS: LatencySample = { kind: 'all', reason: 'no_probe_rays' }
+
+/** The responded probes' cf-rays, or every invocation when there are none. */
+export function latencySampleOf(outcomes: readonly ProbeOutcome[]): LatencySample {
+  const rays: string[] = []
+  for (const outcome of outcomes) {
+    if (outcome.kind === 'responded' && outcome.ray.tag === 'some') rays.push(outcome.ray.value)
+  }
+  return rays.length > 0 ? { kind: 'probes', rays } : ALL_INVOCATIONS
+}
+
 export type Observation =
   | { readonly kind: 'unavailable'; readonly reason: string; readonly ref?: ObservationRef }
   | {
@@ -17,6 +45,13 @@ export type Observation =
     readonly next: VersionStats
     readonly previous: VersionStats
     readonly aggregate: VersionStats
+    /**
+     * The window's invocations of the latency sample (LatencySample): with `probes`, the probes that have reached the
+     * telemetry; with `all`, every external invocation. The polled ingest wait counts these: at 100% the live checks'
+     * own requests are in `aggregate`, and counting them stopped the wait on 2,024 events of which only about 1,950
+     * were probes (run 2026-11-10T14-56-52-021Z; 2,091 had landed when re-queried).
+     */
+    readonly landed: number
     readonly ref?: ObservationRef
   }
 
@@ -164,6 +199,7 @@ export function progressLine(input: {
   readonly decision: RampDecision
   readonly latency: RolloutPolicy['gates']['latency']['mode']
   readonly probe: { readonly kind: 'none' } | { readonly kind: 'measured'; readonly loss: ProbeLoss }
+  readonly sample: LatencySample
 }): string {
   const previousPercent = input.percent >= 100 ? 0 : 100 - input.percent
   const samples = `${input.next?.requests ?? '-'}/${input.previous?.requests ?? '-'}`
@@ -172,7 +208,7 @@ export function progressLine(input: {
   const oldCpu = input.carriedPrevious?.cpuMs ?? input.previous?.cpuMs
   const walls = `${p99(input.next?.wallMs)}/${p99(oldWalls)}`
   const cpu = `${p99(input.next?.cpuMs)}/${p99(oldCpu)}`
-  const latency = input.latency === 'off' ? '' : ` p99_wall_ms=${walls} p99_cpu_ms=${cpu} latency=${input.latency}`
+  const latency = input.latency === 'off' ? '' : ` p99_wall_ms=${walls} p99_cpu_ms=${cpu} latency=${input.latency} latency_sample=${input.sample.kind}`
   const routed = `routed_share=${points(input.share.share)} target=${input.percent} tolerance=${tolerance(input.share)} agg=${input.share.n}`
   const internal = internalNote(input.next, input.previous)
   const probe = input.probe.kind === 'measured'
@@ -207,7 +243,8 @@ export type RampIo = {
   /** Probe during the dwell. When omitted, `sleep` is the whole dwell and no probe sample is judged. */
   dwell?(ms: number, percent: number): Promise<{ readonly outcomes: readonly ProbeOutcome[] }>
   applySplit(percent: number): Promise<null | string | HeldWrite>
-  observe(from: number, to: number, percent: number): Promise<Observation>
+  /** `sample` scopes the latency figures only (LatencySample); every count and gate reads the whole window. */
+  observe(from: number, to: number, percent: number, sample: LatencySample): Promise<Observation>
   /** Called once a step's split is written (or already in place). The pipeline starts the live checks at 100% here. */
   onApplied?(percent: number): void
   /** Called with the observation ref. A missing ref is a bug: a decision without an observation. */
@@ -354,24 +391,30 @@ async function probeWindows(
   dwell: (ms: number, percent: number) => Promise<{ readonly outcomes: readonly ProbeOutcome[] }>,
   dwellMs: number,
   percent: number,
-): Promise<ProbeWindow> {
+): Promise<{ readonly window: ProbeWindow; readonly sample: LatencySample }> {
   const judge = probeJudge(policy)
   let window: ProbeWindow = { kind: 'ok', loss: emptyProbeLoss(policy.probe.maxLossRate) }
   let retryReason = 'harness/network stall'
   const limit = policy.probe.windowAttempts
+  // every attempt's probes are in the step's observed window (it opens before the first), so all of them are the sample
+  const outcomes: ProbeOutcome[] = []
   let attempt = 0
   while (attempt < limit) {
     attempt += 1
     const probed = await dwell(dwellMs, percent)
+    outcomes.push(...probed.outcomes)
     window = judgeProbeWindow(probed.outcomes, judge)
-    if (window.kind !== 'retry') return window
+    if (window.kind !== 'retry') return { window, sample: latencySampleOf(outcomes) }
     retryReason = window.reason
     if (attempt < limit && policy.probe.windowBackoffMs > 0) await io.sleep(policy.probe.windowBackoffMs)
   }
   return {
-    kind: 'insufficient_samples',
-    loss: window.loss,
-    reason: `${retryReason}; ${limit} windows exhausted; ${window.loss.serverErrors} server errors, not rolling back`,
+    window: {
+      kind: 'insufficient_samples',
+      loss: window.loss,
+      reason: `${retryReason}; ${limit} windows exhausted; ${window.loss.serverErrors} server errors, not rolling back`,
+    },
+    sample: latencySampleOf(outcomes),
   }
 }
 
@@ -388,17 +431,18 @@ export async function observeAfterIngest(
   to: number,
   percent: number,
   probes: ProbeLoss | null,
+  sample: LatencySample,
 ): Promise<Observation> {
   if (policy.ingestPollMs <= 0 || probes === null || probes.responded === 0) {
     await io.sleep(policy.ingestWaitMs)
-    return io.observe(from, to, percent)
+    return io.observe(from, to, percent, sample)
   }
   const deadline = io.now() + policy.ingestWaitMs
   for (;;) {
     await io.sleep(Math.min(policy.ingestPollMs, Math.max(0, deadline - io.now())))
-    const observed = await io.observe(from, to, percent)
+    const observed = await io.observe(from, to, percent, sample)
     if (io.now() >= deadline) return observed
-    if (observed.kind === 'sample' && observed.aggregate.invocations >= probes.responded * INGEST_LANDED) return observed
+    if (observed.kind === 'sample' && observed.landed >= probes.responded * INGEST_LANDED) return observed
   }
 }
 
@@ -444,9 +488,12 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
     if (policy.warmupMs > 0) await io.sleep(policy.warmupMs)
     const from = io.now()
     let probeLoss = emptyProbeLoss(policy.probe.maxLossRate)
+    let sample: LatencySample = ALL_INVOCATIONS
     const dwell = io.dwell
     if (dwell) {
-      const window = await probeWindows(policy, io, dwell, step.dwellMs, percent)
+      const probed = await probeWindows(policy, io, dwell, step.dwellMs, percent)
+      const window = probed.window
+      sample = probed.sample
       probeLoss = window.loss
       // `telemetry`: a probe-loss fault is the harness (client aborts, probe tail). Record it and judge the step on the
       // new version's telemetry below; a 5xx the Worker served is in that telemetry.
@@ -465,6 +512,7 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
           decision: noted,
           latency: policy.gates.latency.mode,
           probe: { kind: 'measured', loss: probeLoss },
+          sample,
         })
         lines.push(line)
         steps.push({ percent, burns: noted.burns, outcome: noted.outcome, line, probeLoss, forecast: null })
@@ -492,7 +540,7 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
     // Wait for the dwell's own tail to land, then query that window. The next step
     // has not started. The checked-in wait is above the 2026-11-01 gaps: 12640ms
     // at 1% and 17313ms at 5% on run 2026-11-01T00-10-02-620Z.
-    const observed = await observeAfterIngest(policy, io, from, to, percent, io.dwell ? probeLoss : null)
+    const observed = await observeAfterIngest(policy, io, from, to, percent, io.dwell ? probeLoss : null, sample)
     if (observed.kind === 'sample' && observed.previous.wallMs.length >= CARRY_WALL_SAMPLES) carried = observed.previous
     const carriedPrevious = observed.kind === 'sample'
       && percent === 100
@@ -517,6 +565,7 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
       decision,
       latency: policy.gates.latency.mode,
       probe: io.dwell ? { kind: 'measured', loss: probeLoss } : { kind: 'none' },
+      sample,
     })
     lines.push(line)
     let forecast: ForecastCheck | null = null

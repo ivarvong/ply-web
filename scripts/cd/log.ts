@@ -791,9 +791,11 @@ export class RunLog {
     readonly cfRay: string | null
     readonly requestId: string | null
     readonly artifactsRay: string | null
-  }): Promise<void> {
+  }, stage: string = this.#stage): Promise<void> {
+    // `stage` names who sent it when that is not the stage open now: the ramp's probes run through the 100% step's dwell
+    // beside the live smoke, and were labelled smoke-live by the open stage (run 2026-11-10T14-56-52-021Z: 2,001 probes)
     await this.#enqueue(async () => {
-      await this.#append('request', input)
+      await this.#append('request', input, stage)
     })
   }
 

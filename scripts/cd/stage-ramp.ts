@@ -6,14 +6,15 @@ import { isTrafficSplit, sameSplit, trafficSplit, type VersionShare } from './de
 import { notSpanFilter, queryCapturedSliced, telemetryQueryRetry } from './o11y.ts'
 import { errorMessage } from './proc.ts'
 import { activeLog, BLOB_DIR } from './log.ts'
-import { readPassVerdict, runRamp, type Observation } from './ramp.ts'
+import { readPassVerdict, runRamp, type LatencySample, type Observation } from './ramp.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import type { RolloutPolicy } from './policy.ts'
 import { accountProbeLoss, classifyProbe, probeLossRecord, rayOf, type ProbeOutcome } from './probe.ts'
 import { runProbeSchedule } from './probe-schedule.ts'
 import { writeJson } from './run-dir.ts'
 import { routedShare } from './slo.ts'
-import { percentile, queryTo, scriptVersionId, serviceFilter, statsFromEvents } from './telemetry.ts'
+import { percentile, queryTo, rayIdOf, rayKey, scriptVersionId, serviceFilter, statsFromEvents, type VersionStats } from './telemetry.ts'
+import { asRecord } from './json.ts'
 import { applySplit, readShares, rollbackTo } from './traffic.ts'
 import { armStep, beginRamp, endRamp, HarnessFault, noteStepApplied } from './traffic-gate.ts'
 
@@ -27,7 +28,27 @@ function eventsFor(events: readonly unknown[], version: string): unknown[] {
   return events.filter(event => scriptVersionId(event) === version)
 }
 
-async function observe(config: CdConfig, version: string, previous: string, from: number, to: number, percent: number): Promise<Observation> {
+/** An event whose cf-ray is one of `rays` (a probe's response header against the invocation's `$metadata.rayId`). */
+function rayIn(event: unknown, rays: ReadonlySet<string>): boolean {
+  const rec = asRecord(event)
+  const ray = rec ? rayIdOf(rec) : null
+  return ray !== null && rays.has(rayKey(ray))
+}
+
+/**
+ * The window's stats with wall and CPU read from `sample` only (ramp.ts LatencySample): counts, errors, 5xx, internal
+ * calls and routed share stay those of every event. `excluded` is how many external invocations the latency left out;
+ * `landed` is how many are in the sample (the probes that reached the telemetry), which the ingest wait counts.
+ */
+export function scopedStats(events: readonly unknown[], sample: LatencySample): { readonly stats: VersionStats; readonly excluded: number; readonly landed: number } {
+  const whole = statsFromEvents(events, [])
+  if (sample.kind === 'all') return { stats: whole, excluded: 0, landed: whole.invocations }
+  const rays = new Set(sample.rays.map(rayKey))
+  const timed = statsFromEvents(events.filter(event => rayIn(event, rays)), [])
+  return { stats: { ...whole, wallMs: timed.wallMs, cpuMs: timed.cpuMs }, excluded: whole.wallMs.length - timed.wallMs.length, landed: timed.invocations }
+}
+
+export async function observe(config: CdConfig, version: string, previous: string, from: number, to: number, percent: number, sample: LatencySample): Promise<Observation> {
   const service = serviceFilter(config.worker)
   const query = { view: 'events' as const, filters: [service] }
   try {
@@ -36,9 +57,12 @@ async function observe(config: CdConfig, version: string, previous: string, from
     // load (run 2026-11-06T21-37-46-183Z); spans only fed fetchMs, which gates nothing here.
     const all = await queryCapturedSliced('events', from, to, [service, notSpanFilter()], retry)
     const spans = { events: [] as unknown[], query: all.query }
-    const next = statsFromEvents(eventsFor(all.events, version), spans.events)
-    const prior = statsFromEvents(eventsFor(all.events, previous), spans.events)
-    const aggregate = statsFromEvents(all.events, spans.events)
+    const scopedNext = scopedStats(eventsFor(all.events, version), sample)
+    const scopedPrior = scopedStats(eventsFor(all.events, previous), sample)
+    const scopedAll = scopedStats(all.events, sample)
+    const next = scopedNext.stats
+    const prior = scopedPrior.stats
+    const aggregate = scopedAll.stats
     const share = routedShare(next.invocations, aggregate.invocations, percent, config.policy.split.z)
     const log = activeLog()
     if (!log) throw new HarnessFault('ramp observation with no active log')
@@ -59,6 +83,10 @@ async function observe(config: CdConfig, version: string, previous: string, from
         previousWallP99: percentile(prior.wallMs, 0.99),
         nextCpuP99: percentile(next.cpuMs, 0.99),
         previousCpuP99: percentile(prior.cpuMs, 0.99),
+        latencySample: sample.kind,
+        latencyProbeRays: sample.kind === 'probes' ? sample.rays.length : 0,
+        latencySamples: { next: next.wallMs.length, previous: prior.wallMs.length, aggregate: aggregate.wallMs.length },
+        latencyExcluded: { next: scopedNext.excluded, previous: scopedPrior.excluded, aggregate: scopedAll.excluded },
         internalInvocations: {
           next: next.internal,
           previous: prior.internal,
@@ -71,7 +99,7 @@ async function observe(config: CdConfig, version: string, previous: string, from
       // The pages are the command captures already; cite them by digest instead of embedding a second, escaped copy.
       raw: JSON.stringify({ pages: all.pages.map(digest => `${BLOB_DIR}/${digest}.gz`) }),
     })
-    return { kind: 'sample', next, previous: prior, aggregate, ref }
+    return { kind: 'sample', next, previous: prior, aggregate, landed: scopedAll.landed, ref }
   } catch (error) {
     if (error instanceof HarnessFault) throw error
     const reason = `telemetry unavailable: ${errorMessage(error)}`
@@ -120,7 +148,7 @@ async function probeCall(
         cfRay: orNull(outcome.ray),
         requestId: response.headers.get('x-ply-request-id'),
         artifactsRay: response.headers.get('x-artifacts-ray'),
-      })
+      }, 'ramp')
     }
     return outcome
   } catch (error) {
@@ -297,7 +325,7 @@ export async function stageRamp(
         }
       },
       onApplied: schedule.onApplied,
-      observe: (from, to, percent) => observe(config, opts.version, target, from, queryTo(to), percent),
+      observe: (from, to, percent, sample) => observe(config, opts.version, target, from, queryTo(to), percent, sample),
       onDecision: async (ref, decision, percent) => {
         const log = activeLog()
         if (!log) throw new HarnessFault('ramp decision with no active log')

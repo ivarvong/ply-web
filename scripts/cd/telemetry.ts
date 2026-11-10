@@ -360,6 +360,12 @@ function rayBody(ray: string): string | null {
   return body.toLowerCase()
 }
 
+/** A cf-ray as a join key: its 16-hex body lowercased ("a585f4159ae599a2-IAD" and "A585F4159AE599A2" are one key). */
+export function rayKey(ray: string): string {
+  const body = rayBody(ray)
+  return body === null ? ray : body
+}
+
 export function sameRay(left: string, right: string): boolean {
   if (left === right) return true
   const a = rayBody(left)

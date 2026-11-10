@@ -396,3 +396,16 @@ test('chart png is a png', () => {
   const png = chartPng({ title: 'burn rate', series: [{ name: 'read', rgb: [1, 2, 3], points: [{ x: '1', y: 2 }] }], hLine: { y: 14.4, rgb: [255, 0, 0] } })
   assert.equal(png.subarray(0, 4).toString('hex'), '89504e47')
 })
+
+test('a request names the stage that sent it: a probe inside the live smoke is ramp, the rest take the open stage', async () => {
+  // run 2026-11-10T14-56-52-021Z: the 100% step's 2,001 probes ran beside the live smoke and were logged smoke-live
+  const dir = await temp()
+  const log = await RunLog.open(join(dir, 'run'), join(dir, 'ledger.jsonl'), 'run-stage')
+  log.useStage('smoke-live')
+  const row = { method: 'GET', url: 'https://ply.example/', status: 200, version: VERSION, latencyMs: 5, cfRay: 'a585f4159ae599a2-IAD', requestId: null, artifactsRay: null }
+  await log.request(row, 'ramp')
+  await log.request({ ...row, url: 'https://ply.example/v1/edit', cfRay: 'a585f4159ae599a3-IAD' })
+  const requests = log.recorded().filter(event => event.kind === 'request')
+  assert.deepEqual(requests.map(event => event.stage), ['ramp', 'smoke-live'])
+  await log.finish(0, null)
+})
