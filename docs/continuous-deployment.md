@@ -213,6 +213,8 @@ cd: FAIL bump: npm test failed: …
 
 You push `bump-ply` yourself if you want a pull request for the pin. Deploy runs only when `HEAD` is `origin/main`, so the pin commit is not uploaded until it has been merged there.
 
+Every new ply main is also tested before anyone bumps to it. ply's `notify-ply-web.yml` sends `repository_dispatch` `ply-main-updated` with `client_payload.sha`; `.github/workflows/ply-main.yml` (also runnable by hand: `workflow_dispatch` with a `sha` input) checks out ply-web `main` and runs `sh scripts/ply-main-check.sh <sha> <dir>`, which sets `dependencies.ply` to `github:ivarvong/ply#<sha>` in the runner only (never committed), installs, and runs `npm test`, `npm run lint` and `npm run typecheck`. If a gate fails, the run fails and opens one issue in this repo titled `ply main <short sha> breaks ply-web` (or comments on the open one with that title), with the failed gates, the failing tests and the ply compare range from the current pin to the dispatched sha. It uses only the workflow's `GITHUB_TOKEN` (`contents: read`, `issues: write`), deploys nothing and needs no secrets. Run the same check locally from a clean checkout with `sh scripts/ply-main-check.sh <sha> /tmp/ply-main`, then `git checkout package.json package-lock.json`.
+
 ## 2. Deploy the canary
 
 ```sh
