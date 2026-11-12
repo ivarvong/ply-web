@@ -8,7 +8,7 @@ import { err, ok, type Result } from '../http/machine.ts'
 import { advertisedOid } from './advertised.ts'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
 import { MODE_TREE, BLOB_MODES } from './constants.ts'
-import { assertNever, refExists } from './errors.ts'
+import { assertNever, done, refExistsAt, settle, type WorkerError, type Written } from './errors.ts'
 import { readHead } from './head.ts'
 import { plyPerson, type Stamp } from './identity.ts'
 import { sameBranch, type Change, type EditRequest } from './request.ts'
@@ -229,11 +229,12 @@ async function streamEdit(remote: string, req: EditRequest, target: Target, edit
  * Apply `req` and push. Returns the unified write body.
  * `author` stamps both author and committer unless `committer` is set, in which case the commit is built here
  * (editFile has only one identity).
- * ref_exists is the Worker's own error, not a PlyError: it is thrown through operation() (see branch.ts). The tree
- * edits run inside the git.commit.apply span, which records a thrown error, so applyOne and its helpers still throw.
+ * ref_exists is the Worker's own conflict, not a PlyError: the body returns it as a value (see branch.ts). The tree
+ * edits run inside the git.commit.apply span, before any push: applyOne and its helpers throw only PlyErrors there,
+ * which operation() returns as that Err.
  */
-export async function commitEdit(remote: string, req: EditRequest, opts: CallOpts): Promise<Result<Record<string, unknown>, PlyError>> {
-  return operation<Record<string, unknown>>('commit', remote, {
+export async function commitEdit(remote: string, req: EditRequest, opts: CallOpts): Promise<Result<Record<string, unknown>, PlyError | WorkerError>> {
+  return settle(await operation<Written<Record<string, unknown>>>('commit', remote, {
     ...opts,
     attrs: { 'git.commit.ops': req.changes.map(change => change.kind), 'git.commit.ref': req.ref === null ? 'HEAD' : req.ref },
   }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
@@ -243,7 +244,7 @@ export async function commitEdit(remote: string, req: EditRequest, opts: CallOpt
     const headCheck = checkHead(target, req)
     if (!headCheck.ok) return headCheck
     const baseIsOther = req.base.kind === 'ref' && !sameBranch(req.base.ref, target.ref)
-    if (target.oid !== null && baseIsOther) throw refExists(target.ref, target.oid)
+    if (target.oid !== null && baseIsOther) return outcome('ref_exists', refExistsAt(target.ref, target.oid))
     const creating = target.oid === null
     const edit = singleEdit(req)
     const stream = edit !== null && req.committer === null && req.base.kind !== 'oid' && (target.oid !== null || baseIsOther)
@@ -251,11 +252,11 @@ export async function commitEdit(remote: string, req: EditRequest, opts: CallOpt
     root.set({ 'git.commit.ref': target.ref, 'git.commit.creating': creating, 'git.commit.base': req.base.kind === 'omit' ? '' : req.base.kind === 'oid' ? req.base.oid : req.base.ref })
     if (stream && edit) {
       const streamed = await streamEdit(remote, req, target, edit, creating, opts)
-      if (streamed.ok) return outcome(String(streamed.value.outcome), streamed.value)
+      if (streamed.ok) return outcome(String(streamed.value.outcome), done(streamed.value))
       if (!creating || streamed.error.code !== 'cas_conflict') return streamed
       const cur = await advertisedOid(t, target.ref)
       if (!cur.ok) return cur
-      throw refExists(target.ref, cur.value === null ? '' : cur.value)
+      return outcome('ref_exists', refExistsAt(target.ref, cur.value === null ? '' : cur.value))
     }
     const resolvedParent = await resolveParent(t, req, target)
     if (!resolvedParent.ok) return resolvedParent
@@ -277,7 +278,7 @@ export async function commitEdit(remote: string, req: EditRequest, opts: CallOpt
     const committer: Stamp = req.committer === null ? req.author : req.committer
     if (!creating && parent.oid === target.oid && built.oid === parent.tree) {
       root.set({ 'git.commit.tree': built.oid, 'git.commit.oid': target.oid })
-      return outcome('noop', writeResult('noop', target.ref, target.oid, target.oid, { tree: built.oid, pushBytes: 0 }))
+      return outcome('noop', done(writeResult('noop', target.ref, target.oid, target.oid, { tree: built.oid, pushBytes: 0 })))
     }
     const encoded = encodeCommit({
       tree: built.oid,
@@ -304,8 +305,8 @@ export async function commitEdit(remote: string, req: EditRequest, opts: CallOpt
       if (!creating || pushed.error.code !== 'cas_conflict') return pushed
       const cur = await advertisedOid(t, target.ref)
       if (!cur.ok) return cur
-      throw refExists(target.ref, cur.value === null ? '' : cur.value)
+      return outcome('ref_exists', refExistsAt(target.ref, cur.value === null ? '' : cur.value))
     }
-    return outcome('commit', writeResult('commit', target.ref, oid, creating ? null : target.oid, { tree: built.oid, pushBytes: pushed.value.packBytes, onto: parent.oid }))
-  })
+    return outcome('commit', done(writeResult('commit', target.ref, oid, creating ? null : target.oid, { tree: built.oid, pushBytes: pushed.value.packBytes, onto: parent.oid })))
+  }))
 }

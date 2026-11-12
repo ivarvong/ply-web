@@ -961,3 +961,46 @@ test('x-artifacts-ray: a read, an empty-repo first commit, a delta push, and a C
     raySrv.setBeforeReceive(null);
   }
 });
+
+// ply #277: operation() turns a throw from its body into bad_request 'callback' (or 'ambiguous' after a push handover).
+// The Worker's conflicts are returned values, so each documented 409 holds, including a conflict learnt from a definite
+// cas_conflict push rejection (a racer moves the ref between ls-refs and receive-pack). A push whose outcome is unknown
+// is still ply's ambiguous (502, retry read).
+test('write conflicts are 409 values: pre-check and post-push definite rejection; an unknown push is ambiguous', { skip }, async () => {
+  const r = repo({ 'a.txt': 'a\n' }, () => raySrv.url);
+  const { bare, head } = r;
+  const post = async (path, body, method = 'POST') => { const res = await W(path, { method, body: { remote: r.remote, ...body } }); return { status: res.status, body: await res.json() }; };
+  const env = { ...process.env, GIT_AUTHOR_NAME: 'w', GIT_AUTHOR_EMAIL: 'w@x', GIT_COMMITTER_NAME: 'w', GIT_COMMITTER_EMAIL: 'w@x' };
+  const other = git(bare, ['commit-tree', git(bare, ['rev-parse', 'HEAD^{tree}']).trim(), '-p', head, '-m', 'other'], { env }).trim();
+  const refExists = (x, oid) => { assert.equal(x.status, 409, JSON.stringify(x.body)); assert.equal(x.body.code, 'ref_exists'); assert.equal(x.body.retry, 'no'); assert.equal(x.body.oid, oid); };
+  const stale = (x, expected, actual) => {
+    assert.equal(x.status, 409, JSON.stringify(x.body)); assert.equal(x.body.code, 'stale_expected'); assert.equal(x.body.retry, 'fresh');
+    assert.equal(x.body.expected, expected); assert.equal(x.body.actual, actual); assert.equal(x.body.oid, actual);
+  };
+  // pre-check conflicts (no push)
+  refExists(await post('/v1/branch', { ref: 'main', from: head }), head);
+  let x = await post('/v1/tag', { name: 't0', target: head }); assert.equal(x.status, 201, JSON.stringify(x.body));
+  refExists(await post('/v1/tag', { name: 't0', target: head }), head);
+  stale(await post('/v1/tag', { name: 't0', oid: other }, 'DELETE'), other, head);
+  x = await post('/v1/branch', { ref: 'b0', from: head }); assert.equal(x.status, 201);
+  stale(await post('/v1/branch', { ref: 'b0', oid: other }, 'DELETE'), other, head);
+  const A = { name: 'a', email: 'a@x', time: 1767225600, tz: '+0000' };
+  refExists(await post('/v1/edit', { ref: 'b0', base: 'main', path: 'a.txt', find: 'a', replace: 'b', author: A, message: 'm' }), head);
+  refExists(await post('/v1/edit', { ref: 'b0', base: 'main', changes: [{ op: 'create', path: 'n.txt', content: 'n\n' }], committer: A, author: A, message: 'm' }), head);
+  // post-push definite rejection: a racer moves (or creates) the ref after ls-refs, so git rejects the CAS
+  const race = (ref, to, from = '') => raySrv.setBeforeReceive(() => { raySrv.setBeforeReceive(null); git(bare, from ? ['update-ref', ref, to, from] : ['update-ref', ref, to, '0'.repeat(40)]); });
+  try {
+    race('refs/heads/b1', other); refExists(await post('/v1/branch', { ref: 'b1', from: head }), other);
+    race('refs/tags/t1', other); refExists(await post('/v1/tag', { name: 't1', target: head }), other);
+    race('refs/heads/b0', other, head); stale(await post('/v1/branch', { ref: 'b0' }, 'DELETE'), head, other);
+    race('refs/tags/t0', other, head); stale(await post('/v1/tag', { name: 't0', oid: head }, 'DELETE'), head, other);
+    race('refs/heads/b2', other); refExists(await post('/v1/edit', { ref: 'b2', base: 'main', path: 'a.txt', find: 'a', replace: 'b', author: A, message: 'm' }), other);
+    race('refs/heads/b3', other); refExists(await post('/v1/edit', { ref: 'b3', base: 'main', changes: [{ op: 'create', path: 'n.txt', content: 'n\n' }], committer: A, author: A, message: 'm' }), other);
+    // an unknown push outcome: the receive-pack POST is answered with a 500 after the request was handed over
+    raySrv.setBeforeReceive(() => { raySrv.setBeforeReceive(null); throw new Error('dropped'); });
+    x = await post('/v1/branch', { ref: 'b4', from: head });
+    assert.equal(x.body.code, 'ambiguous', JSON.stringify(x.body)); assert.equal(x.status, 502); assert.equal(x.body.retry, 'read');
+  } finally {
+    raySrv.setBeforeReceive(null);
+  }
+});

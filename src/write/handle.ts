@@ -6,6 +6,7 @@ import { type PlyError } from '../ply-result.ts'
 import { fromNullable, recordGet } from '../absent.ts'
 import { err, ok, type Result } from '../http/machine.ts'
 import { type CallOpts } from './call.ts'
+import { type WorkerError } from './errors.ts'
 import { createBranch, deleteRef } from './branch.ts'
 import { commitEdit } from './commit.ts'
 import { noteUnbornAdvertised, readHead, type HeadState } from './head.ts'
@@ -59,9 +60,9 @@ function optionalStamp(raw: Record<string, unknown>, key: string, field: string,
 }
 
 type Reply = { readonly body: Record<string, unknown> } | { readonly status: number; readonly body: Record<string, unknown> }
-type Handled = Promise<Result<Reply, PlyError>>
+type Handled = Promise<Result<Reply, PlyError | WorkerError>>
 
-const replied = (r: Result<Record<string, unknown>, PlyError>, status: number | null = null): Result<Reply, PlyError> =>
+const replied = (r: Result<Record<string, unknown>, PlyError | WorkerError>, status: number | null = null): Result<Reply, PlyError | WorkerError> =>
   r.ok ? ok(status === null ? { body: r.value } : { status, body: r.value }) : r
 
 export async function handleEdit(remote: string, body: unknown, opts: CallOpts): Handled {
