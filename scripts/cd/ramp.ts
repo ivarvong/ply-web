@@ -70,7 +70,7 @@ export type ProbeSampleDecision = {
   readonly burns: StepVerdict['burns']
 }
 
-/** The client itself stalled and the window could not be refilled: no verdict on the Worker, traffic left where it is. */
+/** The client itself stalled and the window could not be refilled: no verdict on the Worker; `runRamp` settles the step's traffic. */
 export type HarnessUnhealthyDecision = {
   readonly outcome: 'harness_unhealthy'
   readonly reason: string
@@ -82,14 +82,31 @@ export type RampDecision = StepVerdict | HarnessRamp | ProbeSampleDecision | Har
 
 export type HeldWrite = { readonly kind: 'state_conflict'; readonly reason: string }
 
-export type HarnessTraffic = 'rolled_back' | 'held'
+declare const settledBy: unique symbol
+
+/**
+ * Where an unjudged step left traffic: rolled back to `previous`, held at the last fully passed split (or at 0%), or
+ * `settle_failed`: the rollback or hold write failed, so the new version is still at the stopped step's percentage
+ * (the reason names that percentage and the error; `rollbackError` carries the error). The brand is private to this module and only `settleHarnessFault` attaches it, so a state that stopped on an
+ * unjudged step cannot exist without its traffic having been settled (ply-web#145).
+ */
+export type HarnessTraffic = ('rolled_back' | 'held' | 'settle_failed') & { readonly [settledBy]: 'settleHarnessFault' }
+
+/** A step the ramp could not judge. Its split write already moved traffic, so `runRamp` must settle it. */
+export type UnjudgedOutcome = 'harness_fault' | 'insufficient_samples' | 'harness_unhealthy'
+
+/** Not a `RampState`: the step stopped and its traffic is not settled yet. Only `settleHarnessFault` consumes it. */
+export type Unsettled = { readonly kind: 'unsettled'; readonly reason: string; readonly outcome: UnjudgedOutcome }
 
 export type RampState =
   | { readonly kind: 'ramping'; readonly step: number }
   | { readonly kind: 'rolled-back'; readonly reason: string }
   | { readonly kind: 'stopped'; readonly reason: string; readonly fault: 'state_conflict' }
   | { readonly kind: 'stopped'; readonly reason: string; readonly fault: 'harness_fault'; readonly traffic: HarnessTraffic }
-  | { readonly kind: 'held'; readonly reason: string; readonly outcome: 'hold' | 'insufficient_data' | 'insufficient_samples' | 'harness_unhealthy' }
+  /** Judged on telemetry and held by policy (`split.onMismatch` / `onInsufficient`). */
+  | { readonly kind: 'held'; readonly reason: string; readonly outcome: 'hold' | 'insufficient_data' }
+  /** Unjudged (no product verdict); `traffic` says where `settleHarnessFault` left the split. */
+  | { readonly kind: 'held'; readonly reason: string; readonly outcome: 'insufficient_samples' | 'harness_unhealthy'; readonly traffic: HarnessTraffic }
   | { readonly kind: 'complete' }
 
 export function rampStart(): RampState {
@@ -147,17 +164,27 @@ export function decideRampStep(
   })
 }
 
-/** Advance on a clean step. A terminal state stays terminal. Traffic for a harness fault is settled by `runRamp`. */
-export function applyRamp(state: RampState, decision: RampDecision, stepCount: number): RampState {
+/** Advance on a clean step. A terminal state stays terminal. An unjudged step is `unsettled` until `runRamp` settles its traffic. */
+export function applyRamp(state: RampState, decision: RampDecision, stepCount: number): RampState | Unsettled {
   if (state.kind !== 'ramping') return state
-  if (decision.outcome === 'harness_fault') return { kind: 'stopped', reason: decision.reason, fault: 'harness_fault', traffic: 'held' }
-  if (decision.outcome === 'rollback') return { kind: 'rolled-back', reason: decision.reason }
-  if (decision.outcome === 'hold' || decision.outcome === 'insufficient_data' || decision.outcome === 'insufficient_samples' || decision.outcome === 'harness_unhealthy') {
-    return { kind: 'held', reason: decision.reason, outcome: decision.outcome }
+  switch (decision.outcome) {
+    case 'harness_fault':
+    case 'insufficient_samples':
+    case 'harness_unhealthy':
+      return { kind: 'unsettled', reason: decision.reason, outcome: decision.outcome }
+    case 'rollback':
+      return { kind: 'rolled-back', reason: decision.reason }
+    case 'hold':
+    case 'insufficient_data':
+      return { kind: 'held', reason: decision.reason, outcome: decision.outcome }
+    case 'advance': {
+      const next = state.step + 1
+      if (next >= stepCount) return { kind: 'complete' }
+      return { kind: 'ramping', step: next }
+    }
+    default:
+      return assertNever(decision)
   }
-  const next = state.step + 1
-  if (next >= stepCount) return { kind: 'complete' }
-  return { kind: 'ramping', step: next }
 }
 
 function fixedRate(count: number, total: number): string {
@@ -290,42 +317,65 @@ const UNTESTED_SHARE: RoutedShare = { n: 0, newRequests: 0, share: null, low: nu
 
 type Settled = { readonly state: RampState; readonly rollbackError: string | null }
 
-async function rollbackTraffic(io: RampIo, reason: string): Promise<Settled> {
-  const rolled = await io.rollback()
-  const conflict = asConflict(rolled)
-  if (conflict) return { state: { kind: 'stopped', reason: conflict.reason, fault: 'state_conflict' }, rollbackError: null }
-  return {
-    state: { kind: 'stopped', reason, fault: 'harness_fault', traffic: 'rolled_back' },
-    rollbackError: typeof rolled === 'string' ? rolled : null,
+const ROLLED_BACK = 'rolled_back' as HarnessTraffic
+const HELD = 'held' as HarnessTraffic
+const SETTLE_FAILED = 'settle_failed' as HarnessTraffic
+
+function settledState(unsettled: Unsettled, reason: string, traffic: HarnessTraffic): RampState {
+  switch (unsettled.outcome) {
+    case 'harness_fault':
+      return { kind: 'stopped', reason, fault: 'harness_fault', traffic }
+    case 'insufficient_samples':
+    case 'harness_unhealthy':
+      return { kind: 'held', reason, outcome: unsettled.outcome, traffic }
+    default:
+      return assertNever(unsettled.outcome)
   }
 }
 
-/** A harness fault above 0% rolls back to `previous`, or holds the last fully passed split. */
+async function rollbackTraffic(io: RampIo, percent: number, unsettled: Unsettled): Promise<Settled> {
+  const rolled = await io.rollback()
+  const conflict = asConflict(rolled)
+  if (conflict) return { state: { kind: 'stopped', reason: conflict.reason, fault: 'state_conflict' }, rollbackError: null }
+  if (typeof rolled === 'string') {
+    return {
+      state: settledState(unsettled, `${unsettled.reason}; rollback to previous failed: ${rolled}; still at ${percent}%`, SETTLE_FAILED),
+      rollbackError: rolled,
+    }
+  }
+  return { state: settledState(unsettled, `${unsettled.reason}; rolled back to previous`, ROLLED_BACK), rollbackError: null }
+}
+
+/**
+ * An unjudged step (harness fault, too few samples, unhealthy client). Its split write already moved traffic, so
+ * above 0% it rolls back to `previous` (`rollback`, `telemetry`), or holds the last fully passed split (`hold`; a
+ * rollback when no step passed). The returned state's reason says where traffic is, including when that write failed.
+ */
 async function settleHarnessFault(
   policy: RolloutPolicy,
   io: RampIo,
   percent: number,
-  reason: string,
+  unsettled: Unsettled,
   lastPassed: Option<number>,
 ): Promise<Settled> {
-  if (percent <= 0) return { state: { kind: 'stopped', reason, fault: 'harness_fault', traffic: 'held' }, rollbackError: null }
+  if (percent <= 0) return { state: settledState(unsettled, `${unsettled.reason}; held at 0%`, HELD), rollbackError: null }
   switch (policy.probe.onHarnessFault) {
     case 'rollback':
     // A telemetry-unavailable fault under `telemetry` has nothing left to judge on: restore the previous version.
     case 'telemetry':
-      return rollbackTraffic(io, reason)
+      return rollbackTraffic(io, percent, unsettled)
     case 'hold': {
-      if (lastPassed.tag === 'none' || lastPassed.value <= 0) return rollbackTraffic(io, reason)
+      if (lastPassed.tag === 'none' || lastPassed.value <= 0) return rollbackTraffic(io, percent, unsettled)
       const held = await io.applySplit(lastPassed.value)
       const conflict = asConflict(held)
       if (conflict) return { state: { kind: 'stopped', reason: conflict.reason, fault: 'state_conflict' }, rollbackError: null }
       if (typeof held === 'string') {
         return {
-          state: { kind: 'stopped', reason: `${reason}; hold at ${lastPassed.value}% failed: ${held}`, fault: 'harness_fault', traffic: 'held' },
+          state: settledState(unsettled, `${unsettled.reason}; hold at ${lastPassed.value}% failed: ${held}; still at ${percent}%`, SETTLE_FAILED),
           rollbackError: held,
         }
       }
-      return { state: { kind: 'stopped', reason, fault: 'harness_fault', traffic: 'held' }, rollbackError: null }
+      return { state: settledState(unsettled, `${unsettled.reason}; held at ${lastPassed.value}%`, HELD), rollbackError: null }
     }
     default:
       return assertNever(policy.probe.onHarnessFault)
@@ -427,7 +477,7 @@ async function probeWindows(
     window: {
       kind: 'insufficient_samples',
       loss: window.loss,
-      reason: `${retryReason}; ${limit} windows exhausted; ${window.loss.serverErrors} server errors, not rolling back`,
+      reason: `${retryReason}; ${limit} windows exhausted; ${window.loss.serverErrors} server errors, no 5xx verdict`,
     },
     sample: latencySampleOf(outcomes),
   }
@@ -531,11 +581,13 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
         })
         lines.push(line)
         steps.push({ percent, burns: noted.burns, outcome: noted.outcome, line, probeLoss, forecast: null })
-        if (window.kind === 'harness_fault') {
-          const settled = await settleHarnessFault(policy, io, percent, window.reason, lastPassed)
+        if (window.kind === 'harness_fault' || window.kind === 'harness_unhealthy' || window.kind === 'insufficient_samples' || window.kind === 'retry') {
+          // Unjudged: the split write above already moved traffic, so settle it (ply-web#145).
+          const outcome = window.kind === 'retry' ? 'insufficient_samples' : window.kind
+          const settled = await settleHarnessFault(policy, io, percent, { kind: 'unsettled', reason: window.reason, outcome }, lastPassed)
           state = settled.state
           rollbackError = settled.rollbackError
-        } else if (window.kind === 'rollback') {
+        } else {
           const rolled = await io.rollback()
           const rolledConflict = asConflict(rolled)
           if (rolledConflict) state = { kind: 'stopped', reason: rolledConflict.reason, fault: 'state_conflict' }
@@ -543,11 +595,6 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
             rollbackError = typeof rolled === 'string' ? rolled : null
             state = { kind: 'rolled-back', reason: window.reason }
           }
-        } else if (window.kind === 'harness_unhealthy') {
-          // Prod untouched: no rollback, no hold write; the split stays as the last write left it.
-          state = { kind: 'held', reason: window.reason, outcome: 'harness_unhealthy' }
-        } else {
-          state = { kind: 'held', reason: window.reason, outcome: 'insufficient_samples' }
         }
         break
       }
@@ -598,13 +645,14 @@ export async function runRamp(policy: RolloutPolicy, io: RampIo): Promise<RampLo
       if (!observed.ref) throw new Error('decision without an observation')
       await io.onDecision(observed.ref, decision, percent)
     }
-    state = applyRamp(state, decision, policy.steps.length)
-    if (state.kind === 'stopped' && state.fault === 'harness_fault') {
-      const settled = await settleHarnessFault(policy, io, percent, decision.reason, lastPassed)
+    const applied = applyRamp(state, decision, policy.steps.length)
+    if (applied.kind === 'unsettled') {
+      const settled = await settleHarnessFault(policy, io, percent, applied, lastPassed)
       state = settled.state
       rollbackError = settled.rollbackError
       break
     }
+    state = applied
     if (state.kind === 'ramping' || state.kind === 'complete') lastPassed = some(percent)
     if (state.kind === 'rolled-back') {
       const rolled = await io.rollback()

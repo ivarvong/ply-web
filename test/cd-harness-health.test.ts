@@ -281,7 +281,7 @@ test('a freeze longer than the extension cap is harness_unhealthy, never a produ
   })
   const window = judgeProbeWindow(outcomes, judge())
   assert.equal(window.kind, 'harness_unhealthy')
-  assert.match(window.kind === 'harness_unhealthy' ? window.reason : '', /^harness unhealthy, prod untouched/)
+  assert.match(window.kind === 'harness_unhealthy' ? window.reason : '', /^harness unhealthy: /)
 })
 
 test('without a stall the dwell is not extended', async () => {
@@ -337,23 +337,20 @@ function stats(requests: number): VersionStats {
   }
 }
 
-test('runRamp: an unhealthy client holds the split where it is, with no rollback and no split write', async () => {
-  const rollout = policy()
-  let rolled = 0
-  let splits = 0
-  let dwells = 0
+function unhealthyRun(rollout: RolloutPolicy) {
+  const counts = { rolled: 0, splits: [] as number[], dwells: 0 }
   const outcomes: ProbeOutcome[] = []
   for (let index = 0; index < 53; index += 1) outcomes.push(answered(`ok-${index}`, NEW, 50))
   outcomes.push({ kind: 'stalled', id: 'client-stall 0-53733 53733ms' })
-  const result = await runRamp(rollout, {
+  const run = runRamp(rollout, {
     now: () => 0,
     sleep: async () => {},
     dwell: async () => {
-      dwells += 1
+      counts.dwells += 1
       return { outcomes }
     },
-    applySplit: async () => {
-      splits += 1
+    applySplit: async (percent: number) => {
+      counts.splits.push(percent)
       return null
     },
     observe: async (): Promise<Observation> => {
@@ -361,16 +358,38 @@ test('runRamp: an unhealthy client holds the split where it is, with no rollback
       return { kind: 'sample', next, previous: stats(0), aggregate: next, landed: 200 }
     },
     rollback: async () => {
-      rolled += 1
+      counts.rolled += 1
       return null
     },
   })
-  assert.equal(rolled, 0)
-  assert.equal(splits, 1)
-  assert.equal(dwells, 1)
+  return { run, counts }
+}
+
+// ply-web#145: the step's split write already moved traffic, so an unjudged step must settle it like a harness fault.
+test('runRamp: an unhealthy client above 0% rolls back under the checked-in onHarnessFault policy and says so', async () => {
+  const rollout = { ...policy(), steps: [{ percent: 10, dwellMs: 40_000 }] }
+  assert.equal(rollout.probe.onHarnessFault, 'telemetry')
+  const { run, counts } = unhealthyRun(rollout)
+  const result = await run
+  assert.equal(counts.rolled, 1)
+  assert.deepEqual(counts.splits, [10])
+  assert.equal(counts.dwells, 1)
   assert.equal(result.state.kind, 'held')
   if (result.state.kind === 'held') {
     assert.equal(result.state.outcome, 'harness_unhealthy')
-    assert.match(result.state.reason, /^harness unhealthy, prod untouched/)
+    assert.equal('traffic' in result.state ? result.state.traffic : null, 'rolled_back')
+    assert.doesNotMatch(result.state.reason, /prod untouched/)
+    assert.match(result.state.reason, /^harness unhealthy: /)
+    assert.match(result.state.reason, /rolled back to previous$/)
   }
+})
+
+test('runRamp: an unhealthy client under onHarnessFault hold with no passed step rolls back', async () => {
+  const base = policy()
+  const rollout = { ...base, steps: [{ percent: 10, dwellMs: 40_000 }], probe: { ...base.probe, onHarnessFault: 'hold' as const } }
+  const { run, counts } = unhealthyRun(rollout)
+  const result = await run
+  assert.equal(counts.rolled, 1)
+  assert.deepEqual(counts.splits, [10])
+  assert.equal(result.state.kind === 'held' && 'traffic' in result.state ? result.state.traffic : null, 'rolled_back')
 })
