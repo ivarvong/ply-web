@@ -1,0 +1,107 @@
+name: ply main consumer check
+
+# ply's notify-ply-web.yml sends repository_dispatch `ply-main-updated` (client_payload.sha) on `workflow_run`, after
+# ply's ci run for a push to ply main succeeds, and only when ivarvong/ply has the PLY_WEB_DISPATCH_TOKEN secret. Until
+# that secret exists no dispatch arrives (ply's notify run logs "PLY_WEB_DISPATCH_TOKEN is not set") and only
+# workflow_dispatch runs this. It runs ply-web main's gates (npm test, lint, typecheck) against that ply commit without
+# committing the pin (scripts/ply-main-check.sh edits package.json and the lockfile in the runner only). If a gate or
+# the `npm install` of the sha fails, the run fails and opens, or comments on, one issue titled
+# "ply main <short sha> breaks ply-web"; a malformed sha only fails the run. It never deploys and needs no secrets.
+
+on:
+  repository_dispatch:
+    types: [ply-main-updated]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: ply commit to test (7-40 hex)
+        required: true
+        type: string
+
+permissions: {}
+
+# One group per ply sha: GitHub keeps one pending run per group and cancels the older pending one when another
+# queues, so a single fixed group would skip the middle sha of three quick dispatches. Per-sha groups only dedupe a
+# repeat of the same sha (ply's notify-ply-web.yml keys its group by sha for the same reason).
+concurrency:
+  group: ply-main-consumer-check-${{ github.event.client_payload.sha || inputs.sha }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    permissions:
+      contents: read
+      issues: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CF_SEND_TELEMETRY: "false"
+    steps:
+      - name: Validate the ply sha
+        id: sha
+        env:
+          DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          sha="${DISPATCH_SHA:-${INPUT_SHA:-}}"
+          if ! printf '%s' "${sha}" | grep -Eq '^[0-9a-f]{7,40}$'; then
+            echo "::error::ply sha must be 7-40 lowercase hex, got '${sha}'"
+            exit 1
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # cf needs Node ^22.23, ^24.22 or ^26.12. A bare major can resolve to an older cached release.
+          node-version: 24.22
+          cache: npm
+      # package-lock resolves ply as git+ssh. Actions has no SSH key; the repo is public.
+      - name: Fetch GitHub git dependencies over HTTPS
+        run: |
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/"
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+      # Annotated tags in the suite need a committer. The runner has none. Do not sign.
+      - name: Git identity for the test suite
+        run: |
+          git config --global user.name "ply-web"
+          git config --global user.email "ply-web@example.com"
+          git config --global commit.gpgsign false
+      - run: npm ci
+      - name: ply-web gates against the dispatched ply
+        id: check
+        env:
+          PLY_SHA: ${{ steps.sha.outputs.sha }}
+        # The script appends outcome=pass|fail to $GITHUB_OUTPUT itself (a gate or install failure is `fail`; a usage
+        # error writes nothing); test/ply-main-check.test.js pins that and this step's wiring.
+        run: sh scripts/ply-main-check.sh "${PLY_SHA}" "$RUNNER_TEMP/ply-main"
+      - name: Open or comment on the breakage issue
+        if: failure() && steps.check.outputs.outcome == 'fail'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          . "$RUNNER_TEMP/ply-main/summary.env"
+          title="ply main ${PLY_SHORT} breaks ply-web"
+          printf '\n%s\n' "Run: ${RUN_URL}" >> "$RUNNER_TEMP/ply-main/report.md"
+          existing=$(gh issue list --state open --search "\"${title}\" in:title" --json number,title \
+            --jq "map(select(.title == \"${title}\")) | .[0].number // empty")
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body-file "$RUNNER_TEMP/ply-main/report.md"
+          else
+            gh issue create --title "${title}" --body-file "$RUNNER_TEMP/ply-main/report.md"
+          fi
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ply-main-check
+          path: ${{ runner.temp }}/ply-main
+          if-no-files-found: ignore
