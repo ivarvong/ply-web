@@ -345,3 +345,133 @@ test('a stall on only one version still fails the loss-rate gate', () => {
   const window = judgeProbeWindow(outcomes, judge())
   assert.equal(window.kind, 'harness_fault')
 })
+
+// ---- ply-web#145 review round 2: settle paths pinned (hand-derived expectations from the issue's acceptance criteria) ----
+
+/** A sample whose routed share matches `percent`: 200 invocations split by the step's percentage. */
+function atPercent(percent: number): Observation {
+  const next = stats(2 * percent)
+  const previous = stats(200 - 2 * percent)
+  return { kind: 'sample', next, previous, aggregate: stats(200), landed: 200 }
+}
+
+function unhealthyWindow(): ProbeOutcome[] {
+  const outcomes: ProbeOutcome[] = []
+  for (let index = 0; index < 53; index += 1) outcomes.push(answered(`ok-${index}`, NEW, 50))
+  outcomes.push({ kind: 'stalled', id: 'client-stall 0-53733 53733ms' })
+  return outcomes
+}
+
+/** 75% passes on a clean window, then the 100% step gets `bad` on every attempt; onHarnessFault is `hold`. */
+async function holdAfterPass(bad: () => ProbeOutcome[], rollback: () => Promise<null | string> = async () => null) {
+  const base = policy()
+  const rollout: RolloutPolicy = {
+    ...base,
+    steps: [{ percent: 75, dwellMs: 40_000 }, { percent: 100, dwellMs: 40_000 }],
+    probe: { ...base.probe, onHarnessFault: 'hold' },
+  }
+  const counts = { rolled: 0, splits: [] as number[] }
+  let current = 0
+  const result = await runRamp(rollout, {
+    now: () => 0,
+    sleep: async () => {},
+    dwell: async () => ({ outcomes: current === 75 ? clean() : bad() }),
+    applySplit: async percent => {
+      counts.splits.push(percent)
+      current = percent
+      return null
+    },
+    observe: async (_from, _to, percent) => atPercent(percent),
+    rollback: async () => {
+      counts.rolled += 1
+      return rollback()
+    },
+  })
+  return { result, counts }
+}
+
+for (const [name, bad, outcome] of [
+  ['harness_unhealthy', unhealthyWindow, 'harness_unhealthy'],
+  ['insufficient_samples', incident, 'insufficient_samples'],
+] as const) {
+  test(`hold: ${name} at 100% after 75% passed writes the split back to 75% and does not roll back`, async () => {
+    const { result, counts } = await holdAfterPass(bad)
+    assert.deepEqual(counts.splits, [75, 100, 75])
+    assert.equal(counts.rolled, 0)
+    assert.equal(result.rollbackError, null)
+    assert.equal(result.state.kind, 'held')
+    if (result.state.kind === 'held') {
+      assert.equal(result.state.outcome, outcome)
+      assert.equal('traffic' in result.state ? result.state.traffic : null, 'held')
+      assert.match(result.state.reason, /; held at 75%$/)
+      assert.doesNotMatch(result.state.reason, /prod untouched/)
+    }
+  })
+}
+
+test('a failed rollback of an unjudged 100% step says traffic is still at 100%, not that it rolled back', async () => {
+  const rollout = { ...policy(), steps: [{ percent: 100, dwellMs: 40_000 }] }
+  assert.equal(rollout.probe.onHarnessFault, 'rollback')
+  const result = await runRamp(rollout, {
+    now: () => 0,
+    sleep: async () => {},
+    dwell: async () => ({ outcomes: unhealthyWindow() }),
+    applySplit: async () => null,
+    observe: async () => at100(),
+    rollback: async () => 'boom 503',
+  })
+  assert.equal(result.rollbackError, 'boom 503')
+  assert.equal(result.state.kind, 'held')
+  if (result.state.kind === 'held') {
+    assert.equal('traffic' in result.state ? result.state.traffic : null, 'settle_failed')
+    assert.doesNotMatch(result.state.reason, /rolled back to previous/)
+    assert.match(result.state.reason, /; rollback to previous failed: boom 503; still at 100%$/)
+  }
+})
+
+test('a failed hold write says the split is still at the stopped step', async () => {
+  const base = policy()
+  const rollout: RolloutPolicy = {
+    ...base,
+    steps: [{ percent: 75, dwellMs: 40_000 }, { percent: 100, dwellMs: 40_000 }],
+    probe: { ...base.probe, onHarnessFault: 'hold' },
+  }
+  let current = 0
+  let writes = 0
+  const result = await runRamp(rollout, {
+    now: () => 0,
+    sleep: async () => {},
+    dwell: async () => ({ outcomes: current === 75 ? clean() : unhealthyWindow() }),
+    applySplit: async percent => {
+      writes += 1
+      if (writes === 3) return 'split 500'
+      current = percent
+      return null
+    },
+    observe: async (_from, _to, percent) => atPercent(percent),
+    rollback: async () => null,
+  })
+  assert.equal(result.rollbackError, 'split 500')
+  assert.equal(result.state.kind === 'held' && 'traffic' in result.state ? result.state.traffic : null, 'settle_failed')
+  if (result.state.kind === 'held') assert.match(result.state.reason, /; hold at 75% failed: split 500; still at 100%$/)
+})
+
+// the ramp's at-0% branch: nothing to settle, and the reason says so
+test('an unjudged step at 0% holds at 0% without a rollback', async () => {
+  const rollout = { ...policy(), steps: [{ percent: 0, dwellMs: 40_000 }] }
+  let rolled = 0
+  const result = await runRamp(rollout, {
+    now: () => 0,
+    sleep: async () => {},
+    dwell: async () => ({ outcomes: unhealthyWindow() }),
+    applySplit: async () => null,
+    observe: async () => atPercent(0),
+    rollback: async () => {
+      rolled += 1
+      return null
+    },
+  })
+  assert.equal(rolled, 0)
+  assert.equal(result.state.kind === 'held' && 'traffic' in result.state ? result.state.traffic : null, 'held')
+  if (result.state.kind === 'held') assert.match(result.state.reason, /; held at 0%$/)
+})

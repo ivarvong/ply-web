@@ -85,11 +85,12 @@ export type HeldWrite = { readonly kind: 'state_conflict'; readonly reason: stri
 declare const settledBy: unique symbol
 
 /**
- * Where an unjudged step left traffic: rolled back to `previous`, or held at the last fully passed split (or at 0%).
- * The brand is private to this module and only `settleHarnessFault` attaches it, so a state that stopped on an
+ * Where an unjudged step left traffic: rolled back to `previous`, held at the last fully passed split (or at 0%), or
+ * `settle_failed`: the rollback or hold write failed, so the new version is still at the stopped step's percentage
+ * (the reason names that percentage and the error; `rollbackError` carries the error). The brand is private to this module and only `settleHarnessFault` attaches it, so a state that stopped on an
  * unjudged step cannot exist without its traffic having been settled (ply-web#145).
  */
-export type HarnessTraffic = ('rolled_back' | 'held') & { readonly [settledBy]: 'settleHarnessFault' }
+export type HarnessTraffic = ('rolled_back' | 'held' | 'settle_failed') & { readonly [settledBy]: 'settleHarnessFault' }
 
 /** A step the ramp could not judge. Its split write already moved traffic, so `runRamp` must settle it. */
 export type UnjudgedOutcome = 'harness_fault' | 'insufficient_samples' | 'harness_unhealthy'
@@ -318,6 +319,7 @@ type Settled = { readonly state: RampState; readonly rollbackError: string | nul
 
 const ROLLED_BACK = 'rolled_back' as HarnessTraffic
 const HELD = 'held' as HarnessTraffic
+const SETTLE_FAILED = 'settle_failed' as HarnessTraffic
 
 function settledState(unsettled: Unsettled, reason: string, traffic: HarnessTraffic): RampState {
   switch (unsettled.outcome) {
@@ -331,20 +333,23 @@ function settledState(unsettled: Unsettled, reason: string, traffic: HarnessTraf
   }
 }
 
-async function rollbackTraffic(io: RampIo, unsettled: Unsettled): Promise<Settled> {
+async function rollbackTraffic(io: RampIo, percent: number, unsettled: Unsettled): Promise<Settled> {
   const rolled = await io.rollback()
   const conflict = asConflict(rolled)
   if (conflict) return { state: { kind: 'stopped', reason: conflict.reason, fault: 'state_conflict' }, rollbackError: null }
-  return {
-    state: settledState(unsettled, `${unsettled.reason}; rolled back to previous`, ROLLED_BACK),
-    rollbackError: typeof rolled === 'string' ? rolled : null,
+  if (typeof rolled === 'string') {
+    return {
+      state: settledState(unsettled, `${unsettled.reason}; rollback to previous failed: ${rolled}; still at ${percent}%`, SETTLE_FAILED),
+      rollbackError: rolled,
+    }
   }
+  return { state: settledState(unsettled, `${unsettled.reason}; rolled back to previous`, ROLLED_BACK), rollbackError: null }
 }
 
 /**
  * An unjudged step (harness fault, too few samples, unhealthy client). Its split write already moved traffic, so
  * above 0% it rolls back to `previous` (`rollback`, `telemetry`), or holds the last fully passed split (`hold`; a
- * rollback when no step passed). The returned state's reason says where traffic is.
+ * rollback when no step passed). The returned state's reason says where traffic is, including when that write failed.
  */
 async function settleHarnessFault(
   policy: RolloutPolicy,
@@ -358,15 +363,15 @@ async function settleHarnessFault(
     case 'rollback':
     // A telemetry-unavailable fault under `telemetry` has nothing left to judge on: restore the previous version.
     case 'telemetry':
-      return rollbackTraffic(io, unsettled)
+      return rollbackTraffic(io, percent, unsettled)
     case 'hold': {
-      if (lastPassed.tag === 'none' || lastPassed.value <= 0) return rollbackTraffic(io, unsettled)
+      if (lastPassed.tag === 'none' || lastPassed.value <= 0) return rollbackTraffic(io, percent, unsettled)
       const held = await io.applySplit(lastPassed.value)
       const conflict = asConflict(held)
       if (conflict) return { state: { kind: 'stopped', reason: conflict.reason, fault: 'state_conflict' }, rollbackError: null }
       if (typeof held === 'string') {
         return {
-          state: settledState(unsettled, `${unsettled.reason}; hold at ${lastPassed.value}% failed: ${held}`, HELD),
+          state: settledState(unsettled, `${unsettled.reason}; hold at ${lastPassed.value}% failed: ${held}; still at ${percent}%`, SETTLE_FAILED),
           rollbackError: held,
         }
       }

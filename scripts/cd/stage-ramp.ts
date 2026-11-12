@@ -1,3 +1,4 @@
+import { assertNever } from '../../src/never.ts'
 import { readFile, appendFile } from 'node:fs/promises'
 import { CLIENT_MAX_EXTENSION_MS } from './baseline.ts'
 import { clientHealth } from './client-health.ts'
@@ -8,7 +9,7 @@ import { isTrafficSplit, sameSplit, trafficSplit, type VersionShare } from './de
 import { notSpanFilter, queryCapturedSliced, telemetryQueryRetry } from './o11y.ts'
 import { errorMessage } from './proc.ts'
 import { activeLog, BLOB_DIR } from './log.ts'
-import { readPassVerdict, runRamp, type LatencySample, type Observation } from './ramp.ts'
+import { readPassVerdict, runRamp, type HarnessTraffic, type LatencySample, type Observation, type RampState } from './ramp.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import type { RolloutPolicy } from './policy.ts'
 import { accountProbeLoss, classifyProbe, probeLossRecord, rayOf, type ProbeOutcome } from './probe.ts'
@@ -24,6 +25,26 @@ export type RampValue = {
   readonly version: string
   readonly previous: string
   readonly lines: readonly string[]
+}
+
+/** A ramp state whose unjudged step `settleHarnessFault` settled (ramp.ts HarnessTraffic). */
+export type UnjudgedState = Extract<RampState, { readonly traffic: HarnessTraffic }>
+
+/**
+ * The stage result of an unjudged step (ply-web#145). `rolledBack` is true only when the rollback landed; the fault is
+ * the step's own outcome, never `worker`, because the version was not judged. The state's reason already says where
+ * traffic is, including a failed rollback or hold write, so it is not repeated here.
+ */
+export function unjudgedFail(state: UnjudgedState): StageResult<RampValue> {
+  const rolledBack = state.traffic === 'rolled_back'
+  switch (state.kind) {
+    case 'held':
+      return fail('ramp', state.reason, rolledBack, state.outcome)
+    case 'stopped':
+      return fail('ramp', state.reason, rolledBack, state.fault)
+    default:
+      return assertNever(state)
+  }
 }
 
 function eventsFor(events: readonly unknown[], version: string): unknown[] {
@@ -370,16 +391,10 @@ export async function stageRamp(
     if (result.state.kind === 'complete') return pass('ramp', { version: opts.version, previous: target, lines: result.lines })
     if (result.state.kind === 'held') {
       if (!('traffic' in result.state)) return fail('ramp', result.state.reason, false)
-      const rolledBack = result.state.traffic === 'rolled_back' && result.rollbackError === null
-      const reason = result.rollbackError ? `${result.state.reason}; traffic change failed: ${result.rollbackError}` : result.state.reason
-      return fail('ramp', reason, rolledBack, result.state.outcome)
+      return unjudgedFail(result.state)
     }
     if (result.state.kind === 'stopped') {
-      if (result.state.fault === 'harness_fault') {
-        const rolledBack = result.state.traffic === 'rolled_back' && result.rollbackError === null
-        const reason = result.rollbackError ? `${result.state.reason}; traffic change failed: ${result.rollbackError}` : result.state.reason
-        return fail('ramp', reason, rolledBack, 'harness_fault')
-      }
+      if (result.state.fault === 'harness_fault') return unjudgedFail(result.state)
       return fail('ramp', result.state.reason, false, result.state.fault)
     }
     const reason = result.state.kind === 'rolled-back' ? result.state.reason : 'ramp stopped'
