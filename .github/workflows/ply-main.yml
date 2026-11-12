@@ -20,8 +20,11 @@ on:
 
 permissions: {}
 
+# One group per ply sha: GitHub keeps one pending run per group and cancels the older pending one when another
+# queues, so a single fixed group would skip the middle sha of three quick dispatches. Per-sha groups only dedupe a
+# repeat of the same sha (ply's notify-ply-web.yml keys its group by sha for the same reason).
 concurrency:
-  group: ply-main-consumer-check
+  group: ply-main-consumer-check-${{ github.event.client_payload.sha || inputs.sha }}
   cancel-in-progress: false
 
 jobs:

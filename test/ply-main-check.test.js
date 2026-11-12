@@ -17,12 +17,12 @@ const realNpm = execFileSync('sh', ['-c', 'command -v npm'], { encoding: 'utf8' 
 const PREV = '1111111111111111111111111111111111111111';
 const FULL = 'abcdef0123456789abcdef0123456789abcdef01';
 
-function run(sha, { failGate = '', failInstall = false } = {}) {
+function run(sha, { failGate = '', failInstall = false, resolveTo = '', noOut = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ply-main-check-'));
   const bin = join(dir, 'bin');
   mkdirSync(bin);
   const gate = name => (failGate === name
-    ? `node -e "console.log('✔ fine (1ms)'); console.log('✖ ${name} breaks (2ms)'); process.exit(1)"`
+    ? `node -e "console.log('✔ fine (1ms)'); console.log('✖ ${name} breaks (2ms)'); console.log('ℹ fail 1'); console.log('✖ failing tests:'); console.log('✖ ${name} breaks (2ms)'); process.exit(1)"`
     : `node -e "console.log('✔ ${name} ok')"`);
   writeFileSync(join(dir, 'package.json'), JSON.stringify({
     name: 'fixture', private: true, dependencies: { ply: `github:ivarvong/ply#${PREV}` },
@@ -34,7 +34,7 @@ if [ "$1" = install ]; then
   [ -z "$FAKE_INSTALL_FAIL" ] || { echo "npm error prepare: tsc exited 2" >&2; exit 1; }
   exec node -e '
     const fs = require("fs"); const sha = require("./package.json").dependencies.ply.split("#")[1];
-    const full = process.env.FAKE_FULL.startsWith(sha) ? process.env.FAKE_FULL : sha;
+    const full = process.env.FAKE_RESOLVE || (process.env.FAKE_FULL.startsWith(sha) ? process.env.FAKE_FULL : sha);
     fs.writeFileSync("package-lock.json", JSON.stringify({ packages: { "node_modules/ply": { resolved: "git+ssh://git@github.com/ivarvong/ply.git#" + full } } }));'
 fi
 exec "${realNpm}" "$@"
@@ -43,14 +43,14 @@ exec "${realNpm}" "$@"
   const out = join(dir, 'out');
   const ghOut = join(dir, 'github-output');
   writeFileSync(ghOut, '');
-  const r = spawnSync('sh', [script, sha, out], {
+  const r = spawnSync('sh', [script, sha, ...(noOut ? [] : [out])], {
     cwd: dir, encoding: 'utf8',
-    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_FULL: FULL, FAKE_INSTALL_FAIL: failInstall ? '1' : '', GITHUB_OUTPUT: ghOut },
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_FULL: FULL, FAKE_INSTALL_FAIL: failInstall ? '1' : '', FAKE_RESOLVE: resolveTo, GITHUB_OUTPUT: ghOut },
   });
   const read = f => (existsSync(join(out, f)) ? readFileSync(join(out, f), 'utf8') : null);
   const summary = read('summary.env');
   return {
-    code: r.status, stderr: r.stderr, report: read('report.md'),
+    code: r.status, stderr: r.stderr, stdout: r.stdout, report: read('report.md'), logs: ['test', 'lint', 'typecheck'].filter(g => read(`${g}.log`) !== null),
     env: summary && Object.fromEntries(summary.trim().split('\n').map(l => l.split('='))),
     ghOutput: readFileSync(ghOut, 'utf8'),
     pin: JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).dependencies.ply,
@@ -77,6 +77,9 @@ for (const g of ['test', 'lint', 'typecheck']) {
     if (g === 'test') {
       assert.match(r.report, /^Failing tests:\n✖ test breaks \(2ms\)\n/m);
       assert.ok(!/^Failing tests:\n✔/m.test(r.report));
+      // node:test's summary header `✖ failing tests:` is not a test name; the list holds only the test.
+      const list = r.report.slice(r.report.indexOf('Failing tests:\n')).split('\n\n')[0];
+      assert.equal(list, 'Failing tests:\n✖ test breaks (2ms)');
     }
   });
 }
@@ -90,6 +93,27 @@ test('npm install of a valid sha fails: exit 1 and a report, so the workflow ope
   assert.match(r.report, /^Failed gates: install$/m);
   assert.match(r.report, /^### npm install$/m);
   assert.ok(r.report.includes('prepare: tsc exited 2'));
+  // No gate runs after a failed install: no gate log, and the stub gates never printed.
+  assert.deepEqual(r.logs, []);
+  assert.ok(!/npm run (test|lint|typecheck) exit/.test(r.stdout), r.stdout);
+});
+
+test('lockfile resolves ply to a different sha than asked: usage error, exit 2, no report, no gate ran', () => {
+  const other = '2222222222222222222222222222222222222222';
+  const r = run(FULL, { resolveTo: other });
+  assert.equal(r.code, 2, r.stderr);
+  assert.ok(r.stderr.includes(`lockfile resolved ply to '${other}', not ${FULL}`), r.stderr);
+  assert.equal(r.report, null);
+  assert.equal(r.ghOutput, '');
+  assert.deepEqual(r.logs, []);
+});
+
+test('no out-dir: usage error, exit 2, the pin is untouched and nothing is installed', () => {
+  const r = run(FULL, { noOut: true });
+  assert.equal(r.code, 2, r.stderr);
+  assert.match(r.stderr, /^usage: sh scripts\/ply-main-check\.sh <ply-sha> <out-dir>$/m);
+  assert.equal(r.pin, `github:ivarvong/ply#${PREV}`);
+  assert.equal(r.ghOutput, '');
 });
 
 test('a short sha resolves to the full one before the gates run', () => {
@@ -118,4 +142,12 @@ test('workflow: the check step runs the script unmapped and the issue step keys 
   const step = wf.slice(wf.indexOf('id: check'));
   assert.match(step, /^\s+run: sh scripts\/ply-main-check\.sh "\$\{PLY_SHA\}" "\$RUNNER_TEMP\/ply-main"$/m);
   assert.match(wf, /^\s+if: failure\(\) && steps\.check\.outputs\.outcome == 'fail'$/m);
+});
+
+test('workflow: concurrency is keyed by the ply sha, so a queued sha is never cancelled by a newer one', () => {
+  // GitHub keeps one pending run per concurrency group and cancels the older pending one when another queues, so a
+  // single fixed group skips the middle sha of three quick dispatches. One group per sha only dedupes the same sha.
+  const wf = readFileSync(join(root, '.github/workflows/ply-main.yml'), 'utf8');
+  const groups = [...wf.matchAll(/^\s+group: (.*)$/gm)].map(m => m[1]);
+  assert.deepEqual(groups, ['ply-main-consumer-check-${{ github.event.client_payload.sha || inputs.sha }}']);
 });
