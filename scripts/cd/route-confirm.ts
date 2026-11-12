@@ -49,11 +49,6 @@ export function failureFault(verdict: RouteFailure): 'worker' | 'harness_fault' 
   }
 }
 
-/** The pipeline fault a verdict carries: null when confirmed. */
-export function routeFault(verdict: RouteVerdict): 'worker' | 'harness_fault' | null {
-  return verdict.kind === 'confirmed' ? null : failureFault(verdict)
-}
-
 export type RouteIo = {
   now(): number
   sleep(ms: number): Promise<void>

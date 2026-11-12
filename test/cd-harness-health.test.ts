@@ -9,9 +9,11 @@ import { parsePolicy, type RolloutPolicy } from '../scripts/cd/policy.ts'
 import { classifyProbe, judgeProbeWindow, type ProbeJudge, type ProbeOutcome } from '../scripts/cd/probe.ts'
 import { runProbeSchedule, type ProbeClock } from '../scripts/cd/probe-schedule.ts'
 import { runRamp, type Observation } from '../scripts/cd/ramp.ts'
-import { confirmRoute, coloOf, routeFault, stragglers, sustainedFrom, type RouteIo, type RouteSample } from '../scripts/cd/route-confirm.ts'
+import { confirmRoute, coloOf, failureFault, stragglers, sustainedFrom, type RouteIo, type RouteSample } from '../scripts/cd/route-confirm.ts'
 import { liveVerdict } from '../scripts/cd/pipeline-plan.ts'
-import { harnessEvent, reissuable } from '../scripts/cd/stage-smoke.ts'
+import { liveRoute } from '../scripts/cd/pipeline.ts'
+import { pinReady } from '../scripts/cd/stage-deploy.ts'
+import { harnessEvent, reconfirmRoute, reissuable } from '../scripts/cd/stage-smoke.ts'
 import type { VersionStats } from '../scripts/cd/telemetry.ts'
 
 const OLD = '480225db'
@@ -126,18 +128,9 @@ test('#146 pin: every answer HTTP 500 from the wanted version is the Worker (ser
   assert.equal(verdict.kind, 'worker')
   if (verdict.kind === 'worker') assert.equal(verdict.cause, 'served_5xx')
   assert.equal(io.calls, TUNABLES.batch, 'decided after the first round, not after maxMs')
-  assert.equal(routeFault(verdict), 'worker')
+  assert.equal(failureFault(verdict), 'worker')
 })
 
-test('#146 live: a 5xx from the wanted version is the Worker and the live check rolls back', async () => {
-  const io = edge(0, () => NEW, 500)
-  const verdict = await confirmRoute({ url: 'https://x/', version: NEW, headers: {}, since: 0 }, io, TUNABLES)
-  assert.equal(verdict.kind, 'worker')
-  const fault = routeFault(verdict)
-  assert.equal(fault, 'worker')
-  if (fault === null) return
-  assert.equal(liveVerdict([{ kind: 'fail', fault }]), 'rollback')
-})
 
 test('#146 one intermittent 5xx from the wanted version among 2xx answers is the Worker', async () => {
   let n = 0
@@ -161,19 +154,101 @@ test('#146 one intermittent 5xx from the wanted version among 2xx answers is the
 test('#146 a 5xx from another version is still routing, and other-version answers mixed with 2xx from the wanted version are routing', async () => {
   const mixed = await confirmRoute({ url: 'https://x/', version: NEW, headers: {}, since: 0 }, edge(Infinity, (_at, n) => (n % 50 === 0 ? OLD : NEW)), TUNABLES)
   assert.equal(mixed.kind, 'routing')
-  assert.equal(routeFault(mixed), 'harness_fault')
-  assert.equal(liveVerdict([{ kind: 'fail', fault: 'harness_fault' }]), 'halt')
+  assert.equal(failureFault(mixed), 'harness_fault')
   const old5xx = await confirmRoute({ url: 'https://x/', version: NEW, headers: {}, since: 0 }, edge(0, () => OLD, 500), TUNABLES)
   assert.equal(old5xx.kind, 'routing')
 })
 
 test('#146 confirmed has no fault; headerless answers are the Worker (no_version_header)', async () => {
   const ok = await confirmRoute({ url: 'https://x/', version: NEW, headers: {}, since: 0 }, edge(0, () => NEW), TUNABLES)
-  assert.equal(routeFault(ok), null)
+  assert.equal(ok.kind, 'confirmed')
   const bare = await confirmRoute({ url: 'https://x/', version: NEW, headers: {}, since: 0 }, edge(0, () => null), TUNABLES)
   assert.equal(bare.kind, 'worker')
   if (bare.kind === 'worker') assert.equal(bare.cause, 'no_version_header')
 })
+
+// ply-web#146 through the three callers that turn a verdict into a pipeline fault: the pin gate (stage-deploy pinReady),
+// the live check (pipeline liveRoute, judged by liveVerdict) and the smoke restart (stage-smoke reconfirmRoute). Each
+// fake records the headers it was sent, so the pin path is shown to carry the override and the live path to carry none.
+function recording(status: number, version: (n: number) => string | null): RouteIo & { readonly sent: Record<string, string>[] } {
+  let now = 0
+  let n = 0
+  const sent: Record<string, string>[] = []
+  return {
+    sent,
+    now: () => now,
+    sleep: async ms => {
+      now += ms
+    },
+    get: async (_url, headers) => {
+      n += 1
+      now += 1
+      sent.push(headers)
+      return { status, version: version(n), ray: `r${n}-IAD` }
+    },
+  }
+}
+const SITE = { baseUrl: 'https://x', worker: 'ply' }
+const OVERRIDE = { 'Cloudflare-Workers-Version-Overrides': `ply="${NEW}"` }
+
+test('#146 pin path: pinReady fails with fault worker when the canary serves HTTP 500 on the override', async () => {
+  const io = recording(500, () => NEW)
+  const result = await pinReady(SITE, NEW, 0, io, TUNABLES)
+  assert.deepEqual(io.sent[0], OVERRIDE)
+  assert.equal(result.ok, false)
+  if (result.ok) return
+  assert.equal(result.fault, 'worker')
+  assert.match(result.reason, /served HTTP 500/)
+  assert.equal(io.sent.length, TUNABLES.batch, 'decided after the first round')
+})
+
+test('#146 live path: liveRoute returns a Fail with fault worker, and liveVerdict rolls back', async () => {
+  const io = recording(500, () => NEW)
+  const lines: string[] = []
+  const result = await liveRoute(SITE, { version: NEW, log: line => lines.push(line) }, io, TUNABLES)
+  assert.deepEqual(io.sent[0], {})
+  assert.notEqual(result, null)
+  if (result === null) return
+  assert.equal(result.fault, 'worker')
+  assert.equal(result.stage, 'smoke')
+  assert.equal(liveVerdict([result]), 'rollback')
+  assert.match(lines.join('\n'), /route-confirm live: worker/)
+})
+
+test('#146 live path: other-version answers mixed with 2xx from the wanted version halt (harness_fault), never roll back', async () => {
+  const io = recording(200, n => (n % 50 === 0 ? OLD : NEW))
+  const result = await liveRoute(SITE, { version: NEW, log: () => {} }, io, TUNABLES)
+  assert.notEqual(result, null)
+  if (result === null) return
+  assert.equal(result.fault, 'harness_fault')
+  assert.equal(liveVerdict([result]), 'halt')
+})
+
+test('#146 live path: a confirmed route is no failure', async () => {
+  assert.equal(await liveRoute(SITE, { version: NEW, log: () => {} }, recording(200, () => NEW), TUNABLES), null)
+})
+
+test('#146 smoke restart: reconfirmRoute fails with fault worker on a served 5xx, pinned and unpinned', async () => {
+  const pinned = recording(503, () => NEW)
+  const pin = await reconfirmRoute(SITE, NEW, true, pinned, TUNABLES)
+  assert.deepEqual(pinned.sent[0], OVERRIDE)
+  assert.equal(pin.ok ? null : pin.fault, 'worker')
+  const unpinned = recording(503, () => NEW)
+  const live = await reconfirmRoute(SITE, NEW, false, unpinned, TUNABLES)
+  assert.deepEqual(unpinned.sent[0], {})
+  assert.equal(live.ok ? null : live.fault, 'worker')
+})
+
+// The rule is status >= 500 (the issue). A 4xx from the wanted version is not a served 5xx: it never confirms (sustainedFrom
+// needs 2xx/3xx), so it ends as routing at maxMs, not as an immediate Worker verdict.
+for (const status of [404, 499]) {
+  test(`#146 boundary: HTTP ${status} from the wanted version is not served_5xx`, async () => {
+    const io = edge(0, () => NEW, status)
+    const verdict = await confirmRoute({ url: 'https://x/', version: NEW, headers: {}, since: 0 }, io, TUNABLES)
+    assert.equal(verdict.kind, 'routing')
+    assert.ok(io.calls > TUNABLES.batch, 'not decided on the first round')
+  })
+}
 
 // ---- smoke row attribution ----
 
