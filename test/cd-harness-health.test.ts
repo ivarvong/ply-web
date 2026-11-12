@@ -9,7 +9,8 @@ import { parsePolicy, type RolloutPolicy } from '../scripts/cd/policy.ts'
 import { classifyProbe, judgeProbeWindow, type ProbeJudge, type ProbeOutcome } from '../scripts/cd/probe.ts'
 import { runProbeSchedule, type ProbeClock } from '../scripts/cd/probe-schedule.ts'
 import { runRamp, type Observation } from '../scripts/cd/ramp.ts'
-import { confirmRoute, coloOf, stragglers, sustainedFrom, type RouteIo, type RouteSample } from '../scripts/cd/route-confirm.ts'
+import { confirmRoute, coloOf, routeFault, stragglers, sustainedFrom, type RouteIo, type RouteSample } from '../scripts/cd/route-confirm.ts'
+import { liveVerdict } from '../scripts/cd/pipeline-plan.ts'
 import { harnessEvent, reissuable } from '../scripts/cd/stage-smoke.ts'
 import type { VersionStats } from '../scripts/cd/telemetry.ts'
 
@@ -113,6 +114,65 @@ test('lost answers never confirm a route', async () => {
   const io = edge(0, () => null, 0)
   const verdict = await confirmRoute({ url: 'https://x/', version: NEW, headers: {}, since: 0 }, io, TUNABLES)
   assert.equal(verdict.kind, 'routing')
+})
+
+// ply-web#146: the repro from the issue (every GET answers HTTP 500 with the wanted x-ply-version). A served 5xx is the
+// product, never routing, and it is decided on the first such answer, not after maxMs.
+const PIN_HEADERS = { 'Cloudflare-Workers-Version-Overrides': `ply="${NEW}"` }
+
+test('#146 pin: every answer HTTP 500 from the wanted version is the Worker (served_5xx), at once', async () => {
+  const io = edge(0, () => NEW, 500)
+  const verdict = await confirmRoute({ url: 'https://x/', version: NEW, headers: PIN_HEADERS, since: 0 }, io, TUNABLES)
+  assert.equal(verdict.kind, 'worker')
+  if (verdict.kind === 'worker') assert.equal(verdict.cause, 'served_5xx')
+  assert.equal(io.calls, TUNABLES.batch, 'decided after the first round, not after maxMs')
+  assert.equal(routeFault(verdict), 'worker')
+})
+
+test('#146 live: a 5xx from the wanted version is the Worker and the live check rolls back', async () => {
+  const io = edge(0, () => NEW, 500)
+  const verdict = await confirmRoute({ url: 'https://x/', version: NEW, headers: {}, since: 0 }, io, TUNABLES)
+  assert.equal(verdict.kind, 'worker')
+  const fault = routeFault(verdict)
+  assert.equal(fault, 'worker')
+  if (fault === null) return
+  assert.equal(liveVerdict([{ kind: 'fail', fault }]), 'rollback')
+})
+
+test('#146 one intermittent 5xx from the wanted version among 2xx answers is the Worker', async () => {
+  let n = 0
+  let now = 0
+  const io: RouteIo = {
+    now: () => now,
+    sleep: async ms => {
+      now += ms
+    },
+    get: async () => {
+      n += 1
+      now += 1
+      return { status: n === 57 ? 503 : 200, version: NEW, ray: `r${n}-IAD` }
+    },
+  }
+  const verdict = await confirmRoute({ url: 'https://x/', version: NEW, headers: {}, since: 0 }, io, TUNABLES)
+  assert.equal(verdict.kind, 'worker')
+  if (verdict.kind === 'worker') assert.equal(verdict.cause, 'served_5xx')
+})
+
+test('#146 a 5xx from another version is still routing, and other-version answers mixed with 2xx from the wanted version are routing', async () => {
+  const mixed = await confirmRoute({ url: 'https://x/', version: NEW, headers: {}, since: 0 }, edge(Infinity, (_at, n) => (n % 50 === 0 ? OLD : NEW)), TUNABLES)
+  assert.equal(mixed.kind, 'routing')
+  assert.equal(routeFault(mixed), 'harness_fault')
+  assert.equal(liveVerdict([{ kind: 'fail', fault: 'harness_fault' }]), 'halt')
+  const old5xx = await confirmRoute({ url: 'https://x/', version: NEW, headers: {}, since: 0 }, edge(0, () => OLD, 500), TUNABLES)
+  assert.equal(old5xx.kind, 'routing')
+})
+
+test('#146 confirmed has no fault; headerless answers are the Worker (no_version_header)', async () => {
+  const ok = await confirmRoute({ url: 'https://x/', version: NEW, headers: {}, since: 0 }, edge(0, () => NEW), TUNABLES)
+  assert.equal(routeFault(ok), null)
+  const bare = await confirmRoute({ url: 'https://x/', version: NEW, headers: {}, since: 0 }, edge(0, () => null), TUNABLES)
+  assert.equal(bare.kind, 'worker')
+  if (bare.kind === 'worker') assert.equal(bare.cause, 'no_version_header')
 })
 
 // ---- smoke row attribution ----

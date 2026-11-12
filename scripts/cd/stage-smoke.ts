@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { REPO_PREFIX, REVOKE_ATTEMPTS, REVOKE_PROBE_MS, REVOKE_WAIT_MS, SMOKE_HTTP_MS, SMOKE_REISSUE_ATTEMPTS, SMOKE_REISSUE_WAIT_MS, SMOKE_RESTARTS, TOKEN_TTL_SECONDS } from './baseline.ts'
 import { clientHealth, type StallSource } from './client-health.ts'
-import { confirmRoute, logRoute } from './route-confirm.ts'
+import { confirmRoute, failureFault, logRoute } from './route-confirm.ts'
 import { cfOk, runCf } from './cf.ts'
 import {
   appendCleanupFile,
@@ -670,7 +670,7 @@ async function reconfirmRoute(config: CdConfig, version: string | null, pin: boo
   })
   await logRoute({ purpose: pin ? 'pin' : 'live', version, since, started: since }, verdict)
   if (verdict.kind === 'confirmed') return { ok: true }
-  return { ok: false, reason: verdict.reason, fault: verdict.kind === 'worker' ? 'worker' : 'harness_fault' }
+  return { ok: false, reason: verdict.reason, fault: failureFault(verdict) }
 }
 
 export async function stageSmoke(

@@ -1,5 +1,5 @@
 import { MESSAGE_MAX } from './baseline.ts'
-import { confirmRoute, logRoute } from './route-confirm.ts'
+import { confirmRoute, failureFault, logRoute } from './route-confirm.ts'
 import { cfOk, ROOT } from './cf.ts'
 import { isTrafficSplit, planCanary, trafficSplit, versionByTag } from './deploy-plan.ts'
 import { extractJson } from './json.ts'
@@ -36,7 +36,7 @@ export async function pinReady(config: CdConfig, version: string, since: number)
   const line = await logRoute({ purpose: 'pin', version, since, started }, verdict)
   process.stdout.write(`${line}\n`)
   if (verdict.kind === 'confirmed') return { ok: true }
-  return { ok: false, reason: verdict.reason, fault: verdict.kind === 'worker' ? 'worker' : 'harness_fault' }
+  return { ok: false, reason: verdict.reason, fault: failureFault(verdict) }
 }
 
 async function versionTagged(worker: string, tag: string): Promise<string | null> {
