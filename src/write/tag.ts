@@ -6,7 +6,7 @@ import { err, ok, type Result } from '../http/machine.ts'
 import { type PlyError } from '../ply-result.ts'
 import { advertisedOid } from './advertised.ts'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
-import { assertNever, refExists } from './errors.ts'
+import { assertNever, done, refExistsAt, settle, type WorkerError, type Written } from './errors.ts'
 import { nowSeconds, stamp, type Stamp } from './identity.ts'
 import { asBody, parseDeleteOid, tagRef } from './request.ts'
 import { writeResult } from './result.ts'
@@ -52,8 +52,8 @@ async function commitOf(t: Transport, target: string): Promise<Result<string, Pl
   return resolved.ok ? ok(resolved.value.commit) : resolved
 }
 
-// ref_exists is the Worker's own error, not a PlyError: it is thrown through operation() (see branch.ts).
-export async function createTag(remote: string, body: unknown, opts: CallOpts): Promise<Result<Record<string, unknown>, PlyError>> {
+// ref_exists is the Worker's own conflict, not a PlyError: the body returns it as a value (see branch.ts).
+export async function createTag(remote: string, body: unknown, opts: CallOpts): Promise<Result<Record<string, unknown>, PlyError | WorkerError>> {
   const raw = asBody(body)
   const ref = tagRef(raw.name)
   const target = raw.target
@@ -71,10 +71,10 @@ export async function createTag(remote: string, body: unknown, opts: CallOpts): 
   if (messageField.tag === 'some' && typeof messageField.value !== 'string') throw plyError('bad_request', 'message must be a string')
   if (annotatedField.tag === 'some' && typeof annotatedField.value !== 'boolean') throw plyError('bad_request', 'annotated must be true or false')
   const short = ref.replace(/^refs\/tags\//, '')
-  return operation<Record<string, unknown>>('tag_create', remote, { ...opts, attrs: { 'git.tag.ref': ref, 'git.tag.annotated': annotated } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
+  return settle(await operation<Written<Record<string, unknown>>>('tag_create', remote, { ...opts, attrs: { 'git.tag.ref': ref, 'git.tag.annotated': annotated } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
     const existing = await advertisedOid(t, ref)
     if (!existing.ok) return existing
-    if (existing.value) throw refExists(ref, existing.value)
+    if (existing.value) return outcome('ref_exists', refExistsAt(ref, existing.value))
     const tip = await commitOf(t, target)
     if (!tip.ok) return tip
     const commit = tip.value
@@ -102,13 +102,13 @@ export async function createTag(remote: string, body: unknown, opts: CallOpts): 
       if (pushed.error.code !== 'cas_conflict') return pushed
       const cur = await advertisedOid(t, ref)
       if (!cur.ok) return cur
-      throw refExists(ref, cur.value === null ? newOid : cur.value)
+      return outcome('ref_exists', refExistsAt(ref, cur.value === null ? newOid : cur.value))
     }
-    return outcome('tag', writeResult('tag', ref, newOid, null, { commit, annotated, pushBytes: pushed.value.packBytes }))
-  })
+    return outcome('tag', done(writeResult('tag', ref, newOid, null, { commit, annotated, pushBytes: pushed.value.packBytes })))
+  }))
 }
 
-export async function removeTag(remote: string, body: unknown, opts: CallOpts): Promise<Result<Record<string, unknown>, PlyError>> {
+export async function removeTag(remote: string, body: unknown, opts: CallOpts): Promise<Result<Record<string, unknown>, PlyError | WorkerError>> {
   const raw = asBody(body)
   return deleteRef(remote, tagRef(raw.name), parseDeleteOid(raw.oid), opts, 'tag_delete')
 }

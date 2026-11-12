@@ -7,7 +7,7 @@ import { err, ok, type Result } from '../http/machine.ts'
 import { type PlyError } from '../ply-result.ts'
 import { advertisedOid } from './advertised.ts'
 import { type CallOpts, type GitOutcome, type GitSpan, type GitTransport } from './call.ts'
-import { assertNever, refExists, staleExpected } from './errors.ts'
+import { assertNever, done, refExistsAt, settle, staleAt, type WorkerError, type Written } from './errors.ts'
 import { readHead } from './head.ts'
 import { branchRef } from './request.ts'
 import { writeResult } from './result.ts'
@@ -46,29 +46,30 @@ async function tipOf(t: Transport, from: string): Promise<Result<string, PlyErro
   return resolved.ok ? ok(resolved.value.commit) : resolved
 }
 
-// readHead runs in its own span (tracer.span records a throw), so its failure is thrown and operation() returns it.
-async function bornTip(t: Transport): Promise<string> {
+// readHead runs in its own span (tracer.span records a throw); an unusable HEAD is this function's Err.
+async function bornTip(t: Transport): Promise<Result<string, PlyError>> {
   const head = await readHead(t)
-  if (head.kind === 'born') return head.oid
-  if (head.kind === 'unborn') throw plyError('bad_request', `from is required when the remote HEAD is unborn (${head.ref})`)
-  if (head.kind === 'detached') throw plyError('bad_request', 'from is required when the remote HEAD is detached')
-  throw plyError('bad_request', 'from is required when the remote HEAD is absent')
+  if (head.kind === 'born') return ok(head.oid)
+  if (head.kind === 'unborn') return err(plyError('bad_request', `from is required when the remote HEAD is unborn (${head.ref})`))
+  if (head.kind === 'detached') return err(plyError('bad_request', 'from is required when the remote HEAD is detached'))
+  return err(plyError('bad_request', 'from is required when the remote HEAD is absent'))
 }
 
-// The Worker's own errors (ref_exists, stale_expected) are not PlyErrors, so an operation() body cannot return them
-// in its Err: they are thrown, and operation() records them on the root span and rethrows them to index.js.
-export async function createBranch(remote: string, refName: unknown, from: unknown, opts: CallOpts): Promise<Result<Record<string, unknown>, PlyError>> {
+// The Worker's own conflicts (ref_exists, stale_expected) are not PlyErrors, and a throw from an operation() body is
+// ply's bad_request 'callback' (or 'ambiguous' after a push handover; ply #277). So the body returns them as values
+// (Written) and settle() turns them into the Worker error after operation() has returned.
+export async function createBranch(remote: string, refName: unknown, from: unknown, opts: CallOpts): Promise<Result<Record<string, unknown>, PlyError | WorkerError>> {
   const ref = branchRef(refName, 'ref')
   // Zero is refused here, before operation() opens a transport, so receive-pack is never called.
   if (from === ZERO_OID) throw plyError('bad_request', 'from must not be the zero oid')
   const present = fromNullable(from)
   if (present.tag === 'some' && present.value !== '' && typeof present.value !== 'string') throw plyError('bad_request', 'from must be a branch name or a commit id')
   const specified = typeof from === 'string' && from !== '' ? from : null
-  return operation<Record<string, unknown>>('branch_create', remote, { ...opts, attrs: { 'git.branch_create.ref': ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
+  return settle(await operation<Written<Record<string, unknown>>>('branch_create', remote, { ...opts, attrs: { 'git.branch_create.ref': ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
     const existing = await advertisedOid(t, ref)
     if (!existing.ok) return existing
-    if (existing.value) throw refExists(ref, existing.value)
-    const tip = specified === null ? ok(await bornTip(t)) : await tipOf(t, specified)
+    if (existing.value) return outcome('ref_exists', refExistsAt(ref, existing.value))
+    const tip = specified === null ? await bornTip(t) : await tipOf(t, specified)
     if (!tip.ok) return tip
     const commit = tip.value
     root.set({ 'git.branch_create.oid': commit })
@@ -79,19 +80,19 @@ export async function createBranch(remote: string, refName: unknown, from: unkno
       if (pushed.error.code !== 'cas_conflict') return pushed
       const cur = await advertisedOid(t, ref)
       if (!cur.ok) return cur
-      throw refExists(ref, cur.value === null ? commit : cur.value)
+      return outcome('ref_exists', refExistsAt(ref, cur.value === null ? commit : cur.value))
     }
-    return outcome('created', writeResult('created', ref, commit, null, { pushBytes: pushed.value.packBytes }))
-  })
+    return outcome('created', done(writeResult('created', ref, commit, null, { pushBytes: pushed.value.packBytes })))
+  }))
 }
 
-export async function deleteRef(remote: string, ref: string, expected: string | null, opts: CallOpts, op: 'branch_delete' | 'tag_delete'): Promise<Result<Record<string, unknown>, PlyError>> {
-  return operation<Record<string, unknown>>(op, remote, { ...opts, attrs: { [`git.${op}.ref`]: ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
+export async function deleteRef(remote: string, ref: string, expected: string | null, opts: CallOpts, op: 'branch_delete' | 'tag_delete'): Promise<Result<Record<string, unknown>, PlyError | WorkerError>> {
+  return settle(await operation<Written<Record<string, unknown>>>(op, remote, { ...opts, attrs: { [`git.${op}.ref`]: ref } }, async ({ t, root, outcome }: { t: Transport; root: Root; outcome: Outcome }) => {
     const advertised = await advertisedOid(t, ref)
     if (!advertised.ok) return advertised
     const current = advertised.value
     if (!current) return err(plyError('not_found', `ref ${ref} not found`, { miss: { kind: 'ref', ref, candidates: [ref] } }))
-    if (expected && expected !== current) throw staleExpected(ref, expected, current)
+    if (expected && expected !== current) return outcome('stale_expected', staleAt(ref, expected, current))
     root.set({ [`git.${op}.oid`]: current, [`git.${op}.cas_from_caller`]: expected !== null })
     const name = parseRefname(ref)
     if (!name.ok) return name
@@ -100,8 +101,8 @@ export async function deleteRef(remote: string, ref: string, expected: string | 
       if (pushed.error.code !== 'cas_conflict') return pushed
       const now = await advertisedOid(t, ref)
       if (!now.ok) return now
-      throw staleExpected(ref, expected === null ? current : expected, now.value === null ? current : now.value)
+      return outcome('stale_expected', staleAt(ref, expected === null ? current : expected, now.value === null ? current : now.value))
     }
-    return outcome('deleted', writeResult('deleted', ref, null, current, { deleted: current }))
-  })
+    return outcome('deleted', done(writeResult('deleted', ref, null, current, { deleted: current })))
+  }))
 }
