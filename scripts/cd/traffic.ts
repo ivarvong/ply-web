@@ -34,6 +34,36 @@ export async function putSplit(worker: string, message: string, split: TrafficSp
   await cfOk(['workers', 'deployments', 'create', '--worker', worker, '--body', JSON.stringify(body)], secrets)
 }
 
+/**
+ * `cf workers deployments list` is eventually consistent after a create: run 2026-11-12T21-21-31-209Z created the 10%
+ * split (4918caf9, 21:24:12.338Z) and the read 1 ms after the create returned still listed the prior deployment
+ * (9f0dc7f0, 0%), so the step was judged rejected, the rollback's compare-and-swap then saw 10% and stopped with
+ * state_conflict, and the ramp was left at 10%. The read-back now waits for the write to show.
+ */
+export type ReadBackPolicy = { readonly attempts: number; readonly gapMs: number }
+export const DEFAULT_READ_BACK: ReadBackPolicy = { attempts: 10, gapMs: 1_000 }
+let readBack: ReadBackPolicy = DEFAULT_READ_BACK
+
+/** Tests: a shorter read-back. Null restores the default. */
+export function useReadBack(policy: ReadBackPolicy | null): void {
+  readBack = policy === null ? DEFAULT_READ_BACK : policy
+}
+
+/** What one read after a create shows. Pure. */
+export type ReadBack =
+  | { readonly kind: 'applied' }
+  | { readonly kind: 'stale' }
+  | { readonly kind: 'mismatch'; readonly reason: string }
+
+export function classifyReadBack(before: Deployment, after: Deployment, split: TrafficSplit): ReadBack {
+  const mismatch = assertSplit(after.versions, split)
+  if (mismatch === null) return { kind: 'applied' }
+  // Still the deployment the write replaced (same id, or no ids and the same shares): the list has not caught up.
+  if (before.id !== null && after.id === before.id) return { kind: 'stale' }
+  if (before.id === null && after.id === null && sameSplit(after.versions, before.versions)) return { kind: 'stale' }
+  return { kind: 'mismatch', reason: mismatch }
+}
+
 export type ApplyResult =
   | { readonly ok: true }
   | { readonly ok: false; readonly kind: 'state_conflict'; readonly reason: string }
@@ -89,12 +119,20 @@ async function writeSplit(
     return { ok: false, kind: 'state_conflict', reason }
   }
   await putSplit(worker, message, split, secrets)
-  const after = await readDeployment(worker, secrets)
+  let after = await readDeployment(worker, secrets)
+  let seen = classifyReadBack(before, after, split)
+  for (let attempt = 1; attempt < readBack.attempts && seen.kind === 'stale'; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, readBack.gapMs))
+    after = await readDeployment(worker, secrets)
+    seen = classifyReadBack(before, after, split)
+  }
   const log = await requireLog('deployment read-back with no active log')
   await log.stateChange({ before: before.versions, after: after.versions, deploymentId: after.id })
-  const mismatch = assertSplit(after.versions, split)
-  if (mismatch) return { ok: false, kind: 'rejected', reason: mismatch }
-  return { ok: true }
+  switch (seen.kind) {
+    case 'applied': return { ok: true }
+    case 'mismatch': return { ok: false, kind: 'rejected', reason: seen.reason }
+    case 'stale': return { ok: false, kind: 'rejected', reason: `read-back still lists the prior deployment ${String(after.id)} after ${readBack.attempts} reads ${readBack.gapMs} ms apart` }
+  }
 }
 
 /** Null when the deployment matches. Otherwise why it does not. */

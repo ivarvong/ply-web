@@ -7,7 +7,7 @@ import { runCf, useCfRunner, type CfResult } from '../scripts/cd/cf.ts'
 import { isTrafficSplit, trafficSplit, type VersionShare } from '../scripts/cd/deploy-plan.ts'
 import { RunLog, withRun } from '../scripts/cd/log.ts'
 import { withCommandSink } from '../scripts/cd/trace.ts'
-import { applySplit } from '../scripts/cd/traffic.ts'
+import { applySplit, classifyReadBack, useReadBack } from '../scripts/cd/traffic.ts'
 import { armStep, beginRamp, endRamp, HarnessFault, withWriteIntent } from '../scripts/cd/traffic-gate.ts'
 
 const NEXT = 'ab73257f-1111-4111-8111-111111111111'
@@ -20,6 +20,7 @@ describe('traffic gate', { concurrency: false }, () => {
   afterEach(() => {
     endRamp()
     useCfRunner(null)
+    useReadBack(null)
   })
 
   test('a deployment create with no active log is a harness fault and does not call cf', async () => {
@@ -167,6 +168,53 @@ describe('traffic gate', { concurrency: false }, () => {
       assert.equal(fulfilled.filter(result => !result.ok && result.kind === 'state_conflict').length, 1)
       assert.equal(entered, 1)
     }))
+  })
+
+  // Run 2026-11-12T21-21-31-209Z: the create landed (4918caf9) but the list 1 ms later still showed 9f0dc7f0 at 0%.
+  test('a stale list after a create is waited out, not judged rejected', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ply-gate-'))
+    const log = await RunLog.open(join(dir, 'run'), join(dir, 'ledger.jsonl'), 'run-gate')
+    useReadBack({ attempts: 5, gapMs: 1 })
+    const prior: Share[] = [{ version_id: NEXT, percentage: 0 }, { version_id: PREV, percentage: 100 }]
+    let current = { id: '9f0dc7f0', versions: prior }
+    let staleReads = 0
+    let lists = 0
+    useCfRunner(async (args): Promise<CfResult> => {
+      if (args[1] === 'deployments' && args[2] === 'list') {
+        lists++
+        if (staleReads > 0) {
+          staleReads--
+          return { code: 0, stdout: JSON.stringify({ deployments: [{ id: '9f0dc7f0', versions: prior }] }), stderr: '' }
+        }
+        return { code: 0, stdout: JSON.stringify({ deployments: [current] }), stderr: '' }
+      }
+      if (args[1] === 'deployments' && args[2] === 'create') {
+        const raw = args[args.indexOf('--body') + 1]
+        if (!raw) return { code: 1, stdout: '', stderr: 'missing body' }
+        const body = JSON.parse(raw) as { versions: Share[] }
+        current = { id: '4918caf9', versions: body.versions }
+        staleReads = 2
+        return { code: 0, stdout: JSON.stringify({ id: '4918caf9' }), stderr: '' }
+      }
+      return { code: 1, stdout: '', stderr: 'unexpected cf args' }
+    })
+    await withRun(log, () => withCommandSink(note => log.noteCommand(note), async () => {
+      beginRamp(10)
+      const at10 = trafficSplit(10, NEXT, PREV)
+      if (!isTrafficSplit(at10)) throw new Error(at10.reason)
+      const wrote = await applySplit('ply', `ramp ${NEXT} 10%`, at10, shares(prior), { kind: 'step', percent: 10 })
+      assert.deepEqual(wrote, { ok: true })
+      assert.equal(lists, 4, 'one CAS read, two stale read-backs, one that shows the write')
+    }))
+    const at10 = trafficSplit(10, NEXT, PREV)
+    if (!isTrafficSplit(at10)) throw new Error(at10.reason)
+    const before = { id: '9f0dc7f0', versions: shares(prior) }
+    assert.deepEqual(classifyReadBack(before, before, at10), { kind: 'stale' })
+    assert.deepEqual(classifyReadBack(before, { id: '4918caf9', versions: shares([{ version_id: NEXT, percentage: 10 }, { version_id: PREV, percentage: 90 }]) }, at10), { kind: 'applied' })
+    const other = classifyReadBack(before, { id: 'ffff0000', versions: shares([{ version_id: NEXT, percentage: 25 }, { version_id: PREV, percentage: 75 }]) }, at10)
+    assert.equal(other.kind, 'mismatch', 'a new deployment that is not the split is a real rejection')
+    const neverShows = classifyReadBack({ id: null, versions: shares(prior) }, { id: null, versions: shares(prior) }, at10)
+    assert.equal(neverShows.kind, 'stale')
   })
 })
 
