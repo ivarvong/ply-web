@@ -84,8 +84,10 @@ outcome=pass
     echo
     echo '```'
     if [ "$gate" = test ]; then
-      # node:test prints `not ok N - name` per failing test (nested subtests indented); vitest prints FAIL / ×.
-      grep -E '^[[:space:]]*not ok |^[[:space:]]*(FAIL|×) ' "$out/test.log" | head -n 60
+      # node:test's spec reporter prints `✖ name (ms)` per failing test (TAP: `not ok N - name`); vitest prints FAIL / ×.
+      echo "Failing tests:"
+      grep -E '^[[:space:]]*(✖|not ok|FAIL|×) ' "$out/test.log" | grep -v 'failing tests:' | sed 's/^[[:space:]]*//' | sort -u | head -n 60
+      echo
     fi
     tail -n 30 "$out/${gate}.log"
     echo '```'
