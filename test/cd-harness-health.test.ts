@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
-import { some } from '../src/option.ts'
+import { none, some } from '../src/option.ts'
 import { ClientHealth, gapStall, NO_STALLS, type Stall, type StallSource } from '../scripts/cd/client-health.ts'
 import { parsePolicy, type RolloutPolicy } from '../scripts/cd/policy.ts'
 import { classifyProbe, judgeProbeWindow, type ProbeJudge, type ProbeOutcome } from '../scripts/cd/probe.ts'
@@ -13,7 +13,7 @@ import { confirmRoute, coloOf, failureFault, stragglers, sustainedFrom, type Rou
 import { liveVerdict } from '../scripts/cd/pipeline-plan.ts'
 import { liveRoute } from '../scripts/cd/pipeline.ts'
 import { pinReady } from '../scripts/cd/stage-deploy.ts'
-import { harnessEvent, reconfirmRoute, reissuable } from '../scripts/cd/stage-smoke.ts'
+import { findRemote, harnessEvent, reconfirmRoute, reissuable } from '../scripts/cd/stage-smoke.ts'
 import type { VersionStats } from '../scripts/cd/telemetry.ts'
 
 const OLD = '480225db'
@@ -60,6 +60,21 @@ test('sustainedFrom restarts at the round after a straggler', () => {
   assert.equal(stragglers(samples, NEW).length, 1)
   assert.equal(coloOf('a587ec564e0da476-IAD'), 'IAD')
   assert.equal(coloOf(null), null)
+})
+
+test('sustainedFrom judges rounds in round order, whatever order the samples arrived in', () => {
+  const samples = [sample(3000, 3, NEW), sample(1000, 1, NEW), sample(2000, 2, OLD), sample(4000, 4, NEW), sample(3100, 3, NEW)]
+  assert.equal(sustainedFrom(samples, NEW), 3000)
+  assert.equal(sustainedFrom([], NEW), null)
+})
+
+test('findRemote (#147): the first Artifacts remote anywhere in a cf answer is some, an answer with none is none', () => {
+  const remote = 'https://abc123.artifacts.cloudflare.net/git/ns/repo.git'
+  assert.deepEqual(findRemote({ result: { repo: { name: 'r', urls: ['https://example.com/x', remote] } } }), some(remote))
+  assert.deepEqual(findRemote([{ remote: 'git@example.com:x' }, { nested: [remote] }]), some(remote))
+  assert.deepEqual(findRemote({ result: { remote: '' } }), none())
+  assert.deepEqual(findRemote(null), none())
+  assert.deepEqual(findRemote('https://abc123.artifacts.cloudflare.net/other/'), none())
 })
 
 /** A fake edge: requests before `cutoverMs` after the write sometimes reach a machine without the new deployment. */

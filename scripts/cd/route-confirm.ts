@@ -5,6 +5,7 @@
 // 2026-11-10T20-48-18-470Z). Each round here opens PIN_BATCH fresh TCP+TLS connections, and confirmation needs every
 // answer to be the wanted version for PIN_SUSTAIN_MS. Every sample is kept: time since the write, colo, version.
 import { request } from 'node:https'
+import { mapGet } from '../../src/absent.ts'
 import { assertNever } from '../../src/never.ts'
 import { activeLog } from './log.ts'
 import { PIN_BATCH, PIN_INTERVAL_MS, PIN_MAX_MS, PIN_REQUEST_MS, PIN_SUSTAIN_MS } from './baseline.ts'
@@ -122,13 +123,12 @@ export function coloOf(ray: string | null): string | null {
 export function sustainedFrom(samples: readonly RouteSample[], version: string): number | null {
   const rounds = new Map<number, RouteSample[]>()
   for (const sample of samples) {
-    const list = rounds.get(sample.round)
-    if (list) list.push(sample)
+    const list = mapGet(rounds, sample.round)
+    if (list.tag === 'some') list.value.push(sample)
     else rounds.set(sample.round, [sample])
   }
   let from: number | null = null
-  for (const round of [...rounds.keys()].sort((a, b) => a - b)) {
-    const list = rounds.get(round) || []
+  for (const [, list] of [...rounds.entries()].sort(([a], [b]) => a - b)) {
     const good = list.length > 0 && list.every(sample => sample.version === version && sample.status >= 200 && sample.status < 400)
     if (!good) {
       from = null

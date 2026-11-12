@@ -23,6 +23,7 @@ import { judgeCall, type Saved } from './judge.ts'
 import { expectedStatuses, lifecycle, type HttpStep } from './lifecycle.ts'
 import { activeLog } from './log.ts'
 import { assertNever } from '../../src/never.ts'
+import { none, some, type Option } from '../../src/option.ts'
 import { errorMessage, run } from './proc.ts'
 import { createdTokenSecret, harvestSecrets, redact } from './redact.ts'
 import { judgeFsck, judgeRefs, parseShowRef, type ApiRefs } from './refs.ts'
@@ -63,22 +64,20 @@ function header(response: Response, name: string): string | null {
   return value === null || value === '' ? null : value
 }
 
-function findRemote(value: unknown): string | null {
-  if (typeof value === 'string') return REMOTE.test(value) ? value : null
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = findRemote(item)
-      if (found) return found
-    }
-    return null
-  }
-  const rec = asRecord(value)
-  if (!rec) return null
-  for (const item of Object.values(rec)) {
+/** The first Artifacts git remote anywhere in a `cf` JSON answer; none when it carries none. */
+export function findRemote(value: unknown): Option<string> {
+  if (typeof value === 'string') return REMOTE.test(value) ? some(value) : none()
+  const items: readonly unknown[] = Array.isArray(value) ? value : objectValues(value)
+  for (const item of items) {
     const found = findRemote(item)
-    if (found) return found
+    if (found.tag === 'some') return found
   }
-  return null
+  return none()
+}
+
+function objectValues(value: unknown): readonly unknown[] {
+  const rec = asRecord(value)
+  return rec ? Object.values(rec) : []
 }
 
 function tokenIds(value: unknown): string[] {
@@ -543,8 +542,9 @@ async function smokeAttempt(
     ], secrets)
     const found = remember(created, secrets)
     const auto = createdTokenSecret(created, found)
-    remote = findRemote(created) || ''
-    if (!REMOTE.test(remote)) throw new Error('cf did not return an Artifacts remote')
+    const createdRemote = findRemote(created)
+    if (createdRemote.tag === 'none') throw new Error('cf did not return an Artifacts remote')
+    remote = createdRemote.value
     const opening = await listTokenIds(config, name, secrets)
     let revoked = opening.length > 0
     for (const id of opening) {

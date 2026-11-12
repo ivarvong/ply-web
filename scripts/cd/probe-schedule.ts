@@ -4,6 +4,7 @@
 // timeout) to answer, and the dwell does not wait out a hung fetch past that.
 import type { StallSource } from './client-health.ts'
 import type { ProbeOutcome } from './probe.ts'
+import { mapGet } from '../../src/absent.ts'
 
 export type ProbeClock = {
   now(): number
@@ -68,8 +69,9 @@ export async function runProbeSchedule(input: ProbeSchedule): Promise<readonly P
     return typeof from === 'number' && input.health.during(from, at).length > 0
   }
   const finish = (id: number, outcome: ProbeOutcome): void => {
-    if (!inflight.has(id)) return
-    const probeId = inflight.get(id) || String(id)
+    const held = mapGet(inflight, id)
+    if (held.tag === 'none') return
+    const probeId = held.value
     inflight.delete(id)
     pending.delete(id)
     if (outcome.kind === 'lost' && crossedStall(id, input.clock.now())) {
