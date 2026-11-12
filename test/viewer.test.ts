@@ -1228,3 +1228,14 @@ test('quirks: the public namespace (Cloudflare Artifacts, blob:none only) starts
   assert.equal(quirksFor('https://github.com').treeFilter, 'tree:0');
   assert.equal(quirksFor('https://acct.artifacts.cloudflare.net').treeFilter, 'tree:0', 'only the configured public namespace host is seeded');
 });
+
+test('tree page: refsStale shows a "Refs as of <ISO>" note; null renders exactly the main markup', () => {
+  const trace: TraceModel = { bars: [], totalMs: 0, cfRay: '', requestId: '' };
+  const fresh = String(renderLoaded(treeFixture({}), trace, 0));
+  assert.doesNotMatch(fresh, /class="note"/);
+  assert.doesNotMatch(fresh, /Refs as of/);
+  // 1_700_000_000_000 ms = 2023-11-14T22:13:20Z (date -u -r 1700000000).
+  const stale = String(renderLoaded({ ...treeFixture({}), refsStale: { asOf: 1_700_000_000_000, ageMs: 60_000, budgetMs: 3_500 } }, trace, 0));
+  assert.match(stale, /<p class="note"[^>]*>Refs as of 2023-11-14T22:13:20Z/);
+  assert.equal(stale.replace(/<p class="note"[^>]*>.*?<\/p>/, ''), fresh);
+});

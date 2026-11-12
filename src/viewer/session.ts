@@ -3,7 +3,7 @@
 // once per isolate, not once per page. The trace still names the fallback on every fetch that uses it.
 import { chainGet, fromNullable, mapGet } from '../absent.ts';
 import { unwrapOr } from '../option.ts';
-import { REFS_MEMO_ENTRIES, REFS_STALE_BUDGET_MS, createRefsMemo, refsOrStale, type StaleInfo } from './refmemo.ts';
+import { REFS_MEMO_ENTRIES, REFS_MEMO_MAX_REFS, REFS_STALE_BUDGET_MS, createRefsMemo, refsOrStale, type StaleInfo } from './refmemo.ts';
 import { commitView, concat, createTransport, discover, entryType, fetchObject, fetchPack, fetchPackFiltered, hashObject, inflate, isFilterRejection, limitError, lsMode, lsRefs, packStream, parseTree, plyError, refCandidates, spFinish, spInit, spStep, TYPE, walkCommit, walkPath } from 'ply';
 import type { Walked } from 'ply/read';
 import { pathTreesOf, tree0Taken } from 'ply/transport';
@@ -34,7 +34,7 @@ export type SessionDeps = {
   defer: ((p: Promise<unknown>) => void) | null;
 };
 
-const REFS_MEMO = createRefsMemo<{ refs: Map<string, RefRec>; head: string | null }>(REFS_MEMO_ENTRIES);
+const REFS_MEMO = createRefsMemo<{ refs: Map<string, RefRec>; head: string | null }>(REFS_MEMO_ENTRIES, REFS_MEMO_MAX_REFS, v => v.refs.size);
 
 type RefRec = { oid: string };
 type DiscoverInfo = OkOf<ReturnType<typeof discover>>;

@@ -15,7 +15,7 @@ test('budget leaves most of the request timeout for the page', () => {
 });
 
 test('slow body past the budget with an expired entry: stale list, age, background refresh replaces it', async () => {
-  const memo = createRefsMemo(8);
+  const memo = createRefsMemo(8, 1_000, () => 1);
   memo.put('k', { refs: ['old'] }, 1_000);
   const deferred: Promise<unknown>[] = [];
   let resolveLive: (v: { refs: string[] }) => void = () => {};
@@ -31,15 +31,15 @@ test('slow body past the budget with an expired entry: stale list, age, backgrou
 });
 
 test('no entry: waits for the live answer (and its failure) as today', async () => {
-  const memo = createRefsMemo(8);
+  const memo = createRefsMemo(8, 1_000, () => 1);
   const got = await refsOrStale(memo, 'k', after(60, { refs: ['live'] }), { budgetMs: 10, now: () => 5, defer: null });
   assert.deepEqual(got, { value: { refs: ['live'] }, stale: null });
   const timeout = Object.assign(new Error('timeout'), { code: 'timeout' });
-  await assert.rejects(refsOrStale(createRefsMemo(8), 'k', Promise.reject(timeout), { budgetMs: 10, now: () => 5, defer: null }), /timeout/);
+  await assert.rejects(refsOrStale(createRefsMemo(8, 1_000, () => 1), 'k', Promise.reject(timeout), { budgetMs: 10, now: () => 5, defer: null }), /timeout/);
 });
 
 test('fast upstream: fresh, no stale marker, entry updated', async () => {
-  const memo = createRefsMemo(8);
+  const memo = createRefsMemo(8, 1_000, () => 1);
   memo.put('k', { refs: ['old'] }, 1);
   const got = await refsOrStale(memo, 'k', after(1, { refs: ['fresh'] }), { budgetMs: 200, now: () => 9, defer: null });
   assert.deepEqual(got, { value: { refs: ['fresh'] }, stale: null });
@@ -47,7 +47,7 @@ test('fast upstream: fresh, no stale marker, entry updated', async () => {
 });
 
 test('a live failure after a stale serve keeps the last good entry', async () => {
-  const memo = createRefsMemo(8);
+  const memo = createRefsMemo(8, 1_000, () => 1);
   memo.put('k', { refs: ['old'] }, 1);
   const deferred: Promise<unknown>[] = [];
   let fail: (e: Error) => void = () => {};
@@ -61,8 +61,21 @@ test('a live failure after a stale serve keeps the last good entry', async () =>
 });
 
 test('memo is bounded: oldest key evicted', () => {
-  const memo = createRefsMemo(2);
+  const memo = createRefsMemo(2, 1_000, () => 1);
   memo.put('a', 1, 1); memo.put('b', 2, 2); memo.put('c', 3, 3);
   assert.equal(memo.get('a'), null);
   assert.deepEqual(memo.get('c'), { value: 3, at: 3 });
+});
+
+test('memo is bounded by total refs, not only entries: 2000-ref lists evict past the ref budget', async () => {
+  const { REFS_MEMO_MAX_REFS } = await import('../src/viewer/refmemo.ts');
+  // Hand bound: README "refs retained 2000"; ~100 B per retained ref (name + 40-hex oid + Map slot) -> 20_000 refs ~ 2 MB.
+  assert.equal(REFS_MEMO_MAX_REFS, 20_000);
+  const memo = createRefsMemo<number>(256, REFS_MEMO_MAX_REFS, n => n);
+  for (let i = 0; i < 11; i++) memo.put(`k${i}`, 2_000, i);
+  assert.equal(memo.get('k0'), null, '11 x 2000 refs > 20_000: the oldest goes');
+  assert.deepEqual(memo.get('k10'), { value: 2_000, at: 10 });
+  assert.notEqual(memo.get('k1'), null);
+  memo.put('big', 30_000, 99);
+  assert.equal(memo.get('big'), null, 'a single list over the budget is never kept');
 });

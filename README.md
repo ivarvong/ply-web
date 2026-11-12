@@ -276,7 +276,12 @@ host, is refused there before ply sees it. Upstream `User-Agent` is
 | pack-map rate | 20 / minute / client |
 
 Over any cap the response is an HTML error (413 for a limit, 504 for a timeout), with the trace of the calls that
-did finish. Rate limiting is keyed by the SHA-256 of `CF-Connecting-IP` (clients with no header share one key) and
+did finish. One exception, viewer tree pages only (/v1 is unchanged): when the live ls-refs has not finished within 3.5 s
+(`REFS_STALE_BUDGET_MS`) and this isolate holds a last good ref list for the repo (an in-isolate memo, bounded to 256
+entries and 20,000 refs in total), the page uses that list, of any age, and shows a "Refs as of <time>" note; the live
+ls-refs keeps running under `waitUntil` and replaces the list for the next page. With no list the page waits as before
+(504 on timeout). The request span records `ply.viewer.refs_path` (`live` / `stale`), `ply.viewer.refs_stale_age_ms`
+and `ply.viewer.refs_stale_budget_ms`. Rate limiting is keyed by the SHA-256 of `CF-Connecting-IP` (clients with no header share one key) and
 stores no addresses. `RATE_MODE` picks the limiter. `batched` (the default since 2026-11-06, [docs/rate-limit.md](docs/rate-limit.md)):
 the request reads ONE cached document of blocked clients through the cache-enabled `RateCache` entrypoint
 (`max-age=1, stale-while-revalidate=30`) and never waits on a Durable Object; admitted hits are batched per isolate and
@@ -381,7 +386,7 @@ eyeball ─▶ default entrypoint (cache OFF: always runs → rate limit, ply.re
   | kind | exchange | Cache-Control |
   |---|---|---|
   | `pack` | `command=fetch` with wants only (no have / shallow / want-ref / deepen-since / deepen-not) | `public, max-age=31536000, immutable`: objects are named by their hash |
-  | `refs` | `command=ls-refs` | `public, max-age=5, stale-while-revalidate=10`: a ref change shows within 15 s |
+  | `refs` | `command=ls-refs` | `public, max-age=5, stale-while-revalidate=10`: a ref change shows within 15 s (a viewer tree page whose ls-refs passes the 3.5 s budget can show an older in-isolate list, with a note) |
   | `discover` | `GET info/refs?service=git-upload-pack` | v2 capability list: `public, max-age=300, stale-while-revalidate=3600`; a v0 advertisement (carries refs): the refs policy |
   | `pack` | a 400 whose text is a partial-clone filter refusal (Artifacts: `only blob:none is supported`) | `public, max-age=3600`: a fact about the server; uncached, every fresh isolate paid it (11 of 13 GitCache runs in a 20-request cold burst, e021776d) |
   | — | any other non-200, any 3xx | `no-store` (3xx goes back to the guard; GitCache never follows) |
