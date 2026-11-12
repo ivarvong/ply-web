@@ -284,7 +284,7 @@ export function judgeProbeWindow(outcomes: readonly ProbeOutcome[], judge: Probe
     return {
       kind: 'harness_unhealthy',
       loss,
-      reason: `harness unhealthy, prod untouched: the client stalled (${loss.stalled} stalled probes/markers); ${loss.total} real samples < probe.minSamples ${judge.minSamples} after extension`,
+      reason: `harness unhealthy: the client stalled (${loss.stalled} stalled probes/markers); ${loss.total} real samples < probe.minSamples ${judge.minSamples} after extension`,
     }
   }
   if (loss.total === 0 && loss.shed === 0) return { kind: 'ok', loss }

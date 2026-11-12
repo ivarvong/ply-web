@@ -186,7 +186,8 @@ test('hold keeps the last fully passed split instead of rolling back to previous
   if (result.state.kind === 'stopped' && result.state.fault === 'harness_fault') assert.equal(result.state.traffic, 'held')
 })
 
-test('a step under the minimum sample does not advance', async () => {
+// ply-web#145: the step is unjudged but its split already moved traffic, so onHarnessFault 'rollback' restores previous.
+test('a step under the minimum sample does not advance and rolls its traffic back', async () => {
   let rolled = 0
   const result = await runRamp(policy({ onHarnessFault: 'rollback', maxLossRate: 0.5, minSamples: 100 }), {
     now: () => 0,
@@ -199,9 +200,13 @@ test('a step under the minimum sample does not advance', async () => {
       return null
     },
   })
-  assert.equal(rolled, 0)
+  assert.equal(rolled, 1)
   assert.equal(result.state.kind, 'held')
-  if (result.state.kind === 'held') assert.equal(result.state.outcome, 'insufficient_samples')
+  if (result.state.kind === 'held') {
+    assert.equal(result.state.outcome, 'insufficient_samples')
+    assert.equal('traffic' in result.state ? result.state.traffic : null, 'rolled_back')
+    assert.match(result.state.reason, /rolled back to previous$/)
+  }
   const recorded = result.steps[0]
   if (!recorded) throw new Error('missing step')
   assert.equal(recorded.outcome, 'insufficient_samples')

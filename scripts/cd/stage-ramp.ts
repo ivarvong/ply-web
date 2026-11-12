@@ -369,9 +369,10 @@ export async function stageRamp(
     })
     if (result.state.kind === 'complete') return pass('ramp', { version: opts.version, previous: target, lines: result.lines })
     if (result.state.kind === 'held') {
-      if (result.state.outcome === 'insufficient_samples') return fail('ramp', result.state.reason, false, 'insufficient_samples')
-      if (result.state.outcome === 'harness_unhealthy') return fail('ramp', result.state.reason, false, 'harness_unhealthy')
-      return fail('ramp', result.state.reason, false)
+      if (!('traffic' in result.state)) return fail('ramp', result.state.reason, false)
+      const rolledBack = result.state.traffic === 'rolled_back' && result.rollbackError === null
+      const reason = result.rollbackError ? `${result.state.reason}; traffic change failed: ${result.rollbackError}` : result.state.reason
+      return fail('ramp', reason, rolledBack, result.state.outcome)
     }
     if (result.state.kind === 'stopped') {
       if (result.state.fault === 'harness_fault') {

@@ -69,7 +69,7 @@ export const CLIENT_TICK_MS = 100
 export const CLIENT_STALL_MS = 1_000
 /**
  * How far a ramp step may run past its dwell to replace the time the client spent stalled and reach probe.minSamples
- * real samples. Past it, the step ends as `harness_unhealthy` (prod untouched: the split is left as it is).
+ * real samples. Past it, the step ends as `harness_unhealthy`, and its traffic is settled through `probe.onHarnessFault` (ply-web#145).
  * source: the two stalls above (53.7 s, 69.8 s) plus 1,000 samples at 50 req/s (20 s).
  * prediction (2026-11-10): a single VM pause (<= 70 s observed) recovers inside 120 s; harness_unhealthy needs stalls
  * totalling over ~100 s in one step, which no run so far has had.

@@ -277,7 +277,8 @@ test('the same stall on both versions re-runs the dwell and does not roll back',
   assert.deepEqual(waits, [...(rollout.warmupMs > 0 ? [rollout.warmupMs] : []), rollout.probe.windowBackoffMs, rollout.ingestWaitMs])
 })
 
-test('a stall that is still there after the bounded re-runs holds and does not roll back', async () => {
+// ply-web#145: insufficient_samples is unjudged, so the step's traffic is settled through onHarnessFault (this file's policy: rollback).
+test('a stall that is still there after the bounded re-runs is unjudged and rolls back to previous', async () => {
   const rollout = policy()
   let dwells = 0
   let rolled = 0
@@ -296,13 +297,16 @@ test('a stall that is still there after the bounded re-runs holds and does not r
     },
   })
   assert.equal(dwells, rollout.probe.windowAttempts)
-  assert.equal(rolled, 0)
+  assert.equal(rollout.probe.onHarnessFault, 'rollback')
+  assert.equal(rolled, 1)
   assert.equal(result.state.kind, 'held')
   if (result.state.kind === 'held') {
     assert.equal(result.state.outcome, 'insufficient_samples')
+    assert.equal('traffic' in result.state ? result.state.traffic : null, 'rolled_back')
     assert.match(result.state.reason, /harness\/network stall/)
-    assert.match(result.state.reason, /not rolling back/)
+    assert.doesNotMatch(result.state.reason, /not rolling back|prod untouched/)
     assert.match(result.state.reason, /0 server errors/)
+    assert.match(result.state.reason, /rolled back to previous$/)
   }
 })
 
