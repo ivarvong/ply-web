@@ -70,6 +70,8 @@ export type Loaded =
       commit: CommitInfo;
       log: CommitInfo[];
       logStopped: boolean;
+      /** Set when the live ls-refs passed its budget and the isolate's last good list was used (src/viewer/refmemo.ts). */
+      refsStale: { asOf: number; ageMs: number; budgetMs: number } | null;
       branches: BranchInfo[];
       branchesTruncated: number;
       tags: TagInfo[];

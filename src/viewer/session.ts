@@ -3,6 +3,7 @@
 // once per isolate, not once per page. The trace still names the fallback on every fetch that uses it.
 import { chainGet, fromNullable, mapGet } from '../absent.ts';
 import { unwrapOr } from '../option.ts';
+import { REFS_MEMO_ENTRIES, REFS_STALE_BUDGET_MS, createRefsMemo, refsOrStale, type StaleInfo } from './refmemo.ts';
 import { commitView, concat, createTransport, discover, entryType, fetchObject, fetchPack, fetchPackFiltered, hashObject, inflate, isFilterRejection, limitError, lsMode, lsRefs, packStream, parseTree, plyError, refCandidates, spFinish, spInit, spStep, TYPE, walkCommit, walkPath } from 'ply';
 import type { Walked } from 'ply/read';
 import { pathTreesOf, tree0Taken } from 'ply/transport';
@@ -29,7 +30,11 @@ export type SessionDeps = {
   fetchImpl: FetchLike;
   signal: AbortSignal;
   budget: Budget;
+  /** waitUntil, so an ls-refs that outlives a stale-refs page still refreshes the last good list. */
+  defer: ((p: Promise<unknown>) => void) | null;
 };
+
+const REFS_MEMO = createRefsMemo<{ refs: Map<string, RefRec>; head: string | null }>(REFS_MEMO_ENTRIES);
 
 type RefRec = { oid: string };
 type DiscoverInfo = OkOf<ReturnType<typeof discover>>;
@@ -297,14 +302,22 @@ export async function listPageRefs(transport: Transport, ref: string | null): Pr
   return unwrap(await lsRefs(transport, refPrefixes(ref, false)));
 }
 
-async function loadTree(transport: Transport, route: Extract<ViewerRoute, { kind: 'repo' }>, advertised: Promise<ServerInfo>, quirks: Quirks, budget: Budget, tracer: Tracer): Promise<Loaded> {
+async function loadTree(transport: Transport, route: Extract<ViewerRoute, { kind: 'repo' }>, advertised: Promise<ServerInfo>, quirks: Quirks, budget: Budget, tracer: Tracer, deps: SessionDeps): Promise<Loaded> {
   // A full object id names the commit without the ref listing (resolveRef never reads it then), so the listing, which
   // only fills the branch and tag picker, runs beside the window fetch instead of before it, and a raw read skips it.
   // An ls-refs miss is 140-490 ms on /r pages (59f39490).
   const direct = unwrap(refCandidates(route.ref)).length === 0 && route.ref !== null;
   let listing: Promise<{ refs: Map<string, RefRec>; head: string | null }> | null = null;
+  let refsStale: StaleInfo | null = null;
   const refsNow = () => {
-    if (listing === null) listing = listPageRefs(transport, route.ref);
+    if (listing === null) {
+      const key = `${String(route.loc.url)}\n${refPrefixes(route.ref).join('\n')}`;
+      listing = refsOrStale(REFS_MEMO, key, listPageRefs(transport, route.ref), {
+        budgetMs: REFS_STALE_BUDGET_MS,
+        now: Date.now,
+        defer: deps.defer,
+      }).then(got => { refsStale = got.stale; return got.value; });
+    }
     return listing;
   };
   // ls-refs does not wait for discover (ply-web#120; ply#220 makes the two share one advertisement GET): nothing before
@@ -388,7 +401,7 @@ async function loadTree(transport: Transport, route: Extract<ViewerRoute, { kind
   }
   const { log, logStopped } = historyOf(commit, held);
   return {
-    kind: 'tree', header, path: route.path, commit, log, logStopped, ...catalog,
+    kind: 'tree', header, path: route.path, commit, log, logStopped, refsStale, ...catalog,
     entries: entries.shown,
     entriesTruncated: entries.truncated,
     readme,
@@ -431,5 +444,5 @@ export async function loadRepo(route: Extract<ViewerRoute, { kind: 'repo' }>, de
   const transport = openTransport(route.loc.url, route.loc.allowedHosts, { tracer: deps.tracer, fetchImpl: deps.fetchImpl, signal: deps.signal, quirks });
   const advertised = discover(transport).then(info => serverOf(unwrap(info)));
   if (route.pack) return loadPack(transport, route, await advertised, quirks);
-  return loadTree(transport, route, advertised, quirks, deps.budget, deps.tracer);
+  return loadTree(transport, route, advertised, quirks, deps.budget, deps.tracer, deps);
 }

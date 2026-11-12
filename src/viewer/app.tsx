@@ -213,11 +213,11 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
     // request, and are cancelled here.
     const short = publicRepoShortName(route.loc.host, route.loc.repoPath)
     const stop = new AbortController()
-    const pending = loadRepo(route, { tracer, fetchImpl, signal: AbortSignal.any([pageSignal, stop.signal]), budget })
+    const waitUntil = dig(call.ctx, ['waitUntil'])
+    const defer = waitUntil.tag === 'some' && typeof waitUntil.value === 'function' ? (p: Promise<unknown>) => { (waitUntil.value as (p: Promise<unknown>) => void).call(call.ctx, p) } : null
+    const pending = loadRepo(route, { tracer, fetchImpl, signal: AbortSignal.any([pageSignal, stop.signal]), budget, defer })
     if (short) {
       pending.catch(() => {})
-      const waitUntil = dig(call.ctx, ['waitUntil'])
-      const defer = waitUntil.tag === 'some' && typeof waitUntil.value === 'function' ? (p: Promise<unknown>) => { (waitUntil.value as (p: Promise<unknown>) => void).call(call.ctx, p) } : null
       const exists = await publicRepoExistsMemo(env.PUBLIC_REPOS, short, call.now, defer)
       if (exists === false) {
         stop.abort()
@@ -251,6 +251,13 @@ async function serveRepo(req: Request, env: ViewerEnv, call: ViewerCall, route: 
     call.fields['server.address'] = route.loc.host
     call.fields['ply.viewer.ref'] = loaded.header.ref
     call.fields['ply.viewer.upstream_spans'] = trace.bars.length
+    if (loaded.kind === 'tree') {
+      call.fields['ply.viewer.refs_path'] = loaded.refsStale ? 'stale' : 'live'
+      if (loaded.refsStale) {
+        call.fields['ply.viewer.refs_stale_age_ms'] = loaded.refsStale.ageMs
+        call.fields['ply.viewer.refs_stale_budget_ms'] = loaded.refsStale.budgetMs
+      }
+    }
     return headless(req, attach(htmlResponse(200, renderLoaded(loaded, trace, call.now), trace, call.requestId)))
   } catch (err) {
     const code = failureCode(err, 'internal')

@@ -183,6 +183,7 @@ function TreePage(props: { loaded: TreeLoaded; trace: TraceModel; now: number })
     <Document title={path ? `${path} · ${id.name}` : `${id.scope ? `${id.scope}/` : ''}${id.name}`}>
       <RepoTitle header={header} path={path} branches={props.loaded.branches} tags={props.loaded.tags} />
       <PathCrumbs header={header} path={path} />
+      {props.loaded.refsStale ? <p class="note" data-refs-stale={String(props.loaded.refsStale.ageMs)}>Refs as of {new Date(props.loaded.refsStale.asOf).toISOString().replace(/\.\d+Z$/, 'Z')}: the server took over {Math.round(props.loaded.refsStale.budgetMs / 1000 * 10) / 10} s to list them; a fresh list is loading for the next visit.</p> : null}
       <PlyStrip trace={props.trace} header={header} />
       <Card id={null} head={<CommitHead commit={props.loaded.commit} header={header} now={props.now} />} class="tree-card">
         {props.loaded.entries.length === 0 && !path ? <p class="empty">This directory is empty.</p> : (

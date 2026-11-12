@@ -185,7 +185,7 @@ test('hostile markdown, filenames, commits, refs, and authors do not break out o
         oid: 'a'.repeat(40), tree: 'b'.repeat(40), parents: [], authorName: author, authorEmail: 'a@b',
         authorTime: '2020-01-02T03:04:05Z', authorTz: '+0000', message, signed: false,
       },
-      log: [], logStopped: false,
+      log: [], logStopped: false, refsStale: null,
       branches: [{ name: ref, oid: 'a'.repeat(40), head: true }], branchesTruncated: 0,
       tags: [], tagsTruncated: 0,
       entries: [{ name, mode: '100644', oid: 'c'.repeat(40), type: 'blob' }], entriesTruncated: 0,
