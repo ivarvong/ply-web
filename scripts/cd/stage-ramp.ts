@@ -9,7 +9,7 @@ import { isTrafficSplit, sameSplit, trafficSplit, type VersionShare } from './de
 import { notSpanFilter, queryCapturedSliced, telemetryQueryRetry } from './o11y.ts'
 import { errorMessage } from './proc.ts'
 import { activeLog, BLOB_DIR } from './log.ts'
-import { readPassVerdict, runRamp, type HarnessTraffic, type LatencySample, type Observation, type RampState } from './ramp.ts'
+import { readPassVerdict, runRamp, type HarnessTraffic, type LatencySample, type Observation, type RampLoopResult, type RampState } from './ramp.ts'
 import { fail, pass, type StageResult } from './result.ts'
 import type { RolloutPolicy } from './policy.ts'
 import { accountProbeLoss, classifyProbe, probeLossRecord, rayOf, type ProbeOutcome } from './probe.ts'
@@ -45,6 +45,31 @@ export function unjudgedFail(state: UnjudgedState): StageResult<RampValue> {
     default:
       return assertNever(state)
   }
+}
+
+/**
+ * The stage result of a finished ramp loop (ply-web#145): complete passes; a policy hold fails as `worker`, not rolled
+ * back; an unjudged hold or harness_fault stop goes through `unjudgedFail`; a state_conflict stop is not rolled back;
+ * a rollback is rolledBack unless its write failed, which names `previous` and the error and is not rolledBack.
+ */
+export function rampStageResult(
+  result: Pick<RampLoopResult, 'state' | 'lines' | 'rollbackError'>,
+  version: string,
+  previous: string,
+): StageResult<RampValue> {
+  const state = result.state
+  if (state.kind === 'complete') return pass('ramp', { version, previous, lines: result.lines })
+  if (state.kind === 'held') {
+    if (!('traffic' in state)) return fail('ramp', state.reason, false)
+    return unjudgedFail(state)
+  }
+  if (state.kind === 'stopped') {
+    if (state.fault === 'harness_fault') return unjudgedFail(state)
+    return fail('ramp', state.reason, false, state.fault)
+  }
+  const reason = state.kind === 'rolled-back' ? state.reason : 'ramp stopped'
+  if (result.rollbackError) return fail('ramp', `${reason}; rollback to ${previous} failed: ${result.rollbackError}`)
+  return fail('ramp', reason, true)
 }
 
 function eventsFor(events: readonly unknown[], version: string): unknown[] {
@@ -388,18 +413,7 @@ export async function stageRamp(
       version: opts.version,
       previous: target,
     })
-    if (result.state.kind === 'complete') return pass('ramp', { version: opts.version, previous: target, lines: result.lines })
-    if (result.state.kind === 'held') {
-      if (!('traffic' in result.state)) return fail('ramp', result.state.reason, false)
-      return unjudgedFail(result.state)
-    }
-    if (result.state.kind === 'stopped') {
-      if (result.state.fault === 'harness_fault') return unjudgedFail(result.state)
-      return fail('ramp', result.state.reason, false, result.state.fault)
-    }
-    const reason = result.state.kind === 'rolled-back' ? result.state.reason : 'ramp stopped'
-    if (result.rollbackError) return fail('ramp', `${reason}; rollback to ${target} failed: ${result.rollbackError}`)
-    return fail('ramp', reason, true)
+    return rampStageResult(result, opts.version, target)
   } catch (error) {
     if (!(error instanceof HarnessFault)) throw error
     let rolled = false
