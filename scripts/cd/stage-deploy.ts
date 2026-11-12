@@ -1,5 +1,5 @@
 import { MESSAGE_MAX } from './baseline.ts'
-import { confirmRoute, logRoute } from './route-confirm.ts'
+import { confirmRoute, failureFault, logRoute, ROUTE_TUNABLES, SYSTEM_ROUTE_IO, type RouteIo, type RouteTunables } from './route-confirm.ts'
 import { cfOk, ROOT } from './cf.ts'
 import { isTrafficSplit, planCanary, trafficSplit, versionByTag } from './deploy-plan.ts'
 import { extractJson } from './json.ts'
@@ -25,18 +25,24 @@ export type DeployValue = {
  * The canary is served to pinned requests on every fresh connection for PIN_SUSTAIN_MS (route-confirm.ts). `since` is
  * the split write, so the log's sample offsets are time since it.
  */
-export async function pinReady(config: CdConfig, version: string, since: number): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string; readonly fault: 'harness_fault' | 'worker' }> {
-  const started = Date.now()
+export async function pinReady(
+  config: Pick<CdConfig, 'baseUrl' | 'worker'>,
+  version: string,
+  since: number,
+  io: RouteIo = SYSTEM_ROUTE_IO,
+  tunables: RouteTunables = ROUTE_TUNABLES,
+): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string; readonly fault: 'harness_fault' | 'worker' }> {
+  const started = io.now()
   const verdict = await confirmRoute({
     url: `${config.baseUrl}/`,
     version,
     headers: { 'Cloudflare-Workers-Version-Overrides': `${config.worker}="${version}"` },
     since,
-  })
+  }, io, tunables)
   const line = await logRoute({ purpose: 'pin', version, since, started }, verdict)
   process.stdout.write(`${line}\n`)
   if (verdict.kind === 'confirmed') return { ok: true }
-  return { ok: false, reason: verdict.reason, fault: verdict.kind === 'worker' ? 'worker' : 'harness_fault' }
+  return { ok: false, reason: verdict.reason, fault: failureFault(verdict) }
 }
 
 async function versionTagged(worker: string, tag: string): Promise<string | null> {

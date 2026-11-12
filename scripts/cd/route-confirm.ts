@@ -5,6 +5,7 @@
 // 2026-11-10T20-48-18-470Z). Each round here opens PIN_BATCH fresh TCP+TLS connections, and confirmation needs every
 // answer to be the wanted version for PIN_SUSTAIN_MS. Every sample is kept: time since the write, colo, version.
 import { request } from 'node:https'
+import { assertNever } from '../../src/never.ts'
 import { activeLog } from './log.ts'
 import { PIN_BATCH, PIN_INTERVAL_MS, PIN_MAX_MS, PIN_REQUEST_MS, PIN_SUSTAIN_MS } from './baseline.ts'
 
@@ -19,12 +20,34 @@ export type RouteSample = {
   readonly colo: string | null
 }
 
+/** Why a route check is the Worker's fault. */
+export type WorkerCause =
+  /** The wanted version answered with HTTP 5xx: the product, decided on the first such answer. */
+  | 'served_5xx'
+  /** No answer carried x-ply-version at all. */
+  | 'no_version_header'
+
 export type RouteVerdict =
   | { readonly kind: 'confirmed'; readonly samples: readonly RouteSample[]; readonly sustainedFrom: number; readonly at: number }
-  /** A different version answered after the deadline, or no sustained window formed: routing, not the Worker. */
+  /** Only other versions or lost samples kept the window from sustaining: routing, not the Worker. */
   | { readonly kind: 'routing'; readonly samples: readonly RouteSample[]; readonly reason: string }
-  /** The wanted version never answered and answers had no version header at all: the Worker. */
-  | { readonly kind: 'worker'; readonly samples: readonly RouteSample[]; readonly reason: string }
+  /** The wanted version served a 5xx, or nothing carried the version header: the Worker. */
+  | { readonly kind: 'worker'; readonly cause: WorkerCause; readonly samples: readonly RouteSample[]; readonly reason: string }
+
+/** A verdict that did not confirm. */
+export type RouteFailure = Exclude<RouteVerdict, { readonly kind: 'confirmed' }>
+
+/** The pipeline fault an unconfirmed verdict carries. Every caller (pin, live, smoke restart) maps it here. */
+export function failureFault(verdict: RouteFailure): 'worker' | 'harness_fault' {
+  switch (verdict.kind) {
+    case 'worker':
+      return 'worker'
+    case 'routing':
+      return 'harness_fault'
+    default:
+      return assertNever(verdict)
+  }
+}
 
 export type RouteIo = {
   now(): number
@@ -150,6 +173,16 @@ export async function confirmRoute(
       return { at: io.now() - input.since, round: this1, status: answer.status, version: answer.version, colo: coloOf(answer.ray) }
     }))
     samples.push(...answers)
+    // A 5xx from the wanted version is the product (ply-web#146): decided on the first one, never waited out.
+    for (const served of answers) {
+      if (served.version !== input.version || served.status < 500) continue
+      return {
+        kind: 'worker',
+        cause: 'served_5xx',
+        samples,
+        reason: `${input.version} served HTTP ${served.status} at +${served.at} ms (${summarizeRoute(samples, input.version)})`,
+      }
+    }
     const from = sustainedFrom(samples, input.version)
     const last = Math.max(...answers.map(sample => sample.at))
     if (from !== null && last - from >= tunables.sustainMs) return { kind: 'confirmed', samples, sustainedFrom: from, at: last }
@@ -159,7 +192,7 @@ export async function confirmRoute(
   const wanted = answered.some(sample => sample.version === input.version)
   const headerless = answered.length > 0 && answered.every(sample => sample.version === null)
   if (!wanted && headerless) {
-    return { kind: 'worker', samples, reason: `no answer carried x-ply-version in ${tunables.maxMs} ms (${summarizeRoute(samples, input.version)})` }
+    return { kind: 'worker', cause: 'no_version_header', samples, reason: `no answer carried x-ply-version in ${tunables.maxMs} ms (${summarizeRoute(samples, input.version)})` }
   }
   return { kind: 'routing', samples, reason: `routing: ${input.version} not served on every fresh connection for ${tunables.sustainMs} ms within ${tunables.maxMs} ms (${summarizeRoute(samples, input.version)})` }
 }

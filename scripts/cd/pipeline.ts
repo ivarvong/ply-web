@@ -11,7 +11,7 @@ import { errorMessage } from './proc.ts'
 import { liveSmokeAlreadyPassed, reconcile, reconcileReason, type Reconcile } from './reconcile.ts'
 import { checkoutReason, readCheckout, releasePair, releaseTag, type ReleaseId } from './release.ts'
 import { fail, type Fail, type StageResult } from './result.ts'
-import { confirmRoute, logRoute } from './route-confirm.ts'
+import { confirmRoute, failureFault, logRoute, ROUTE_TUNABLES, SYSTEM_ROUTE_IO, type RouteIo, type RouteTunables } from './route-confirm.ts'
 import { writeJson } from './run-dir.ts'
 import { stageBump } from './stage-bump.ts'
 import { stageDeploy } from './stage-deploy.ts'
@@ -181,6 +181,24 @@ async function span<T>(log: RunLog, name: string, fn: () => Promise<T>): Promise
 }
 
 /**
+ * Unpinned traffic serves `version` on every fresh connection (route-confirm.ts). Null when confirmed; otherwise the
+ * Fail that liveVerdict judges: a routing failure is a harness fault (halt), a 5xx served by `version` or answers with
+ * no version header are the Worker (rollback; ply-web#146).
+ */
+export async function liveRoute(
+  config: Pick<CdConfig, 'baseUrl'>,
+  opts: { readonly version: string; readonly log: (line: string) => void },
+  io: RouteIo = SYSTEM_ROUTE_IO,
+  tunables: RouteTunables = ROUTE_TUNABLES,
+): Promise<Fail | null> {
+  const started = io.now()
+  const verdict = await confirmRoute({ url: `${config.baseUrl}/`, version: opts.version, headers: {}, since: started }, io, tunables)
+  opts.log(await logRoute({ purpose: 'live', version: opts.version, since: started, started }, verdict))
+  if (verdict.kind === 'confirmed') return null
+  return fail('smoke', `live: ${verdict.reason}; prod is already at 100% on ${opts.version}`, false, failureFault(verdict))
+}
+
+/**
  * After promotion: the live lifecycle smoke and its telemetry, beside the CDP visual smoke.
  * Each failure is returned in the order the checks finished; a pass is an empty list.
  */
@@ -191,18 +209,12 @@ async function liveChecks(
 ): Promise<readonly StageResult<unknown>[]> {
   // The split write returns before every colo serves it (98.74% at 100% on run 2026-11-06T20-11-49-685Z). The unpinned
   // smoke asserts x-ply-version, so first confirm unpinned traffic the same way the pin is confirmed (route-confirm.ts:
-  // fresh connections, a sustained all-new window). A routing failure is a harness fault, never a product verdict.
-  const converged = async (): Promise<StageResult<unknown> | null> => {
-    const started = Date.now()
-    const verdict = await confirmRoute({ url: `${config.baseUrl}/`, version: opts.version, headers: {}, since: started })
-    opts.log(await logRoute({ purpose: 'live', version: opts.version, since: started, started }, verdict))
-    if (verdict.kind === 'confirmed') return null
-    return fail('smoke', `live: ${verdict.reason}; prod is already at 100% on ${opts.version}`, false, verdict.kind === 'worker' ? 'worker' : 'harness_fault')
-  }
+  // fresh connections, a sustained all-new window). A routing failure is a harness fault, never a product verdict; a 5xx
+  // served by the new version is the Worker and rolls back (ply-web#146).
   const smokeAndTelemetry = async (): Promise<StageResult<unknown>[]> => {
-    const route = await converged()
+    const route = await liveRoute(config, opts)
     if (route !== null) {
-      opts.log(`smoke: ${route.kind === 'fail' ? route.reason : 'route'}`)
+      opts.log(`smoke: ${route.reason}`)
       return [route]
     }
     const started = Date.now()

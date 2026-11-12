@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { REPO_PREFIX, REVOKE_ATTEMPTS, REVOKE_PROBE_MS, REVOKE_WAIT_MS, SMOKE_HTTP_MS, SMOKE_REISSUE_ATTEMPTS, SMOKE_REISSUE_WAIT_MS, SMOKE_RESTARTS, TOKEN_TTL_SECONDS } from './baseline.ts'
 import { clientHealth, type StallSource } from './client-health.ts'
-import { confirmRoute, logRoute } from './route-confirm.ts'
+import { confirmRoute, failureFault, logRoute, ROUTE_TUNABLES, SYSTEM_ROUTE_IO, type RouteIo, type RouteTunables } from './route-confirm.ts'
 import { cfOk, runCf } from './cf.ts'
 import {
   appendCleanupFile,
@@ -659,18 +659,24 @@ async function smokeAttempt(
 }
 
 /** The route the smoke needs, confirmed again before a restart: the override for a pinned smoke, the split otherwise. */
-async function reconfirmRoute(config: CdConfig, version: string | null, pin: boolean): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string; readonly fault: 'harness_fault' | 'worker' }> {
+export async function reconfirmRoute(
+  config: Pick<CdConfig, 'baseUrl' | 'worker'>,
+  version: string | null,
+  pin: boolean,
+  io: RouteIo = SYSTEM_ROUTE_IO,
+  tunables: RouteTunables = ROUTE_TUNABLES,
+): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string; readonly fault: 'harness_fault' | 'worker' }> {
   if (version === null) return { ok: true }
-  const since = Date.now()
+  const since = io.now()
   const verdict = await confirmRoute({
     url: `${config.baseUrl}/`,
     version,
     headers: pin ? { 'Cloudflare-Workers-Version-Overrides': `${config.worker}="${version}"` } : {},
     since,
-  })
+  }, io, tunables)
   await logRoute({ purpose: pin ? 'pin' : 'live', version, since, started: since }, verdict)
   if (verdict.kind === 'confirmed') return { ok: true }
-  return { ok: false, reason: verdict.reason, fault: verdict.kind === 'worker' ? 'worker' : 'harness_fault' }
+  return { ok: false, reason: verdict.reason, fault: failureFault(verdict) }
 }
 
 export async function stageSmoke(
