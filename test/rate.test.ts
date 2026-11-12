@@ -14,8 +14,12 @@ import { CounterCore, InvalidBatch, blockedUntil, firstLiveSlot, type ApplyReque
 import { Batcher, defaultTuning, type BatcherDeps, type FlushReport } from '../src/rate/batcher.ts';
 import { SLOT_MS, WINDOW_MS, DOC_PATH, DOC_URL, KEY_HEX, MEMO_FALLBACK_MS, MEMO_REFRESH_ABANDON_MS, MEMO_REFRESH_MS, PRUNE_BATCH_ROWS, DEDUPE_RETENTION_MS } from '../src/rate/config.ts';
 import { indexDoc, serveDoc } from '../src/rate/doc.ts';
+import type { RefreshTrigger } from '../src/rate/admit.ts';
+
+const COLD_START: RefreshTrigger = { kind: 'cold', cause: { kind: 'isolate_start' } };
+const STALE: RefreshTrigger = { kind: 'stale' };
 import { counterNamespace } from '../src/rate/stub.ts';
-import { admitBatched, parseFault, rateIdentity, readDoc, readMemo, refreshMemo, resetRateState, LOAD_CLIENT_HEADER, LOAD_MODE_HEADER, LOAD_TOKEN_HEADER } from '../src/rate/admit.ts';
+import { admitBatched, coldCause, parseFault, rateIdentity, readDoc, readMemo, refreshMemo, resetRateState, LOAD_CLIENT_HEADER, LOAD_MODE_HEADER, LOAD_TOKEN_HEADER } from '../src/rate/admit.ts';
 
 function sqlite(): SqlExec {
   const db = new DatabaseSync(':memory:');
@@ -694,15 +698,16 @@ test('memo: a cold isolate admits at once (fail_open, read cold) and refreshes i
   resetRateState();
 });
 
-test('memo: cold while the first read is in flight is start-up (rate.cold_isolate); cold after a failed read is not', async () => {
+test('memo: cold while the first read is in flight is isolate_start (rate.cold); cold after a failed read is read_failed', async () => {
   resetRateState();
   const rig = memoRig(60);
   await rig.admit('a');
-  assert.equal(rig.attrs['rate.cold_isolate'], true, 'the isolate\'s first check');
-  delete rig.attrs['rate.cold_isolate'];
+  assert.equal(rig.attrs['rate.cold'], 'isolate_start', 'the isolate\'s first check');
+  assert.equal(rig.attrs['rate.fail_open_reason'], 'isolate_start');
+  delete rig.attrs['rate.cold'];
   await rig.admit('b');
   assert.equal(rig.attrs['rate.read'], 'cold');
-  assert.equal(rig.attrs['rate.cold_isolate'], true, 'joined the first read, still start-up');
+  assert.equal(rig.attrs['rate.cold'], 'isolate_start', 'joined the first read, still start-up');
   await rig.settle();
   resetRateState();
   // A broken read path: the first refresh settles with no document. Later cold checks are degradation, not start-up.
@@ -713,23 +718,74 @@ test('memo: cold while the first read is in flight is start-up (rate.cold_isolat
   const set = (k: string, v: string | number | boolean) => { attrs[k] = v; };
   const id = { hex: 'c'.repeat(64), mode: 'memo' as const, fault: null, load: false, modeSource: 'default' as const };
   await admitBatched({ ctx, env, id, bucket: 'page', now: Date.now(), limitFor: () => 60, set });
-  assert.equal(attrs['rate.cold_isolate'], true);
+  assert.equal(attrs['rate.cold'], 'isolate_start');
   await Promise.all(waits);
-  delete attrs['rate.cold_isolate'];
+  delete attrs['rate.cold'];
   await admitBatched({ ctx, env, id, bucket: 'page', now: Date.now(), limitFor: () => 60, set });
   assert.equal(attrs['rate.read'], 'cold');
   assert.equal(attrs['rate.decision'], 'fail_open');
-  assert.equal('rate.cold_isolate' in attrs, false, 'the first read settled with nothing: a warm fail_open the CD gate counts');
+  assert.equal(attrs['rate.fail_open_reason'], 'read_failed');
+  assert.equal(attrs['rate.cold_last_read'], 'fail');
+  assert.equal('rate.cold' in attrs, false, 'the first read settled with nothing: a warm fail_open the CD gate counts');
   await Promise.all(waits);
   resetRateState();
+});
+
+// ply-web#156: CD 2026-11-12T13-06-51-511Z, isolate 2058502eefa348bb9abc idle 339.4 s after the canary probes, then a
+// crawler request (cf-ray a595ccf10c639249) read cold and failed open; its refresh read ok in 6 ms.
+test('memo: an idle isolate whose memo aged past MEMO_FALLBACK_MS is memo_expired (expected), and its refresh carries the cause', async () => {
+  resetRateState();
+  const rig = memoRig(1);
+  const spans: { name: string; attrs: Record<string, string | number | boolean> }[] = [];
+  const tracing = { startActiveSpan: async <T>(name: string, fn: (span: { setAttribute(k: string, v: string | number | boolean): void; end(): void; setStatus(): void; recordException(): void }) => Promise<T>) => {
+    const attrs: Record<string, string | number | boolean> = {};
+    spans.push({ name, attrs });
+    return fn({ setAttribute: (k, v) => { attrs[k] = v; }, end: () => {}, setStatus: () => {}, recordException: () => {} });
+  } };
+  const ctx = { ...rig.ctx, tracing };
+  await admitBatched({ ctx, env: rig.env, id: { hex: 'a'.repeat(64), mode: 'memo', fault: null, load: false, modeSource: 'default' }, bucket: 'page', now: Date.now(), limitFor: () => 60, set: () => {} });
+  await rig.settle();
+  const realNow = Date.now;
+  const idle = 339_400;
+  try {
+    const base = realNow();
+    Date.now = () => base + idle;
+    const attrs: Record<string, string | number | boolean> = {};
+    const set = (k: string, v: string | number | boolean) => { attrs[k] = v; };
+    const d = await admitBatched({ ctx, env: rig.env, id: { hex: 'b'.repeat(64), mode: 'memo', fault: null, load: false, modeSource: 'default' }, bucket: 'page', now: base + idle, limitFor: () => 60, set });
+    assert.equal(d.ok, true);
+    assert.equal(attrs['rate.read'], 'cold');
+    assert.equal(attrs['rate.decision'], 'fail_open');
+    assert.equal(attrs['rate.cold'], 'memo_expired');
+    assert.equal(attrs['rate.fail_open_reason'], 'memo_expired');
+    assert.ok(Number(attrs['rate.memo_expired_ms']) >= idle - 50, 'the expired memo\'s age is stamped');
+    assert.equal(attrs['rate.refresh.started'], true);
+  } finally {
+    Date.now = realNow;
+  }
+  await rig.settle();
+  const refresh = spans.filter(s => s.name === 'ply.rate.refresh').pop();
+  assert.ok(refresh !== void 0 && refresh.attrs['rate.refresh.trigger'] === 'cold');
+  assert.equal(refresh.attrs['rate.refresh.cold'], 'memo_expired');
+  assert.equal(refresh.attrs['rate.refresh.read'], 'ok', 'healthy: the CD gate keeps it out of the warm share');
+  resetRateState();
+});
+
+test('memo: an expired memo after a failed refresh is read_failed, not memo_expired', () => {
+  const memo = { etag: '', index: new Map(), gen: 1, at: 0, entries: 0, fetchedAt: 0, bytes: 0, truncated: false };
+  assert.deepEqual(coldCause(memo, { kind: 'ok' }, MEMO_FALLBACK_MS + 1), { kind: 'memo_expired', memoAgeMs: MEMO_FALLBACK_MS + 1 });
+  assert.deepEqual(coldCause(memo, { kind: 'failed', read: 'memo' }, MEMO_FALLBACK_MS + 1), { kind: 'read_failed', lastRead: 'memo', memoAgeMs: MEMO_FALLBACK_MS + 1 });
+  assert.deepEqual(coldCause(memo, { kind: 'failed', read: 'abandoned' }, MEMO_FALLBACK_MS + 1), { kind: 'read_failed', lastRead: 'abandoned', memoAgeMs: MEMO_FALLBACK_MS + 1 });
+  assert.deepEqual(coldCause(null, { kind: 'failed', read: 'fail' }, 5), { kind: 'read_failed', lastRead: 'fail', memoAgeMs: null });
+  assert.deepEqual(coldCause(null, { kind: 'none' }, 5), { kind: 'isolate_start' });
 });
 
 test('memo: refresh is single-flight — concurrent stale requests join the one in flight', async () => {
   resetRateState();
   const rig = memoRig(80);
-  const a = refreshMemo(rig.ctx, rig.env, 'cold');
+  const a = refreshMemo(rig.ctx, rig.env, COLD_START);
   assert.equal(a.started, true);
-  const joined = [refreshMemo(rig.ctx, rig.env, 'stale'), refreshMemo(rig.ctx, rig.env, 'stale'), refreshMemo(rig.ctx, rig.env, 'stale')];
+  const joined = [refreshMemo(rig.ctx, rig.env, STALE), refreshMemo(rig.ctx, rig.env, STALE), refreshMemo(rig.ctx, rig.env, STALE)];
   for (const j of joined) assert.equal(j.started, false);
   const report = await a.promise;
   assert.equal(rig.fetches(), 1);
@@ -738,7 +794,7 @@ test('memo: refresh is single-flight — concurrent stale requests join the one 
   for (const j of joined) assert.equal(await j.promise, report, 'joiners see the same refresh');
   assert.equal(rig.waits.length, 4, 'every joiner keeps the flight alive with waitUntil');
   // Settled: the next stale request starts a new flight.
-  assert.equal(refreshMemo(rig.ctx, rig.env, 'stale').started, true);
+  assert.equal(refreshMemo(rig.ctx, rig.env, STALE).started, true);
   await rig.settle();
   assert.equal(rig.fetches(), 2);
   // Through admit: stale memo, many requests, one fetch.
@@ -763,18 +819,20 @@ test('memo: age bounds — fresh below MEMO_REFRESH_MS, stale-and-refresh above,
   const rig = memoRig(1);
   rig.core.apply(req('m:2', [['a'.repeat(KEY_HEX), 0, 60]]), Date.now());
   const fetchedBy = Date.now();
-  await refreshMemo(rig.ctx, rig.env, 'cold').promise;
+  await refreshMemo(rig.ctx, rig.env, COLD_START).promise;
   const fresh = readMemo(rig.ctx, rig.env, fetchedBy + MEMO_REFRESH_MS - 50);
   assert.equal(fresh.read, 'memo_fresh');
   assert.equal(rig.fetches(), 1);
   const stale = readMemo(rig.ctx, rig.env, Date.now() + MEMO_REFRESH_MS);
   assert.equal(stale.read, 'memo_stale_refresh');
+  if (stale.read !== 'memo_stale_refresh') return;
   assert.equal(stale.started, true);
-  assert.notEqual(stale.memo, null, 'a stale memo still decides');
+  assert.equal(stale.memo.entries, 1, 'a stale memo still decides');
   await rig.settle();
   const expired = readMemo(rig.ctx, rig.env, Date.now() + MEMO_FALLBACK_MS + 1);
   assert.equal(expired.read, 'cold', 'older than the 5 min bound: treated as no memo');
-  assert.equal(expired.memo, null);
+  if (expired.read !== 'cold') return;
+  assert.equal(expired.cause.kind, 'memo_expired', 'the last refresh read ok: the memo expired while idle');
   await rig.settle();
   resetRateState();
 });
@@ -784,13 +842,13 @@ test('memo: a hung refresh is abandoned after MEMO_REFRESH_ABANDON_MS, so the fl
   let calls = 0;
   const ctx = { waitUntil: () => {}, exports: { RateCache: { fetch: () => { calls++; return new Promise<Response>(() => {}); } } } };
   const env = { RATE_MODE: 'memo', RATE_COUNTER: fakeNamespace(new CounterCore(sqlite())) };
-  assert.equal(refreshMemo(ctx, env, 'cold').started, true);
-  assert.equal(refreshMemo(ctx, env, 'cold').started, false);
+  assert.equal(refreshMemo(ctx, env, COLD_START).started, true);
+  assert.equal(refreshMemo(ctx, env, COLD_START).started, false);
   const realNow = Date.now;
   const base = realNow();
   try {
     Date.now = () => base + MEMO_REFRESH_ABANDON_MS + 1;
-    assert.equal(refreshMemo(ctx, env, 'cold').started, true);
+    assert.equal(refreshMemo(ctx, env, COLD_START).started, true);
   } finally {
     Date.now = realNow;
   }

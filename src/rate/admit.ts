@@ -232,11 +232,18 @@ export async function readDoc(ctx: unknown, now: number, budgetMs: number | null
 export type RefreshReport = { readonly read: DocRead['read']; readonly cache: string; readonly parsed: boolean; readonly ms: number; readonly joins: number };
 type Flight = { promise: Promise<RefreshReport>; readonly startedAt: number; joins: number };
 let flight: Flight | null = null;
+
 /**
- * Refreshes this isolate has finished (settled either way, or abandoned). Zero means its first read is still in flight:
- * a cold check then is the isolate's start-up, not a broken read path (the CD rate gate counts it as a cold isolate).
+ * How this isolate's last refresh ended. `none`: its first read is still in flight (or not started), so a cold check is
+ * start-up. `ok`: the document was read, so a memo that has since aged past MEMO_FALLBACK_MS expired while the isolate
+ * sat idle (no request came to refresh it). `failed`: the read path returned no document (a hung flight that was
+ * abandoned counts), so a cold check is a broken read path.
  */
-let refreshesSettled = 0;
+export type LastRefresh =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'ok' }
+  | { readonly kind: 'failed'; readonly read: DocRead['read'] | 'abandoned' | 'threw' };
+let lastRefresh: LastRefresh = { kind: 'none' };
 
 function waitUntilOf(ctx: unknown): (p: Promise<unknown>) => void {
   const found = dig(ctx, ['waitUntil']);
@@ -250,7 +257,7 @@ function waitUntilOf(ctx: unknown): (p: Promise<unknown>) => void {
  * waitUntil'd: free, and the refresh survives the starter's context ending). A flight older than
  * MEMO_REFRESH_ABANDON_MS is abandoned and replaced. Returns whether this call started a new flight.
  */
-export function refreshMemo(ctx: unknown, env: unknown, trigger: 'cold' | 'stale'): { started: boolean; promise: Promise<RefreshReport> } {
+export function refreshMemo(ctx: unknown, env: unknown, trigger: RefreshTrigger): { started: boolean; promise: Promise<RefreshReport> } {
   const now = Date.now();
   const keep = waitUntilOf(ctx);
   if (flight !== null && now - flight.startedAt < MEMO_REFRESH_ABANDON_MS) {
@@ -258,19 +265,26 @@ export function refreshMemo(ctx: unknown, env: unknown, trigger: 'cold' | 'stale
     keep(flight.promise);
     return { started: false, promise: flight.promise };
   }
-  if (flight !== null) refreshesSettled++; // abandoned: a hung first read is no longer start-up
+  if (flight !== null) lastRefresh = { kind: 'failed', read: 'abandoned' }; // a hung read is no longer start-up
   const mine: Flight = { promise: Promise.resolve({ read: 'fail', cache: 'NONE', parsed: false, ms: 0, joins: 0 }), startedAt: now, joins: 0 };
   flight = mine;
   const run = inSpan(ctx, 'ply.rate.refresh', { [EDGE_ATTR.version]: versionOf(env), [EDGE_ATTR.route]: 'rate.refresh' }, async set => {
     const t0 = performance.now();
-    set('rate.refresh.trigger', trigger);
+    set('rate.refresh.trigger', trigger.kind);
+    if (trigger.kind === 'cold') {
+      set('rate.refresh.cold', trigger.cause.kind);
+      if (trigger.cause.kind === 'memo_expired') set('rate.refresh.memo_expired_ms', trigger.cause.memoAgeMs);
+    }
     let r: DocRead;
     try {
       r = await fetchDoc(ctx, now);
+    } catch (e) {
+      lastRefresh = { kind: 'failed', read: 'threw' };
+      throw e;
     } finally {
       if (flight === mine) flight = null;
-      refreshesSettled++;
     }
+    lastRefresh = r.read === 'ok' ? { kind: 'ok' } : { kind: 'failed', read: r.read };
     const report: RefreshReport = { read: r.read, cache: r.cache, parsed: r.parsed, ms: Math.round((performance.now() - t0) * 1000) / 1000, joins: mine.joins };
     set('rate.refresh.read', report.read);
     set('rate.refresh.cache', report.cache);
@@ -294,27 +308,73 @@ export function refreshMemo(ctx: unknown, env: unknown, trigger: 'cold' | 'stale
   return { started: true, promise: mine.promise };
 }
 
+/**
+ * Why a memo-mode check found no usable document (docs/rate-limit.md "CD gate"). Each one admits (fail_open):
+ *
+ *   isolate_start  the isolate's first refresh has not settled: start-up, expected.
+ *   memo_expired   the isolate held a document, its last refresh read ok, and the document aged past MEMO_FALLBACK_MS
+ *                  because no request came to refresh it (an idle isolate): expected. The refresh this check starts is
+ *                  stamped with the cause, so the CD gate counts it as a read-path failure when that refresh fails too.
+ *   read_failed    the last refresh settled with no document: the read path is broken. A real failure.
+ */
+export type ColdCause =
+  | { readonly kind: 'isolate_start' }
+  | { readonly kind: 'memo_expired'; readonly memoAgeMs: number }
+  | { readonly kind: 'read_failed'; readonly lastRead: DocRead['read'] | 'abandoned' | 'threw'; readonly memoAgeMs: number | null };
+
+export type RefreshTrigger = { readonly kind: 'cold'; readonly cause: ColdCause } | { readonly kind: 'stale' };
+
+/** Why a check admitted without a decision (`rate.fail_open_reason`): a memo cold cause, or a batched read that failed or ran late. */
+export type FailOpenReason = ColdCause['kind'] | 'read_late';
+
+/** Cold causes that are expected (`rate.cold` on the check): the CD rate gate keeps them out of the warm share. */
+export type ExpectedCold = Extract<ColdCause['kind'], 'isolate_start' | 'memo_expired'>;
+
+export function coldCause(held: Memo | null, last: LastRefresh, now: number): ColdCause {
+  const memoAgeMs = held === null ? null : Math.max(0, now - held.fetchedAt);
+  switch (last.kind) {
+    case 'none': return { kind: 'isolate_start' };
+    // An ok refresh always sets the memo; a null one here is unreachable, and is judged as the strict case.
+    case 'ok': return memoAgeMs === null ? { kind: 'read_failed', lastRead: 'ok', memoAgeMs } : { kind: 'memo_expired', memoAgeMs };
+    case 'failed': return { kind: 'read_failed', lastRead: last.read, memoAgeMs };
+  }
+}
+
 /** The memo-mode read: never a fetch on the request path. */
-export type MemoRead = {
-  readonly read: 'memo_fresh' | 'memo_stale_refresh' | 'cold';
-  readonly memo: Memo | null;
-  readonly memoAgeMs: number | null;
-  readonly started: boolean;
-  /** Cold, and no refresh of this isolate has settled yet: its first read is in flight. */
-  readonly firstRead: boolean;
-};
+export type MemoRead =
+  | { readonly read: 'memo_fresh'; readonly memo: Memo; readonly memoAgeMs: number }
+  | { readonly read: 'memo_stale_refresh'; readonly memo: Memo; readonly memoAgeMs: number; readonly started: boolean }
+  | { readonly read: 'cold'; readonly cause: ColdCause; readonly started: boolean };
 
 export function readMemo(ctx: unknown, env: unknown, now: number): MemoRead {
   const held = memo !== null && now - memo.fetchedAt < MEMO_FALLBACK_MS ? memo : null;
   if (held === null) {
-    const firstRead = refreshesSettled === 0;
-    const { started } = refreshMemo(ctx, env, 'cold');
-    return { read: 'cold', memo: null, memoAgeMs: null, started, firstRead };
+    const cause = coldCause(memo, lastRefresh, now);
+    const { started } = refreshMemo(ctx, env, { kind: 'cold', cause });
+    return { read: 'cold', cause, started };
   }
   const age = Math.max(0, now - held.fetchedAt);
-  if (age < MEMO_REFRESH_MS) return { read: 'memo_fresh', memo: held, memoAgeMs: age, started: false, firstRead: false };
-  const { started } = refreshMemo(ctx, env, 'stale');
-  return { read: 'memo_stale_refresh', memo: held, memoAgeMs: age, started, firstRead: false };
+  if (age < MEMO_REFRESH_MS) return { read: 'memo_fresh', memo: held, memoAgeMs: age };
+  const { started } = refreshMemo(ctx, env, { kind: 'stale' });
+  return { read: 'memo_stale_refresh', memo: held, memoAgeMs: age, started };
+}
+
+/** Stamp an expected cold check (`rate.cold`); the CD gate excludes these from the warm fail_open share. */
+export function stampCold(set: SpanSet, kind: ExpectedCold): void {
+  set('rate.cold', kind);
+}
+
+/** Stamp a memo-mode cold read's cause on its `ply.rate.check` span. */
+function stampColdCause(set: SpanSet, cause: ColdCause): void {
+  set('rate.fail_open_reason', cause.kind);
+  switch (cause.kind) {
+    case 'isolate_start': stampCold(set, cause.kind); return;
+    case 'memo_expired': stampCold(set, cause.kind); set('rate.memo_expired_ms', cause.memoAgeMs); return;
+    case 'read_failed':
+      set('rate.cold_last_read', cause.lastRead);
+      if (cause.memoAgeMs !== null) set('rate.memo_expired_ms', cause.memoAgeMs);
+      return;
+  }
 }
 
 // ---- write side: the isolate's one batcher ----
@@ -383,7 +443,7 @@ export function resetRateState(): void {
   batcher = null;
   memo = null;
   flight = null;
-  refreshesSettled = 0;
+  lastRefresh = { kind: 'none' };
   isolate = '';
 }
 
@@ -412,12 +472,25 @@ export async function admitBatched(input: {
     const m = readMemo(ctx, env, now);
     set('rate.read', m.read);
     set('rate.cache', 'MEMO');
-    if (m.memoAgeMs !== null) set('rate.memo_age_ms', m.memoAgeMs);
-    if (m.read !== 'memo_fresh') set('rate.refresh.started', m.started);
-    // Cold while the isolate's first read is still in flight (or about to start): start-up, judged as a cold isolate.
-    if (m.read === 'cold' && m.firstRead) set('rate.cold_isolate', true);
-    held = m.memo;
-    open = m.read === 'cold';
+    switch (m.read) {
+      case 'memo_fresh':
+        set('rate.memo_age_ms', m.memoAgeMs);
+        held = m.memo;
+        open = false;
+        break;
+      case 'memo_stale_refresh':
+        set('rate.memo_age_ms', m.memoAgeMs);
+        set('rate.refresh.started', m.started);
+        held = m.memo;
+        open = false;
+        break;
+      case 'cold':
+        set('rate.refresh.started', m.started);
+        stampColdCause(set, m.cause);
+        held = null;
+        open = true;
+        break;
+    }
   } else {
     const doc = await readDoc(ctx, now, READ_BUDGET_MS);
     set('rate.read', doc.read);
@@ -425,6 +498,8 @@ export async function admitBatched(input: {
     set('rate.doc_parsed', doc.parsed);
     held = doc.memo;
     open = doc.read === 'fail' || doc.read === 'late_open';
+    if (doc.read === 'fail') set('rate.fail_open_reason', 'read_failed' satisfies FailOpenReason);
+    if (doc.read === 'late_open') set('rate.fail_open_reason', 'read_late' satisfies FailOpenReason);
   }
   if (held !== null) {
     set('rate.doc_entries', held.entries);

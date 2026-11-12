@@ -5,7 +5,10 @@
 // This gate reads the version's own `ply.rate.check` / `ply.rate.flush` spans and fails it when:
 //
 //   mode       a default-mode check (not chosen by a load request's x-ply-rate-mode) ran a limiter other than the policy's
-//   fail_open  warm default-mode checks (not the isolate's first) failed open above maxFailOpenRate
+//   fail_open  warm default-mode checks failed open above maxFailOpenRate. A check the Worker stamps `rate.cold` is an
+//              expected fail-open and is counted on its own line, out of the warm share: `isolate_start` (the isolate's
+//              first read is in flight) and `memo_expired` (an idle isolate's document aged past MEMO_FALLBACK_MS;
+//              ply-web#156). A memo_expired check whose own refresh then failed is put back as a warm failure.
 //   dropped    flushes dropped (deadline or overflow) with no injected fault, above maxDroppedFlushes
 //
 // The gate sends its own pinned probes first (the viewer redirect route: rate-checked, no git work), carrying the load
@@ -13,23 +16,39 @@
 // probes never spend the operator's address quota (the visual smoke shares it).
 import { atIndex, dig, recordGet } from '../../src/absent.ts'
 import { unwrapOr } from '../../src/option.ts'
+import type { ExpectedCold } from '../../src/rate/admit.ts'
 import type { RateGatePolicy } from './policy.ts'
 import type { CountRow } from './o11y.ts'
 import type { Filter } from './telemetry.ts'
+
+/** Default-mode checks of one expected cold cause, and how many of them failed open. */
+export type ColdTally = { readonly checks: number; readonly failOpen: number }
+
+export const EXPECTED_COLD: readonly ExpectedCold[] = ['isolate_start', 'memo_expired']
 
 export type RateCounts = {
   /** Default-mode checks by `rate.mode`. */
   readonly modes: Readonly<Record<string, number>>
   readonly defaultChecks: number
-  readonly coldChecks: number
   readonly failOpen: number
-  readonly coldFailOpen: number
+  /** Default-mode checks stamped `rate.cold`, by cause: expected fail-opens, out of the warm share. */
+  readonly cold: Readonly<Record<ExpectedCold, ColdTally>>
+  /** `ply.rate.refresh` started by a memo_expired check, by outcome. A failed one is a warm read-path failure. */
+  readonly expiredRefresh: { readonly ok: number; readonly failed: number }
   /** Checks whose mode a load request chose (excluded from every judgement). */
   readonly headerChecks: number
   readonly overflowDrops: number
   readonly flushes: number
   readonly droppedFlushes: number
   readonly faultedDrops: number
+}
+
+/** The warm share's inputs: expected cold checks out, memo_expired ones whose refresh failed back in. Pure. */
+export function warmShare(counts: RateCounts): { readonly warm: number; readonly warmOpen: number; readonly back: number } {
+  const coldChecks = EXPECTED_COLD.reduce((n, k) => n + counts.cold[k].checks, 0)
+  const coldOpen = EXPECTED_COLD.reduce((n, k) => n + counts.cold[k].failOpen, 0)
+  const back = Math.min(counts.expiredRefresh.failed, counts.cold.memo_expired.failOpen)
+  return { warm: counts.defaultChecks - coldChecks + back, warmOpen: counts.failOpen - coldOpen + back, back }
 }
 
 export type RateVerdict =
@@ -55,10 +74,11 @@ export function judgeRate(counts: RateCounts, policy: RateGatePolicy): RateVerdi
   if (dropped > policy.maxDroppedFlushes) {
     failures.push(`dropped: ${dropped} batches lost without an injected fault (deadline ${counts.droppedFlushes - counts.faultedDrops}, overflow ${counts.overflowDrops}) of ${counts.flushes} flushes > ${policy.maxDroppedFlushes}`)
   }
-  const warm = counts.defaultChecks - counts.coldChecks
-  const warmOpen = counts.failOpen - counts.coldFailOpen
+  const { warm, warmOpen, back } = warmShare(counts)
   const share = warm > 0 ? warmOpen / warm : 0
-  const summary = `default ${counts.defaultChecks} (cold ${counts.coldChecks}), fail_open warm ${warmOpen}/${warm} = ${pct(share)} (cold ${counts.coldFailOpen}), flushes ${counts.flushes} dropped ${dropped}, header-mode ${counts.headerChecks}`
+  const { isolate_start: start, memo_expired: expired } = counts.cold
+  const expected = `expected fail_open isolate_start ${start.failOpen}/${start.checks}, memo_expired ${expired.failOpen}/${expired.checks} (refresh ok ${counts.expiredRefresh.ok}, failed ${counts.expiredRefresh.failed}${back > 0 ? `, ${back} counted warm` : ''})`
+  const summary = `default ${counts.defaultChecks}, fail_open warm ${warmOpen}/${warm} = ${pct(share)}; ${expected}; flushes ${counts.flushes} dropped ${dropped}, header-mode ${counts.headerChecks}`
   if (warm >= policy.minChecks && share > policy.maxFailOpenRate) {
     failures.push(`fail_open: ${warmOpen}/${warm} warm default-mode checks failed open = ${pct(share)} > ${pct(policy.maxFailOpenRate)}`)
   }
@@ -83,8 +103,10 @@ export type RateRows = {
   readonly checks: readonly CountRow[]
   /** The same, only rate.mode_source = header. */
   readonly header: readonly CountRow[]
-  /** ply.rate.check with rate.cold_isolate = true, grouped by rate.mode_source, rate.decision. */
+  /** ply.rate.check with rate.cold present, grouped by rate.cold, rate.mode_source, rate.decision. */
   readonly cold: readonly CountRow[]
+  /** ply.rate.refresh with rate.refresh.cold = memo_expired, grouped by rate.refresh.read. */
+  readonly expiredRefresh: readonly CountRow[]
   /** ply.rate.check with rate.batch.dropped present. */
   readonly overflow: readonly CountRow[]
   /** ply.rate.flush grouped by rate.batch.outcome. */
@@ -99,18 +121,30 @@ function bump(counts: Record<string, number>, key: string, by: number): void {
   else counts[key] = next
 }
 
+function isExpectedCold(value: unknown): value is ExpectedCold {
+  return EXPECTED_COLD.some(k => k === value)
+}
+
+function tallyCold(rows: readonly CountRow[]): Record<ExpectedCold, ColdTally> {
+  const tally = (kind: ExpectedCold): ColdTally => ({
+    checks: sum(rows, g => g['rate.cold'] === kind && g['rate.mode_source'] !== 'header'),
+    failOpen: sum(rows, g => g['rate.cold'] === kind && g['rate.mode_source'] !== 'header' && g['rate.decision'] === 'fail_open'),
+  })
+  return { isolate_start: tally('isolate_start'), memo_expired: tally('memo_expired') }
+}
+
 export function countsFromRows(rows: RateRows): RateCounts {
   const modes: Record<string, number> = {}
   for (const row of rows.checks) bump(modes, unwrapOr(recordGet(row.groups, 'rate.mode'), '?'), row.count)
   for (const row of rows.header) bump(modes, unwrapOr(recordGet(row.groups, 'rate.mode'), '?'), -row.count)
   const failOpen = (g: Readonly<Record<string, string>>): boolean => g['rate.decision'] === 'fail_open'
-  const coldDefault = (g: Readonly<Record<string, string>>): boolean => g['rate.mode_source'] !== 'header'
+  const refreshOk = sum(rows.expiredRefresh, g => g['rate.refresh.read'] === 'ok')
   return {
     modes,
     defaultChecks: sum(rows.checks) - sum(rows.header),
-    coldChecks: sum(rows.cold, coldDefault),
     failOpen: sum(rows.checks, failOpen) - sum(rows.header, failOpen),
-    coldFailOpen: sum(rows.cold, g => coldDefault(g) && failOpen(g)),
+    cold: tallyCold(rows.cold),
+    expiredRefresh: { ok: refreshOk, failed: sum(rows.expiredRefresh) - refreshOk },
     headerChecks: sum(rows.header),
     overflowDrops: sum(rows.overflow),
     flushes: sum(rows.flushes),
@@ -138,7 +172,9 @@ function spanName(event: unknown): string {
  */
 export function countsFromSpans(events: readonly unknown[], version: string): RateCounts {
   const modes: Record<string, number> = {}
-  let defaultChecks = 0, coldChecks = 0, failOpen = 0, coldFailOpen = 0, headerChecks = 0, overflowDrops = 0, flushes = 0, droppedFlushes = 0, faultedDrops = 0
+  const cold: Record<ExpectedCold, { checks: number; failOpen: number }> = { isolate_start: { checks: 0, failOpen: 0 }, memo_expired: { checks: 0, failOpen: 0 } }
+  const expiredRefresh = { ok: 0, failed: 0 }
+  let defaultChecks = 0, failOpen = 0, headerChecks = 0, overflowDrops = 0, flushes = 0, droppedFlushes = 0, faultedDrops = 0
   for (const event of events) {
     if (attr(event, 'ply.script_version') !== version) continue
     const name = spanName(event)
@@ -148,11 +184,17 @@ export function countsFromSpans(events: readonly unknown[], version: string): Ra
       const mode = attr(event, 'rate.mode')
       bump(modes, mode === null ? '?' : String(mode), 1)
       defaultChecks++
-      const cold = attr(event, 'rate.cold_isolate') === true || attr(event, 'rate.cold_isolate') === 'true'
       const open = attr(event, 'rate.decision') === 'fail_open'
-      if (cold) coldChecks++
       if (open) failOpen++
-      if (cold && open) coldFailOpen++
+      const kind = attr(event, 'rate.cold')
+      if (isExpectedCold(kind)) {
+        cold[kind].checks++
+        if (open) cold[kind].failOpen++
+      }
+    } else if (name === 'ply.rate.refresh') {
+      if (attr(event, 'rate.refresh.cold') !== 'memo_expired') continue
+      if (attr(event, 'rate.refresh.read') === 'ok') expiredRefresh.ok++
+      else expiredRefresh.failed++
     } else if (name === 'ply.rate.flush') {
       flushes++
       if (attr(event, 'rate.batch.outcome') === 'dropped') {
@@ -161,35 +203,37 @@ export function countsFromSpans(events: readonly unknown[], version: string): Ra
       }
     }
   }
-  return { modes, defaultChecks, coldChecks, failOpen, coldFailOpen, headerChecks, overflowDrops, flushes, droppedFlushes, faultedDrops }
+  return { modes, defaultChecks, failOpen, cold, expiredRefresh, headerChecks, overflowDrops, flushes, droppedFlushes, faultedDrops }
 }
 
 // ---- the queries ----
 
 export type CountQuery = (filters: readonly Filter[], groupBys: readonly string[]) => Promise<CountRow[]>
 
-function eq(key: string, value: string, type = 'string'): Filter {
-  return { key, operation: 'eq', type, value }
+function eq(key: string, value: string): Filter {
+  return { key, operation: 'eq', type: 'string', value }
 }
 
 function exists(key: string): Filter {
   return { key, operation: 'exists', type: 'string', value: '' }
 }
 
-/** The six aggregate queries, scoped to the Worker and to the version's own `ply.script_version` stamp. */
+/** The seven aggregate queries, scoped to the Worker and to the version's own `ply.script_version` stamp. */
 export async function queryRateRows(worker: string, version: string, count: CountQuery): Promise<RateRows> {
   const base = [eq('$metadata.service', worker), eq('ply.script_version', version)]
   const check = [...base, eq('$metadata.spanName', 'ply.rate.check')]
   const flush = [...base, eq('$metadata.spanName', 'ply.rate.flush')]
-  const [checks, header, cold, overflow, flushes, faulted] = await Promise.all([
+  const refresh = [...base, eq('$metadata.spanName', 'ply.rate.refresh')]
+  const [checks, header, cold, expiredRefresh, overflow, flushes, faulted] = await Promise.all([
     count(check, ['rate.mode', 'rate.decision']),
     count([...check, eq('rate.mode_source', 'header')], ['rate.mode', 'rate.decision']),
-    count([...check, eq('rate.cold_isolate', 'true', 'boolean')], ['rate.mode_source', 'rate.decision']),
+    count([...check, exists('rate.cold')], ['rate.cold', 'rate.mode_source', 'rate.decision']),
+    count([...refresh, eq('rate.refresh.cold', 'memo_expired')], ['rate.refresh.read']),
     count([...check, exists('rate.batch.dropped')], []),
     count(flush, ['rate.batch.outcome']),
     count([...flush, eq('rate.batch.outcome', 'dropped'), exists('rate.fault')], []),
   ])
-  return { checks, header, cold, overflow, flushes, faulted }
+  return { checks, header, cold, expiredRefresh, overflow, flushes, faulted }
 }
 
 // ---- the probes ----

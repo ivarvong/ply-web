@@ -11,7 +11,7 @@ import { VIEWER_CAPS, rateLimitFor, type RateBucket } from './limits.ts'
 import type { RateDecision, TraceModel, ViewerEnv } from './model.ts'
 import { isPlyCode } from 'ply'
 import { EDGE_ATTR, cacheStatsOf, plyTracer, routeStamp, spanList } from '../edge-trace.ts'
-import { admitBatched, firstCheckInIsolate, inSpan, rateIdentity, versionOf } from '../rate/admit.ts'
+import { admitBatched, firstCheckInIsolate, inSpan, rateIdentity, stampCold, versionOf } from '../rate/admit.ts'
 import { describeCounter } from '../rate/stub.ts'
 import { createLoopbackFetch, isLoopback, type LoopbackBinding } from '../gitcache.ts'
 import { applyUpstreamHeaders, createRayLog, observeUpstream, stampUpstreamSpans } from '../rays.ts'
@@ -42,7 +42,7 @@ export async function admitClient(req: Request, env: ViewerEnv, bucket: RateBuck
     set('rate.mode', id.mode)
     set('rate.mode_source', id.modeSource)
     set('rate.bucket', bucket)
-    if (firstCheckInIsolate()) set('rate.cold_isolate', true)
+    if (firstCheckInIsolate()) stampCold(set, 'isolate_start')
     if (id.load) {
       set('rate.load', true)
       set('rate.counter', describeCounter(ctx))

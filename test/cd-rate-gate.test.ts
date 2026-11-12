@@ -6,6 +6,7 @@ import { parsePolicy, DEFAULT_RATE_GATE, type RateGatePolicy } from '../scripts/
 import { countRows, type CountRow } from '../scripts/cd/o11y.ts'
 import { countsFromRows, countsFromSpans, judgeRate, pollRate, queryRateRows, sendRateProbes, type RateCounts } from '../scripts/cd/rate-gate.ts'
 import type { Filter } from '../scripts/cd/telemetry.ts'
+import type { ExpectedCold } from '../src/rate/admit.ts'
 import { dig, recordGet } from '../src/absent.ts'
 import { unwrapOr } from '../src/option.ts'
 
@@ -19,7 +20,7 @@ const VE61A5742 = 'e61a5742-d17e-4adf-beda-0ed2e9e26272'
 
 const V = 'aaaaaaaa-0000-4000-8000-000000000001'
 
-type Check = Partial<{ mode: string; decision: string; source: 'default' | 'header'; cold: boolean; dropped: string }>
+type Check = Partial<{ mode: string; decision: string; source: 'default' | 'header'; cold: ExpectedCold; dropped: string }>
 
 function check(c: Check, version = V): unknown {
   const field = (key: keyof Check, fallback: string): string => {
@@ -27,7 +28,7 @@ function check(c: Check, version = V): unknown {
     return got.tag === 'some' ? String(got.value) : fallback
   }
   const rate: Record<string, unknown> = { mode: field('mode', 'memo'), decision: field('decision', 'allow'), mode_source: field('source', 'default'), bucket: 'page' }
-  if (c.cold) rate.cold_isolate = true
+  if (c.cold) rate.cold = c.cold
   if (c.dropped) rate.batch = { dropped: c.dropped }
   return { $metadata: { spanName: 'ply.rate.check', type: 'span' }, source: { name: 'ply.rate.check', rate, ply: { script_version: version, route: 'rate.check' } } }
 }
@@ -38,11 +39,16 @@ function flush(outcome: 'ok' | 'dropped', fault: string | null = null, version =
   return { $metadata: { spanName: 'ply.rate.flush', type: 'span' }, source: { name: 'ply.rate.flush', rate, ply: { script_version: version, route: 'rate.flush' } } }
 }
 
+/** A ply.rate.refresh span: `cold` is the cause the starting check stamped (rate.refresh.cold), read its outcome. */
+function refresh(cold: string, read: string, version = V): unknown {
+  return { $metadata: { spanName: 'ply.rate.refresh', type: 'span' }, source: { name: 'ply.rate.refresh', rate: { refresh: { trigger: 'cold', cold, read } }, ply: { script_version: version, route: 'rate.refresh' } } }
+}
+
 function times<T>(n: number, f: () => T): T[] {
   return Array.from({ length: n }, f)
 }
 
-const HEALTHY = [check({ cold: true, decision: 'fail_open' }), ...times(40, () => check({})), ...times(30, () => flush('ok'))]
+const HEALTHY = [check({ cold: 'isolate_start', decision: 'fail_open' }), ...times(40, () => check({})), ...times(30, () => flush('ok'))]
 
 test('policy: cd.policy.json carries the rate gate with its evidence', () => {
   assert.equal(POLICY.expectMode, 'memo')
@@ -112,11 +118,53 @@ test('fail_open: a warm share above the threshold fails; at it passes; cold isol
   assert.equal(failed.kind, 'worker')
   assert.match(failed.line, /fail_open: \d+\/40 warm default-mode checks failed open/)
   // A fresh canary: every isolate's first check fails open (no document yet). That is by design, not degradation.
-  const fresh = [...times(15, () => check({ cold: true, decision: 'fail_open' })), ...times(30, () => check({}))]
+  const fresh = [...times(15, () => check({ cold: 'isolate_start', decision: 'fail_open' })), ...times(30, () => check({}))]
   assert.equal(judgeRate(countsFromSpans(fresh, V), POLICY).kind, 'pass')
   // A broken read path: every warm check fails open.
-  const broken = [...times(3, () => check({ cold: true, decision: 'fail_open' })), ...times(30, () => check({ decision: 'fail_open' }))]
+  const broken = [...times(3, () => check({ cold: 'isolate_start', decision: 'fail_open' })), ...times(30, () => check({ decision: 'fail_open' }))]
   assert.equal(judgeRate(countsFromSpans(broken, V), POLICY).kind, 'worker')
+})
+
+// ply-web#156: the live window of CD 2026-11-12T13-06-51-511Z (33d69a40): 33 default-mode checks, 4 isolate starts, and
+// one crawler request (cf-ray a595ccf10c639249) on isolate 2058502eefa348bb9abc after 339.4 s idle, whose memo had
+// expired; its refresh read ok in 6 ms. Before the Worker stamped rate.cold = memo_expired, that read 1/29 warm.
+const LIVE_156 = [
+  ...times(4, () => check({ cold: 'isolate_start', decision: 'fail_open' })),
+  check({ cold: 'memo_expired', decision: 'fail_open' }),
+  refresh('memo_expired', 'ok'),
+  ...times(28, () => check({})),
+  ...times(33, () => flush('ok')),
+]
+
+test('#156: an idle isolate\'s expired memo is an expected fail_open, counted on its own, not in the warm share', () => {
+  const verdict = judgeRate(countsFromSpans(LIVE_156, V), POLICY)
+  assert.equal(verdict.kind, 'pass', verdict.line)
+  assert.match(verdict.line, /fail_open warm 0\/28 = 0\.00%/)
+  assert.match(verdict.line, /expected fail_open isolate_start 4\/4, memo_expired 1\/1 \(refresh ok 1, failed 0\)/)
+  // Three idle expiries in one window: 3/31 = 9.7% warm before, a false rollback one expiry away. Now 0 warm.
+  const three = [...LIVE_156, ...times(2, () => check({ cold: 'memo_expired', decision: 'fail_open' })), ...times(2, () => refresh('memo_expired', 'ok'))]
+  const threeVerdict = judgeRate(countsFromSpans(three, V), POLICY)
+  assert.equal(threeVerdict.kind, 'pass', threeVerdict.line)
+  assert.match(threeVerdict.line, /fail_open warm 0\/28/)
+  // The same three as read_failed (no document after a settled refresh) are real failures: 3/31 warm, and 4 fails.
+  const broken = [...LIVE_156, ...times(4, () => check({ decision: 'fail_open' }))]
+  const brokenVerdict = judgeRate(countsFromSpans(broken, V), POLICY)
+  assert.equal(brokenVerdict.kind, 'worker', brokenVerdict.line)
+  assert.match(brokenVerdict.line, /fail_open: 4\/32 warm/)
+})
+
+test('#156: an expired memo whose own refresh failed is a warm read-path failure', () => {
+  const failedRefresh = [...LIVE_156.filter(e => e !== LIVE_156[5]), refresh('memo_expired', 'fail')]
+  const counts = countsFromSpans(failedRefresh, V)
+  assert.deepEqual(counts.expiredRefresh, { ok: 0, failed: 1 })
+  const verdict = judgeRate(counts, POLICY)
+  assert.match(verdict.line, /fail_open warm 1\/29 = 3\.45%/)
+  assert.match(verdict.line, /1 counted warm/)
+  // Enough of them fail the version, at the unchanged threshold.
+  const many = [...failedRefresh, ...times(3, () => check({ cold: 'memo_expired', decision: 'fail_open' })), ...times(3, () => refresh('memo_expired', 'fail'))]
+  const manyVerdict = judgeRate(countsFromSpans(many, V), POLICY)
+  assert.equal(manyVerdict.kind, 'worker', manyVerdict.line)
+  assert.match(manyVerdict.line, /fail_open: 4\/32 warm/)
 })
 
 test('dropped: one flush dropped without a fault fails; injected-fault drops do not; overflow does', () => {
@@ -166,9 +214,14 @@ test('countsFromRows (the production aggregate path) agrees with countsFromSpans
   const events = [
     ...HEALTHY,
     ...times(7, () => check({ decision: 'fail_open' })),
-    ...times(3, () => check({ cold: true })),
+    ...times(3, () => check({ cold: 'isolate_start' })),
     ...times(4, () => check({ mode: 'legacy', source: 'header' })),
-    ...times(2, () => check({ mode: 'batched', source: 'header', decision: 'fail_open', cold: true })),
+    ...times(2, () => check({ mode: 'batched', source: 'header', decision: 'fail_open', cold: 'isolate_start' })),
+    ...times(2, () => check({ cold: 'memo_expired', decision: 'fail_open' })),
+    check({ cold: 'memo_expired', decision: 'fail_open', source: 'header' }),
+    refresh('memo_expired', 'ok'),
+    refresh('memo_expired', 'fail'),
+    refresh('isolate_start', 'fail'),
     check({ dropped: 'overflow' }),
     flush('dropped'),
     flush('dropped', 'error=0;attempts=2'),
@@ -182,7 +235,8 @@ test('countsFromRows (the production aggregate path) agrees with countsFromSpans
     return aggregate(events, (rate, n) => {
       if (n !== name) return false
       if (has('rate.mode_source', 'header') && rate.mode_source !== 'header') return false
-      if (has('rate.cold_isolate') && rate.cold_isolate !== true) return false
+      if (has('rate.cold') && dig(rate, ['cold']).tag === 'none') return false
+      if (has('rate.refresh.cold', 'memo_expired') && unwrapOr(dig(rate, ['refresh', 'cold']), '') !== 'memo_expired') return false
       if (has('rate.batch.dropped') && dig(rate, ['batch', 'dropped']).tag === 'none') return false
       if (has('rate.batch.outcome', 'dropped') && unwrapOr(dig(rate, ['batch', 'outcome']), '') !== 'dropped') return false
       if (has('rate.fault') && dig(rate, ['fault']).tag === 'none') return false
@@ -190,14 +244,21 @@ test('countsFromRows (the production aggregate path) agrees with countsFromSpans
     }, groupBys)
   })
   assert.deepEqual(countsFromRows(rows), countsFromSpans(events, V))
-  assert.equal(seen.length, 6)
+  assert.equal(seen.length, 7)
   for (const q of seen) {
     assert.ok(q.filters.some(f => f.key === 'ply.script_version' && f.value === V), 'every query is scoped to the version')
     assert.ok(q.filters.some(f => f.key === '$metadata.service' && f.value === 'ply'))
   }
-  const cold = seen.find(q => q.filters.some(f => f.key === 'rate.cold_isolate'))
+  const cold = seen.find(q => q.filters.some(f => f.key === 'rate.cold'))
   assert.ok(cold)
-  assert.deepEqual(cold.filters.find(f => f.key === 'rate.cold_isolate'), { key: 'rate.cold_isolate', operation: 'eq', type: 'boolean', value: 'true' })
+  assert.deepEqual(cold.filters.find(f => f.key === 'rate.cold'), { key: 'rate.cold', operation: 'exists', type: 'string', value: '' })
+  assert.deepEqual(cold.groupBys, ['rate.cold', 'rate.mode_source', 'rate.decision'])
+  const expired = seen.find(q => q.filters.some(f => f.key === 'rate.refresh.cold'))
+  assert.ok(expired)
+  assert.deepEqual(expired.groupBys, ['rate.refresh.read'])
+  const counts = countsFromRows(rows)
+  assert.deepEqual(counts.cold.memo_expired, { checks: 2, failOpen: 2 }, 'the header-mode one is not judged')
+  assert.deepEqual(counts.expiredRefresh, { ok: 1, failed: 1 })
 })
 
 test('countRows reads a calculations response, grouped and ungrouped', () => {

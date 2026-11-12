@@ -161,9 +161,9 @@ Workers spans (`ctx.tracing`), each stamped with `ply.route` and `ply.script_ver
 
 | span | attributes |
 |---|---|
-| `ply.rate.check` | `rate.mode` legacy/batched, `rate.mode_source` default/header (header: a load request chose the arm), `rate.cold_isolate` (the isolate's first check), `rate.bucket`, `rate.decision` allow/deny/fail_open, `rate.check_ms`, `rate.cache` (HIT/STALE/MISS/EXPIRED/…), `rate.read` ok/memo/fail, `rate.doc_entries`, `rate.doc_age_ms`, `rate.blocked_for_ms` (deny: now − crossed) |
-| `ply.rate.check` (memo) | `rate.read` memo_fresh / memo_stale_refresh / cold, `rate.cache` MEMO, `rate.memo_age_ms` (now − the isolate's last read), `rate.doc_age_ms` (now − the DO's `at`), `rate.refresh.started` |
-| `ply.rate.refresh` | `rate.refresh.trigger` cold/stale, `.read` ok/memo/fail, `.cache` (the RateCache read's cf-cache-status), `.parsed`, `.ms`, `.joins` (requests that found it in flight), `rate.doc_age_ms` |
+| `ply.rate.check` | `rate.mode` legacy/batched, `rate.mode_source` default/header (header: a load request chose the arm), `rate.cold` isolate_start/memo_expired (an expected cold check: see "CD gate"), `rate.bucket`, `rate.decision` allow/deny/fail_open, `rate.fail_open_reason` (on every fail_open: isolate_start / memo_expired / read_failed / read_late), `rate.check_ms`, `rate.cache` (HIT/STALE/MISS/EXPIRED/…), `rate.read` ok/memo/fail, `rate.doc_entries`, `rate.doc_age_ms`, `rate.blocked_for_ms` (deny: now − crossed) |
+| `ply.rate.check` (memo) | `rate.read` memo_fresh / memo_stale_refresh / cold, `rate.cache` MEMO, `rate.memo_age_ms` (now − the isolate's last read), `rate.doc_age_ms` (now − the DO's `at`), `rate.refresh.started`; cold: `rate.memo_expired_ms` (the expired document's age, when the isolate held one), `rate.cold_last_read` (read_failed: how the last refresh ended, fail/memo/abandoned/threw) |
+| `ply.rate.refresh` | `rate.refresh.trigger` cold/stale, `.cold` (trigger cold: the starting check's cause), `.memo_expired_ms`, `.read` ok/memo/fail, `.cache` (the RateCache read's cf-cache-status), `.parsed`, `.ms`, `.joins` (requests that found it in flight), `rate.doc_age_ms` |
 | `ply.rate.flush` | `rate.batch.id`, `.keys`, `.hits`, `.linger_ms`, `.attempts`, `.attempt_log` (`ok:34,timeout:1000,…`), `.timeouts`, `.errors`, `.outcome` ok/dropped, `.deadline_hit`, `.replay` (DO said duplicate), `.flush_ms`, `.alive_ms` (batch open → flush end, the waitUntil lifetime), `rate.do.apply_ms`, `rate.do.rows_written`, `rate.do.new_blocks` |
 
 DO log lines: `ply.rate.apply` (id, attempt, replay, keys, hits, apply_ms, rows_written, new_blocks, fault) and
@@ -180,7 +180,8 @@ began, by aggregate count. It fails the version when
 
 - any default-mode check (`rate.mode_source` default) ran a limiter other than `rate.expectMode` (memo since
   2026-11-07; test/cd-rate-gate.test.ts asserts it equals `RATE_MODE` in cloudflare.config.ts);
-- warm default-mode checks (not `rate.cold_isolate`) failed open above 10% (with ≥ 20 of them; fewer is a harness fault);
+- warm default-mode checks (no `rate.cold`, plus memo_expired checks whose own refresh failed) failed open above 10%
+  (with ≥ 20 of them; fewer is a harness fault);
 - any flush was dropped (deadline) or any batch overflowed without an injected fault.
 
 The thresholds and their evidence (7 days of spans, 128,753 flushes, every version since the limiter shipped) are in
@@ -188,9 +189,20 @@ The thresholds and their evidence (7 days of spans, 128,753 flushes, every versi
 too, in the same commit, shipped through the pipeline: a `cf` var or secret edit creates and deploys a version at 100%
 directly (d4e3eea6 did).
 
-Memo start-up: an isolate's first check, and any memo check that is cold while that isolate's first refresh is still
-in flight, carry `rate.cold_isolate` and are not judged. A cold read after a refresh has settled with no document
-(the read path is broken) is a warm `fail_open` and counts.
+Expected cold checks (`rate.cold`, counted on their own line and kept out of the warm share; ply-web#156):
+
+- `isolate_start`: an isolate's first check, and any memo check that is cold while that isolate's first refresh is
+  still in flight.
+- `memo_expired`: the isolate's last refresh read the document ok, and the document then aged past MEMO_FALLBACK_MS
+  (5 min) because no request came to refresh it (an idle isolate). The check admits and starts a refresh stamped
+  `rate.refresh.cold = memo_expired`; if that refresh does not read ok, the check is put back as a warm failure. CD
+  makes this likely: the canary isolate takes the 30 probes in ~11 s and then idles through the ramp, so the live
+  watch's first request on it is past 5 min (2026-11-12T13-06-51-511Z: 339.4 s idle, refresh ok in 6 ms, counted 1/29
+  warm before this).
+
+A cold read after a refresh has settled with no document (`rate.fail_open_reason = read_failed`: the read path is
+broken) is a warm `fail_open` and counts. The gate prints both, e.g. `fail_open warm 0/28 = 0.00%; expected fail_open
+isolate_start 4/4, memo_expired 1/1 (refresh ok 1, failed 0)`.
 
 ## Results
 
@@ -279,7 +291,7 @@ The page p99.9 (≈3 s in both arms) is git work, not the limiter (lat1, A/A leg
   −4 [−4, −4] (p90) / −8 [−8, −8] / −25 [−25, −25]; wall p50 −2 [−2, −2], p90 −1 [−2, −1], p99 −4 [−8, −1], p99.9
   −193 [−720, +409] (the tail is git work). mem1m2 (48 generators × 25 req/s × 900 s, a new client per request,
   1,063,558 distinct): every percentile lower on memo (Workers Observability calculations). Memo reads (memoab1):
-  memo_fresh 3,200, memo_stale_refresh 10,918, cold 24 (all start-up, `rate.cold_isolate`); warm fail_open 0 vs 1 on
+  memo_fresh 3,200, memo_stale_refresh 10,918, cold 24 (all start-up, then stamped `rate.cold_isolate`, now `rate.cold = isolate_start`); warm fail_open 0 vs 1 on
   batched. Refreshes 10,977 (one per 1.3 requests), all ok, HIT 80% / UPDATING 20%, ms p50 / p99 / p99.9 / max
   3 / 8 / 40 / 173; memo age p50 / p99 500 / 1001 ms. Promoted with `npm run cd` (canary + live rate gate: memo on every
   default check, warm fail_open 0/26 and 0/37, 0 drops; visual smoke 32/32). Previous: 935e8eb1.
