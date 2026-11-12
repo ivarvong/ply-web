@@ -1,9 +1,12 @@
 name: ply main consumer check
 
-# ply's notify-ply-web.yml sends repository_dispatch `ply-main-updated` (client_payload.sha) when ply main moves.
-# This runs ply-web main's gates (npm test, lint, typecheck) against that ply commit without committing the pin
-# (scripts/ply-main-check.sh edits package.json and the lockfile in the runner only). On failure the run fails and
-# opens, or comments on, one issue titled "ply main <short sha> breaks ply-web". It never deploys and needs no secrets.
+# ply's notify-ply-web.yml sends repository_dispatch `ply-main-updated` (client_payload.sha) on `workflow_run`, after
+# ply's ci run for a push to ply main succeeds, and only when ivarvong/ply has the PLY_WEB_DISPATCH_TOKEN secret. Until
+# that secret exists no dispatch arrives (ply's notify run logs "PLY_WEB_DISPATCH_TOKEN is not set") and only
+# workflow_dispatch runs this. It runs ply-web main's gates (npm test, lint, typecheck) against that ply commit without
+# committing the pin (scripts/ply-main-check.sh edits package.json and the lockfile in the runner only). If a gate or
+# the `npm install` of the sha fails, the run fails and opens, or comments on, one issue titled
+# "ply main <short sha> breaks ply-web"; a malformed sha only fails the run. It never deploys and needs no secrets.
 
 on:
   repository_dispatch:
@@ -70,12 +73,9 @@ jobs:
         id: check
         env:
           PLY_SHA: ${{ steps.sha.outputs.sha }}
-        run: |
-          set -uo pipefail
-          sh scripts/ply-main-check.sh "${PLY_SHA}" "$RUNNER_TEMP/ply-main"
-          code=$?
-          if [ "$code" -eq 1 ]; then echo "outcome=fail" >> "$GITHUB_OUTPUT"; fi
-          exit "$code"
+        # The script appends outcome=pass|fail to $GITHUB_OUTPUT itself (a gate or install failure is `fail`; a usage
+        # error writes nothing); test/ply-main-check.test.js pins that and this step's wiring.
+        run: sh scripts/ply-main-check.sh "${PLY_SHA}" "$RUNNER_TEMP/ply-main"
       - name: Open or comment on the breakage issue
         if: failure() && steps.check.outputs.outcome == 'fail'
         env:
