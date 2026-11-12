@@ -8,7 +8,8 @@
 # Writes <out-dir>/report.md (the issue body), <out-dir>/{install,test,lint,typecheck}.log and <out-dir>/summary.env
 # (PLY_SHA, PLY_SHORT, PLY_PREV, OUTCOME). Exit 0 when every gate passed (OUTCOME=pass); 1 when a gate failed or
 # `npm install` of the (valid) sha failed (OUTCOME=fail, report.md written: an install failure is a breakage too, e.g.
-# ply's `prepare: tsc` or an exports/engines change); 2 on a usage error (bad sha, no out-dir), with no report.
+# ply's `prepare: tsc` or an exports/engines change); 2 on a usage error (bad sha, no out-dir) or when the lockfile
+# resolved ply to a sha that does not start with the one asked for, with no report and no $GITHUB_OUTPUT outcome.
 # When $GITHUB_OUTPUT is set it also appends `outcome=pass|fail` there, so the workflow maps nothing itself.
 # Used by .github/workflows/ply-main.yml; runs the same on a laptop. Tested by test/ply-main-check.test.js.
 set -u

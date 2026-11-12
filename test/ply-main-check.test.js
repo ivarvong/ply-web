@@ -17,11 +17,13 @@ const realNpm = execFileSync('sh', ['-c', 'command -v npm'], { encoding: 'utf8' 
 const PREV = '1111111111111111111111111111111111111111';
 const FULL = 'abcdef0123456789abcdef0123456789abcdef01';
 
-function run(sha, { failGate = '', failInstall = false, resolveTo = '', noOut = false } = {}) {
+function run(sha, { failGate = '', failInstall = false, failInstallFor = '', resolveTo = '', noOut = false, gateLines = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ply-main-check-'));
   const bin = join(dir, 'bin');
   mkdirSync(bin);
-  const gate = name => (failGate === name
+  const gate = name => (failGate === name && gateLines
+    ? `node -e ${JSON.stringify(`${gateLines.map(l => `console.log(${JSON.stringify(l)});`).join(' ')} process.exit(1)`)}`
+    : failGate === name
     ? `node -e "console.log('✔ fine (1ms)'); console.log('✖ ${name} breaks (2ms)'); console.log('ℹ fail 1'); console.log('✖ failing tests:'); console.log('✖ ${name} breaks (2ms)'); process.exit(1)"`
     : `node -e "console.log('✔ ${name} ok')"`);
   writeFileSync(join(dir, 'package.json'), JSON.stringify({
@@ -32,6 +34,9 @@ function run(sha, { failGate = '', failInstall = false, resolveTo = '', noOut = 
   writeFileSync(join(bin, 'npm'), `#!/bin/sh
 if [ "$1" = install ]; then
   [ -z "$FAKE_INSTALL_FAIL" ] || { echo "npm error prepare: tsc exited 2" >&2; exit 1; }
+  if [ -n "$FAKE_INSTALL_FAIL_SHA" ] && [ "$(node -p 'require("./package.json").dependencies.ply.split("#")[1]')" = "$FAKE_INSTALL_FAIL_SHA" ]; then
+    echo "npm error prepare: tsc exited 2 (full-sha reinstall)" >&2; exit 1
+  fi
   exec node -e '
     const fs = require("fs"); const sha = require("./package.json").dependencies.ply.split("#")[1];
     const full = process.env.FAKE_RESOLVE || (process.env.FAKE_FULL.startsWith(sha) ? process.env.FAKE_FULL : sha);
@@ -45,7 +50,7 @@ exec "${realNpm}" "$@"
   writeFileSync(ghOut, '');
   const r = spawnSync('sh', [script, sha, ...(noOut ? [] : [out])], {
     cwd: dir, encoding: 'utf8',
-    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_FULL: FULL, FAKE_INSTALL_FAIL: failInstall ? '1' : '', FAKE_RESOLVE: resolveTo, GITHUB_OUTPUT: ghOut },
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_FULL: FULL, FAKE_INSTALL_FAIL: failInstall ? '1' : '', FAKE_INSTALL_FAIL_SHA: failInstallFor, FAKE_RESOLVE: resolveTo, GITHUB_OUTPUT: ghOut },
   });
   const read = f => (existsSync(join(out, f)) ? readFileSync(join(out, f), 'utf8') : null);
   const summary = read('summary.env');
@@ -96,6 +101,43 @@ test('npm install of a valid sha fails: exit 1 and a report, so the workflow ope
   // No gate runs after a failed install: no gate log, and the stub gates never printed.
   assert.deepEqual(r.logs, []);
   assert.ok(!/npm run (test|lint|typecheck) exit/.test(r.stdout), r.stdout);
+});
+
+test('short sha resolves to FULL but the re-install of FULL fails: exit 1, install failure, no gate ran', () => {
+  // The first install (short pin) succeeds and resolves to FULL; the second (full pin, written back for vite.config.ts)
+  // fails. The gates must not run on whatever the first install left in node_modules, and the run must not pass.
+  const r = run(FULL.slice(0, 7), { failInstallFor: FULL });
+  assert.equal(r.code, 1, r.stderr);
+  assert.equal(r.env.OUTCOME, 'fail');
+  assert.equal(r.env.PLY_SHA, FULL);
+  assert.equal(r.ghOutput, 'outcome=fail\n');
+  assert.match(r.report, /^Failed gates: install$/m);
+  assert.ok(r.report.includes('full-sha reinstall'), r.report);
+  assert.ok(r.stderr.includes(`npm install of ply#${FULL} failed`), r.stderr);
+  assert.deepEqual(r.logs, []);
+  assert.ok(!/npm run (test|lint|typecheck) exit/.test(r.stdout), r.stdout);
+});
+
+test('failing tests list: vitest FAIL / × lines and TAP not ok lines are listed, passing lines are not', () => {
+  // Lines as a real failing vitest test prints them (hand-checked: `FAIL  test/flags/zz.test.ts > zz deliberately
+  // fails`, `× zz deliberately fails 5ms`), plus TAP's `not ok N - name` (node:test --test-reporter=tap).
+  const lines = [
+    ' ✓ test/flags/ok.test.ts > fine 1ms',
+    ' FAIL  test/flags/zz.test.ts > zz deliberately fails',
+    '   × zz deliberately fails 5ms',
+    'ok 1 - tap passes',
+    'not ok 2 - tap breaks',
+  ];
+  const r = run(FULL, { failGate: 'test', gateLines: lines });
+  assert.equal(r.code, 1, r.stderr);
+  const list = r.report.slice(r.report.indexOf('Failing tests:\n')).split('\n\n')[0].split('\n').slice(1);
+  // Expected: exactly the three failure lines, leading whitespace stripped (order is `sort -u`'s, not asserted).
+  assert.deepEqual(new Set(list), new Set([
+    'FAIL  test/flags/zz.test.ts > zz deliberately fails',
+    '× zz deliberately fails 5ms',
+    'not ok 2 - tap breaks',
+  ]));
+  assert.equal(list.length, 3);
 });
 
 test('lockfile resolves ply to a different sha than asked: usage error, exit 2, no report, no gate ran', () => {
