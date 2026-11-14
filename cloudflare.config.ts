@@ -34,6 +34,9 @@ const durableObjects = {
 	// RefsWatch (2026-11-07) is new and additive: grants and purges the public namespace's long-lived refs cache
 	// (src/refs-watch.ts). Reached through ctx.exports.RefsWatch, never an env binding (same reason as RateCounter).
 	RefsWatch: exports.durableObject({ storage: "sqlite" }),
+	// ProbeBench (2026-11-14) is new and additive: the probe workbench's state (src/bench/entry.ts). This version only
+	// declares it (docs/continuous-deployment.md "Exports changes"); the next one gives it a body and the /bench routes.
+	ProbeBench: exports.durableObject({ storage: "sqlite" }),
 } as const;
 
 // Workers Caching (never the Cache API / caches.default). The default entrypoint is uncached so it always runs (rate limit,

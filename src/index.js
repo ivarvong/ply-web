@@ -58,6 +58,7 @@ export { ObjectCache, TreeCache, CommitCache, ResolvePathCache, RefCache } from 
 export { RefsWatch } from './refs-watch-entry.ts';
 export { RateCounter } from './rate/counter.ts';
 export { RateCache } from './rate/cache-entry.ts';
+export { ProbeBench } from './bench-export.ts';
 
 const MAX_BODY = API_CAPS.maxBodyBytes;
 const LIMITS = API_LIMITS;
