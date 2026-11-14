@@ -256,7 +256,9 @@ test('read endpoints equal git: refs, discover, tree, read (bytes, headers, cont
     assert.ok(/ls-refs;dur=\d+/.test(timing) || /ply\.cas\.ref;dur=\d+/.test(timing), timing);
   }
   await tr1.arrayBuffer();
-  for (const [path, code, status] of [['nope', 'not_found', 404], ['a/b', 'bad_request', 400], ['README.md/x', 'not_found', 404], ['../x', 'bad_request', 400]]) {
+  // 'README.md/' names a directory: git answers "path 'README.md/' does not exist" for a blob, and ply refuses it before
+  // any request (ply#316, #300-8; it used to drop the slash and read README.md).
+  for (const [path, code, status] of [['nope', 'not_found', 404], ['a/b', 'bad_request', 400], ['README.md/x', 'not_found', 404], ['../x', 'bad_request', 400], ['README.md/', 'bad_request', 400]]) {
     const res = await W(`/v1/read?${qs({ remote: r.remote, path })}`); const b = await res.json();
     assert.equal(res.status, status, path); assert.equal(b.code, code); assert.equal(b.retry, 'no');
     if (path === 'a/b') assert.match(b.message, /GET \/v1\/tree/);
