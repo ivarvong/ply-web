@@ -10,6 +10,7 @@ import {
 } from "./src/flags/operator-names.ts";
 import { FLAGS_MAX_AGE_S, FLAGS_SWR_S } from "./src/flags/ttl.ts";
 import { PUBLIC_NAMESPACE } from "./src/public-namespace.ts";
+import { PROBE_NAMESPACE } from "./src/bench/namespace.ts";
 
 const MILLISECONDS_PER_SECOND = 1_000;
 const SECONDS_PER_MINUTE = 60;
@@ -34,6 +35,9 @@ const durableObjects = {
 	// RefsWatch (2026-11-07) is new and additive: grants and purges the public namespace's long-lived refs cache
 	// (src/refs-watch.ts). Reached through ctx.exports.RefsWatch, never an env binding (same reason as RateCounter).
 	RefsWatch: exports.durableObject({ storage: "sqlite" }),
+	// ProbeBench (2026-11-14) is new and additive: the probe workbench's runs, repositories and admissions
+	// (src/bench/entry.ts). Reached through ctx.exports.ProbeBench, never an env binding (same reason as RateCounter).
+	ProbeBench: exports.durableObject({ storage: "sqlite" }),
 } as const;
 
 // Workers Caching (never the Cache API / caches.default). The default entrypoint is uncached so it always runs (rate limit,
@@ -127,6 +131,12 @@ const plyWorker = {
 			// The public namespace, served read-only with no token (src/public.ts). The binding is scoped to this one
 			// namespace; the Worker calls only get(<repo>).createToken("read", 3600) and list(). No stored secret.
 			PUBLIC_REPOS: bindings.artifacts({ namespace: PUBLIC_NAMESPACE }),
+			// The probe workbench's namespace (src/bench): ProbeBench creates one repository per run here, revokes every token
+			// it has and deletes it when the run ends. Scoped to the load-and-probe namespace, never the public one.
+			PROBE_REPOS: bindings.artifacts({ namespace: PROBE_NAMESPACE }),
+			// Exchange bodies of workbench runs (runs/<run>/<exchange>.<request|response>, at most 1 MiB each). Create the
+			// bucket before the first deploy that uploads this binding: `cf r2 bucket create ply-bench`.
+			BENCH_BLOBS: bindings.r2({ name: "ply-bench" }),
 			// The running version's id, sent as x-ply-version on every front-door response so a deploy can prove which
 			// version answered a request pinned with Cloudflare-Workers-Version-Overrides (`npm run cd`).
 			VERSION: bindings.versionMetadata(),

@@ -44,6 +44,8 @@ import { applyUpstreamHeaders, createRayLog, ensureRayServerTiming, observeUpstr
 import { usageNote } from './flags/client.ts';
 import { handleFlagHttp } from './flags/http.ts';
 import { headerNumber, parseBearer, readHeader } from './http/inbound.ts';
+import { benchRoute, benchRouteKey, handleBench, isBenchPath } from './bench/http.ts';
+import { BENCH_CHALLENGE, presentedSecret } from './bench/auth.ts';
 import { err, ok, runRequest } from './http/machine.ts';
 import { chainGet, dig, envBinding, header, queryParam, recordGet } from './absent.ts';
 import { orElse, unwrapOr } from './option.ts';
@@ -58,6 +60,7 @@ export { ObjectCache, TreeCache, CommitCache, ResolvePathCache, RefCache } from 
 export { RefsWatch } from './refs-watch-entry.ts';
 export { RateCounter } from './rate/counter.ts';
 export { RateCache } from './rate/cache-entry.ts';
+export { ProbeBench } from './bench/entry.ts';
 
 const MAX_BODY = API_CAPS.maxBodyBytes;
 const LIMITS = API_LIMITS;
@@ -634,6 +637,13 @@ const worker = {
     return runRequest({
       parse: () => {
         if (req.method === 'GET' && url.pathname === '/') { surface = 'usage'; route = 'GET /'; return ok({ kind: 'usage' }); }
+        // The probe workbench (src/bench/http.ts): private, PLY_TOKEN as a Bearer token or a Basic password.
+        if (isBenchPath(url.pathname)) {
+          surface = 'bench';
+          const benchAt = benchRoute(req.method, url.pathname);
+          route = benchRouteKey(benchAt);
+          return ok({ kind: 'bench', route: benchAt });
+        }
         // Public viewer, including the public-namespace index (/r) and short repo URLs (/r/<name>).
         // Before the token gate, and it never reads Authorization / Git-Token / Cookie.
         if (viewerPath) {
@@ -652,6 +662,16 @@ const worker = {
       },
       authorize: async parsed => {
         if (parsed.kind === 'usage') return ok(parsed);
+        if (parsed.kind === 'bench') {
+          if (parsed.route !== null && parsed.route.tag === 'css') return ok(parsed);
+          const benchToken = env.PLY_TOKEN;
+          if (!benchToken) return err(jsonOut(500, { code: 'internal', message: 'PLY_TOKEN is not configured', retry: 'no' }));
+          const presented = presentedSecret(req.headers.get('authorization'));
+          if (presented.tag !== 'secret' || !(await timingSafeTokenEqual(presented.value, benchToken))) {
+            return err(rawOut(401, 'The workbench is private: sign in with PLY_TOKEN as the password.\n', new Headers({ 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'www-authenticate': BENCH_CHALLENGE }), { bench: 1, code: 'unauthorized' }));
+          }
+          return ok(parsed);
+        }
         if (parsed.kind === 'viewer') {
           if (!(parsed.pinKey && parsed.pin)) return ok(parsed);
           const decision = await admitClient(req, env, 'page', Date.now(), ctx);
@@ -694,6 +714,7 @@ const worker = {
           if (note) body = `${USAGE}\n${note}\n`;
           return ok(rawOut(200, body, new Headers({ 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })));
         }
+        if (parsed.kind === 'bench') return ok(taken(await handleBench(req, ctx, parsed.route), { bench: 1 }));
         if (parsed.kind === 'viewer') {
           try {
             const viewerLog = (res, extra = {}) => {
