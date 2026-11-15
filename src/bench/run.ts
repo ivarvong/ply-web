@@ -7,7 +7,7 @@ import { GitHttp, type Span, type Tracer } from 'ply';
 import { plyOutcome, type Classified, type EndState, type Fault, type From, type Names, type Observation, type Push, type Scenario, type StepObservation, type Timeouts } from 'ply/probes';
 import { renderRay } from '../rays.ts';
 import type { RepoName, RunSeed } from './brand.ts';
-import { handPack } from './handpack.ts';
+import { defectPack, handPack } from './handpack.ts';
 import { readEnd } from './judge.ts';
 import { createRecorder, type Channel, type Exchange, type Recorder } from './recorder.ts';
 import { type Result, err, ok } from './result.ts';
@@ -104,16 +104,21 @@ async function plyPush(c: Ctx, push: Push, from: From, timeouts: Timeouts, paren
   if (typeof first !== 'object') return { outcome: 'rejected', error: 'harness', detail: 'a push with no command' };
   const commands = [first, ...rest] as const;
   const atomic = push.atomic ? { atomic: true } : {};
-  if (push.pack.tag === 'hand') {
-    const bytes = await handPack(c.store, objects.value, push.pack);
+  const send = async (bytes: Result<Uint8Array, string>): Promise<Classified> => {
     if (!bytes.ok) return { outcome: 'rejected', error: 'harness', detail: bytes.error };
     const body = bytes.value;
     const pack = new ReadableStream<Uint8Array>({ start(ctl) { ctl.enqueue(body); ctl.close(); } });
     const r = await g.value.pushPack({ commands, pack, length: body.length, ...atomic });
     return r.ok ? plyOutcome({ ok: true }) : plyErr(r.error, '');
+  };
+  switch (push.pack.tag) {
+    case 'hand': return send(await handPack(c.store, objects.value, push.pack));
+    case 'defect': return send(await defectPack(c.store, objects.value, push.pack.defect));
+    case 'objects': {
+      const r = await g.value.push({ commands, objects: asPackObjects(objects.value), ...atomic });
+      return r.ok ? plyOutcome({ ok: true }) : plyErr(r.error, '');
+    }
   }
-  const r = await g.value.push({ commands, objects: asPackObjects(objects.value), ...atomic });
-  return r.ok ? plyOutcome({ ok: true }) : plyErr(r.error, '');
 }
 
 async function plyFetch(c: Ctx, want: string, timeouts: Timeouts, parent: Span): Promise<Classified> {

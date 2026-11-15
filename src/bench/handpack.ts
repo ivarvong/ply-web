@@ -1,21 +1,27 @@
-// Packs the harness writes and ply sends as written (PackForm 'hand' in ply/probes): plain entries, the first blob
-// optionally as a REF_DELTA, then damaged, as ply's runner writes them (test/probes/runner.mjs writePack,
-// deltaFor, damagePack), entry for entry; the zlib streams come from the platform's CompressionStream (so the bytes
+// Packs the harness writes and ply sends as written (PackForm 'hand' and 'defect' in ply/probes): plain entries, the
+// first blob optionally as a REF_DELTA, then damaged, or a pack with one structural defect, as ply's runner writes them
+// (test/probes/runner.mjs writePack, deltaFor, damagePack, defectPack), entry for entry; the zlib streams come from the platform's CompressionStream (so the bytes
 // may differ from Node's zlib, the objects and the damage do not), the trailer from ply's SHA-1.
 import { Sha1 } from 'ply';
-import type { Damage, PackForm } from 'ply/probes';
+import type { Damage, PackDefect, PackForm } from 'ply/probes';
 import { type Result, err, ok } from './result.ts';
 import { resolveObjRef, type SeedStore, type StoredObject } from './seed.ts';
 import { mapGet } from '../absent.ts';
 
 const TYPE_CODE: Readonly<Record<StoredObject['type'], number>> = { commit: 1, tree: 2, blob: 3, tag: 4 };
+const OFS_DELTA = 6;
 const REF_DELTA = 7;
+const BEFORE_START = 4096;
 const TRAILER_BYTES = 20;
 const LITERAL_MAX = 127;
 const PAST_END = 1000;
 const COPY_BYTES = 16;
 
-export type PackEntry = { readonly tag: 'whole'; readonly type: number; readonly data: Uint8Array } | { readonly tag: 'ref-delta'; readonly base: Uint8Array; readonly delta: Uint8Array };
+// `stated` is an entry whose header is written as given over a payload deflated as is (a type or size that lies).
+export type PackEntry =
+  | { readonly tag: 'whole'; readonly type: number; readonly data: Uint8Array }
+  | { readonly tag: 'ref-delta'; readonly base: Uint8Array; readonly delta: Uint8Array }
+  | { readonly tag: 'stated'; readonly head: Uint8Array; readonly payload: Uint8Array };
 
 const concat = (parts: readonly Uint8Array[]): Uint8Array => {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
@@ -51,8 +57,8 @@ export async function writePack(entries: readonly PackEntry[]): Promise<WrittenP
   let at = 12;
   const zlibEnds: number[] = [];
   for (const e of entries) {
-    const head = e.tag === 'ref-delta' ? concat([entryHeader(REF_DELTA, e.delta.length), e.base]) : entryHeader(e.type, e.data.length);
-    const z = await deflate(e.tag === 'ref-delta' ? e.delta : e.data);
+    const head = e.tag === 'ref-delta' ? concat([entryHeader(REF_DELTA, e.delta.length), e.base]) : e.tag === 'stated' ? e.head : entryHeader(e.type, e.data.length);
+    const z = await deflate(e.tag === 'ref-delta' ? e.delta : e.tag === 'stated' ? e.payload : e.data);
     parts.push(head, z);
     at += head.length + z.length;
     zlibEnds.push(at);
@@ -73,9 +79,18 @@ export function deltaFor(srcSize: number, target: Uint8Array, kind: 'literal' | 
     args.push(COPY_BYTES);
     return concat([varint(srcSize), varint(COPY_BYTES), Uint8Array.from([op, ...args])]);
   }
+  return concat([varint(srcSize), varint(target.length), literalInserts(target)]);
+}
+const literalInserts = (target: Uint8Array): Uint8Array => {
   const chunks: Uint8Array[] = [];
   for (let o = 0; o < target.length; o += LITERAL_MAX) { const c = target.subarray(o, o + LITERAL_MAX); chunks.push(Uint8Array.of(c.length), c); }
-  return concat([varint(srcSize), varint(target.length), ...chunks]);
+  return concat(chunks);
+};
+// git's OFS_DELTA base offset: big-endian 7-bit groups, each continuation adding one (pack-format.txt).
+export function ofsEncode(value: number): Uint8Array {
+  const out = [value & 0x7f];
+  for (let n = Math.floor(value / 128); n > 0; n = Math.floor(n / 128)) { n -= 1; out.unshift(0x80 | (n & 0x7f)); }
+  return Uint8Array.from(out);
 }
 
 export function damagePack(written: WrittenPack, damage: Damage): Uint8Array {
@@ -105,4 +120,52 @@ export async function handPack(store: SeedStore, objects: readonly StoredObject[
     entries = entries.map((e, k) => (k === i && e.tag === 'whole' ? { tag: 'ref-delta', base: fromHex(base.value), delta: deltaFor(baseObj.value.data.length, e.data, form.delta) } : e));
   }
   return ok(damagePack(await writePack(entries), form.damage));
+}
+
+// The header and body of a written pack with its trailer recomputed after `edit` (the defect is the only wrong thing).
+const retrail = (pack: Uint8Array, edit: (body: DataView, bytes: Uint8Array) => void): Uint8Array => {
+  const body = pack.slice(0, pack.length - TRAILER_BYTES);
+  edit(new DataView(body.buffer), body);
+  return concat([body, sha1(body)]);
+};
+
+// A pack with one structural defect (ply/probes PackDefect), as test/probes/runner.mjs defectPack writes it.
+export async function defectPack(store: SeedStore, objects: readonly StoredObject[], defect: PackDefect): Promise<Result<Uint8Array, string>> {
+  const plain: PackEntry[] = objects.map(o => ({ tag: 'whole', type: TYPE_CODE[o.type], data: o.data }));
+  const blob = objects.findIndex(o => o.type === 'blob');
+  const firstBlob = (): Result<StoredObject, string> => { const o = objects[blob]; return typeof o === 'object' ? ok(o) : err('defect pack: no blob'); };
+  switch (defect.tag) {
+    case 'signature': return ok(retrail((await writePack(plain)).pack, (_, b) => { b.set(new TextEncoder().encode('PACX'), 0); }));
+    case 'version': return ok(retrail((await writePack(plain)).pack, v => { v.setUint32(4, defect.version); }));
+    case 'count': return ok(retrail((await writePack(plain)).pack, v => { v.setUint32(8, plain.length + defect.by); }));
+    case 'duplicate': return ok((await writePack([...plain, ...plain])).pack);
+    case 'no-objects': return ok((await writePack([])).pack);
+    case 'size-header': case 'bad-type': {
+      const o = firstBlob();
+      if (!o.ok) return o;
+      const head = defect.tag === 'bad-type' ? entryHeader(defect.type, o.value.data.length) : entryHeader(TYPE_CODE.blob, o.value.data.length + defect.by);
+      return ok((await writePack(plain.map((e, k) => (k === blob ? { tag: 'stated', head, payload: o.value.data } : e)))).pack);
+    }
+    case 'ofs-delta-before-start': {
+      const o = firstBlob();
+      if (!o.ok) return o;
+      // the entries before the blob fix its offset; its base is that offset plus 4096 bytes back, before the pack
+      const before = await writePack(plain.slice(0, blob));
+      const at = before.pack.length - TRAILER_BYTES;
+      const delta = deltaFor(o.value.data.length, o.value.data, 'literal');
+      const head = concat([entryHeader(OFS_DELTA, delta.length), ofsEncode(at + BEFORE_START)]);
+      return ok((await writePack(plain.map((e, k) => (k === blob ? { tag: 'stated', head, payload: delta } : e)))).pack);
+    }
+    case 'delta-size-mismatch': {
+      const o = firstBlob();
+      if (!o.ok) return o;
+      const base = resolveObjRef(store, defect.base);
+      if (!base.ok) return base;
+      const baseObj = mapGet(store.objects, base.value);
+      if (baseObj.tag === 'none') return err(`defect pack: delta base ${base.value} is not in the seed`);
+      // the header states one byte more than the inserts write
+      const delta = concat([varint(baseObj.value.data.length), varint(o.value.data.length + 1), literalInserts(o.value.data)]);
+      return ok((await writePack(plain.map((e, k) => (k === blob ? { tag: 'ref-delta', base: fromHex(base.value), delta } : e)))).pack);
+    }
+  }
 }
