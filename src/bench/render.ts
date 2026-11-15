@@ -111,7 +111,7 @@ export function runPage(run: StoredRun, scenario: Scenario | null): Html {
   const steps = r.steps.map((o, i) => {
     const st = scenario === null ? null : scenario.steps[i];
     const e = scenario === null ? null : scenario.expect[i];
-    const stated = typeof e === 'object' && e !== null ? (e.tag === 'one' ? `${e.ply.outcome} (${String(e.ply.error)})` : e.ply.join(', ')) : '';
+    const stated = typeof e === 'object' && e !== null ? (e.tag === 'one' ? `${e.ply.outcome} (${String(e.ply.error)})` : e.tag === 'either' ? e.ply.map(x => `${x.outcome} (${String(x.error)})`).join(' or ') : e.ply.join(', ')) : '';
     const kind = typeof st === 'object' && st !== null ? (st.tag === 'push' || st.tag === 'fetch' ? `${st.tag}${st.fault.tag === 'none' ? '' : ` + ${st.fault.tag}`}` : st.tag) : '';
     return html`<tr><td>${i}</td><td>${kind}</td><td>${o.outcomes.map(x => html`<div><b>${x.outcome}</b> (${String(x.error)}) <span class="note">${x.detail}</span></div>`)}</td><td>${stated}</td></tr>`;
   });

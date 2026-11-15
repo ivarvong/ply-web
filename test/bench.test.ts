@@ -166,3 +166,16 @@ test('index page: every catalogue scenario listed, the runnable ones offered', (
   for (const e of CATALOGUE) assert.ok(text.includes(e.scenario.id), e.scenario.id)
   assert.equal((text.match(/<option /g) || []).length, CATALOGUE.filter(e => e.support.tag === 'runnable').length)
 })
+
+test('either: a git-version-dependent step is met by any listed pair, and a landed step is named without a single expected pair', () => {
+  const s = SCENARIOS.find(x => x.id === 'refs.directory-file-conflict#file-then-dir')
+  assert.ok(typeof s === 'object')
+  const end = { head: 'refs/heads/main', refs: {}, objects: [], trees: {}, ancestry: [], mergeBases: {}, fsck: [] }
+  const at = (outcome: 'conflict' | 'rejected' | 'landed', error: 'cas_conflict' | 'push_rejected' | null) => ({ steps: [{ outcomes: [{ outcome, error, detail: '' }] as const }], end })
+  const stepFailures = (v: ReturnType<typeof verdictOf>) => v.tag === 'fail' ? v.failures.filter(f => f.difference.field === 'outcome' || f.difference.field === 'error') : []
+  assert.deepEqual(stepFailures(verdictOf(s, at('conflict', 'cas_conflict'), {}, [])), [])
+  assert.deepEqual(stepFailures(verdictOf(s, at('rejected', 'push_rejected'), {}, [])), [])
+  const landed = stepFailures(verdictOf(s, at('landed', null), {}, []))
+  assert.ok(landed.length > 0)
+  assert.ok(landed.every(f => f.step !== null && f.step.index === 0 && f.step.outcome === 'landed' && f.step.expected === null), JSON.stringify(landed.map(f => f.step)))
+})

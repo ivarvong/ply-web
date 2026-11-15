@@ -92,7 +92,8 @@ function serverContradiction(obs: Observation, xs: readonly Exchange[]): Evidenc
   return out;
 }
 
-// The first step whose outcome (or error) is not the stated one: a concurrent step by its sorted outcomes.
+// The first step whose outcome (or error) is not the stated one: a concurrent step by its sorted outcomes, an
+// `either` step by whether it is one of the listed pairs.
 const stepOf = (d: Difference, s: Scenario, obs: Observation): StepAt | null => {
   if (d.field !== 'outcome' && d.field !== 'error') return null;
   for (const [i, e] of s.expect.entries()) {
@@ -100,6 +101,8 @@ const stepOf = (d: Difference, s: Scenario, obs: Observation): StepAt | null => 
     if (typeof seen !== 'object') continue;
     const o = seen.outcomes[0];
     if (e.tag === 'one' && (e.ply.outcome !== o.outcome || e.ply.error !== o.error)) return { index: i, outcome: o.outcome, error: o.error, expected: e.ply };
+    // a git-version-dependent step: any listed outcome/error pair meets it; none is singled out as the expected one
+    if (e.tag === 'either' && !e.ply.some(p => p.outcome === o.outcome && p.error === o.error)) return { index: i, outcome: o.outcome, error: o.error, expected: null };
     if (e.tag === 'many' && [...e.ply].sort().join(',') !== seen.outcomes.map(x => x.outcome).sort().join(',')) return { index: i, outcome: o.outcome, error: o.error, expected: null };
   }
   return null;
