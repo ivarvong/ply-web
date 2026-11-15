@@ -114,7 +114,8 @@ async function plyPush(c: Ctx, push: Push, from: From, timeouts: Timeouts, paren
   switch (push.pack.tag) {
     case 'hand': return send(await handPack(c.store, objects.value, push.pack));
     case 'defect': return send(await defectPack(c.store, objects.value, push.pack.defect));
-    case 'objects': {
+    case 'objects':
+    case 'listed': {
       const r = await g.value.push({ commands, objects: asPackObjects(objects.value), ...atomic });
       return r.ok ? plyOutcome({ ok: true }) : plyErr(r.error, '');
     }

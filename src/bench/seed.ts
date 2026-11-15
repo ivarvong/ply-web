@@ -180,6 +180,14 @@ export async function buildSeed(seed: Seed): Promise<Result<SeedStore, string>> 
         names.set(o.name, put(objects, 'commit', enc.encode(text), [tree.value, ...parents]));
         break;
       }
+      case 'raw-tag': {
+        // the type line as written, which may disagree with the target or name a missing one
+        const target = mapGet(names, o.object);
+        if (target.tag === 'none') return err(`raw tag ${o.name}: object ${o.object} is not defined before it`);
+        const body = `object ${target.value}\ntype ${o.type}\ntag ${o.tagName}\ntagger ${IDENT}\n\n${o.message}\n`;
+        names.set(o.name, put(objects, 'tag', enc.encode(body), [target.value]));
+        break;
+      }
       case 'phantom':
         // an id nothing holds: named, never stored
         names.set(o.name, toHex(new Sha1().update(enc.encode(`probe phantom ${o.seed}`)).digest()) as Oid);
@@ -230,9 +238,21 @@ export function reachable(store: SeedStore, tips: readonly Oid[]): Oid[] {
 }
 
 // The objects a push carries: reachable from its new ids and not from `have` (the ids the target holds), minus the
-// plan's `omit` (test/probes/runner.mjs objectsFor); none for a `no-objects` defect pack.
+// plan's `omit` (test/probes/runner.mjs objectsFor); none for a `no-objects` defect pack; exactly the named objects for a
+// `listed` pack, with no walk.
 export function objectsFor(store: SeedStore, push: Push, have: readonly Oid[]): Result<StoredObject[], string> {
   if (push.pack.tag === 'defect' && push.pack.defect.tag === 'no-objects') return ok([]);
+  if (push.pack.tag === 'listed') {
+    const listed: StoredObject[] = [];
+    for (const n of push.pack.objects) {
+      const id = oidOf(store, { tag: 'obj', name: n });
+      if (!id.ok) return id;
+      const o = mapGet(store.objects, id.value);
+      if (o.tag === 'none') return err(`listed object ${n} is not stored in the seed`);
+      listed.push(o.value);
+    }
+    return ok(listed);
+  }
   const news: Oid[] = [];
   for (const u of push.updates) {
     const n = oidOf(store, u.new);

@@ -55,6 +55,10 @@ async function gitSeed(seed: Seed): Promise<Map<string, string>> {
           names.set(o.name, git(['hash-object', '--literally', '-t', 'commit', '-w', '--stdin'], body));
           break;
         }
+        case 'raw-tag':
+          // the type line as written (it may disagree with the target, or name an object nothing holds)
+          names.set(o.name, git(['hash-object', '--literally', '-t', 'tag', '-w', '--stdin'], `object ${names.get(o.object)}\ntype ${o.type}\ntag ${o.tagName}\ntagger ply probe <probe@ply.invalid> 1700000000 +0000\n\n${o.message}\n`));
+          break;
         case 'phantom':
           names.set(o.name, createHash('sha1').update(`probe phantom ${o.seed}`).digest('hex'));
           break;
@@ -96,4 +100,18 @@ test('objectsFor: a push carries what the target lacks, minus the plan omit', as
   assert.ok(objs.ok);
   // ff: its commit and its root tree; f.txt's new blob is omitted, dir/ is unchanged and held
   assert.deepEqual(objs.value.map(o => o.type).sort(), ['commit', 'tree']);
+});
+
+test('objectsFor: a listed pack carries exactly the named objects, with no walk', async () => {
+  const s = SCENARIOS.find(x => x.id === 'pack.push-malformed-object-refused#tag-type-mismatch');
+  assert.ok(s);
+  const built = await buildSeed(s.seed);
+  assert.ok(built.ok);
+  const step = s.steps[0];
+  assert.equal(step.tag, 'push');
+  if (step.tag !== 'push') return;
+  assert.equal(step.push.pack.tag, 'listed');
+  const objs = objectsFor(built.value, step.push, []);
+  assert.ok(objs.ok);
+  assert.deepEqual(objs.value.map(o => o.type), ['tag']);
 });
