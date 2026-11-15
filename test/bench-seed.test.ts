@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,18 +24,40 @@ async function gitSeed(seed: Seed): Promise<Map<string, string>> {
   const trees = new Map<string, string>();
   try {
     for (const o of seed.objects) {
-      if (o.tag === 'commit') {
-        const idx = { GIT_INDEX_FILE: join(root, `index-${o.name}`) };
-        const first = o.parents[0];
-        git(typeof first === 'string' ? ['read-tree', String(trees.get(first))] : ['read-tree', '--empty'], null, idx);
-        for (const f of o.files) {
-          const blob = git(['hash-object', '-w', '--stdin'], await contentBytes(f.content));
-          git(['update-index', '--add', '--cacheinfo', `100644,${blob},${f.path}`], null, idx);
+      switch (o.tag) {
+        case 'commit': {
+          const idx = { GIT_INDEX_FILE: join(root, `index-${o.name}`) };
+          const first = o.parents[0];
+          git(typeof first === 'string' ? ['read-tree', String(trees.get(first))] : ['read-tree', '--empty'], null, idx);
+          for (const f of o.files) {
+            const blob = git(['hash-object', '-w', '--stdin'], await contentBytes(f.content));
+            git(['update-index', '--add', '--cacheinfo', `100644,${blob},${f.path}`], null, idx);
+          }
+          trees.set(o.name, git(['write-tree'], null, idx));
+          names.set(o.name, git(['commit-tree', String(trees.get(o.name)), ...o.parents.flatMap(p => ['-p', String(names.get(p))]), '-m', o.message]));
+          break;
         }
-        trees.set(o.name, git(['write-tree'], null, idx));
-        names.set(o.name, git(['commit-tree', String(trees.get(o.name)), ...o.parents.flatMap(p => ['-p', String(names.get(p))]), '-m', o.message]));
-      } else {
-        names.set(o.name, git(['mktag'], `object ${names.get(o.target)}\ntype commit\ntag ${o.tagName}\ntagger ply probe <probe@ply.invalid> 1700000000 +0000\n\n${o.message}\n`));
+        case 'annotated-tag':
+          names.set(o.name, git(['mktag'], `object ${names.get(o.target)}\ntype commit\ntag ${o.tagName}\ntagger ply probe <probe@ply.invalid> 1700000000 +0000\n\n${o.message}\n`));
+          break;
+        case 'raw-tree': {
+          // git plumbing resolves each entry's blob, then writes the bytes as given (hash-object --literally)
+          const body = Buffer.concat(o.entries.map(e => {
+            const blob = e.blob.tag === 'commit' ? String(names.get(e.blob.name)) : git(['rev-parse', `${trees.get(e.blob.of)}:${e.blob.path}`]);
+            return Buffer.concat([Buffer.from(`${e.mode} ${e.name}\0`), Buffer.from(blob, 'hex')]);
+          }));
+          names.set(o.name, git(['hash-object', '--literally', '-t', 'tree', '-w', '--stdin'], body));
+          break;
+        }
+        case 'raw-commit': {
+          const tree = trees.has(o.tree) ? trees.get(o.tree) : names.get(o.tree);
+          const body = [`tree ${tree}`, ...o.parents.map(p => `parent ${names.get(p)}`), `author ${o.author}`, 'committer ply probe <probe@ply.invalid> 1700000000 +0000', '', o.message, ''].join('\n');
+          names.set(o.name, git(['hash-object', '--literally', '-t', 'commit', '-w', '--stdin'], body));
+          break;
+        }
+        case 'phantom':
+          names.set(o.name, createHash('sha1').update(`probe phantom ${o.seed}`).digest('hex'));
+          break;
       }
     }
     return names;

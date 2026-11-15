@@ -2,7 +2,7 @@
 // (test/probes/runner.mjs buildSeed: fixed identity and dates, `git commit-tree -m <name>`, `git mktag`), so a plan run
 // from a Worker holds the same object ids as every run of it in ply's suite. test/bench-seed.test.ts checks that against
 // git itself. Pure apart from SHA-256 (the noise stream), which is the platform's crypto.subtle.
-import { hashObject, parseOid, toHex, treeSort, encodeTree, type Oid } from 'ply';
+import { Sha1, hashObject, parseOid, toHex, treeSort, encodeTree, type Oid } from 'ply';
 import type { Content, ObjRef, ObjectSpec, OidExpr, Push, Scenario, Seed } from 'ply/probes';
 import { mapGet } from '../absent.ts';
 import { type Result, err, ok } from './result.ts';
@@ -32,12 +32,16 @@ export async function noiseBytes(seed: string, n: number): Promise<Uint8Array> {
   return out;
 }
 export async function contentBytes(c: Content): Promise<Uint8Array> {
-  if (c.tag === 'text') return enc.encode(c.text);
-  return noiseBytes(c.seed, c.bytes);
+  switch (c.tag) {
+    case 'text': return enc.encode(c.text);
+    case 'noise': return noiseBytes(c.seed, c.bytes);
+    case 'repeat': return new Uint8Array(c.bytes).fill(c.byte);
+  }
 }
+const contentSize = (c: Content): number => (c.tag === 'text' ? c.text.length : c.bytes);
 // The bytes a seed asks for, so a runner can refuse a plan too large for its memory before building it.
 export function seedBytes(seed: Seed): number {
-  return seed.objects.reduce((sum, o) => sum + (o.tag === 'commit' ? o.files.reduce((s, f) => s + (f.content.tag === 'text' ? f.content.text.length : f.content.bytes), 0) : 0), 0);
+  return seed.objects.reduce((sum, o) => sum + (o.tag === 'commit' ? o.files.reduce((s, f) => s + contentSize(f.content), 0) : 0), 0);
 }
 
 type Dir = { readonly files: Map<string, Oid>; readonly dirs: Map<string, Dir> };
@@ -120,21 +124,67 @@ async function buildCommit(objects: Map<string, StoredObject>, names: Map<string
   return ok(put(objects, 'commit', enc.encode(text), [tree.value, ...parents]));
 }
 
+// A raw tree's bytes, `<mode> <name>\0<20-byte id>` per entry in the plan's order (ply/probes RawTreeSpec), and the
+// blobs it names.
+function rawTree(store: SeedStore, o: Extract<ObjectSpec, { readonly tag: 'raw-tree' }>): Result<{ readonly data: Uint8Array; readonly links: readonly Oid[] }, string> {
+  const parts: Uint8Array[] = [];
+  const links: Oid[] = [];
+  for (const e of o.entries) {
+    const blob = resolveObjRef(store, e.blob);
+    if (!blob.ok) return err(`raw tree ${o.name}: ${blob.error}`);
+    parts.push(enc.encode(`${e.mode} ${e.name}\0`), Uint8Array.from(blob.value.match(/../g) || [], h => parseInt(h, 16)));
+    links.push(blob.value);
+  }
+  const data = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) { data.set(p, at); at += p.length; }
+  return ok({ data, links });
+}
+
 export async function buildSeed(seed: Seed): Promise<Result<SeedStore, string>> {
   const objects = new Map<string, StoredObject>();
   const names = new Map<string, Oid>();
   const trees = new Map<string, Oid>();
   for (const o of seed.objects) {
-    if (o.tag === 'commit') {
-      const c = await buildCommit(objects, names, trees, o);
-      if (!c.ok) return c;
-      names.set(o.name, c.value);
-      continue;
+    switch (o.tag) {
+      case 'commit': {
+        const c = await buildCommit(objects, names, trees, o);
+        if (!c.ok) return c;
+        names.set(o.name, c.value);
+        break;
+      }
+      case 'annotated-tag': {
+        const target = mapGet(names, o.target);
+        if (target.tag === 'none') return err(`tag ${o.name}: target ${o.target} is not defined before it`);
+        const body = `object ${target.value}\ntype commit\ntag ${o.tagName}\ntagger ${IDENT}\n\n${o.message}\n`;
+        names.set(o.name, put(objects, 'tag', enc.encode(body), [target.value]));
+        break;
+      }
+      case 'raw-tree': {
+        const t = rawTree({ names, byOid: {}, objects, trees }, o);
+        if (!t.ok) return t;
+        names.set(o.name, put(objects, 'tree', t.value.data, t.value.links));
+        break;
+      }
+      case 'raw-commit': {
+        const fromCommit = mapGet(trees, o.tree);
+        const tree = fromCommit.tag === 'some' ? fromCommit : mapGet(names, o.tree);
+        if (tree.tag === 'none') return err(`raw commit ${o.name}: tree ${o.tree} is not defined before it`);
+        const parents: Oid[] = [];
+        for (const p of o.parents) {
+          const id = mapGet(names, p);
+          if (id.tag === 'none') return err(`raw commit ${o.name}: parent ${p} is not defined before it`);
+          parents.push(id.value);
+        }
+        const text = `tree ${tree.value}\n${parents.map(p => `parent ${p}\n`).join('')}author ${o.author}\ncommitter ${IDENT}\n\n${o.message}\n`;
+        names.set(o.name, put(objects, 'commit', enc.encode(text), [tree.value, ...parents]));
+        break;
+      }
+      case 'phantom':
+        // an id nothing holds: named, never stored
+        names.set(o.name, toHex(new Sha1().update(enc.encode(`probe phantom ${o.seed}`)).digest()) as Oid);
+        break;
     }
-    const target = mapGet(names, o.target);
-    if (target.tag === 'none') return err(`tag ${o.name}: target ${o.target} is not defined before it`);
-    const body = `object ${target.value}\ntype commit\ntag ${o.tagName}\ntagger ${IDENT}\n\n${o.message}\n`;
-    names.set(o.name, put(objects, 'tag', enc.encode(body), [target.value]));
   }
   const byOid: Record<string, string> = {};
   for (const [n, oid] of names) byOid[oid] = n;
@@ -180,8 +230,9 @@ export function reachable(store: SeedStore, tips: readonly Oid[]): Oid[] {
 }
 
 // The objects a push carries: reachable from its new ids and not from `have` (the ids the target holds), minus the
-// plan's `omit` (test/probes/runner.mjs objectsFor).
+// plan's `omit` (test/probes/runner.mjs objectsFor); none for a `no-objects` defect pack.
 export function objectsFor(store: SeedStore, push: Push, have: readonly Oid[]): Result<StoredObject[], string> {
+  if (push.pack.tag === 'defect' && push.pack.defect.tag === 'no-objects') return ok([]);
   const news: Oid[] = [];
   for (const u of push.updates) {
     const n = oidOf(store, u.new);
