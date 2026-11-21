@@ -370,8 +370,8 @@ The step decision is the policy. A signal set to `hard` rolls back. The same sig
 | Signal | Checked-in mode | What happens |
 | --- | --- | --- |
 | Smoke | `hard` | The 0% lifecycle only. While the ramp query returns, a probe's HTTP status is not a gate, except a 5xx in a window the loss-rate gate will not judge (a harness stall, or fewer issued probes than `probe.minSamples`): that 5xx rolls back without waiting for the query. When the query is lost, a 5xx on a responded probe is the correctness signal |
-| Exception, 5xx, error log, non-ok outcome | `hard` | Any, on the new version, on the old version, or across the worker. One request is enough |
-| SLO burn | `hard` | The same three scopes. `bad/total` divided by the error budget is above `burn.fastBurn` (**14.4**), and that SLO saw at least `burn.minSamples` (**100**) requests |
+| Exception, 5xx, error log, non-ok outcome | `hard` | Any, on the new version. One request is enough. The same counts on the old version and across the worker are named on the reason as `informational` and never roll back (`scripts/cd/slo.ts` `judgeStep`) |
+| SLO burn | `hard` | On the new version: `bad/total` divided by the error budget is above `burn.fastBurn` (**14.4**), and that SLO saw at least `burn.minSamples` (**100**) requests. The old version and the aggregate are judged the same way and reported as `informational` |
 | Routed share | `rollback` | `routedNewShare` outside the binomial band. `split.onMismatch` may instead be `hold`, which leaves the split |
 | Thin evidence | `hold` | Fewer than `split.minNewRequests` (**100**) new-version invocations, or no invocations at all. Outcome `insufficient_data`. `onInsufficient: advance` moves on and still says so |
 | Latency | `informational` | Never, under this file. Wall p99 and CPU p99 are on the line and on the ramp observation. `off` omits them from the line. `gate` needs `minSamples`, `p99Ratio` (> 1), and `effectFloorMs`, and rolls back only when both sides have that many wall samples and p99 clears both thresholds |
@@ -398,7 +398,7 @@ The checked-in probe schedules `25 × 2 × 30s = 1500` requests at the 10% step,
 | New version at 50% | 625 | 0.48% |
 | Aggregate, and the new version at 100% | 2000 | 0.15% |
 
-A step with fewer than 100 new-version invocations does not advance. That floor is the 2.95% row. A normal 10% step sees about 150 and can catch a 2% regression on the new version (it was 200 and 1.5% at the old 40 s dwell). The aggregate, which is what users feel, can catch 0.15% in the same window. Per-version is what keeps a regression on the small arm from being diluted into the aggregate.
+A step with fewer than 100 new-version invocations does not advance. That floor is the 2.95% row. A normal 10% step sees about 150 and can catch a 2% regression on the new version (it was 200 and 1.5% at the old 40 s dwell). The aggregate, which is what users feel, would resolve 0.15% in the same window, but it is informational: only the new version's signals roll back. Per-version is what keeps a regression on the small arm from being diluted into the aggregate.
 
 The share check is the same `n`. For target proportion `p` and `z = 3`, the band is `p ± z √(p(1−p)/n)`. At 10% and `n = 1500` that is 7.68%..12.32%. At 100%, `p(1−p)` is 0, so the share has to be 100%. Counts come from external fetch invocations, not from the probe's own bookkeeping and not from named entrypoints. `test/fixtures/cd/routed-share.json` is a synthetic 10% window of this shape: 200 of 2000 advances, 1000 of 2000 rolls back, 40 of 400 is `insufficient_data`.
 
